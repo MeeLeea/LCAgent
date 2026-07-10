@@ -1,0 +1,19 @@
+# ============================================
+# LangChainAgent 依赖列表
+# ============================================
+
+# ---------- LangChain 核心框架 ----------
+langchain>=1.0.0,<2.0.0
+langchain-core>=1.0.0,<2.0.0
+langchain-openai>=1.0.0,<2.0.0
+
+# ---------- LangGraph (Agent 调度) ----------
+langgraph>=1.0.0,<2.0.0
+langgraph-prebuilt>=1.0.0,<2.0.0
+
+# ---------- MCP (Model Context Protocol) ----------
+langchain-mcp-adapters>=0.3.0,<1.0.0
+mcp>=1.9.0,<2.0.0
+
+# ---------- LLM SDK ----------
+openai>=1.0.0,<3.0.0
