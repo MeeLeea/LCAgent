@@ -22,6 +22,8 @@ class AgentCore:
         llm_client: LLMClient,
         memory_size: int = 10,
         long_term_memory_file: Optional[str] = None,
+        checkpoint_file: Optional[str] = None,
+        thread_id: Optional[str] = None,
         max_iterations: int = 25,
         verbose: bool = True,
         mcp_config_file: Optional[str] = None,
@@ -32,8 +34,10 @@ class AgentCore:
 
         Args:
             llm_client: LLM客户端实例
-            memory_size: 短期记忆容量
-            long_term_memory_file: 长期记忆文件路径
+            memory_size: 仅兼容旧 API(checkpoint 不限容量)
+            long_term_memory_file: 长期记忆 JSON 文件(用于 compress)
+            checkpoint_file: SQLite checkpoint 文件路径(为 None 时用内存)
+            thread_id: 会话线程 ID(为 None 时自动生成)
             max_iterations: Agent最大迭代次数(langgraph recursion_limit)
             verbose: 是否打印详细执行过程
             mcp_config_file: MCP servers 配置文件路径
@@ -41,8 +45,11 @@ class AgentCore:
         """
         self.llm = llm_client
         self.memory = AgentMemory(
+            checkpoint_file=checkpoint_file,
+            long_term_file=long_term_memory_file,
+            thread_id=thread_id,
             short_term_size=memory_size,
-            long_term_file=long_term_memory_file
+            use_sqlite=checkpoint_file is not None
         )
         self.max_iterations = max_iterations
         self.verbose = verbose
@@ -103,10 +110,12 @@ class AgentCore:
 
         # create_react_agent 直接返回可调用的agent
         # prompt 参数作为系统提示词
+        # checkpointer 让 Agent 自动持久化状态到 SQLite
         agent = create_react_agent(
             model=chat_model,
             tools=self.tools,
             prompt=self._get_system_prompt(),
+            checkpointer=self.memory.get_checkpointer(),
             # recursion_limit=self.max_iterations
         )
         return agent
@@ -120,13 +129,13 @@ class AgentCore:
             "1. 当用户要求创建文件、读写文件、创建目录、搜索信息等操作时，你【必须】调用相应工具来完成，"
             "绝对不要回复'我无法访问你的文件系统'、'我没有权限'、'请你自己保存'之类的话。\n"
             "2. 你确实拥有这些工具的能力，工具会在用户本地执行，可以真正创建和修改文件。\n"
-            "3. 如果用户要保存内容到文件，直接调用 write_file 工具，不要把内容贴出来让用户自己保存。\n"
-            "4. 如果用户要创建目录，直接调用 create_workspace 工具，不要让用户手动操作，创建文件夹默认位置是：'当前工作目录/test/'。\n"
-            "5. 只有纯知识性问答（不需要操作文件/搜索/计算）才直接回答，不调用工具。\n"
-            "6. 调用工具时，如果一次任务需要多步操作（例如先创建目录再写文件），请依次调用多个工具。\n"
-            "7. 如果用户要求跑一下或者测试一下，直接调用相应工具，不要让用户手动操作。\n"
-            "8. 如果用户要求生成工具,直接在tools目录下创建，并使用@tool装饰器，不修改__init__.py文件。\n"
-            "9. 如果用户要求获取本地时间，直接调用 get_local_time 工具，不要自己计算。\n"
+            "3. 对话过程中创建文件、脚本、文件夹默认位置是：'./test/'。\n"
+            "4. 如果用户要保存内容到文件，或创建文件，直接调用 write_file 工具，不要把内容贴出来让用户自己保存。\n"
+            "5. 如果用户要创建目录，直接调用 create_workspace 工具，不要让用户手动操作\n"
+            "6. 只有纯知识性问答（不需要操作文件/搜索/计算）才直接回答，不调用工具。\n"
+            "7. 调用工具时，如果一次任务需要多步操作（例如先创建目录再写文件），请依次调用多个工具。\n"
+            "8. 如果用户要求跑一下或者测试一下，直接调用相应工具，不要让用户手动操作。\n"
+            "9. 如果用户要求生成工具,直接在tools目录下创建，并使用@tool装饰器，不修改__init__.py文件。\n"
             "\n"
             "请用中文回答。"
         )
@@ -146,12 +155,12 @@ class AgentCore:
         print(f"{'='*50}\n")
 
         try:
-            # 构建消息列表：历史消息 + 当前任务
-            messages = list(self.memory.get_langchain_messages())
-            messages.append(HumanMessage(content=task))
-
-            # 执行Agent
-            result = self.agent_executor.invoke({"messages": messages})
+            # Checkpoint 模式: 只传当前消息, 自动从 checkpoint 恢复历史
+            config = self.memory.get_config()
+            result = self.agent_executor.invoke(
+                {"messages": [HumanMessage(content=task)]},
+                config=config
+            )
 
             # 解析结果
             output = ""
@@ -222,17 +231,16 @@ class AgentCore:
             助手回复
         """
         try:
-            # 构建消息列表：历史消息 + 当前任务
-            messages = list(self.memory.get_langchain_messages())
-            messages.append(HumanMessage(content=message))
-
-            # 静默执行（保存原 verbose 状态）
+            # Checkpoint 模式: 只传当前消息, 自动从 checkpoint 恢复历史
+            config = self.memory.get_config()
             original_verbose = self.verbose
             self.verbose = False
 
-            result = self.agent_executor.invoke({"messages": messages})
+            result = self.agent_executor.invoke(
+                {"messages": [HumanMessage(content=message)]},
+                config=config
+            )
 
-            # 恢复 verbose
             self.verbose = original_verbose
 
             # 取最后一条 AI 消息作为输出
@@ -280,7 +288,8 @@ class AgentCore:
             "请用中文回答。"
         )
 
-        context = self.memory.get_all_context()
+        # CoT 模式不调用工具,直接用 LLM + checkpoint 历史
+        context = self.memory.get_short_term() + self.memory.get_long_term(3)
         response = self.llm.chat_with_history(
             user_input=task,
             history=context,

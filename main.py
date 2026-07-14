@@ -11,6 +11,7 @@ CONFIG_FILE = "llm_config.json"
 MCP_CONFIG_FILE = "mcp_servers.json"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MEMORY_FILE = os.path.join(BASE_DIR, "data", "memory.json")
+CHECKPOINT_FILE = os.path.join(BASE_DIR, "data", "checkpoints.sqlite")
 
 def select_provider() -> str:
     """启动时选择提供商"""
@@ -79,11 +80,12 @@ def main():
     llm = create_llm(provider)
 
     # 创建Agent
-    print("初始化Agent(含MCP工具加载)...")
+    print("初始化Agent(含MCP工具加载 + Checkpoint 持久化)...")
     agent = AgentCore(
         llm_client=llm,
         memory_size=10,
         long_term_memory_file=MEMORY_FILE,
+        checkpoint_file=CHECKPOINT_FILE,
         max_iterations=5,
         verbose=True,
         mcp_config_file=MCP_CONFIG_FILE,
@@ -103,10 +105,13 @@ def main():
     print("  - 输入 'react:任务' 使用Agent模式(自动调用工具)")
     print("  - 输入 'cot:任务' 使用链式思考模式(纯推理)")
     print("  - 输入 'switch:提供商名' 切换模型 (zhipu/qwen/deepseek/kimi)")
-    print("  - 输入 'info' 查看当前模型信息")
+    print("  - 输入 'info' 查看当前模型信息 + 记忆状态")
     print("  - 输入 'tools' 查看可用工具")
     print("  - 输入 'clear [long|short|all]' 清理记忆(默认 long)")
     print("  - 输入 'compress' 压缩长期记忆(LLM摘要后替换原内容)")
+    print("  - 输入 'thread' 查看所有会话(包含历史)")
+    print("  - 输入 'thread:new' 开启新会话(原会话保留)")
+    print("  - 输入 'thread:switch <thread_id>' 切换到指定会话")
     print("  - 输入 'mcp' 查看 MCP Server 状态")
     print("  - 输入 'mcp:reload' 重新加载 MCP 工具")
     print("  - 输入 'mcp:add <name> <command> <arg1> [arg2...]' 添加 stdio MCP Server")
@@ -138,7 +143,47 @@ def main():
                 print(f"当前模型:   {info['model']}")
                 print(f"API地址:    {info['base_url']}")
                 mem = agent.get_memory_summary()
-                print(f"记忆状态:   短期{mem['short_term_count']}/{mem['short_term_capacity']}, 长期{mem['long_term_count']}")
+                print(f"\n--- 记忆状态 ---")
+                print(f"当前会话:   {mem['thread_id']}")
+                print(f"Checkpoint: {mem['checkpoint_backend']} → {mem['checkpoint_file']}")
+                print(f"已存消息:   {mem['checkpoint_messages']} 条")
+                print(f"长期记忆:   {mem['long_term_count']} 条")
+                print(f"总会话数:   {mem['total_threads']}")
+                continue
+
+            # ========= 会话(Thread)管理 =========
+            if user_input.lower() == 'thread' or user_input.lower() == 'threads':
+                threads = agent.memory.list_threads()
+                current = agent.memory.thread_id
+                print(f"\n所有会话 (共 {len(threads)} 个):")
+                print("-" * 60)
+                for t in threads:
+                    mark = " *" if t == current else "  "
+                    print(f"{mark} {t}")
+                print("-" * 60)
+                print("* = 当前会话")
+                continue
+
+            if user_input.lower() == 'thread:new':
+                old = agent.memory.thread_id
+                new = agent.memory.new_thread()
+                print(f"\n已开启新会话: {new}")
+                print(f"原会话 {old} 已保留,可用 'thread:switch {old}' 切回")
+                continue
+
+            if user_input.lower().startswith('thread:switch'):
+                parts = user_input.split(None, 1)
+                if len(parts) < 2:
+                    print("用法: thread:switch <thread_id>")
+                    continue
+                tid = parts[1].strip()
+                found = agent.memory.switch_thread(tid)
+                msgs = agent.memory.get_messages()
+                if found:
+                    print(f"\n已切换到会话: {tid} (恢复 {len(msgs)} 条历史消息)")
+                else:
+                    print(f"\n已切换到会话: {tid} (新会话,无历史)")
+                    print(f"提示:可用 'thread' 命令查看所有已有会话")
                 continue
 
             # 查看可用工具

@@ -1,83 +1,187 @@
 """
-记忆模块 - 基于LangChain Memory，支持短期记忆和长期记忆
+记忆模块 - 基于 LangGraph Checkpoint
+
+替代原 deque + memory.json 方案:
+- 短期记忆 → checkpoint 自动管理(SQLite 持久化,自动恢复)
+- 长期记忆 → memory.json 手动标记(用于 compress 摘要)
+
+特性:
+1. 自动持久化: Agent 每步执行后自动保存完整状态
+2. 跨会话恢复: 通过 thread_id 恢复历史对话
+3. 中断恢复: 程序崩溃可从最近 checkpoint 续跑
+4. 多会话隔离: 不同 thread_id 独立
+5. 工具调用中间状态: 完整保存(tool_calls、tool_outputs)
 """
-from typing import List, Dict, Any, Optional
-from langchain_core.chat_history import InMemoryChatMessageHistory
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from collections import deque
-import json
 import os
+import json
+import sqlite3
+import uuid
+from typing import List, Dict, Any, Optional
 from datetime import datetime
+
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.memory import MemorySaver
 
 
 class AgentMemory:
-    """记忆管理类，结合LangChain消息和持久化长期记忆"""
+    """
+    基于 LangGraph Checkpoint 的记忆系统
+
+    - checkpointer: 自动持久化 Agent 执行状态(SQLite)
+    - long_term_memory: 手动标记的重要记忆(JSON,用于 compress)
+    """
 
     def __init__(
         self,
-        short_term_size: int = 10,
-        long_term_file: Optional[str] = None
+        checkpoint_file: Optional[str] = None,
+        long_term_file: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        short_term_size: int = 10,  # 仅兼容旧 API
+        use_sqlite: bool = True
     ):
         """
         初始化记忆系统
 
         Args:
-            short_term_size: 短期记忆容量
-            long_term_file: 长期记忆存储文件路径
+            checkpoint_file: SQLite 持久化文件路径(为 None 时用内存)
+            long_term_file: 长期记忆 JSON 文件路径(用于 compress)
+            thread_id: 会话线程 ID(为 None 时自动生成)
+            short_term_size: 仅兼容旧 API(checkpoint 不限容量)
+            use_sqlite: True=SQLite持久化, False=内存(调试用)
         """
-        self.short_term_size = short_term_size
-        self.short_term_memory = deque(maxlen=short_term_size)
+        self.checkpoint_file = checkpoint_file
         self.long_term_file = long_term_file
+        self.thread_id = thread_id or f"thread-{uuid.uuid4().hex[:8]}"
+        self.short_term_size = short_term_size
+        self.use_sqlite = use_sqlite and checkpoint_file is not None
+
+        # 长期记忆(独立于 checkpoint,用于 compress)
         self.long_term_memory: List[Dict[str, Any]] = []
 
-        # LangChain 消息历史（用于与LangChain组件交互）
-        self.chat_history = InMemoryChatMessageHistory()
+        # 初始化 checkpointer
+        self._checkpointer = self._init_checkpointer()
 
+        # 加载长期记忆
         if long_term_file and os.path.exists(long_term_file):
             self._load_long_term_memory()
 
+    # ============ Checkpointer 管理 ============
+
+    def _init_checkpointer(self):
+        """初始化 checkpointer"""
+        if self.use_sqlite:
+            parent = os.path.dirname(os.path.abspath(self.checkpoint_file))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            conn = sqlite3.connect(self.checkpoint_file, check_same_thread=False)
+            return SqliteSaver(conn)
+        else:
+            return MemorySaver()
+
+    def get_checkpointer(self):
+        """获取 checkpointer 实例(传给 create_react_agent)"""
+        return self._checkpointer
+
+    def get_config(self) -> Dict[str, Any]:
+        """获取 invoke 需要传入的 config"""
+        return {"configurable": {"thread_id": self.thread_id}}
+
+    # ============ 会话(Thread)管理 ============
+
+    def new_thread(self) -> str:
+        """开启新会话(原会话保留在数据库)"""
+        self.thread_id = f"thread-{uuid.uuid4().hex[:8]}"
+        return self.thread_id
+
+    def switch_thread(self, thread_id: str) -> bool:
+        """
+        切换到指定会话(恢复历史)
+
+        Returns:
+            True=该 thread 有 checkpoint 记录, False=新会话(无历史)
+        """
+        self.thread_id = thread_id
+        # 如果数据库里有记录,返回 True;否则是新建会话
+        return thread_id in self.list_threads()
+
+    def list_threads(self) -> List[str]:
+        """列出数据库中所有 thread_id"""
+        if not self.use_sqlite:
+            return [self.thread_id]
+        try:
+            conn = sqlite3.connect(self.checkpoint_file, check_same_thread=False)
+            cursor = conn.execute(
+                "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
+            )
+            threads = [row[0] for row in cursor.fetchall()]
+            conn.close()
+            return threads
+        except Exception:
+            return [self.thread_id]
+
+    # ============ 消息获取 ============
+
+    def get_messages(self) -> List[BaseMessage]:
+        """从 checkpoint 获取当前 thread 的所有消息"""
+        config = self.get_config()
+        try:
+            # langgraph 1.x: 用 get_tuple 获取 CheckpointTuple
+            tup = self._checkpointer.get_tuple(config)
+            if tup and tup.checkpoint:
+                channel_values = tup.checkpoint.get("channel_values", {})
+                if "messages" in channel_values:
+                    return list(channel_values["messages"])
+        except Exception:
+            pass
+        return []
+
+    def get_langchain_messages(self) -> List[BaseMessage]:
+        """兼容旧 API:等同于 get_messages()"""
+        return self.get_messages()
+
+    def get_short_term(self, limit: Optional[int] = None) -> List[Dict[str, str]]:
+        """兼容旧 API:从 checkpoint 取消息转为 dict 格式"""
+        msgs = self.get_messages()
+        if limit:
+            msgs = msgs[-limit:]
+        elif self.short_term_size:
+            msgs = msgs[-self.short_term_size:]
+        result = []
+        for m in msgs:
+            role = "user"
+            if isinstance(m, AIMessage):
+                role = "assistant"
+            elif isinstance(m, SystemMessage):
+                role = "system"
+            result.append({"role": role, "content": m.content})
+        return result
+
+    def get_all_context(self, long_term_limit: int = 3) -> List[Dict[str, str]]:
+        """兼容旧 API:长期记忆 + 短期记忆"""
+        context = self.get_long_term(long_term_limit)
+        context.extend(self.get_short_term())
+        return context
+
+    # ============ 长期记忆(用于 compress) ============
+
     def add(self, role: str, content: str, metadata: Optional[Dict[str, Any]] = None):
         """
-        添加一条记忆
+        添加记忆
 
-        Args:
-            role: 角色 (user/assistant/system)
-            content: 内容
-            metadata: 额外元数据，设置 {"important": True} 会存入长期记忆
+        注意:checkpoint 会在 agent invoke 时自动保存对话,
+        此方法只处理 important=True 的重要记忆(写入 memory.json 供 compress)。
+        普通对话不需要调用此方法(由 checkpoint 自动处理)。
         """
-        memory_item = {
-            "role": role,
-            "content": content,
-            "timestamp": datetime.now().isoformat(),
-            "metadata": metadata or {}
-        }
-
-        # 添加到短期记忆
-        self.short_term_memory.append(memory_item)
-
-        # 添加到LangChain消息历史
-        if role == "user":
-            self.chat_history.add_message(HumanMessage(content=content))
-        elif role == "assistant":
-            self.chat_history.add_message(AIMessage(content=content))
-        elif role == "system":
-            self.chat_history.add_message(SystemMessage(content=content))
-
-        # 根据重要性决定是否存入长期记忆
         if metadata and metadata.get("important", False):
-            self.long_term_memory.append(memory_item)
+            item = {
+                "role": role,
+                "content": content,
+                "timestamp": datetime.now().isoformat(),
+                "metadata": metadata
+            }
+            self.long_term_memory.append(item)
             self._save_long_term_memory()
-
-    def get_short_term(self) -> List[Dict[str, str]]:
-        """获取短期记忆（字典格式，用于对话上下文）"""
-        return [
-            {"role": item["role"], "content": item["content"]}
-            for item in self.short_term_memory
-        ]
-
-    def get_langchain_messages(self) -> List:
-        """获取LangChain消息列表（用于LangChain组件）"""
-        return self.chat_history.messages
 
     def get_long_term(self, limit: int = 5) -> List[Dict[str, str]]:
         """获取长期记忆"""
@@ -87,17 +191,9 @@ class AgentMemory:
             for item in recent
         ]
 
-    def get_all_context(self, long_term_limit: int = 3) -> List[Dict[str, str]]:
-        """获取完整的上下文（长期记忆 + 短期记忆）"""
-        context = []
-        context.extend(self.get_long_term(long_term_limit))
-        context.extend(self.get_short_term())
-        return context
-
     def clear_short_term(self):
-        """清空短期记忆"""
-        self.short_term_memory.clear()
-        self.chat_history = InMemoryChatMessageHistory()
+        """清空当前 thread(开启新会话替代删除)"""
+        self.new_thread()
 
     def clear_long_term(self):
         """清空长期记忆"""
@@ -109,7 +205,6 @@ class AgentMemory:
         """保存长期记忆到文件"""
         if not self.long_term_file:
             return
-        # 自动创建父目录
         parent = os.path.dirname(os.path.abspath(self.long_term_file))
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -129,7 +224,10 @@ class AgentMemory:
     def summarize(self) -> Dict[str, Any]:
         """获取记忆摘要统计"""
         return {
-            "short_term_count": len(self.short_term_memory),
-            "short_term_capacity": self.short_term_size,
-            "long_term_count": len(self.long_term_memory)
+            "thread_id": self.thread_id,
+            "checkpoint_messages": len(self.get_messages()),
+            "checkpoint_backend": "sqlite" if self.use_sqlite else "memory",
+            "checkpoint_file": self.checkpoint_file or "(内存)",
+            "long_term_count": len(self.long_term_memory),
+            "total_threads": len(self.list_threads())
         }
