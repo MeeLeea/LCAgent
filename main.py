@@ -165,7 +165,9 @@ def main():
         max_iterations=5,
         verbose=True,
         mcp_config_file=MCP_CONFIG_FILE,
-        enable_mcp=True
+        enable_mcp=True,
+        skills_dir=os.path.join(BASE_DIR, ".agents", "skills"),
+        auto_match_skills=True
     )
 
     # 显示信息
@@ -196,6 +198,10 @@ def main():
     print("  - 输入 'mcp:add <name> <url>' 添加 sse/http MCP Server (前缀 sse: 或 http:)")
     print("  - 输入 'mcp:remove <name>' 删除 MCP Server")
     print("  - 输入 'mcp:toggle <name> <on|off>' 启用/禁用 MCP Server")
+    print("  - 输入 'skill' 查看所有本地可用技能")
+    print("  - 输入 'skill:<name>' 将某技能加载进当前会话(注入 system prompt)")
+    print("  - 输入 'skill:<name> <任务>' 加载技能并立即执行该任务(如 skill:git-commit 提交README)")
+    print("  - 输入 'skill:clear' 清空手动加载的技能")
     print("  - 其他输入为普通对话模式")
     print(f"\n本地工具: {', '.join(t.name for t in agent.local_tools)}")
     if agent.mcp_tools:
@@ -511,6 +517,64 @@ def main():
                     print(f"已加载 {count} 个 MCP 工具")
                 else:
                     print(f"\n未找到: {name}")
+                continue
+
+            # ========= 技能阅读(Skills)管理 =========
+            low_skill = user_input.lower()
+            if low_skill == 'skill' or low_skill == 'skills':
+                skills = agent.list_skills()
+                if not skills:
+                    print("\n当前没有可用技能(目录 .agents/skills 为空)")
+                else:
+                    print("\n可用技能:")
+                    print("-" * 50)
+                    for s in skills:
+                        print(f"  • {s['name']}")
+                        if s['description']:
+                            desc = s['description']
+                            if len(desc) > 80:
+                                desc = desc[:80] + "..."
+                            print(f"      {desc}")
+                    print("-" * 50)
+                    print("使用 'skill:<name>' 加载技能到当前会话, 'skill:clear' 清空已加载技能")
+                continue
+
+            if low_skill.startswith('skill:'):
+                rest = user_input[6:].strip()
+                # 拆成: 技能名(首个词) + 可选任务(剩余文本)
+                parts = rest.split(None, 1)
+                sub = parts[0].strip().lower()
+                task_text = parts[1].strip() if len(parts) > 1 else ""
+                if sub in ('clear', '清空', 'reset'):
+                    agent.clear_skills()
+                    print("\n已清空手动加载的技能")
+                elif not sub:
+                    print("\n用法: skill:<name> [任务]  或  skill (列出所有)")
+                else:
+                    matched = None
+                    for s in agent.list_skills():
+                        if s['name'].lower() == sub:
+                            matched = s['name']
+                            break
+                    if matched is None:
+                        for s in agent.list_skills():
+                            if sub in s['name'].lower():
+                                matched = s['name']
+                                break
+                    if matched is None:
+                        available = [s['name'] for s in agent.list_skills()]
+                        print(f"\n未找到技能: {sub}")
+                        print(f"可用: {', '.join(available) or '(无)'}")
+                    elif agent.load_skill(matched):
+                        print(f"\n已加载技能: {matched} (将注入后续对话的 system prompt)")
+                        if not agent.auto_match_skills:
+                            print("提示: 自动匹配已关闭,本技能仅手动加载生效")
+                        # 若附带任务,加载后直接以 Agent 模式执行
+                        if task_text:
+                            result = agent.run(task_text)
+                            print(f"\n助手: {result}")
+                    else:
+                        print(f"\n加载失败: {matched}")
                 continue
 
             # ReAct/Agent模式

@@ -4,6 +4,7 @@ Agent核心调度模块 - 基于LangChain 1.x + LangGraph
 支持动态加载本地工具 + MCP Server工具
 """
 import asyncio
+import os
 from typing import Dict, Any, List, Optional
 from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
@@ -12,6 +13,7 @@ from llm_client import LLMClient
 from .memory import AgentMemory
 from tools import all_tools as local_tools
 from tools.mcp_loader import load_mcp_tools, DEFAULT_CONFIG_FILE
+from tools.skills import SkillManager
 
 
 class AgentCore:
@@ -27,7 +29,9 @@ class AgentCore:
         max_iterations: int = 25,
         verbose: bool = True,
         mcp_config_file: Optional[str] = None,
-        enable_mcp: bool = True
+        enable_mcp: bool = True,
+        skills_dir: Optional[str] = None,
+        auto_match_skills: bool = True
     ):
         """
         初始化Agent核心
@@ -65,6 +69,14 @@ class AgentCore:
         self.mcp_config_file = mcp_config_file or DEFAULT_CONFIG_FILE
         self.enable_mcp = enable_mcp
 
+        # 技能阅读(本地 .agents/skills)
+        if skills_dir is None:
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            skills_dir = os.path.join(base_dir, ".agents", "skills")
+        self.skill_manager = SkillManager(skills_dir)
+        self.active_skills: set = set()      # 由 CLI (skill:<name>) 手动加载
+        self.auto_match_skills = auto_match_skills  # 任务开始时自动匹配注入
+
         # 启动时加载 MCP 工具
         if enable_mcp:
             self.reload_mcp_tools()
@@ -86,9 +98,11 @@ class AgentCore:
             count = asyncio.run(self._async_load_mcp_tools())
             # 合并工具列表
             self.tools = list(self.local_tools) + list(self.mcp_tools)
-            # 重建Agent
+            # 重建Agent(保留已加载的技能)
             if hasattr(self, "agent_executor"):
-                self.agent_executor = self._create_agent_executor()
+                self.agent_executor = self._create_agent_executor(
+                    self._compute_skill_block("")
+                )
             return count
         except Exception as e:
             print(f"[MCP] 重新加载失败: {e}")
@@ -104,7 +118,7 @@ class AgentCore:
             print("[MCP] 未加载到任何工具(可能配置为空或服务器未启用)")
         return len(tools)
 
-    def _create_agent_executor(self):
+    def _create_agent_executor(self, skill_block: str = ""):
         """创建LangGraph ReAct Agent"""
         chat_model = self.llm.get_chat_model()
 
@@ -114,15 +128,15 @@ class AgentCore:
         agent = create_react_agent(
             model=chat_model,
             tools=self.tools,
-            prompt=self._get_system_prompt(),
+            prompt=self._get_system_prompt(skill_block),
             checkpointer=self.memory.get_checkpointer(),
             # recursion_limit=self.max_iterations
         )
         return agent
 
-    def _get_system_prompt(self) -> str:
-        """获取系统提示词"""
-        return (
+    def _get_system_prompt(self, skill_block: str = "") -> str:
+        """获取系统提示词(可附加技能指引块)"""
+        base = (
             "你是一个智能助手，配备了多种工具（包括文件读写、目录管理、搜索、计算等）。\n"
             "\n"
             "【重要规则】\n"
@@ -136,9 +150,14 @@ class AgentCore:
             "7. 调用工具时，如果一次任务需要多步操作（例如先创建目录再写文件），请依次调用多个工具。\n"
             "8. 如果用户要求跑一下或者测试一下，直接调用相应工具，不要让用户手动操作。\n"
             "9. 如果用户要求生成工具,直接在tools目录下创建，并使用@tool装饰器，不修改__init__.py文件。\n"
+            "10. 当任务涉及某个专业领域(如提交 git、生成 pptx、查找技能等)时，"
+            "应优先用 read_skill 工具读取对应技能的详细指引,并按指引完成。\n"
             "\n"
             "请用中文回答。"
         )
+        if skill_block:
+            return base + "\n" + skill_block
+        return base
 
     def run(self, task: str) -> str:
         """
@@ -157,8 +176,13 @@ class AgentCore:
         try:
             # Checkpoint 模式: 只传当前消息, 自动从 checkpoint 恢复历史
             config = self.memory.get_config()
+            input_msg = HumanMessage(content=task)
+            # 重建 Agent,注入与本次任务相关的技能指引
+            self.agent_executor = self._create_agent_executor(
+                self._compute_skill_block(task)
+            )
             result = self.agent_executor.invoke(
-                {"messages": [HumanMessage(content=task)]},
+                {"messages": [input_msg]},
                 config=config
             )
 
@@ -169,7 +193,7 @@ class AgentCore:
             step_count = 0
             for msg in result_messages:
                 # 跳过我们传入的历史消息
-                if msg in messages:
+                if msg in (input_msg,):
                     continue
 
                 if isinstance(msg, AIMessage):
@@ -235,6 +259,10 @@ class AgentCore:
             config = self.memory.get_config()
             original_verbose = self.verbose
             self.verbose = False
+            # 重建 Agent,注入与本次对话相关的技能指引
+            self.agent_executor = self._create_agent_executor(
+                self._compute_skill_block(message)
+            )
 
             result = self.agent_executor.invoke(
                 {"messages": [HumanMessage(content=message)]},
@@ -313,8 +341,54 @@ class AgentCore:
             llm_client: 新的LLM客户端实例
         """
         self.llm = llm_client
-        # 重新创建Agent
-        self.agent_executor = self._create_agent_executor()
+        # 重新创建Agent(保留已加载的技能)
+        self.agent_executor = self._create_agent_executor(self._compute_skill_block(""))
+
+    # ============ 技能阅读(Skills) ============
+
+    def list_skills(self) -> List[Dict[str, str]]:
+        """列出所有本地可用技能"""
+        return self.skill_manager.list_skills()
+
+    def load_skill(self, name: str) -> bool:
+        """
+        手动将某技能加载进当前会话(注入后续 system prompt)
+
+        Args:
+            name: 技能名(目录名或 frontmatter name)
+
+        Returns:
+            True=成功加载, False=技能不存在
+        """
+        if self.skill_manager.get_skill(name) is None:
+            return False
+        self.active_skills.add(name)
+        # 立即重建 Agent,使后续对话带上该技能指引
+        self.agent_executor = self._create_agent_executor(self._compute_skill_block(""))
+        return True
+
+    def clear_skills(self):
+        """清空手动加载的技能"""
+        self.active_skills.clear()
+        self.agent_executor = self._create_agent_executor(self._compute_skill_block(""))
+
+    def set_auto_match(self, enabled: bool):
+        """开关任务自动匹配技能"""
+        self.auto_match_skills = enabled
+
+    def _compute_skill_block(self, task: str) -> str:
+        """
+        计算当前应注入的技能指引块:
+        - 自动匹配(若开启)命中的技能
+        - 手动加载的技能(active_skills)
+        两者合并去重后渲染
+        """
+        names = set(self.active_skills)
+        if self.auto_match_skills and task:
+            names.update(self.skill_manager.match_skills(task))
+        if not names:
+            return ""
+        return self.skill_manager.render_block(sorted(names))
 
     def get_available_tools(self) -> List[str]:
         """获取可用工具名称列表"""
