@@ -120,6 +120,37 @@ class AgentMemory:
         except Exception:
             return [self.thread_id]
 
+    def delete_thread(self, thread_id: str) -> bool:
+        """
+        删除指定会话(从 SQLite checkpoint 表移除)
+
+        Args:
+            thread_id: 要删除的会话 ID
+
+        Returns:
+            True=删除成功, False=失败或不存在
+        """
+        if not self.use_sqlite:
+            # 内存模式:无法删除单个 thread,只能清空
+            return False
+        try:
+            conn = sqlite3.connect(self.checkpoint_file, check_same_thread=False)
+            cursor = conn.execute(
+                "DELETE FROM checkpoints WHERE thread_id = ?",
+                (thread_id,)
+            )
+            deleted_rows = cursor.rowcount
+            conn.commit()
+            conn.close()
+            # 如果删的是当前会话,自动切到一个剩余的会话(或新建)
+            if thread_id == self.thread_id:
+                remaining = self.list_threads()
+                self.thread_id = remaining[0] if remaining else self.new_thread()
+            return deleted_rows > 0
+        except Exception as e:
+            print(f"[删除会话失败] {e}")
+            return False
+
     # ============ 消息获取 ============
 
     def get_messages(self) -> List[BaseMessage]:

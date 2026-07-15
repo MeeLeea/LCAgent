@@ -13,22 +13,95 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MEMORY_FILE = os.path.join(BASE_DIR, "data", "memory.json")
 CHECKPOINT_FILE = os.path.join(BASE_DIR, "data", "checkpoints.sqlite")
 
-def select_provider() -> str:
-    """启动时选择提供商"""
-    providers = list_providers()
-    print("\n可用的大模型提供商:")
-    print("-" * 50)
-    for i, (key, config) in enumerate(providers.items(), 1):
-        env_key = config["env_key"]
-        has_key = bool(os.environ.get(env_key))
-        status = "✓" if has_key else " "
-        print(f"  {i}. [{status}] {key:10s} ({config['name']})")
-        print(f"     模型: {', '.join(config['models'])}")
-        print(f"     环境变量: {env_key}")
-    print("-" * 50)
-    print("  [✓] = 已检测到环境变量API密钥")
 
-    # 检查配置文件
+def select_menu(title: str, options, current=None):
+    """
+    方向键交互式选择菜单(Windows msvcrt, 无需额外依赖)
+
+    Args:
+        title: 提示标题
+        options: 选项列表(list[str] 或 list[(label, value)])
+        current: 默认选中项的 value 或 label(可选)
+
+    Returns:
+        选中的 value(若 options 是 str 列表则返回该 str);按 Esc 取消返回 None
+    """
+    import msvcrt
+
+    # 统一为 (label, value) 形式
+    normalized = []
+    for opt in options:
+        if isinstance(opt, (tuple, list)) and len(opt) == 2:
+            normalized.append((str(opt[0]), opt[1]))
+        else:
+            normalized.append((str(opt), opt))
+
+    if not normalized:
+        return None
+
+    # 确定默认选中索引
+    idx = 0
+    if current is not None:
+        for i, (label, value) in enumerate(normalized):
+            if value == current or label == str(current):
+                idx = i
+                break
+
+    def render():
+        # 先清掉上一次的输出(按行数回退)
+        lines = len(normalized) + 3  # 标题2行 + 选项 + 底部提示
+        # \033[A = 光标上移一行, \r 回到行首
+        sys.stdout.write("\r" + "\033[A" * lines + "\033[J")
+        print(f"\033[36m{title}\033[0m")
+        print("  (↑↓ 选择, Enter 确认, Esc 取消)")
+        for i, (label, _) in enumerate(normalized):
+            if i == idx:
+                print(f"  \033[32m❯ {label}\033[0m")
+            else:
+                print(f"    {label}")
+        print("-" * 40)
+
+    print()  # 预留空行便于回退
+    render()
+
+    while True:
+        key = msvcrt.getch()
+        # Enter
+        if key in (b"\r", b"\n"):
+            # 清掉菜单输出
+            lines = len(normalized) + 3
+            sys.stdout.write("\r" + "\033[A" * lines + "\033[J")
+            label, value = normalized[idx]
+            print(f"{title} \033[32m❯ {label}\033[0m")
+            return value
+        # Esc
+        if key == b"\x1b":
+            lines = len(normalized) + 3
+            sys.stdout.write("\r" + "\033[A" * lines + "\033[J")
+            print(f"{title} \033[90m(已取消)\033[0m")
+            return None
+        # 方向键: 前缀 \xe0 或 \x00, 后跟 H=↑ P=↓ K=← M=→
+        if key in (b"\xe0", b"\x00"):
+            k2 = msvcrt.getch()
+            if k2 == b"H":  # 上
+                idx = (idx - 1) % len(normalized)
+                render()
+            elif k2 == b"P":  # 下
+                idx = (idx + 1) % len(normalized)
+                render()
+        # 数字快捷键: 1-9 直接选第 N 项
+        if key.isdigit():
+            n = int(key)
+            if 1 <= n <= len(normalized):
+                idx = n - 1
+                render()
+
+def select_provider() -> str:
+    """启动时选择提供商(方向键选择)"""
+    providers = list_providers()
+
+    # 检查配置文件中已配置的 key
+    configured_keys = set()
     if os.path.exists(CONFIG_FILE):
         try:
             import json
@@ -36,22 +109,25 @@ def select_provider() -> str:
                 config = json.load(f)
             for key in providers:
                 if config.get(key, {}).get("api_key"):
-                    print(f"  [✓] {key} 在 {CONFIG_FILE} 中已配置")
+                    configured_keys.add(key)
         except Exception:
             pass
 
-    print()
-    while True:
-        choice = input("请选择提供商 (1-4) 或直接回车使用默认[智谱]: ").strip()
-        if not choice:
-            return "zhipu"
-        try:
-            idx = int(choice)
-            if 1 <= idx <= len(providers):
-                return list(providers.keys())[idx - 1]
-        except ValueError:
-            pass
-        print("无效选择，请重试")
+    # 构建选项: label 带 ✓ 标记和模型列表
+    options = []
+    for key, config in providers.items():
+        env_key = config["env_key"]
+        has_key = bool(os.environ.get(env_key)) or key in configured_keys
+        mark = "✓" if has_key else " "
+        label = f"[{mark}] {key:10s} ({config['name']})  模型: {', '.join(config['models'])}"
+        options.append((label, key))
+
+    selected = select_menu(
+        "选择大模型提供商 ([✓] = 已配置 API Key)",
+        options,
+        current="zhipu"
+    )
+    return selected if selected else "zhipu"
 
 
 def create_llm(provider: str) -> LLMClient:
@@ -104,14 +180,16 @@ def main():
     print("  - 输入 'quit' 或 'exit' 退出")
     print("  - 输入 'react:任务' 使用Agent模式(自动调用工具)")
     print("  - 输入 'cot:任务' 使用链式思考模式(纯推理)")
-    print("  - 输入 'switch:提供商名' 切换模型 (zhipu/qwen/deepseek/kimi)")
+    print("  - 输入 'switch:提供商名' 切换提供商 (zhipu/qwen/deepseek/kimi)")
+    print("  - 输入 'model' 查看当前提供商可用模型")
+    print("  - 输入 'model:<模型名>' 切换模型 (如 model:glm-4-flash)")
     print("  - 输入 'info' 查看当前模型信息 + 记忆状态")
     print("  - 输入 'tools' 查看可用工具")
     print("  - 输入 'clear [long|short|all]' 清理记忆(默认 long)")
     print("  - 输入 'compress' 压缩长期记忆(LLM摘要后替换原内容)")
-    print("  - 输入 'thread' 查看所有会话(包含历史)")
+    print("  - 输入 'thread' 查看所有会话(方向键选择切换)")
     print("  - 输入 'thread:new' 开启新会话(原会话保留)")
-    print("  - 输入 'thread:switch <thread_id>' 切换到指定会话")
+    print("  - 输入 'thread:delete <thread_id>' 删除指定会话")
     print("  - 输入 'mcp' 查看 MCP Server 状态")
     print("  - 输入 'mcp:reload' 重新加载 MCP 工具")
     print("  - 输入 'mcp:add <name> <command> <arg1> [arg2...]' 添加 stdio MCP Server")
@@ -155,35 +233,67 @@ def main():
             if user_input.lower() == 'thread' or user_input.lower() == 'threads':
                 threads = agent.memory.list_threads()
                 current = agent.memory.thread_id
-                print(f"\n所有会话 (共 {len(threads)} 个):")
-                print("-" * 60)
-                for t in threads:
-                    mark = " *" if t == current else "  "
-                    print(f"{mark} {t}")
-                print("-" * 60)
-                print("* = 当前会话")
+                if not threads:
+                    print("\n暂无会话记录")
+                    continue
+
+                # 构建 label:带消息数预览,value 是 thread_id
+                options = []
+                for tid in threads:
+                    # 临时切过去读消息数,再切回当前(不实际修改状态)
+                    try:
+                        saved = agent.memory.thread_id
+                        agent.memory.thread_id = tid
+                        msg_count = len(agent.memory.get_messages() or [])
+                        agent.memory.thread_id = saved
+                    except Exception:
+                        msg_count = 0
+                    mark = " (当前)" if tid == current else ""
+                    label = f"{tid}  [{msg_count} 条消息]{mark}"
+                    options.append((label, tid))
+
+                selected = select_menu(
+                    f"选择会话 (共 {len(threads)} 个,↑↓ 选择,Enter 切换)",
+                    options,
+                    current=current
+                )
+                if selected is None:
+                    continue  # Esc 取消
+                if selected == current:
+                    print(f"\n已在当前会话: {current}")
+                    continue
+                # 执行切换
+                agent.memory.switch_thread(selected)
+                msgs = agent.memory.get_messages()
+                print(f"\n已切换到会话: {selected} (恢复 {len(msgs or [])} 条历史消息)")
                 continue
 
             if user_input.lower() == 'thread:new':
                 old = agent.memory.thread_id
                 new = agent.memory.new_thread()
                 print(f"\n已开启新会话: {new}")
-                print(f"原会话 {old} 已保留,可用 'thread:switch {old}' 切回")
+                print(f"原会话 {old} 已保留,可用 'thread' 切回")
                 continue
 
-            if user_input.lower().startswith('thread:switch'):
+            if user_input.lower().startswith('thread:delete'):
                 parts = user_input.split(None, 1)
                 if len(parts) < 2:
-                    print("用法: thread:switch <thread_id>")
+                    print("用法: thread:delete <thread_id>")
                     continue
                 tid = parts[1].strip()
-                found = agent.memory.switch_thread(tid)
-                msgs = agent.memory.get_messages()
-                if found:
-                    print(f"\n已切换到会话: {tid} (恢复 {len(msgs)} 条历史消息)")
+                # 二次确认
+                confirm = input(f"确认删除会话 '{tid}'? 此操作不可恢复 [y/N]: ").strip().lower()
+                if confirm not in ("y", "yes"):
+                    print("已取消")
+                    continue
+                was_current = tid == agent.memory.thread_id
+                ok = agent.memory.delete_thread(tid)
+                if ok:
+                    print(f"\n已删除会话: {tid}")
+                    if was_current:
+                        print(f"当前会话已被删除,自动切换到: {agent.memory.thread_id}")
                 else:
-                    print(f"\n已切换到会话: {tid} (新会话,无历史)")
-                    print(f"提示:可用 'thread' 命令查看所有已有会话")
+                    print(f"\n删除失败:会话 '{tid}' 不存在或数据库错误")
                 continue
 
             # 查看可用工具
@@ -245,6 +355,58 @@ def main():
                     print(f"\n已切换到: {info['provider_name']} ({info['model']})")
                 except SystemExit:
                     pass
+                except Exception as e:
+                    print(f"\n切换失败: {e}")
+                continue
+
+            # ========= 模型管理 =========
+            low = user_input.lower()
+
+            # 查看可用模型(方向键选择)
+            if low == 'model' or low == 'models':
+                info = llm.get_info()
+                models = llm.list_models()
+                options = [(m, m) for m in models]
+                selected = select_menu(
+                    f"选择模型 [{info['provider_name']}]",
+                    options,
+                    current=llm.model
+                )
+                if selected is None:
+                    continue  # Esc 取消
+                if selected == llm.model:
+                    print(f"\n模型未变: {llm.model}")
+                    continue
+                try:
+                    llm.switch_model(selected)
+                    # 重建 Agent 以应用新模型
+                    agent.switch_llm(llm)
+                    info = llm.get_info()
+                    print(f"\n已切换模型: {info['model']} (提供商: {info['provider_name']})")
+                except Exception as e:
+                    print(f"\n切换失败: {e}")
+                continue
+
+            # 直接切换模型: 'model:<name>' 或 'model <name>'
+            if low.startswith('model:') or (low.startswith('model ') and not low.startswith('model:')):
+                if low.startswith('model:'):
+                    new_model = user_input[6:].strip()
+                else:
+                    parts = user_input.split(None, 1)
+                    new_model = parts[1].strip() if len(parts) > 1 else ""
+
+                if not new_model:
+                    print("用法: model:<模型名>  或  model <模型名>")
+                    print("示例: model:glm-4-flash")
+                    continue
+
+                try:
+                    llm.switch_model(new_model)
+                    agent.switch_llm(llm)
+                    info = llm.get_info()
+                    print(f"\n已切换模型: {info['model']} (提供商: {info['provider_name']})")
+                except ValueError as e:
+                    print(f"\n切换失败: {e}")
                 except Exception as e:
                     print(f"\n切换失败: {e}")
                 continue

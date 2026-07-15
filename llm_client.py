@@ -17,7 +17,7 @@ PROVIDERS = {
         "base_url": "https://open.bigmodel.cn/api/paas/v4/",
         "env_key": "ZHIPU_API_KEY",
         "default_model": "glm-4.7",
-        "models": ["glm-4", "glm-4-flash", "glm-4-long"]
+        "models": ["glm-4", "glm-4-flash", "glm-4-long", "glm-4.7-flash", "glm-4.7-long"]
     },
     "qwen": {
         "name": "通义千问",
@@ -48,7 +48,7 @@ class LLMClient:
 
     def __init__(
         self,
-        provider: str = "zhipu",
+        provider: Optional[str] = "openai",
         api_key: Optional[str] = None,
         model: Optional[str] = None,
         config_file: Optional[str] = None,
@@ -203,6 +203,26 @@ class LLMClient:
         self.api_key = new_key
         self.model = model or self.provider_config["default_model"]
         self.client = self._create_chat_model()
+
+    def switch_model(self, model: str):
+        """
+        运行时切换模型(仅限当前提供商支持的模型)
+
+        Args:
+            model: 模型名称(必须在当前提供商 PROVIDERS['models'] 列表中)
+        """
+        available_models = self.provider_config.get("models", [])
+        if model not in available_models:
+            raise ValueError(
+                f"不支持的模型: {model}\n"
+                f"当前提供商 [{self.provider_config['name']}] 可用模型: {', '.join(available_models)}"
+            )
+        self.model = model
+        self.client = self._create_chat_model()
+
+    def list_models(self) -> List[str]:
+        """列出当前提供商支持的所有模型"""
+        return list(self.provider_config.get("models", []))
 
     def get_info(self) -> Dict[str, str]:
         """获取当前客户端信息"""
