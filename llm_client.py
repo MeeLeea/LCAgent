@@ -1,11 +1,12 @@
 """
 统一大模型封装 - 基于LangChain，支持多提供商(智谱/千问/DeepSeek/Kimi)
-所有提供商均兼容 OpenAI API 格式，使用 langchain_openai.ChatOpenAI 统一调用
+所有提供商均兼容 OpenAI API 格式，使用 langchain.chat_models.init_chat_model 统一调用
 """
 import os
 import json
 from typing import Optional, Dict, List, Any
-from langchain_openai import ChatOpenAI
+from langchain.chat_models import init_chat_model
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 
 
@@ -38,13 +39,6 @@ PROVIDERS = {
         "env_key": "MOONSHOT_API_KEY",
         "default_model": "moonshot-v1-8k",
         "models": ["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"]
-    },
-    "siliconflow": {
-        "name": "SiliconFlow",
-        "base_url": "https://api.siliconflow.cn/v1",
-        "env_key": "SILICONFLOW_API_KEY",
-        "default_model": "Qwen2.5-7B-Instruct",
-        "models": ["Qwen2.5-7B-Instruct", "Qwen2.5-14B-Instruct"]
     }
 }
 
@@ -102,18 +96,22 @@ class LLMClient:
         # 设置模型
         self.model = self._load_model_from_config(config_file, provider) or self.provider_config["default_model"]
 
-        # 创建LangChain ChatOpenAI客户端
+        # 创建 LangChain 统一聊天模型(init_chat_model)
         self.client = self._create_chat_model()
 
-    def _create_chat_model(self) -> ChatOpenAI:
-        """创建LangChain ChatOpenAI实例"""
-        return ChatOpenAI(
-            model=self.model,
-            api_key=self.api_key,
-            base_url=self.provider_config["base_url"],
-            temperature=self.temperature,
-            max_tokens=self.max_tokens
-        )
+    def _create_chat_model(self) -> BaseChatModel:
+        """创建统一聊天模型(init_chat_model, OpenAI 兼容接口)"""
+        kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "model_provider": "openai",
+            "api_key": self.api_key,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+        }
+        base_url = self.provider_config.get("base_url")
+        if base_url:  # base_url 可选:仅当 PROVIDERS 中提供时才传入
+            kwargs["base_url"] = base_url
+        return init_chat_model(**kwargs)
 
     def chat(
         self,
@@ -135,17 +133,15 @@ class LLMClient:
         # 转换为LangChain消息格式
         langchain_messages = self._to_langchain_messages(messages)
 
-        # 如果有临时参数，创建新实例
+        # 如果有临时参数，通过 bind 轻量覆盖，避免重建客户端
+        client = self.client
         if temperature is not None or max_tokens is not None:
-            client = ChatOpenAI(
-                model=self.model,
-                api_key=self.api_key,
-                base_url=self.provider_config["base_url"],
-                temperature=temperature if temperature is not None else self.temperature,
-                max_tokens=max_tokens if max_tokens is not None else self.max_tokens
-            )
-        else:
-            client = self.client
+            overrides: Dict[str, Any] = {}
+            if temperature is not None:
+                overrides["temperature"] = temperature
+            if max_tokens is not None:
+                overrides["max_tokens"] = max_tokens
+            client = client.bind(**overrides)
 
         try:
             response = client.invoke(langchain_messages)
@@ -182,8 +178,8 @@ class LLMClient:
                     pass
         return None
 
-    def get_chat_model(self) -> ChatOpenAI:
-        """获取LangChain ChatOpenAI实例（供Agent使用）"""
+    def get_chat_model(self) -> BaseChatModel:
+        """获取统一聊天模型实例（供Agent使用）"""
         return self.client
 
     def switch_provider(
