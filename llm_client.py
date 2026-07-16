@@ -10,37 +10,43 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 
 
-# 提供商配置
-PROVIDERS = {
-    "zhipu": {
-        "name": "智谱AI",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4/",
-        "env_key": "ZHIPU_API_KEY",
-        "default_model": "glm-4.7",
-        "models": ["glm-4", "glm-4-flash", "glm-4-long", "glm-4.7-flash", "glm-4.7-long"]
-    },
-    "qwen": {
-        "name": "通义千问",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "env_key": "DASHSCOPE_API_KEY",
-        "default_model": "qwen-plus",
-        "models": ["qwen-plus", "qwen-turbo", "qwen-max"]
-    },
-    "deepseek": {
-        "name": "DeepSeek",
-        "base_url": "https://api.deepseek.com",
-        "env_key": "DEEPSEEK_API_KEY",
-        "default_model": "deepseek-chat",
-        "models": ["deepseek-chat", "deepseek-reasoner"]
-    },
-    "kimi": {
-        "name": "Kimi (Moonshot)",
-        "base_url": "https://api.moonshot.cn/v1",
-        "env_key": "MOONSHOT_API_KEY",
-        "default_model": "moonshot-v1-8k",
-        "models": ["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"]
+# 提供商配置(单一来源: 见 config/llm_config.json 的 providers 字段)
+DEFAULT_CONFIG_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "config",
+    "llm_config.json"
+)
+
+
+def load_providers(config_file: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """从配置文件读取提供商定义(配置即唯一来源,不再在代码中维护)
+
+    config/llm_config.json 结构:
+    {
+        "providers": {
+            "<name>": {
+                "name": "...", "base_url": "...", "env_key": "...",
+                "model": "...(可选覆盖)", "models": [...],
+                "api_key": "...(可选)"
+            }
+        },
+        "tavily": {"api_key": "..."}
     }
-}
+    """
+    path = config_file or DEFAULT_CONFIG_FILE
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("providers", {})
+    except (json.JSONDecodeError, IOError):
+        return {}
+
+
+def list_providers(config_file: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """列出所有支持的提供商(来自配置文件)"""
+    return load_providers(config_file)
 
 
 class LLMClient:
@@ -50,7 +56,7 @@ class LLMClient:
         self,
         provider: Optional[str] = "openai",
         api_key: Optional[str] = None,
-        model: Optional[str] = None,
+        model: Optional[str] = "gpt-5.5",
         config_file: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 2048
@@ -59,42 +65,45 @@ class LLMClient:
         初始化LLM客户端
 
         Args:
-            provider: 提供商名称 (zhipu/qwen/deepseek/kimi)
+            provider: 提供商名称(见 config/llm_config.json 的 providers 字段)
             api_key: API密钥，不提供则从环境变量或配置文件获取
             model: 模型名称，不提供则使用提供商默认模型
             config_file: 配置文件路径，用于读取API密钥
             temperature: 温度参数
             max_tokens: 最大生成token数
         """
-        provider = provider.lower()
-        if provider not in PROVIDERS:
+        provider = (provider or "openai").lower()
+        self.config_file = config_file or DEFAULT_CONFIG_FILE
+        providers = load_providers(self.config_file)
+        if provider not in providers:
+            available = ", ".join(providers.keys()) or "(配置文件中未定义任何提供商)"
             raise ValueError(
                 f"不支持的提供商: {provider}\n"
-                f"支持的提供商: {', '.join(PROVIDERS.keys())}"
+                f"支持的提供商: {available}"
             )
 
         self.provider = provider
-        self.provider_config = PROVIDERS[provider]
+        self.provider_config = providers[provider]
         self.temperature = temperature
         self.max_tokens = max_tokens
 
         # 获取API密钥: 优先参数传入 > 配置文件 > 环境变量
-        self.api_key = api_key
-        if not self.api_key and config_file:
-            self.api_key = self._load_api_key_from_config(config_file, provider)
-        if not self.api_key:
-            self.api_key = os.environ.get(self.provider_config["env_key"])
+        self.api_key = (
+            api_key
+            or self.provider_config.get("api_key")
+            or os.environ.get(self.provider_config.get("env_key", ""))
+        )
 
         if not self.api_key:
             raise ValueError(
                 f"请提供 {self.provider_config['name']} 的API密钥\n"
                 f"  方式1: 设置环境变量 {self.provider_config['env_key']}\n"
-                f"  方式2: 在 llm_config.json 中配置\n"
+                f"  方式2: 在 config/llm_config.json 中配置\n"
                 f"  方式3: 初始化时传入 api_key 参数"
             )
 
-        # 设置模型
-        self.model = self._load_model_from_config(config_file, provider) or self.provider_config["default_model"]
+        # 设置模型: 参数 > 配置文件 model
+        self.model = model or self.provider_config.get("model")
 
         # 创建 LangChain 统一聊天模型(init_chat_model)
         self.client = self._create_chat_model()
@@ -109,7 +118,7 @@ class LLMClient:
             "max_tokens": self.max_tokens,
         }
         base_url = self.provider_config.get("base_url")
-        if base_url:  # base_url 可选:仅当 PROVIDERS 中提供时才传入
+        if base_url:  # base_url 可选:仅当配置中提供时才传入
             kwargs["base_url"] = base_url
         return init_chat_model(**kwargs)
 
@@ -190,18 +199,23 @@ class LLMClient:
     ):
         """运行时切换提供商"""
         provider = provider.lower()
-        if provider not in PROVIDERS:
+        providers = load_providers(self.config_file)
+        if provider not in providers:
             raise ValueError(f"不支持的提供商: {provider}")
 
         self.provider = provider
-        self.provider_config = PROVIDERS[provider]
+        self.provider_config = providers[provider]
 
-        new_key = api_key or os.environ.get(self.provider_config["env_key"])
+        new_key = (
+            api_key
+            or self.provider_config.get("api_key")
+            or os.environ.get(self.provider_config.get("env_key", ""))
+        )
         if not new_key:
             raise ValueError(f"请提供 {self.provider_config['name']} 的API密钥")
 
         self.api_key = new_key
-        self.model = model or self.provider_config["default_model"]
+        self.model = model or self.provider_config.get("model")
         self.client = self._create_chat_model()
 
     def switch_model(self, model: str):
@@ -209,7 +223,7 @@ class LLMClient:
         运行时切换模型(仅限当前提供商支持的模型)
 
         Args:
-            model: 模型名称(必须在当前提供商 PROVIDERS['models'] 列表中)
+            model: 模型名称(必须在当前提供商 providers.<provider>.models 列表中)
         """
         available_models = self.provider_config.get("models", [])
         if model not in available_models:
@@ -247,33 +261,6 @@ class LLMClient:
             else:
                 result.append(HumanMessage(content=content))
         return result
-
-    def _load_api_key_from_config(self, config_file: str, provider: str) -> Optional[str]:
-        """从配置文件读取API密钥"""
-        if not os.path.exists(config_file):
-            return None
-        try:
-            with open(config_file, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-            return config.get(provider, {}).get("api_key")
-        except (json.JSONDecodeError, IOError):
-            return None
-
-    def _load_model_from_config(self, config_file: str, provider: str) -> Optional[str]:
-        """从配置文件读取模型名称"""
-        if not os.path.exists(config_file):
-            return None
-        try:
-            with open(config_file, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-            return config.get(provider, {}).get("model")
-        except (json.JSONDecodeError, IOError):
-            return None
-
-def list_providers() -> Dict[str, Dict]:
-    """列出所有支持的提供商"""
-    return PROVIDERS
-
 
 def create_client(
     provider: str = "zhipu",
