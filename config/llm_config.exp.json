@@ -1,0 +1,13 @@
+{
+  "providers": {
+    "example": {
+      "name": "Example Provider",
+      "base_url": "https://api.example.com/v1",
+      "env_key": "EXAMPLE_PROVIDER_TOKEN",
+      "model": "example-chat-model"
+    }
+  },
+  "tavily": {
+    "env_key": "TAVILY_TOKEN"
+  }
+}
