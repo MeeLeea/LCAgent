@@ -19,7 +19,7 @@ MEMORY_FILE = os.path.join(BASE_DIR, "data", "memory.json")
 CHECKPOINT_FILE = os.path.join(BASE_DIR, "data", "checkpoints.sqlite")
 
 
-def select_menu(title: str, options, current=None):
+def select_menu(title: str, options, current=None, action_keys=None, hint=None):
     """
     方向键交互式选择菜单(Windows msvcrt, 无需额外依赖)
 
@@ -27,6 +27,8 @@ def select_menu(title: str, options, current=None):
         title: 提示标题
         options: 选项列表(list[str] 或 list[(label, value)])
         current: 默认选中项的 value 或 label(可选)
+        action_keys: 额外快捷键映射,返回 (action, value)
+        hint: 底部提示文本(可选)
 
     Returns:
         选中的 value(若 options 是 str 列表则返回该 str);按 Esc 取消返回 None
@@ -58,7 +60,7 @@ def select_menu(title: str, options, current=None):
         # \033[A = 光标上移一行, \r 回到行首
         sys.stdout.write("\r" + "\033[A" * lines + "\033[J")
         print(f"\033[36m{title}\033[0m")
-        print("  (↑↓ 选择, Enter 确认, Esc 取消)")
+        print(hint or "  (↑↓ 选择, Enter 确认, Esc 取消)")
         for i, (label, _) in enumerate(normalized):
             if i == idx:
                 print(f"  \033[32m❯ {label}\033[0m")
@@ -85,6 +87,14 @@ def select_menu(title: str, options, current=None):
             sys.stdout.write("\r" + "\033[A" * lines + "\033[J")
             print(f"{title} \033[90m(已取消)\033[0m")
             return None
+        # 额外动作快捷键(调用方处理副作用)
+        if action_keys and key in action_keys:
+            lines = len(normalized) + 3
+            sys.stdout.write("\r" + "\033[A" * lines + "\033[J")
+            label, value = normalized[idx]
+            action = action_keys[key]
+            print(f"{title} \033[33m{action}: {label}\033[0m")
+            return (action, value)
         # 方向键: 前缀 \xe0 或 \x00, 后跟 H=↑ P=↓ K=← M=→
         if key in (b"\xe0", b"\x00"):
             k2 = msvcrt.getch()
@@ -167,7 +177,7 @@ def show_help(agent, llm):
     print("  - 输入 'tools' 查看可用工具")
     print("  - 输入 'clear [long|short|all]' 清理记忆(默认 long)")
     print("  - 输入 'compress' 压缩长期记忆(LLM摘要后替换原内容)")
-    print("  - 输入 'thread' 查看所有会话(方向键选择切换)")
+    print("  - 输入 'thread' 查看所有会话(方向键选择切换,Ctrl+D 删除高亮会话)")
     print("  - 输入 'thread:new' 开启新会话(原会话保留)")
     print("  - 输入 'thread:delete <thread_id>' 删除指定会话")
     print("  - 输入 'mcp' 查看 MCP Server 状态")
@@ -272,41 +282,60 @@ def main():
 
             # ========= 会话(Thread)管理 =========
             if user_input.lower() == 'thread' or user_input.lower() == 'threads':
-                threads = agent.memory.list_threads()
-                current = agent.memory.thread_id
-                if not threads:
-                    print("\n暂无会话记录")
-                    continue
+                while True:
+                    threads = agent.memory.list_threads()
+                    current = agent.memory.thread_id
+                    if not threads:
+                        print("\n暂无会话记录")
+                        break
 
-                # 构建 label:带消息数预览,value 是 thread_id
-                options = []
-                for tid in threads:
-                    # 临时切过去读消息数,再切回当前(不实际修改状态)
-                    try:
-                        saved = agent.memory.thread_id
-                        agent.memory.thread_id = tid
-                        msg_count = len(agent.memory.get_messages() or [])
-                        agent.memory.thread_id = saved
-                    except Exception:
-                        msg_count = 0
-                    mark = " (当前)" if tid == current else ""
-                    label = f"{tid}  [{msg_count} 条消息]{mark}"
-                    options.append((label, tid))
+                    # 构建 label:带消息数预览,value 是 thread_id
+                    options = []
+                    for tid in threads:
+                        # 临时切过去读消息数,再切回当前(不实际修改状态)
+                        try:
+                            saved = agent.memory.thread_id
+                            agent.memory.thread_id = tid
+                            msg_count = len(agent.memory.get_messages() or [])
+                            agent.memory.thread_id = saved
+                        except Exception:
+                            msg_count = 0
+                        mark = " (当前)" if tid == current else ""
+                        label = f"{tid}  [{msg_count} 条消息]{mark}"
+                        options.append((label, tid))
 
-                selected = select_menu(
-                    f"选择会话 (共 {len(threads)} 个,↑↓ 选择,Enter 切换)",
-                    options,
-                    current=current
-                )
-                if selected is None:
-                    continue  # Esc 取消
-                if selected == current:
-                    print(f"\n已在当前会话: {current}")
-                    continue
-                # 执行切换
-                agent.memory.switch_thread(selected)
-                msgs = agent.memory.get_messages()
-                print(f"\n已切换到会话: {selected} (恢复 {len(msgs or [])} 条历史消息)")
+                    selected = select_menu(
+                        f"选择会话 (共 {len(threads)} 个,↑↓ 选择,Enter 切换)",
+                        options,
+                        current=current,
+                        action_keys={b"\x04": "delete"},
+                        hint="  (↑↓ 选择, Enter 切换, Ctrl+D 删除, Esc 取消)"
+                    )
+                    if selected is None:
+                        break  # Esc 取消
+                    if isinstance(selected, tuple) and selected[0] == "delete":
+                        tid = selected[1]
+                        confirm = input(f"确认删除会话 '{tid}'? 此操作不可恢复 [y/N]: ").strip().lower()
+                        if confirm not in ("y", "yes"):
+                            print("已取消")
+                            continue
+                        was_current = tid == agent.memory.thread_id
+                        ok = agent.memory.delete_thread(tid)
+                        if ok:
+                            print(f"\n已删除会话: {tid}")
+                            if was_current:
+                                print(f"当前会话已被删除,自动切换到: {agent.memory.thread_id}")
+                            continue
+                        print(f"\n删除失败:会话 '{tid}' 不存在或数据库错误")
+                        continue
+                    if selected == current:
+                        print(f"\n已在当前会话: {current}")
+                        break
+                    # 执行切换
+                    agent.memory.switch_thread(selected)
+                    msgs = agent.memory.get_messages()
+                    print(f"\n已切换到会话: {selected} (恢复 {len(msgs or [])} 条历史消息)")
+                    break
                 continue
 
             if user_input.lower() == 'thread:new':

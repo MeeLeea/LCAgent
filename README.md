@@ -433,13 +433,15 @@ MEMORY_FILE = os.path.join(BASE_DIR, "data", "memory.json")            # 长期�
 | `thread:delete <id>` | 删除指定会话(二次确认,不可恢复) | `thread:delete thread-abc123` |
 
 > 切换会话统一走 `thread` 方向键菜单，无需手动输入 thread_id。
+>
+> 在 `thread` 菜单中，使用方向键移动高亮项，按 `Enter` 切换会话，按 `Esc` 取消；按 `Ctrl+D` 可删除当前高亮会话。删除前会要求输入 `y` 或 `yes` 确认。
 
 **示例**：
 
 ```
 你: thread
-选择会话 (共 2 个,↑↓ 选择,Enter 切换)
-  (↑↓ 选择, Enter 确认, Esc 取消)
+ 选择会话 (共 2 个,↑↓ 选择,Enter 切换)
+  (↑↓ 选择, Enter 切换, Ctrl+D 删除, Esc 取消)
     thread-a4d099d2  [6 条消息]
   ❯ thread-b1dc3b2a  [0 条消息] (当前)
 ----------------------------------------
@@ -452,6 +454,17 @@ MEMORY_FILE = os.path.join(BASE_DIR, "data", "memory.json")            # 长期�
 你: thread:delete thread-a4d099d2
 确认删除会话 'thread-a4d099d2'? 此操作不可恢复 [y/N]: y
 已删除会话: thread-a4d099d2
+```
+
+在会话菜单中删除高亮会话的操作示例：
+
+```
+你: thread
+  (↑↓ 选择, Enter 切换, Ctrl+D 删除, Esc 取消)
+  ❯ thread-b1dc3b2a  [0 条消息] (当前)
+
+确认删除会话 'thread-b1dc3b2a'? 此操作不可恢复 [y/N]: y
+已删除会话: thread-b1dc3b2a
 ```
 
 ### 记忆管理命令
@@ -858,7 +871,7 @@ LLM 决定是否调用工具
 | `tools` | 查看可用工具列表（含 MCP 工具） |
 | `clear [long\|short\|all]` | 清理记忆（默认 long） |
 | `compress` 或 `压缩` | 压缩长期记忆（LLM 摘要后替换原内容） |
-| `thread` | 方向键选择切换会话(显示消息数预览) |
+| `thread` | 方向键选择切换会话(显示消息数预览); `Enter` 切换, `Ctrl+D` 删除高亮会话 |
 | `thread:new` | 开启新会话(原会话保留) |
 | `thread:delete <id>` | 删除指定会话(二次确认,不可恢复) |
 | `mcp` | 查看 MCP Server 状态 |
