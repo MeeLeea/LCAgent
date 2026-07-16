@@ -167,6 +167,50 @@ class AgentMemory:
             pass
         return []
 
+    def export_thread(self, thread_id: Optional[str] = None, fmt: str = "text") -> str:
+        """
+        将指定会话(默认当前会话)的对话导出为可读文本
+
+        Args:
+            thread_id: 要导出的会话 ID(为 None 时导出当前会话)
+            fmt: 导出格式,目前支持 'text'(默认) 与 'markdown'
+
+        Returns:
+            格式化后的对话文本
+        """
+        target = thread_id or self.thread_id
+        saved = self.thread_id
+        self.thread_id = target
+        try:
+            msgs = self.get_messages() or []
+        finally:
+            self.thread_id = saved
+
+        blocks = []
+        for m in msgs:
+            if isinstance(m, HumanMessage):
+                role = "用户"
+            elif isinstance(m, AIMessage):
+                role = "助手"
+            elif isinstance(m, SystemMessage):
+                role = "系统"
+            else:
+                role = "工具"
+            content = getattr(m, "content", "")
+            if isinstance(content, list):
+                content = " ".join(str(x) for x in content)
+            text = str(content).strip()
+            if not text:
+                continue
+            if fmt == "markdown":
+                blocks.append(f"**{role}**:\n\n{text}")
+            else:
+                blocks.append(f"【{role}】\n{text}")
+
+        sep = "\n\n---\n\n" if fmt == "markdown" else "\n\n"
+        header = f"# 对话导出 - {target}\n\n" if fmt == "markdown" else f"对话导出 - {target}\n{'='*40}\n"
+        return header + sep.join(blocks)
+
     def get_langchain_messages(self) -> List[BaseMessage]:
         """兼容旧 API:等同于 get_messages()"""
         return self.get_messages()

@@ -31,7 +31,9 @@ class AgentCore:
         mcp_config_file: Optional[str] = None,
         enable_mcp: bool = True,
         skills_dir: Optional[str] = None,
-        auto_match_skills: bool = True
+        auto_match_skills: bool = True,
+        max_context_messages: int = 0,
+        context_trim_keep: int = 12
     ):
         """
         初始化Agent核心
@@ -46,6 +48,8 @@ class AgentCore:
             verbose: 是否打印详细执行过程
             mcp_config_file: MCP servers 配置文件路径
             enable_mcp: 是否启用 MCP 工具加载
+            max_context_messages: 长上下文裁剪阈值(0=关闭);超过则自动摘要并开新会话
+            context_trim_keep: 裁剪时保留的最近消息条数
         """
         self.llm = llm_client
         self.memory = AgentMemory(
@@ -57,6 +61,9 @@ class AgentCore:
         )
         self.max_iterations = max_iterations
         self.verbose = verbose
+        self.max_context_messages = max_context_messages
+        self.context_trim_keep = context_trim_keep
+        self.compaction_summary = ""  # 长上下文裁剪后的历史摘要(注入 system prompt)
 
         # 本地工具
         self.local_tools: List[BaseTool] = list(local_tools)
@@ -130,7 +137,6 @@ class AgentCore:
             tools=self.tools,
             prompt=self._get_system_prompt(skill_block),
             checkpointer=self.memory.get_checkpointer(),
-            # recursion_limit=self.max_iterations
         )
         return agent
 
@@ -143,20 +149,27 @@ class AgentCore:
             "1. 当用户要求创建文件、读写文件、创建目录、搜索信息等操作时，你【必须】调用相应工具来完成，"
             "绝对不要回复'我无法访问你的文件系统'、'我没有权限'、'请你自己保存'之类的话。\n"
             "2. 你确实拥有这些工具的能力，工具会在用户本地执行，可以真正创建和修改文件。\n"
-            "3. 对话过程中创建文件、脚本、文件夹默认位置是：'./test/'。\n"
+            "3. 对话过程中创建文件、脚本、文件夹默认位置是：'./tests/'。\n"
             "4. 如果用户要保存内容到文件，或创建文件，直接调用 write_file 工具，不要把内容贴出来让用户自己保存。\n"
             "5. 如果用户要创建目录，直接调用 create_workspace 工具，不要让用户手动操作\n"
             "6. 只有纯知识性问答（不需要操作文件/搜索/计算）才直接回答，不调用工具。\n"
             "7. 调用工具时，如果一次任务需要多步操作（例如先创建目录再写文件），请依次调用多个工具。\n"
             "8. 如果用户要求跑一下或者测试一下，直接调用相应工具，不要让用户手动操作。\n"
             "9. 如果用户要求生成工具,直接在tools目录下创建，并使用@tool装饰器，不修改__init__.py文件。\n"
-            "10. 当任务涉及某个专业领域(如提交 git、生成 pptx、查找技能等)时，"
+            "10. 危险命令(如 rm -rf、format、shutdown 等)会被安全策略拦截或要求用户确认，"
+            "不要尝试使用破坏性命令；需要删除/移动文件时优先使用专门的文件工具。\n"
+            "11. 当任务涉及某个专业领域(如提交 git、生成 pptx、查找技能等)时，"
             "应优先用 read_skill 工具读取对应技能的详细指引,并按指引完成。\n"
             "\n"
             "请用中文回答。"
         )
         if skill_block:
-            return base + "\n" + skill_block
+            base = base + "\n" + skill_block
+        if self.compaction_summary:
+            base = base + (
+                "\n\n【历史对话摘要(上文因过长已被自动裁剪压缩)】\n"
+                + self.compaction_summary
+            )
         return base
 
     def run(self, task: str) -> str:
@@ -174,8 +187,10 @@ class AgentCore:
         print(f"{'='*50}\n")
 
         try:
+            # 长上下文裁剪(超阈值时自动摘要历史并开新会话)
+            self._maybe_compact()
             # Checkpoint 模式: 只传当前消息, 自动从 checkpoint 恢复历史
-            config = self.memory.get_config()
+            config = {**self.memory.get_config(), "recursion_limit": self.max_iterations}
             input_msg = HumanMessage(content=task)
             # 重建 Agent,注入与本次任务相关的技能指引
             self.agent_executor = self._create_agent_executor(
@@ -255,8 +270,10 @@ class AgentCore:
             助手回复
         """
         try:
+            # 长上下文裁剪(超阈值时自动摘要历史并开新会话)
+            self._maybe_compact()
             # Checkpoint 模式: 只传当前消息, 自动从 checkpoint 恢复历史
-            config = self.memory.get_config()
+            config = {**self.memory.get_config(), "recursion_limit": self.max_iterations}
             original_verbose = self.verbose
             self.verbose = False
             # 重建 Agent,注入与本次对话相关的技能指引
@@ -389,6 +406,77 @@ class AgentCore:
         if not names:
             return ""
         return self.skill_manager.render_block(sorted(names))
+
+    # ============ 长上下文裁剪 ============
+
+    def _maybe_compact(self):
+        """
+        长上下文裁剪: 当当前会话消息数超过 max_context_messages 时,
+        将较早的消息用 LLM 摘要,开启新会话并把摘要注入后续 system prompt,
+        从而避免撞上 LLM 上下文窗口。
+
+        阈值 max_context_messages <= 0 时关闭(默认)。
+        """
+        if not self.max_context_messages or self.max_context_messages <= 0:
+            return
+        msgs = self.memory.get_messages()
+        if len(msgs) <= self.max_context_messages:
+            return
+
+        keep = min(self.context_trim_keep, max(len(msgs) - 1, 0))
+        old = msgs[:-keep] if keep > 0 else msgs
+        summary = self._summarize_messages(old)
+        if not summary:
+            return
+
+        # 开启新会话,把历史摘要注入 system prompt(保留上下文精华)
+        old_tid = self.memory.thread_id
+        self.memory.new_thread()
+        self.compaction_summary = summary
+        # 重建 Agent,使新 prompt 包含摘要
+        self.agent_executor = self._create_agent_executor(
+            self._compute_skill_block("")
+        )
+        if self.verbose:
+            print(
+                f"\n[上下文裁剪] 会话过长({len(msgs)} 条),已自动摘要历史并开启新会话: "
+                f"{self.memory.thread_id} (原 {old_tid})"
+            )
+
+    def _summarize_messages(self, msgs: List[BaseMessage]) -> str:
+        """将一批消息摘要为中文要点(失败返回空字符串)"""
+        lines = []
+        for m in msgs:
+            if isinstance(m, HumanMessage):
+                role = "user"
+            elif isinstance(m, AIMessage):
+                role = "assistant"
+            elif isinstance(m, SystemMessage):
+                role = "system"
+            else:
+                role = "tool"
+            content = getattr(m, "content", "")
+            if isinstance(content, list):
+                content = " ".join(str(x) for x in content)
+            text = str(content).strip()
+            if text:
+                lines.append(f"{role}: {text}")
+        if not lines:
+            return ""
+
+        prompt = (
+            "请将以下对话历史压缩成一份简洁的中文摘要,保留关键决策、用户意图与事实,"
+            "按主题分条列出,不要添加推测内容:"
+        )
+        try:
+            return self.llm.chat([
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": "\n".join(lines)},
+            ]).strip()
+        except Exception as e:
+            if self.verbose:
+                print(f"[上下文摘要生成失败,跳过裁剪] {e}")
+            return ""
 
     def get_available_tools(self) -> List[str]:
         """获取可用工具名称列表"""
