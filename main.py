@@ -3,12 +3,17 @@ LangChain Agent 项目入口 - 支持多提供商(智谱/千问/DeepSeek/Kimi) +
 """
 import os
 import sys
+import json
+import re
 from llm_client import create_client, list_providers, LLMClient
 from agent import AgentCore
 from tools import mcp_loader
+from tools import safety as safety_module
+from config import load_agent_config, resolve_path
 
-CONFIG_FILE = "llm_config.json"
-MCP_CONFIG_FILE = "mcp_servers.json"
+CONFIG_FILE = "config/llm_config.json"
+MCP_CONFIG_FILE = "config/mcp_servers.json"
+AGENT_CONFIG_FILE = "config/agent_config.json"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MEMORY_FILE = os.path.join(BASE_DIR, "data", "memory.json")
 CHECKPOINT_FILE = os.path.join(BASE_DIR, "data", "checkpoints.sqlite")
@@ -108,7 +113,7 @@ def select_provider() -> str:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 config = json.load(f)
             for key in providers:
-                if config.get(key, {}).get("api_key"):
+                if config.get("providers", {}).get(key, {}).get("api_key"):
                     configured_keys.add(key)
         except Exception:
             pass
@@ -142,35 +147,8 @@ def create_llm(provider: str) -> LLMClient:
         sys.exit(1)
 
 
-def main():
-    """主函数"""
-    print("=" * 50)
-    print("  LangChain Agent (基于LangChain框架)")
-    print("=" * 50)
-
-    # 选择提供商
-    provider = select_provider()
-
-    # 创建LLM客户端
-    print(f"\n初始化 {list_providers()[provider]['name']} 客户端...")
-    llm = create_llm(provider)
-
-    # 创建Agent
-    print("初始化Agent(含MCP工具加载 + Checkpoint 持久化)...")
-    agent = AgentCore(
-        llm_client=llm,
-        memory_size=10,
-        long_term_memory_file=MEMORY_FILE,
-        checkpoint_file=CHECKPOINT_FILE,
-        max_iterations=5,
-        verbose=True,
-        mcp_config_file=MCP_CONFIG_FILE,
-        enable_mcp=True,
-        skills_dir=os.path.join(BASE_DIR, ".agents", "skills"),
-        auto_match_skills=True
-    )
-
-    # 显示信息
+def show_help(agent, llm):
+    """打印交互命令说明(输入 help 时展示)"""
     info = llm.get_info()
     print("\n" + "=" * 50)
     print("Agent 已就绪！")
@@ -182,7 +160,7 @@ def main():
     print("  - 输入 'quit' 或 'exit' 退出")
     print("  - 输入 'react:任务' 使用Agent模式(自动调用工具)")
     print("  - 输入 'cot:任务' 使用链式思考模式(纯推理)")
-    print("  - 输入 'switch:提供商名' 切换提供商 (zhipu/qwen/deepseek/kimi)")
+    print("  - 输入 'switch' 方向键选择切换提供商(或 'switch:提供商名' 直接切换)")
     print("  - 输入 'model' 查看当前提供商可用模型")
     print("  - 输入 'model:<模型名>' 切换模型 (如 model:glm-4-flash)")
     print("  - 输入 'info' 查看当前模型信息 + 记忆状态")
@@ -202,10 +180,62 @@ def main():
     print("  - 输入 'skill:<name>' 将某技能加载进当前会话(注入 system prompt)")
     print("  - 输入 'skill:<name> <任务>' 加载技能并立即执行该任务(如 skill:git-commit 提交README)")
     print("  - 输入 'skill:clear' 清空手动加载的技能")
+    print("  - 输入 'safety' 查看当前安全策略(黑名单/白名单/确认)")
+    print("  - 输入 'safety:mode <blacklist|whitelist>' 切换模式")
+    print("  - 输入 'safety:confirm <on|off>' 开关危险命令确认")
+    print("  - 输入 'export' 或 'export:<thread_id> [路径]' 导出对话为 Markdown(默认存 exports/)")
+    print("  - 输入 'json:<任务>' 让 Agent 以 JSON 对象返回结果并解析展示")
     print("  - 其他输入为普通对话模式")
+    print("  - 运行时配置见 config/agent_config.json(迭代上限/技能目录/长上下文裁剪等)")
     print(f"\n本地工具: {', '.join(t.name for t in agent.local_tools)}")
     if agent.mcp_tools:
         print(f"MCP工具:  {', '.join(t.name for t in agent.mcp_tools)}")
+    print()
+
+
+def main():
+    """主函数"""
+    print("=" * 50)
+    print("  LangChain Agent (基于LangChain框架)")
+    print("=" * 50)
+
+    # 选择提供商
+    provider = select_provider()
+
+    # 创建LLM客户端
+    print(f"\n初始化 {list_providers()[provider]['name']} 客户端...")
+    llm = create_llm(provider)
+
+    # 创建Agent
+    print("加载运行时配置...")
+    cfg = load_agent_config(AGENT_CONFIG_FILE)
+    skills_dir = resolve_path(cfg["skills_dir"], BASE_DIR)
+    mcp_cfg = resolve_path(cfg["mcp_config_file"], BASE_DIR)
+    print("初始化Agent(含MCP工具加载 + Checkpoint 持久化)...")
+    agent = AgentCore(
+        llm_client=llm,
+        memory_size=cfg["memory_size"],
+        long_term_memory_file=MEMORY_FILE,
+        checkpoint_file=CHECKPOINT_FILE,
+        max_iterations=cfg["max_iterations"],
+        verbose=cfg["verbose"],
+        mcp_config_file=mcp_cfg,
+        enable_mcp=cfg["enable_mcp"],
+        skills_dir=skills_dir,
+        auto_match_skills=cfg["auto_match_skills"],
+        max_context_messages=cfg["max_context_messages"],
+        context_trim_keep=cfg["context_trim_keep"],
+    )
+
+    # 显示就绪信息(简要)
+    info = llm.get_info()
+    print("\n" + "=" * 50)
+    print("Agent 已就绪！")
+    print("=" * 50)
+    print(f"\n当前提供商: {info['provider_name']}")
+    print(f"当前模型:   {info['model']}")
+    print(f"框架:       LangChain")
+    print("\n输入 'help' 查看所有命令说明")
     print()
 
     while True:
@@ -219,6 +249,11 @@ def main():
             if user_input.lower() in ['quit', 'exit']:
                 print("再见!")
                 break
+
+            # 查看帮助
+            if user_input.lower() == 'help':
+                show_help(agent, llm)
+                continue
 
             # 查看当前信息
             if user_input.lower() == 'info':
@@ -302,6 +337,38 @@ def main():
                     print(f"\n删除失败:会话 '{tid}' 不存在或数据库错误")
                 continue
 
+            # ========= 对话导出(Export) =========
+            low_export = user_input.lower()
+            if low_export == 'export' or low_export.startswith('export:'):
+                if low_export.startswith('export:'):
+                    rest = user_input[7:].strip()
+                else:
+                    rest = user_input[6:].strip()
+                parts = rest.split(None, 1)
+                tid = parts[0] if parts else None
+                path = parts[1] if len(parts) > 1 else None
+
+                text = agent.memory.export_thread(tid)
+                if not text.strip():
+                    print("\n该会话没有可导出的消息")
+                    continue
+
+                if not path:
+                    exports_dir = os.path.join(BASE_DIR, "exports")
+                    os.makedirs(exports_dir, exist_ok=True)
+                    tid_safe = tid or agent.memory.thread_id
+                    path = os.path.join(exports_dir, f"{tid_safe}.md")
+
+                try:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(text)
+                    print(f"\n已导出对话到: {path} ({len(text)} 字符)")
+                except Exception as e:
+                    print(f"\n导出失败: {e}")
+                    print("\n--- 对话内容预览 ---")
+                    print(text[:1000])
+                continue
+
             # 查看可用工具
             if user_input.lower() == 'tools':
                 print(f"\n可用工具: {', '.join(agent.get_available_tools())}")
@@ -350,9 +417,24 @@ def main():
                 continue
 
 
-            # 切换提供商
-            if user_input.lower().startswith('switch:'):
-                new_provider = user_input[7:].strip().lower()
+            # 切换提供商(方向键选择)
+            if user_input.lower().startswith('switch'):
+                if user_input.lower() == 'switch':
+                    providers = list_providers()
+                    options = [
+                        (f"{p}  ({providers[p]['name']})", p) for p in providers
+                    ]
+                    selected = select_menu(
+                        "选择提供商",
+                        options,
+                        current=llm.provider
+                    )
+                    if selected is None:
+                        continue  # Esc 取消
+                    new_provider = selected
+                else:
+                    new_provider = user_input[7:].strip().lower()
+
                 try:
                     new_llm = create_llm(new_provider)
                     agent.switch_llm(new_llm)
@@ -575,6 +657,70 @@ def main():
                             print(f"\n助手: {result}")
                     else:
                         print(f"\n加载失败: {matched}")
+                continue
+
+            # ========= 安全策略(Safety)管理 =========
+            low_safety = user_input.lower()
+            if low_safety == 'safety':
+                cfg = safety_module.load_config()
+                print("\n安全策略:")
+                print("-" * 50)
+                print(f"  模式:        {cfg['mode']}")
+                print(f"  危险确认:    {'开启' if cfg['confirm_dangerous'] else '关闭'}")
+                print(f"  追加黑名单:  {cfg.get('blacklist') or '(空)'}")
+                if cfg['mode'] == 'whitelist':
+                    print(f"  白名单命令:  {cfg.get('whitelist')}")
+                print("-" * 50)
+                continue
+
+            if low_safety.startswith('safety:'):
+                rest = user_input[7:].strip().lower()
+                parts = rest.split(None, 1)
+                sub = parts[0]
+                if sub == 'mode':
+                    mode = parts[1].strip() if len(parts) > 1 else ''
+                    if mode not in ('blacklist', 'whitelist'):
+                        print("\n用法: safety:mode <blacklist|whitelist>")
+                    else:
+                        cfg = safety_module.load_config()
+                        cfg['mode'] = mode
+                        if safety_module.save_config(cfg):
+                            print(f"\n已切换安全模式: {mode}")
+                        else:
+                            print("\n保存失败")
+                elif sub == 'confirm':
+                    on = parts[1].strip() if len(parts) > 1 else ''
+                    enabled = on in ('on', 'true', '1', '启用')
+                    cfg = safety_module.load_config()
+                    cfg['confirm_dangerous'] = enabled
+                    if safety_module.save_config(cfg):
+                        print(f"\n危险命令确认已{'开启' if enabled else '关闭'}")
+                    else:
+                        print("\n保存失败")
+                else:
+                    print("\n用法: safety:mode <blacklist|whitelist> | safety:confirm <on|off>")
+                continue
+
+            # ========= JSON 模式 =========
+            # 让 Agent 完成任务后以 JSON 对象返回,并解析展示
+            if low_skill.startswith('json:'):
+                jtask = user_input[5:].strip()
+                if not jtask:
+                    print("\n用法: json:<任务描述>  (要求 Agent 以 JSON 对象返回结果)")
+                else:
+                    full = (
+                        jtask + "\n\n【输出要求】请只输出一个合法的 JSON 对象,"
+                        "不要包含 ``` 代码块标记或其它任何解释性文字,"
+                        "直接用 JSON 表达任务结果。"
+                    )
+                    result = agent.run(full)
+                    parsed = agent.llm.extract_json(result)
+                    if parsed is not None:
+                        print("\n解析成功,JSON 结构:")
+                        print(json.dumps(parsed, ensure_ascii=False, indent=2))
+                    else:
+                        print("\n未能解析为 JSON,原始输出:")
+                        print(result)
                 continue
 
             # ReAct/Agent模式
