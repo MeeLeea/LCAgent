@@ -25,6 +25,31 @@ from mcp.server.fastmcp import FastMCP
 mcp = FastMCP("workspace-server")
 
 
+def _is_protected_path(folder_path: str) -> Optional[str]:
+    """
+    路径安全保护:禁止删除/操作系统关键目录与项目根
+    返回 None 表示允许;返回字符串表示被拦截的原因
+    """
+    try:
+        abs_path = os.path.abspath(folder_path)
+    except Exception:
+        return "路径无效"
+    # 根目录 / 盘符根
+    parent = os.path.dirname(abs_path)
+    if abs_path == parent or abs_path.endswith(":\\") or abs_path in ("/", "\\"):
+        return "禁止操作系统根目录"
+    # 系统目录与用户主目录
+    sys_root = os.path.abspath(os.environ.get("SystemRoot", "C:\\Windows"))
+    windir = os.path.abspath(os.environ.get("windir", "C:\\Windows"))
+    home = os.path.abspath(os.path.expanduser("~"))
+    project_root = os.path.abspath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    protected = [sys_root, windir, home, project_root]
+    for p in protected:
+        if abs_path == p or abs_path.startswith(p + os.sep):
+            return f"禁止操作系统/项目关键目录: {p}"
+    return None
+
+
 @mcp.tool()
 def create_workspace(folder_name: str, parent_dir: Optional[str] = None) -> Dict[str, Any]:
     """
@@ -144,6 +169,11 @@ def delete_workspace(folder_path: str, recursive: bool = True) -> Dict[str, Any]
     """
     try:
         abs_path = os.path.abspath(folder_path)
+
+        # 路径安全保护(禁止删除系统/项目关键目录)
+        blocked = _is_protected_path(abs_path)
+        if blocked:
+            return {"success": False, "error": blocked}
 
         if not os.path.exists(abs_path):
             return {"success": False, "error": f"路径不存在: {abs_path}"}
