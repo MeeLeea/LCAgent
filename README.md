@@ -1,12 +1,13 @@
 # LangChainAgent
 
 基于 **LangChain 1.x + LangGraph** 框架的智能 Agent 项目，支持：
-- 多 LLM 提供商（智谱/千问/DeepSeek/Kimi），运行时可切换提供商/模型
-- 本地工具调用（搜索、文件读写、计算、终端命令、文件打开）
-- **MCP Server 工具动态加载**（文件夹管理、可扩展任意 MCP 服务）
+- 配置驱动的多 LLM 提供商（见 `config/llm_config.json`），运行时可切换提供商/模型
+- 本地工具调用（搜索、文件读写、计算、终端命令、文件打开、技能读取）
+- **MCP Server 工具动态加载**（已预置 workspace 文件夹管理服务，可扩展任意 MCP 服务）
 - **LangGraph Checkpoint 持久化**（SQLite 自动保存，程序重启可恢复对话）
-- 长期记忆管理（compress 压缩摘要）
-- 多会话隔离（thread_id 机制，方向键菜单切换）
+- 长期记忆管理（compress 压缩摘要）与长上下文自动裁剪
+- 多会话隔离（thread_id 机制，方向键菜单切换/删除/导出）
+- 安全护栏（危险终端命令拦截/确认、路径保护）
 
 ---
 
@@ -32,12 +33,15 @@
   - [本地工具](#1-本地工具local-tools)
   - [MCP 工具](#2-mcp-工具mcp-server-tools)
   - [技能阅读 Skills](#3-技能阅读skills)
+  - [安全护栏 Safety](#4-安全护栏safety)
   - [工具调用机制](#工具调用机制)
   - [System Prompt 强化](#system-prompt-强化)
 - [交互命令参考](#交互命令参考)
 - [运行示例](#运行示例)
 - [代码使用示例](#代码使用示例)
 - [扩展工具](#扩展工具)
+- [运行时配置（agent_config.json）](#运行时配置agent_configjson)
+- [测试](#测试)
 - [技术栈](#技术栈)
 
 ---
@@ -62,22 +66,35 @@ pip install -r requirements.txt
 
 ### 3. 配置 API 密钥
 
-编辑 [llm_config.json](llm_config.json)，填入你的密钥：
+编辑 [config/llm_config.json](config/llm_config.json)，填入你的密钥（提供商元数据也在此文件定义，代码不再硬编码）：
 
 ```json
 {
-    "zhipu": {
-        "api_key": "你的智谱密钥",
-        "model": "glm-4"
+    "providers": {
+        "zhipu": {
+            "name": "智谱AI",
+            "base_url": "https://open.bigmodel.cn/api/paas/v4/",
+            "env_key": "ZHIPU_API_KEY",
+            "model": "glm-4.7-flash",
+            "models": ["glm-4", "glm-4-flash", "glm-4-long", "glm-4.7-flash", "glm-4.7-long"],
+            "api_key": "你的智谱密钥"
+        },
+        "deepseek": {
+            "name": "DeepSeek",
+            "base_url": "https://api.deepseek.com",
+            "env_key": "DEEPSEEK_API_KEY",
+            "model": "deepseek-chat",
+            "models": ["deepseek-chat", "deepseek-reasoner"],
+            "api_key": "你的DeepSeek密钥"
+        }
     },
-    "deepseek": {
-        "api_key": "你的DeepSeek密钥",
-        "model": "deepseek-chat"
+    "tavily": {
+        "api_key": "你的Tavily密钥"
     }
 }
 ```
 
-> 也可以通过环境变量配置，例如 `set DEEPSEEK_API_KEY=sk-xxx`
+> 增删提供商只需编辑 `config/llm_config.json` 的 `providers` 字段；密钥也可通过环境变量配置，例如 `set DEEPSEEK_API_KEY=sk-xxx`
 
 ### 4. 运行
 
@@ -95,9 +112,13 @@ python main.py
 LangChainAgent/
 ├── main.py                  # 入口文件，交互式命令行
 ├── llm_client.py            # 统一大模型封装（多提供商 + 多模型）
-├── llm_config.json          # API密钥配置文件
-├── mcp_servers.json         # MCP Server 配置文件
-├── requirements.txt         # 依赖列表
+├── config/                  # 配置目录
+│   ├── llm_config.json      # API密钥配置文件
+│   ├── agent_config.json    # 运行时配置(迭代上限/技能目录/长上下文裁剪等)
+│   ├── mcp_servers.json     # MCP Server 配置(已预置 workspace 本地服务器,enabled)
+│   └── safety.json          # 安全护栏配置（运行时按需生成）
+├── requirements.txt         # 运行依赖(含开发/测试依赖 pytest)
+├── pytest.ini               # pytest 配置
 ├── .agents/skills/          # 本地技能目录（每个子目录一个 SKILL.md）
 ├── data/
 │   ├── checkpoints.sqlite   # Checkpoint 持久化数据库（运行时自动生成）
@@ -106,18 +127,29 @@ LangChainAgent/
 │   ├── __init__.py
 │   ├── memory.py            # 记忆模块（Checkpoint + 长期记忆）
 │   └── agent_core.py        # Agent核心调度
-└── tools/
-    ├── __init__.py          # 本地工具注册
-    ├── search.py            # 联网搜索工具
-    ├── file_tool.py         # 文件读写工具
-    ├── calculator.py        # 数学计算工具
-    ├── terminal_tools.py    # 终端命令工具（shell/python/bat/ps1）
-    ├── get_local_time.py    # 获取本地时间工具
-    ├── open_file.py         # 文件打开工具（系统默认程序/DB Browser）
-    ├── skills.py            # SkillManager（扫描/匹配/渲染技能）
-    ├── skill_tool.py        # read_skill 工具（LLM 自助读取技能指引）
-    ├── mcp_loader.py        # MCP 工具加载器
-    └── workspace_tool.py    # 工作目录管理 MCP Server
+├── tools/
+│   ├── __init__.py          # 本地工具注册
+│   ├── search.py            # 联网搜索工具(Tavily API)
+│   ├── file_tool.py         # 文件读写工具
+│   ├── calculator.py        # 数学计算工具
+│   ├── terminal_tools.py    # 终端命令工具（shell/python/bat/ps1,含安全护栏）
+│   ├── get_local_time.py    # 获取本地时间工具
+│   ├── open_file.py         # 文件打开工具（系统默认程序/DB Browser）
+│   ├── skills.py            # SkillManager（扫描/匹配/渲染技能）
+│   ├── skill_tool.py        # read_skill 工具（LLM 自助读取技能指引）
+│   ├── safety.py            # 安全护栏(黑名单/白名单/交互确认/路径保护)
+│   ├── mcp_loader.py        # MCP 工具加载器
+│   └── workspace_tool.py    # 工作目录管理 MCP Server
+├── tests/                   # 离线单元测试(pytest)
+│   ├── conftest.py
+│   ├── test_config.py
+│   ├── test_safety.py
+│   ├── test_skills.py
+│   ├── test_search.py
+│   ├── test_terminal.py
+│   └── test_memory.py
+├── config.py                # 运行时配置加载(config/agent_config.json)
+└── exports/                 # 对话导出目录(运行 export 时生成)
 ```
 
 ### 模块职责
@@ -125,9 +157,10 @@ LangChainAgent/
 | 模块 | 职责 |
 |------|------|
 | [main.py](main.py) | 交互式命令行：方向键选择提供商、解析命令、调用 Agent |
-| [llm_client.py](llm_client.py) | 统一封装 4 个 LLM 提供商，支持运行时切换提供商/模型 |
-| [agent/memory.py](agent/memory.py) | 双层记忆：Checkpoint（自动）+ memory.json（手动） |
-| [agent/agent_core.py](agent/agent_core.py) | Agent 核心：`run()` / `chat()` / `cot()` 三种模式 + 技能注入 |
+| [llm_client.py](llm_client.py) | 从 `config/llm_config.json` 读取提供商配置，支持运行时切换提供商/模型 |
+| [config.py](config.py) | 加载 `config/agent_config.json`，统一运行时配置 |
+| [agent/memory.py](agent/memory.py) | 双层记忆：Checkpoint（自动）+ memory.json（手动）+ 对话导出 |
+| [agent/agent_core.py](agent/agent_core.py) | Agent 核心：`run()` / `chat()` / `cot()` 三种模式 + 技能注入 + 长上下文裁剪 |
 | [tools/skills.py](tools/skills.py) | `SkillManager`：扫描/匹配/渲染本地技能 |
 | [tools/skill_tool.py](tools/skill_tool.py) | `read_skill` 工具：LLM 在任务中自助读取技能指引 |
 | [tools/](tools/) | 本地工具 + MCP 工具加载 + 技能管理 |
@@ -136,7 +169,7 @@ LangChainAgent/
 
 | 类/函数 | 说明 |
 |---------|------|
-| `LLMClient` | 核心客户端类，支持4个提供商 |
+| `LLMClient` | 核心客户端类，支持配置文件中的所有提供商 |
 | `LLMClient.chat()` | 发送对话请求 |
 | `LLMClient.chat_with_history()` | 带历史记录的对话 |
 | `LLMClient.get_chat_model()` | 获取 LangChain `ChatOpenAI` 实例 |
@@ -148,12 +181,15 @@ LangChainAgent/
 
 **支持的提供商：**
 
-| 提供商 | 名称 | API地址 | 环境变量 | 默认模型 |
-|--------|------|---------|----------|----------|
-| `zhipu` | 智谱AI | open.bigmodel.cn | `ZHIPU_API_KEY` | glm-4 |
-| `qwen` | 通义千问 | dashscope.aliyuncs.com | `DASHSCOPE_API_KEY` | qwen-plus |
-| `deepseek` | DeepSeek | api.deepseek.com | `DEEPSEEK_API_KEY` | deepseek-chat |
-| `kimi` | Kimi | api.moonshot.cn | `MOONSHOT_API_KEY` | moonshot-v1-8k |
+提供商不再硬编码在代码中，全部来自 [config/llm_config.json](config/llm_config.json) 的 `providers` 字段。当前配置包含：
+
+| 提供商 | 名称 | 环境变量 | 默认模型 |
+|--------|------|----------|----------|
+| `zhipu` | 智谱AI | `ZHIPU_API_KEY` | `glm-4.7-flash` |
+| `qwen` | 通义千问 | `DASHSCOPE_API_KEY` | `Qwen2.5-7B-Instruct` |
+| `deepseek` | DeepSeek | `DEEPSEEK_API_KEY` | `deepseek-chat` |
+| `kimi` | Kimi (Moonshot) | `MOONSHOT_API_KEY` | `moonshot-v1-8k` |
+| `yunwu` | 云雾 | `YUNWU_API_KEY` | `gpt-5.5` |
 
 ---
 
@@ -237,15 +273,33 @@ response = self.llm.chat_with_history(
 - `get_long_term(3)` → 从 **memory.json** 取最近 3 条长期记忆
 - 两者拼接后作为 history 传给 LLM
 
+#### 技能指引与长上下文摘要的注入
+
+`react:` 和 `chat()` 在每次执行前会根据任务重建 Agent：
+
+```python
+self.agent_executor = self._create_agent_executor(
+    self._compute_skill_block(task)
+)
+```
+
+因此除了 checkpoint 历史外，system prompt 还可能包含：
+
+| 来源 | 触发方式 | 说明 |
+|------|---------|------|
+| 手动技能 | `skill:<name>` | 后续对话都会注入该技能指引，直到 `skill:clear` |
+| 自动匹配技能 | `auto_match_skills=true` | 根据任务与技能描述的关键词重叠度自动注入相关技能 |
+| 长上下文摘要 | `max_context_messages > 0` 且消息超阈值 | 旧消息被摘要后注入 system prompt，并开启新 thread |
+
 #### 对比表
 
-| 模式 | checkpoint | memory.json | 说明 |
-|------|-----------|-------------|------|
-| `react:` | ✅ 自动注入 | ❌ 不参与 | LangGraph 自动恢复该 thread 历史 |
-| 普通对话 | ✅ 自动注入 | ❌ 不参与 | 同上 |
-| `cot:` | ✅ 手动取 | ✅ 取最近 3 条 | 两者拼接作为 history |
+| 模式 | checkpoint | memory.json | 技能指引 | 长上下文摘要 | 说明 |
+|------|-----------|-------------|----------|--------------|------|
+| `react:` | ✅ 自动注入 | ❌ 不参与 | ✅ 可注入 | ✅ 可注入 | LangGraph 自动恢复该 thread 历史 |
+| 普通对话 | ✅ 自动注入 | ❌ 不参与 | ✅ 可注入 | ✅ 可注入 | 同上，但不打印步骤、不存长期 |
+| `cot:` | ✅ 手动取 | ✅ 取最近 3 条 | ❌ 不注入 | ❌ 不注入 | 绕过 Agent，纯 LLM 推理 |
 
-> ⚠️ **重要副作用**：由于 `react:` 模式**不读 memory.json**，意味着你在会话 A 里用 `react:` 做的事（已存入 memory.json），切到会话 B 再用 `react:` 时，**LLM 看不到**会话 A 的关键信息。只有 `cot:` 模式或 `compress` 命令才会读 memory.json。也就是说 **memory.json 的跨会话"记忆"能力目前只对 cot 生效**。
+> ⚠️ **重要副作用**：由于 `react:` 和普通对话**不读 memory.json**，意味着你在会话 A 里用 `react:` 做的事（已存入 memory.json），切到会话 B 再用 `react:` 时，**LLM 看不到**会话 A 的关键信息。只有 `cot:` 模式或 `compress` 命令才会读 memory.json。也就是说 **memory.json 的跨会话"记忆"能力目前只对 cot 生效**。
 
 ### 两层存储对比
 
@@ -474,7 +528,7 @@ LLM 生成摘要
 
 --- 摘要内容 ---
 - 用户要求创建 LangChainAgent 项目
-- 已配置 4 个 LLM 提供商（智谱/千问/DeepSeek/Kimi）
+- 已通过 config/llm_config.json 配置多个 LLM 提供商
 - 添加了 MCP workspace 工具（6 个文件夹管理工具）
 - 修复了 StructuredTool 同步调用问题
 - ...
@@ -532,6 +586,7 @@ LLM 生成摘要
 | `switch_thread(thread_id)` | 切换到指定会话(代码层 API,CLI 用 `thread` 菜单) |
 | `delete_thread(thread_id)` | 删除指定会话(删当前会话时自动切换到其他会话) |
 | `list_threads()` | 列出所有会话 ID |
+| `export_thread(thread_id, fmt)` | 导出指定会话为可读文本/Markdown |
 | `clear_short_term()` | 开启新会话(替代删除) |
 | `clear_long_term()` | 清空长期记忆并删除文件 |
 | `summarize()` | 返回记忆统计信息(含 thread_id、消息数、会话数) |
@@ -563,13 +618,13 @@ Agent 的工具分为两类：
 
 | 工具 | 文件 | 功能 | 参数 |
 |------|------|------|------|
-| `search` | [tools/search.py](tools/search.py) | 联网搜索 | `query`, `num_results` |
+| `search` | [tools/search.py](tools/search.py) | 联网搜索(Tavily API) | `query`, `num_results`, `search_depth` |
 | `read_file` | [tools/file_tool.py](tools/file_tool.py) | 读取文件 | `file_path` |
 | `write_file` | [tools/file_tool.py](tools/file_tool.py) | 写入文件 | `file_path`, `content`, `mode` |
 | `calculate` | [tools/calculator.py](tools/calculator.py) | 数学计算 | `expression` |
-| `run_shell` | [tools/terminal_tools.py](tools/terminal_tools.py) | 执行 shell 命令 | `command`, `timeout` |
-| `run_python` | [tools/terminal_tools.py](tools/terminal_tools.py) | 执行 Python 脚本 | `code`, `timeout` |
-| `run_cmd` | [tools/terminal_tools.py](tools/terminal_tools.py) | 执行 .bat/.ps1 文件 | `file_path`, `args` |
+| `run_shell` | [tools/terminal_tools.py](tools/terminal_tools.py) | 执行 shell 命令 | `command`, `cwd`, `timeout` |
+| `run_python` | [tools/terminal_tools.py](tools/terminal_tools.py) | 执行 Python 脚本文件 | `file_path`, `script_args`, `cwd`, `timeout` |
+| `run_cmd` | [tools/terminal_tools.py](tools/terminal_tools.py) | 执行 .bat/.cmd/.ps1 文件 | `file_path`, `script_args`, `cwd`, `timeout` |
 | `get_local_time` | [tools/get_local_time.py](tools/get_local_time.py) | 获取本地时间 | 无 |
 | `open_file` | [tools/open_file.py](tools/open_file.py) | 用系统默认/指定程序打开文件或文件夹 | `file_path`, `app_path` |
 | `open_sqlite` | [tools/open_file.py](tools/open_file.py) | 用 DB Browser for SQLite 打开 .sqlite/.db | `file_path` |
@@ -586,8 +641,8 @@ Agent 的工具分为两类：
 | Server 名称 | 工具数 | 传输方式 | 说明 |
 |-------------|--------|---------|------|
 | `workspace` | 6 | stdio | 文件夹创建/删除/移动/复制/列举（Python 实现） |
-| `filesystem` | - | stdio | 官方文件系统服务（默认禁用，需 Node.js） |
-| `fetch` | - | stdio | 官方网页抓取服务（默认禁用，需 Node.js） |
+| `filesystem` | - | stdio | 可选官方文件系统服务（需手动添加/启用，需 Node.js） |
+| `fetch` | - | stdio | 可选官方网页抓取服务（需手动添加/启用，需 Node.js） |
 
 #### workspace MCP Server 提供的工具
 
@@ -604,26 +659,22 @@ Agent 的工具分为两类：
 
 #### MCP 配置文件
 
-[mcp_servers.json](mcp_servers.json) 定义所有 MCP Server：
+[config/mcp_servers.json](config/mcp_servers.json) 定义所有 MCP Server：
 
 ```json
 {
     "servers": {
         "workspace": {
             "transport": "stdio",
-            "command": "D:\\work\\LangChainAgent\\.venv\\Scripts\\python.exe",
-            "args": ["D:\\work\\LangChainAgent\\tools\\workspace_tool.py"],
+            "command": "python",
+            "args": ["tools/workspace_tool.py"],
             "enabled": true
-        },
-        "filesystem": {
-            "transport": "stdio",
-            "command": "npx",
-            "args": ["-y", "@modelcontextprotocol/server-filesystem", "D:\\work"],
-            "enabled": false
         }
     }
 }
 ```
+
+> 说明：配置文件中的 `command: "python"`（或 `"python3"`）会在加载时自动替换为**当前运行的解释器**（即激活的 venv），因此无需写死绝对路径。stdio 的 `args` 路径相对于项目根目录。
 
 | 字段 | 说明 |
 |------|------|
@@ -714,6 +765,49 @@ SkillManager.match_skills(task)
 | `SkillManager.match_skills(task)` | 根据任务匹配相关技能（确定性打分） |
 | `SkillManager.render_block(names)` | 把若干技能渲染为可注入的指引块 |
 
+### 4. 安全护栏（Safety）
+
+Agent 可自动执行终端命令与文件操作，为防止破坏性操作，内置两级安全策略（由 [tools/safety.py](tools/safety.py) 实现）：
+
+| 级别 | 规则 | 行为 |
+|------|------|------|
+| **BLOCKLIST（始终拒绝）** | `rm -rf /`、`format`、`mkfs`、`dd if=`、`shutdown`、`fork bomb`、`:(){`、``curl\|sh``/``wget\|sh``、`del /f /s`、`rd /s /q` 等灾难性命令 | 直接拦截，返回拒绝错误 |
+| **CONFIRM（需确认）** | `sudo`、`rm`、`chmod`、`chown`、`mv`、`kill`、`taskkill`、`schtasks` 等危险但有时需要的命令 | 交互式确认（输入 `y` 才执行，空/超时/EOF 默认拒绝） |
+
+> 执行任意脚本文件（`.py` / `.ps1` / `.bat`）因无法静态分析内容，默认也需确认。
+
+#### 配置（config/safety.json）
+
+```json
+{
+    "mode": "blacklist",
+    "confirm_dangerous": true,
+    "blacklist": [],
+    "whitelist": ["echo", "dir", "ls", "python", "pip", "git", "cat", "type"]
+}
+```
+
+字段含义：
+- `mode`: `blacklist`(默认) 或 `whitelist`
+- `confirm_dangerous`: 是否对危险命令交互确认
+- `blacklist`: 追加的拒绝正则(与内置合并)
+- `whitelist`: 白名单模式下允许的首命令
+
+- `blacklist` 模式：仅拦截 BLOCKLIST + 追加黑名单，其余放行（危险命令需确认）
+- `whitelist` 模式：只有白名单内的首命令才允许，其余一律拒绝
+
+#### 路径保护
+
+`delete_workspace`（MCP 子进程）无法交互确认，改为**路径保护**：禁止删除系统目录（`C:\Windows` 等）、用户主目录、项目根目录及根目录本身。
+
+#### 交互命令
+
+| 命令 | 作用 |
+|------|------|
+| `safety` | 查看当前安全策略（模式 / 确认开关 / 黑名单） |
+| `safety:mode <blacklist\|whitelist>` | 切换模式 |
+| `safety:confirm <on\|off>` | 开关危险命令确认 |
+
 ### 工具调用机制
 
 Agent 基于 **LangGraph `create_react_agent`** 实现，工具调用流程：
@@ -740,8 +834,12 @@ LLM 决定是否调用工具
 1. 当用户要求创建文件、读写文件、创建目录等操作时，你【必须】调用相应工具
 2. 绝对不要回复'我无法访问你的文件系统'、'请你自己保存'之类的话
 3. 你确实拥有这些工具的能力，工具会在用户本地执行
-4. 如果用户要保存内容到文件，直接调用 write_file 工具
-5. 如果用户要创建目录，直接调用 create_workspace 工具
+4. 创建文件、脚本、文件夹默认位置是 ./tests/
+5. 如果用户要保存内容到文件，直接调用 write_file 工具
+6. 如果用户要创建目录，直接调用 create_workspace 工具
+7. 测试/运行脚本时直接调用终端工具
+8. 危险命令会被安全策略拦截或要求确认
+9. 专业任务应优先用 read_skill 读取相关技能指引
 ```
 
 ---
@@ -755,6 +853,7 @@ LLM 决定是否调用工具
 | `switch:提供商名` | 运行时切换 LLM 提供商（如 `switch:deepseek`） |
 | `model` | 方向键选择切换当前提供商的模型 |
 | `model:<name>` | 直接切换模型（如 `model:glm-4-flash`） |
+| `help` | 查看完整命令说明 |
 | `info` | 查看当前模型和记忆状态(含 thread_id、会话数) |
 | `tools` | 查看可用工具列表（含 MCP 工具） |
 | `clear [long\|short\|all]` | 清理记忆（默认 long） |
@@ -771,6 +870,11 @@ LLM 决定是否调用工具
 | `skill:<name>` | 将某技能加载进当前会话(注入 system prompt) |
 | `skill:<name> <任务>` | 加载技能并立即以 Agent 模式执行该任务(如 `skill:git-commit 提交README`) |
 | `skill:clear` | 清空手动加载的技能 |
+| `safety` | 查看当前安全策略 |
+| `safety:mode <blacklist\|whitelist>` | 切换安全模式 |
+| `safety:confirm <on\|off>` | 开关危险命令确认 |
+| `export` 或 `export:<thread_id> [路径]` | 导出对话为 Markdown(默认存 `exports/`) |
+| `json:<任务>` | 让 Agent 以 JSON 对象返回结果并解析展示 |
 | `quit` / `exit` | 退出 |
 | 其他输入 | 普通对话模式（也支持工具调用，但不打印步骤） |
 
@@ -791,13 +895,14 @@ LLM 决定是否调用工具
         kimi       (Kimi (Moonshot))
 ----------------------------------------
 
+[MCP] workspace: 加载了 6 个工具
 [MCP] 已加载 6 个工具: create_workspace, get_current_workspace, list_directory, delete_workspace, move_workspace, copy_workspace
 
 Agent 已就绪！
 当前提供商: DeepSeek
 当前模型:   deepseek-chat
 
-本地工具: search, read_file, write_file, calculate, run_shell, run_python, run_cmd, get_local_time, open_file, open_sqlite
+本地工具: search, read_file, write_file, calculate, run_shell, run_python, run_cmd, get_local_time, open_file, open_sqlite, read_skill
 MCP工具:  create_workspace, get_current_workspace, list_directory, delete_workspace, move_workspace, copy_workspace
 
 你: 在 D:\work 下创建一个叫 my_project 的文件夹
@@ -855,9 +960,7 @@ Checkpoint: sqlite → D:\work\LangChainAgent\data\checkpoints.sqlite
 MCP Servers:
 ------------------------------------------------------------
   [✓启用] workspace (stdio)
-           D:\work\LangChainAgent\.venv\Scripts\python.exe D:\work\LangChainAgent\tools\workspace_tool.py
-  [✗禁用] filesystem (stdio)
-           npx -y @modelcontextprotocol/server-filesystem D:\work
+           python tools/workspace_tool.py
 ------------------------------------------------------------
 已加载 MCP 工具数: 6
 
@@ -876,15 +979,19 @@ from llm_client import create_client
 from agent import AgentCore
 
 # 创建客户端和Agent
-llm = create_client(provider="deepseek", config_file="llm_config.json")
+llm = create_client(provider="deepseek", config_file="config/llm_config.json")
 agent = AgentCore(
     llm_client=llm,
     memory_size=10,
     long_term_memory_file="data/memory.json",        # 长期记忆(用于 compress)
     checkpoint_file="data/checkpoints.sqlite",       # Checkpoint 持久化
-    max_iterations=25,
-    mcp_config_file="mcp_servers.json",
-    enable_mcp=True
+    max_iterations=15,
+    mcp_config_file="config/mcp_servers.json",
+    enable_mcp=True,
+    skills_dir=".agents/skills",
+    auto_match_skills=True,
+    max_context_messages=0,                           # 0=关闭长上下文裁剪
+    context_trim_keep=12
 )
 
 # 普通对话（自动判断是否调用工具，自动写 checkpoint，不存长期记忆）
@@ -898,7 +1005,7 @@ result = agent.cot("分析机器学习的应用场景")
 
 # 切换LLM提供商
 from llm_client import create_client
-new_llm = create_client(provider="qwen", config_file="llm_config.json")
+new_llm = create_client(provider="qwen", config_file="config/llm_config.json")
 agent.switch_llm(new_llm)
 
 # 切换模型(同一提供商内)
@@ -911,6 +1018,7 @@ agent.memory.new_thread()                    # 开启新会话
 agent.memory.switch_thread("thread-abc123")  # 切换到已有会话
 agent.memory.delete_thread("thread-xxx")     # 删除指定会话
 print(agent.memory.list_threads())           # 列出所有会话
+print(agent.memory.export_thread(fmt="markdown"))  # 导出当前会话为 Markdown 文本
 
 # 记忆管理
 agent.memory.clear_long_term()   # 清空长期记忆
@@ -969,7 +1077,7 @@ all_tools = [search, read_file, write_file, calculate, my_tool]
 mcp:add fetch npx -y @modelcontextprotocol/server-fetch
 ```
 
-或直接编辑 [mcp_servers.json](mcp_servers.json)：
+或直接编辑 [config/mcp_servers.json](config/mcp_servers.json)：
 
 ```json
 {
@@ -1003,7 +1111,7 @@ if __name__ == "__main__":
     mcp.run()
 ```
 
-注册到 `mcp_servers.json`：
+注册到 `config/mcp_servers.json`：
 
 ```json
 {
@@ -1033,6 +1141,78 @@ if __name__ == "__main__":
 
 ---
 
+## 运行时配置（agent_config.json）
+
+原先硬编码在 `main.py` 的运行时参数已外置到 `config/agent_config.json`，由 [config.py](config.py) 的 `load_agent_config` 加载并与默认值合并（缺省键不报错）。
+
+| 键 | 类型 | 默认值 | 说明 |
+|----|------|--------|------|
+| `max_iterations` | int | 15 | 单次 `invoke` 最大推理步数（即 `recursion_limit`） |
+| `skills_dir` | str | `.agents/skills` | 技能目录（相对项目根或绝对路径） |
+| `auto_match_skills` | bool | true | 任务自动匹配并注入相关技能 |
+| `enable_mcp` | bool | true | 是否加载 MCP 工具 |
+| `memory_size` | int | 10 | 兼容旧 API 的记忆容量 |
+| `verbose` | bool | true | 是否打印详细过程 |
+| `mcp_config_file` | str | `config/mcp_servers.json` | MCP 配置文件（相对项目根或绝对路径） |
+| `max_context_messages` | int | 0 | 长上下文裁剪阈值（0 = 关闭） |
+| `context_trim_keep` | int | 12 | 裁剪时保留的最近消息条数 |
+
+修改后重启 `main.py` 即可生效。
+
+### 长上下文裁剪（Long-Context Trimming）
+
+当某个会话的消息数超过 `max_context_messages` 时，Agent 会自动：
+1. 用 LLM 将较早的消息压缩成一份中文摘要；
+2. 开启**新会话**，并把摘要注入后续 system prompt（保留上下文精华）；
+3. 仅保留最近 `context_trim_keep` 条消息，从而避免撞上 LLM 上下文窗口。
+
+> 触发时会在终端打印提示（含新旧 `thread_id`）。默认 `max_context_messages=0`（关闭），需要时在 `config/agent_config.json` 中设一个合理值（如 60）即可开启。
+
+### 对话导出（Export）
+
+```
+export                 # 导出当前会话到 exports/<thread_id>.md
+export:<thread_id>     # 导出指定会话
+export:<thread_id> 路径/文件.md   # 导出到指定路径
+```
+
+由 [agent/memory.py](agent/memory.py) 的 `AgentMemory.export_thread()` 实现，将 checkpoint 中的对话渲染为可读文本/Markdown。
+
+### JSON 模式（Structured Output）
+
+```
+json:<任务描述>
+```
+
+Agent 会按要求**只输出一个合法 JSON 对象**（不含 ``` 标记与解释文字），执行后自动用 `LLMClient.extract_json` 解析并美化打印；解析失败则回退显示原始输出。适用于需要结构化返回（如生成配置、报表、API 响应）的场景。
+
+---
+
+## 测试
+
+项目提供一套**离线**单元测试（无需 API Key、不联网），覆盖核心逻辑：
+
+| 测试文件 | 覆盖内容 |
+|----------|----------|
+| `tests/test_config.py` | 运行时配置：默认值合并、路径解析 |
+| `tests/test_safety.py` | 安全护栏：黑名单拒绝、白名单放行、危险命令确认、路径保护 |
+| `tests/test_skills.py` | `SkillManager`：列出/读取/匹配(中→英别名)/渲染技能 |
+| `tests/test_search.py` | `search` 工具：无 Key 降级、Tavily 返回结构(mock) |
+| `tests/test_terminal.py` | 终端工具：输出截断、护栏拒绝、安全执行(mock subprocess) |
+| `tests/test_memory.py` | `AgentMemory`：长期记忆、会话管理(SQLite) |
+
+运行：
+
+```powershell
+cd D:\work\LangChainAgent
+.\.venv\Scripts\pip.exe install -r requirements.txt
+.\.venv\Scripts\pytest.exe
+```
+
+测试配置见 `pytest.ini`（`pythonpath = .` 保证 `import tools`/`import agent` 可用），`conftest.py` 提供安全配置缓存隔离的 autouse fixture。
+
+---
+
 ## 技术栈
 
 - Python 3.10+
@@ -1040,5 +1220,7 @@ if __name__ == "__main__":
 - LangGraph 1.x（`create_react_agent`）
 - LangGraph Checkpoint（`langgraph-checkpoint-sqlite`，SQLite 持久化）
 - langchain-mcp-adapters 0.3+（MCP 工具适配）
-- mcp 1.9+（FastMCP Server）
-- OpenAI SDK（兼容所有4个提供商的 API 格式）
+- mcp 1.9+ / fastmcp 2.x（FastMCP Server）
+- OpenAI SDK（用于 OpenAI 兼容接口）
+- Tavily Python SDK（联网搜索）
+- pytest（离线单元测试）
