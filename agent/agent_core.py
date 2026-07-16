@@ -4,6 +4,7 @@ Agent核心调度模块 - 基于LangChain 1.x + LangGraph
 支持动态加载本地工具 + MCP Server工具
 """
 import asyncio
+import os
 from typing import Dict, Any, List, Optional
 from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
@@ -12,6 +13,7 @@ from llm_client import LLMClient
 from .memory import AgentMemory
 from tools import all_tools as local_tools
 from tools.mcp_loader import load_mcp_tools, DEFAULT_CONFIG_FILE
+from tools.skills import SkillManager
 
 
 class AgentCore:
@@ -22,30 +24,46 @@ class AgentCore:
         llm_client: LLMClient,
         memory_size: int = 10,
         long_term_memory_file: Optional[str] = None,
+        checkpoint_file: Optional[str] = None,
+        thread_id: Optional[str] = None,
         max_iterations: int = 25,
         verbose: bool = True,
         mcp_config_file: Optional[str] = None,
-        enable_mcp: bool = True
+        enable_mcp: bool = True,
+        skills_dir: Optional[str] = None,
+        auto_match_skills: bool = True,
+        max_context_messages: int = 0,
+        context_trim_keep: int = 12
     ):
         """
         初始化Agent核心
 
         Args:
             llm_client: LLM客户端实例
-            memory_size: 短期记忆容量
-            long_term_memory_file: 长期记忆文件路径
+            memory_size: 仅兼容旧 API(checkpoint 不限容量)
+            long_term_memory_file: 长期记忆 JSON 文件(用于 compress)
+            checkpoint_file: SQLite checkpoint 文件路径(为 None 时用内存)
+            thread_id: 会话线程 ID(为 None 时自动生成)
             max_iterations: Agent最大迭代次数(langgraph recursion_limit)
             verbose: 是否打印详细执行过程
             mcp_config_file: MCP servers 配置文件路径
             enable_mcp: 是否启用 MCP 工具加载
+            max_context_messages: 长上下文裁剪阈值(0=关闭);超过则自动摘要并开新会话
+            context_trim_keep: 裁剪时保留的最近消息条数
         """
         self.llm = llm_client
         self.memory = AgentMemory(
+            checkpoint_file=checkpoint_file,
+            long_term_file=long_term_memory_file,
+            thread_id=thread_id,
             short_term_size=memory_size,
-            long_term_file=long_term_memory_file
+            use_sqlite=checkpoint_file is not None
         )
         self.max_iterations = max_iterations
         self.verbose = verbose
+        self.max_context_messages = max_context_messages
+        self.context_trim_keep = context_trim_keep
+        self.compaction_summary = ""  # 长上下文裁剪后的历史摘要(注入 system prompt)
 
         # 本地工具
         self.local_tools: List[BaseTool] = list(local_tools)
@@ -57,6 +75,14 @@ class AgentCore:
         # MCP 配置
         self.mcp_config_file = mcp_config_file or DEFAULT_CONFIG_FILE
         self.enable_mcp = enable_mcp
+
+        # 技能阅读(本地 .agents/skills)
+        if skills_dir is None:
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            skills_dir = os.path.join(base_dir, ".agents", "skills")
+        self.skill_manager = SkillManager(skills_dir)
+        self.active_skills: set = set()      # 由 CLI (skill:<name>) 手动加载
+        self.auto_match_skills = auto_match_skills  # 任务开始时自动匹配注入
 
         # 启动时加载 MCP 工具
         if enable_mcp:
@@ -79,9 +105,11 @@ class AgentCore:
             count = asyncio.run(self._async_load_mcp_tools())
             # 合并工具列表
             self.tools = list(self.local_tools) + list(self.mcp_tools)
-            # 重建Agent
+            # 重建Agent(保留已加载的技能)
             if hasattr(self, "agent_executor"):
-                self.agent_executor = self._create_agent_executor()
+                self.agent_executor = self._create_agent_executor(
+                    self._compute_skill_block("")
+                )
             return count
         except Exception as e:
             print(f"[MCP] 重新加载失败: {e}")
@@ -97,39 +125,52 @@ class AgentCore:
             print("[MCP] 未加载到任何工具(可能配置为空或服务器未启用)")
         return len(tools)
 
-    def _create_agent_executor(self):
+    def _create_agent_executor(self, skill_block: str = ""):
         """创建LangGraph ReAct Agent"""
         chat_model = self.llm.get_chat_model()
 
         # create_react_agent 直接返回可调用的agent
         # prompt 参数作为系统提示词
+        # checkpointer 让 Agent 自动持久化状态到 SQLite
         agent = create_react_agent(
             model=chat_model,
             tools=self.tools,
-            prompt=self._get_system_prompt(),
-            # recursion_limit=self.max_iterations
+            prompt=self._get_system_prompt(skill_block),
+            checkpointer=self.memory.get_checkpointer(),
         )
         return agent
 
-    def _get_system_prompt(self) -> str:
-        """获取系统提示词"""
-        return (
+    def _get_system_prompt(self, skill_block: str = "") -> str:
+        """获取系统提示词(可附加技能指引块)"""
+        base = (
             "你是一个智能助手，配备了多种工具（包括文件读写、目录管理、搜索、计算等）。\n"
             "\n"
             "【重要规则】\n"
             "1. 当用户要求创建文件、读写文件、创建目录、搜索信息等操作时，你【必须】调用相应工具来完成，"
             "绝对不要回复'我无法访问你的文件系统'、'我没有权限'、'请你自己保存'之类的话。\n"
             "2. 你确实拥有这些工具的能力，工具会在用户本地执行，可以真正创建和修改文件。\n"
-            "3. 如果用户要保存内容到文件，直接调用 write_file 工具，不要把内容贴出来让用户自己保存。\n"
-            "4. 如果用户要创建目录，直接调用 create_workspace 工具，不要让用户手动操作，创建文件夹默认位置是：'当前工作目录/test/'。\n"
-            "5. 只有纯知识性问答（不需要操作文件/搜索/计算）才直接回答，不调用工具。\n"
-            "6. 调用工具时，如果一次任务需要多步操作（例如先创建目录再写文件），请依次调用多个工具。\n"
-            "7. 如果用户要求跑一下或者测试一下，直接调用相应工具，不要让用户手动操作。\n"
-            "8. 如果用户要求生成工具,直接在tools目录下创建，并使用@tool装饰器，不修改__init__.py文件。\n"
-            "9. 如果用户要求获取本地时间，直接调用 get_local_time 工具，不要自己计算。\n"
+            "3. 对话过程中创建文件、脚本、文件夹默认位置是：'./tests/'。\n"
+            "4. 如果用户要保存内容到文件，或创建文件，直接调用 write_file 工具，不要把内容贴出来让用户自己保存。\n"
+            "5. 如果用户要创建目录，直接调用 create_workspace 工具，不要让用户手动操作\n"
+            "6. 只有纯知识性问答（不需要操作文件/搜索/计算）才直接回答，不调用工具。\n"
+            "7. 调用工具时，如果一次任务需要多步操作（例如先创建目录再写文件），请依次调用多个工具。\n"
+            "8. 如果用户要求跑一下或者测试一下，直接调用相应工具，不要让用户手动操作。\n"
+            "9. 如果用户要求生成工具,直接在tools目录下创建，并使用@tool装饰器，不修改__init__.py文件。\n"
+            "10. 危险命令(如 rm -rf、format、shutdown 等)会被安全策略拦截或要求用户确认，"
+            "不要尝试使用破坏性命令；需要删除/移动文件时优先使用专门的文件工具。\n"
+            "11. 当任务涉及某个专业领域(如提交 git、生成 pptx、查找技能等)时，"
+            "应优先用 read_skill 工具读取对应技能的详细指引,并按指引完成。\n"
             "\n"
             "请用中文回答。"
         )
+        if skill_block:
+            base = base + "\n" + skill_block
+        if self.compaction_summary:
+            base = base + (
+                "\n\n【历史对话摘要(上文因过长已被自动裁剪压缩)】\n"
+                + self.compaction_summary
+            )
+        return base
 
     def run(self, task: str) -> str:
         """
@@ -146,12 +187,19 @@ class AgentCore:
         print(f"{'='*50}\n")
 
         try:
-            # 构建消息列表：历史消息 + 当前任务
-            messages = list(self.memory.get_langchain_messages())
-            messages.append(HumanMessage(content=task))
-
-            # 执行Agent
-            result = self.agent_executor.invoke({"messages": messages})
+            # 长上下文裁剪(超阈值时自动摘要历史并开新会话)
+            self._maybe_compact()
+            # Checkpoint 模式: 只传当前消息, 自动从 checkpoint 恢复历史
+            config = {**self.memory.get_config(), "recursion_limit": self.max_iterations}
+            input_msg = HumanMessage(content=task)
+            # 重建 Agent,注入与本次任务相关的技能指引
+            self.agent_executor = self._create_agent_executor(
+                self._compute_skill_block(task)
+            )
+            result = self.agent_executor.invoke(
+                {"messages": [input_msg]},
+                config=config
+            )
 
             # 解析结果
             output = ""
@@ -160,7 +208,7 @@ class AgentCore:
             step_count = 0
             for msg in result_messages:
                 # 跳过我们传入的历史消息
-                if msg in messages:
+                if msg in (input_msg,):
                     continue
 
                 if isinstance(msg, AIMessage):
@@ -222,17 +270,22 @@ class AgentCore:
             助手回复
         """
         try:
-            # 构建消息列表：历史消息 + 当前任务
-            messages = list(self.memory.get_langchain_messages())
-            messages.append(HumanMessage(content=message))
-
-            # 静默执行（保存原 verbose 状态）
+            # 长上下文裁剪(超阈值时自动摘要历史并开新会话)
+            self._maybe_compact()
+            # Checkpoint 模式: 只传当前消息, 自动从 checkpoint 恢复历史
+            config = {**self.memory.get_config(), "recursion_limit": self.max_iterations}
             original_verbose = self.verbose
             self.verbose = False
+            # 重建 Agent,注入与本次对话相关的技能指引
+            self.agent_executor = self._create_agent_executor(
+                self._compute_skill_block(message)
+            )
 
-            result = self.agent_executor.invoke({"messages": messages})
+            result = self.agent_executor.invoke(
+                {"messages": [HumanMessage(content=message)]},
+                config=config
+            )
 
-            # 恢复 verbose
             self.verbose = original_verbose
 
             # 取最后一条 AI 消息作为输出
@@ -280,7 +333,8 @@ class AgentCore:
             "请用中文回答。"
         )
 
-        context = self.memory.get_all_context()
+        # CoT 模式不调用工具,直接用 LLM + checkpoint 历史
+        context = self.memory.get_short_term() + self.memory.get_long_term(3)
         response = self.llm.chat_with_history(
             user_input=task,
             history=context,
@@ -304,8 +358,125 @@ class AgentCore:
             llm_client: 新的LLM客户端实例
         """
         self.llm = llm_client
-        # 重新创建Agent
-        self.agent_executor = self._create_agent_executor()
+        # 重新创建Agent(保留已加载的技能)
+        self.agent_executor = self._create_agent_executor(self._compute_skill_block(""))
+
+    # ============ 技能阅读(Skills) ============
+
+    def list_skills(self) -> List[Dict[str, str]]:
+        """列出所有本地可用技能"""
+        return self.skill_manager.list_skills()
+
+    def load_skill(self, name: str) -> bool:
+        """
+        手动将某技能加载进当前会话(注入后续 system prompt)
+
+        Args:
+            name: 技能名(目录名或 frontmatter name)
+
+        Returns:
+            True=成功加载, False=技能不存在
+        """
+        if self.skill_manager.get_skill(name) is None:
+            return False
+        self.active_skills.add(name)
+        # 立即重建 Agent,使后续对话带上该技能指引
+        self.agent_executor = self._create_agent_executor(self._compute_skill_block(""))
+        return True
+
+    def clear_skills(self):
+        """清空手动加载的技能"""
+        self.active_skills.clear()
+        self.agent_executor = self._create_agent_executor(self._compute_skill_block(""))
+
+    def set_auto_match(self, enabled: bool):
+        """开关任务自动匹配技能"""
+        self.auto_match_skills = enabled
+
+    def _compute_skill_block(self, task: str) -> str:
+        """
+        计算当前应注入的技能指引块:
+        - 自动匹配(若开启)命中的技能
+        - 手动加载的技能(active_skills)
+        两者合并去重后渲染
+        """
+        names = set(self.active_skills)
+        if self.auto_match_skills and task:
+            names.update(self.skill_manager.match_skills(task))
+        if not names:
+            return ""
+        return self.skill_manager.render_block(sorted(names))
+
+    # ============ 长上下文裁剪 ============
+
+    def _maybe_compact(self):
+        """
+        长上下文裁剪: 当当前会话消息数超过 max_context_messages 时,
+        将较早的消息用 LLM 摘要,开启新会话并把摘要注入后续 system prompt,
+        从而避免撞上 LLM 上下文窗口。
+
+        阈值 max_context_messages <= 0 时关闭(默认)。
+        """
+        if not self.max_context_messages or self.max_context_messages <= 0:
+            return
+        msgs = self.memory.get_messages()
+        if len(msgs) <= self.max_context_messages:
+            return
+
+        keep = min(self.context_trim_keep, max(len(msgs) - 1, 0))
+        old = msgs[:-keep] if keep > 0 else msgs
+        summary = self._summarize_messages(old)
+        if not summary:
+            return
+
+        # 开启新会话,把历史摘要注入 system prompt(保留上下文精华)
+        old_tid = self.memory.thread_id
+        self.memory.new_thread()
+        self.compaction_summary = summary
+        # 重建 Agent,使新 prompt 包含摘要
+        self.agent_executor = self._create_agent_executor(
+            self._compute_skill_block("")
+        )
+        if self.verbose:
+            print(
+                f"\n[上下文裁剪] 会话过长({len(msgs)} 条),已自动摘要历史并开启新会话: "
+                f"{self.memory.thread_id} (原 {old_tid})"
+            )
+
+    def _summarize_messages(self, msgs: List[BaseMessage]) -> str:
+        """将一批消息摘要为中文要点(失败返回空字符串)"""
+        lines = []
+        for m in msgs:
+            if isinstance(m, HumanMessage):
+                role = "user"
+            elif isinstance(m, AIMessage):
+                role = "assistant"
+            elif isinstance(m, SystemMessage):
+                role = "system"
+            else:
+                role = "tool"
+            content = getattr(m, "content", "")
+            if isinstance(content, list):
+                content = " ".join(str(x) for x in content)
+            text = str(content).strip()
+            if text:
+                lines.append(f"{role}: {text}")
+        if not lines:
+            return ""
+
+        prompt = (
+            "请将以下对话历史压缩成一份简洁的中文摘要,保留关键决策、用户意图与事实,"
+            "按主题分条列出,不要添加推测内容:"
+        )
+        try:
+            return self.llm.chat([
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": "\n".join(lines)},
+            ]).strip()
+        except Exception as e:
+            if self.verbose:
+                print(f"[上下文摘要生成失败,跳过裁剪] {e}")
+            return ""
 
     def get_available_tools(self) -> List[str]:
         """获取可用工具名称列表"""

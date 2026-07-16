@@ -9,6 +9,8 @@ import subprocess
 import sys
 import platform
 
+from .safety import check_command, check_exec, confirm
+
 
 # Windows 默认超时（秒），防止命令卡死
 DEFAULT_TIMEOUT = 60
@@ -21,6 +23,51 @@ def _truncate(text: str, max_chars: int = 4000) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + f"\n... [输出已截断，共 {len(text)} 字符，仅显示前 {max_chars} 字符]"
+
+
+def _guard_command(command: str) -> Optional[Dict[str, Any]]:
+    """
+    命令安全护栏: 在执行前检查
+    - deny  -> 返回错误字典(不执行)
+    - confirm -> 交互式确认,拒绝则返回错误字典
+    - allow -> 返回 None(允许执行)
+    """
+    status, reason = check_command(command)
+    if status == "deny":
+        return {
+            "success": False,
+            "error": f"命令被安全策略拦截: {reason}",
+            "command": command,
+        }
+    if status == "confirm":
+        if not confirm(f"⚠ 检测到危险命令 [{reason}]\n确认执行? [y/N]: "):
+            return {
+                "success": False,
+                "error": "用户拒绝执行危险命令",
+                "command": command,
+            }
+    return None
+
+
+def _guard_exec(file_path: str) -> Optional[Dict[str, Any]]:
+    """
+    脚本执行安全护栏(运行任意 .py/.ps1/.bat 本质危险)
+    """
+    status, reason = check_exec()
+    if status == "deny":
+        return {
+            "success": False,
+            "error": f"执行被安全策略拦截: {reason}",
+            "file_path": file_path,
+        }
+    if status == "confirm":
+        if not confirm(f"⚠ {reason} [{file_path}]\n确认执行? [y/N]: "):
+            return {
+                "success": False,
+                "error": "用户拒绝执行",
+                "file_path": file_path,
+            }
+    return None
 
 
 @tool
@@ -39,6 +86,10 @@ def run_shell(command: str, cwd: Optional[str] = None, timeout: int = DEFAULT_TI
         包含执行结果的字典：success, returncode, stdout, stderr, command, cwd
     """
     try:
+        guard = _guard_command(command)
+        if guard:
+            return guard
+
         is_windows = platform.system() == "Windows"
         if is_windows:
             # Windows 用 PowerShell
@@ -111,6 +162,10 @@ def run_python(file_path: str, script_args: str = "", cwd: Optional[str] = None,
         包含执行结果的字典：success, returncode, stdout, stderr, file_path, script_args
     """
     try:
+        guard = _guard_exec(file_path)
+        if guard:
+            return guard
+
         # 规范化路径
         abs_path = os.path.abspath(file_path)
         if not os.path.isfile(abs_path):
@@ -186,6 +241,10 @@ def run_cmd(file_path: str, script_args: str = "", cwd: Optional[str] = None, ti
         包含执行结果的字典：success, returncode, stdout, stderr, file_path, script_args, script_type
     """
     try:
+        guard = _guard_exec(file_path)
+        if guard:
+            return guard
+
         abs_path = os.path.abspath(file_path)
         if not os.path.isfile(abs_path):
             return {

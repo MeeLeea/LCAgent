@@ -5,13 +5,14 @@ MCP 工具加载器 - 从 MCP Server 动态加载 LangChain 工具
 import asyncio
 import json
 import os
+import sys
 import functools
 from typing import List, Dict, Any, Optional, Type
 from langchain_core.tools import BaseTool, StructuredTool
 
 
 # 默认配置文件路径
-DEFAULT_CONFIG_FILE = "mcp_servers.json"
+DEFAULT_CONFIG_FILE = "config/mcp_servers.json"
 
 
 def load_mcp_config(config_file: str = DEFAULT_CONFIG_FILE) -> Dict[str, Any]:
@@ -123,9 +124,13 @@ async def load_mcp_tools(config_file: str = DEFAULT_CONFIG_FILE) -> List[BaseToo
             continue
         transport = cfg.get("transport", "stdio")
         if transport == "stdio":
+            command = cfg["command"]
+            # 用当前解释器(venv)替换 python/python3，避免子进程误用系统解释器
+            if command in ("python", "python3"):
+                command = sys.executable
             enabled_servers[name] = {
                 "transport": "stdio",
-                "command": cfg["command"],
+                "command": command,
                 "args": cfg.get("args", []),
                 "env": cfg.get("env"),
             }
