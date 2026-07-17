@@ -5,15 +5,47 @@ Agent核心调度模块 - 基于LangChain 1.x + LangGraph
 """
 import asyncio
 import os
-from typing import Dict, Any, List, Optional
+from dataclasses import dataclass, field
+from typing import Dict, Any, List, Optional, Literal
 from langgraph.prebuilt import create_react_agent
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage, BaseMessage
 from langchain_core.tools import BaseTool
+from langgraph.types import Command, Interrupt
 from llm_client import LLMClient
 from .memory import AgentMemory
 from tools import all_tools as local_tools
 from tools.mcp_loader import load_mcp_tools, DEFAULT_CONFIG_FILE
 from tools.skills import SkillManager
+from tools.terminal_tools import UserRejectedCommandError
+
+
+@dataclass(frozen=True, slots=True)
+class AgentTurnResult:
+    """Typed result for one LangGraph turn."""
+
+    status: Literal["completed", "interrupted", "cancelled"]
+    output: str | None = None
+    interrupts: list[Interrupt] = field(default_factory=list)
+
+    @classmethod
+    def completed(cls, output: str) -> "AgentTurnResult":
+        return cls(status="completed", output=output, interrupts=[])
+
+    @classmethod
+    def interrupted(cls, interrupts: list[Interrupt]) -> "AgentTurnResult":
+        return cls(status="interrupted", output=None, interrupts=interrupts)
+
+    @classmethod
+    def cancelled(cls, output: str) -> "AgentTurnResult":
+        return cls(status="cancelled", output=output, interrupts=[])
+
+    @property
+    def is_completed(self) -> bool:
+        return self.status == "completed"
+
+    @property
+    def is_interrupted(self) -> bool:
+        return self.status == "interrupted"
 
 
 class AgentCore:
@@ -93,6 +125,7 @@ class AgentCore:
 
         # 执行历史
         self.execution_history: List[Dict[str, Any]] = []
+        self._recorded_tool_call_ids: set[str] = set()
 
     def reload_mcp_tools(self) -> int:
         """
@@ -160,6 +193,8 @@ class AgentCore:
             "不要尝试使用破坏性命令；需要删除/移动文件时优先使用专门的文件工具。\n"
             "11. 当任务涉及某个专业领域(如提交 git、生成 pptx、查找技能等)时，"
             "应优先用 read_skill 工具读取对应技能的详细指引,并按指引完成。\n"
+            "12. 当需要人工确认、选择或补充信息才能继续时，调用 ask_human 工具并提供结构化 choices，"
+            "等待返回的结构化选择后再继续；不要用普通文本假装等待人工输入。\n"
             "\n"
             "请用中文回答。"
         )
@@ -171,6 +206,184 @@ class AgentCore:
                 + self.compaction_summary
             )
         return base
+
+    def _invoke_config(self) -> Dict[str, Any]:
+        return {**self.memory.get_config(), "recursion_limit": self.max_iterations}
+
+    def _thread_id_from_config(self, config: Dict[str, Any]) -> str | None:
+        configurable = config.get("configurable")
+        if isinstance(configurable, dict):
+            thread_id = configurable.get("thread_id")
+            if isinstance(thread_id, str):
+                return thread_id
+        return None
+
+    def _capture_pending_interrupt(self, config: Dict[str, Any], mode: str) -> None:
+        self._pending_interrupt_thread_id = self._thread_id_from_config(config)
+        self._pending_interrupt_mode = mode
+
+    def _clear_pending_interrupt(self) -> None:
+        self._pending_interrupt_thread_id = None
+        self._pending_interrupt_mode = None
+
+    def _record_tool_steps(self, result_messages: List[BaseMessage], input_msg: HumanMessage) -> None:
+        # LangGraph 会返回当前线程的完整消息历史，按 tool_call id 去重避免重复记账。
+        recorded_ids = getattr(self, "_recorded_tool_call_ids", None)
+        if recorded_ids is None:
+            recorded_ids = set()
+            self._recorded_tool_call_ids = recorded_ids
+        new_entries_by_call_id: dict[str, Dict[str, Any]] = {}
+        for msg in result_messages:
+            if msg in (input_msg,):
+                continue
+
+            if isinstance(msg, AIMessage):
+                tool_calls = getattr(msg, "tool_calls", None)
+                if tool_calls:
+                    for tc in tool_calls:
+                        call_id = tc.get("id")
+                        if isinstance(call_id, str) and call_id in recorded_ids:
+                            continue
+                        step_count = len(self.execution_history) + 1
+                        if self.verbose:
+                            print(f"\n--- 步骤 {step_count} ---")
+                            print(f"工具: {tc.get('name', 'unknown')}")
+                            print(f"输入: {tc.get('args', {})}")
+                        entry = {
+                            "step": step_count,
+                            "tool": tc.get("name"),
+                            "input": tc.get("args"),
+                            "observation": ""
+                        }
+                        self.execution_history.append(entry)
+                        if isinstance(call_id, str):
+                            recorded_ids.add(call_id)
+                            new_entries_by_call_id[call_id] = entry
+            elif hasattr(msg, "content") and hasattr(msg, "tool_call_id"):
+                call_id = getattr(msg, "tool_call_id")
+                entry = new_entries_by_call_id.get(call_id)
+                if entry is not None:
+                    entry["observation"] = str(msg.content)[:500]
+                if self.verbose and entry is not None:
+                    print(f"结果: {str(msg.content)[:200]}...")
+
+    def _parse_turn_result(self, result: Dict[str, Any]) -> AgentTurnResult:
+        interrupts = result.get("__interrupt__")
+        if interrupts:
+            return AgentTurnResult.interrupted(list(interrupts))
+
+        for msg in reversed(result.get("messages", [])):
+            if isinstance(msg, AIMessage) and msg.content:
+                return AgentTurnResult.completed(str(msg.content))
+        return AgentTurnResult.completed("")
+
+    def _repair_rejected_tool_calls(self, config: Dict[str, Any]) -> None:
+        """为 checkpoint 中未完成的工具调用补齐取消结果。"""
+        state = self.agent_executor.get_state(config)
+        messages = list(state.values.get("messages", []))
+        existing_results = [message for message in messages if isinstance(message, ToolMessage)]
+        answered_ids = {message.tool_call_id for message in existing_results}
+        repairs = []
+        for message in messages:
+            if not isinstance(message, AIMessage):
+                continue
+            for tool_call in message.tool_calls:
+                call_id = tool_call.get("id")
+                if not isinstance(call_id, str) or call_id in answered_ids:
+                    continue
+                repairs.append(
+                    ToolMessage(
+                        content="用户拒绝执行危险命令，工具调用已取消。",
+                        name=tool_call.get("name"),
+                        tool_call_id=call_id,
+                        status="error",
+                    )
+                )
+                answered_ids.add(call_id)
+        if repairs:
+            # 保留并行调用已经产生的结果，再补齐缺失项，确保消息历史满足工具协议。
+            self.agent_executor.update_state(
+                config,
+                {"messages": [*existing_results, *repairs]},
+                as_node="tools",
+            )
+
+    def run_structured(self, task: str) -> AgentTurnResult:
+        self._maybe_compact()
+        config = self._invoke_config()
+        input_msg = HumanMessage(content=task)
+        self.agent_executor = self._create_agent_executor(
+            self._compute_skill_block(task)
+        )
+        try:
+            result = self.agent_executor.invoke(
+                {"messages": [input_msg]},
+                config=config
+            )
+        except UserRejectedCommandError:
+            self._repair_rejected_tool_calls(config)
+            self._clear_pending_interrupt()
+            return AgentTurnResult.cancelled("用户已拒绝执行危险命令，当前任务已取消。")
+        self._record_tool_steps(result.get("messages", []), input_msg)
+        turn = self._parse_turn_result(result)
+        if turn.is_interrupted:
+            self._capture_pending_interrupt(config, "run")
+        elif turn.is_completed:
+            self._clear_pending_interrupt()
+            self.memory.add("user", task)
+            self.memory.add("assistant", turn.output or "", {"important": True})
+        return turn
+
+    def chat_structured(self, message: str) -> AgentTurnResult:
+        self._maybe_compact()
+        config = self._invoke_config()
+        original_verbose = self.verbose
+        self.verbose = False
+        try:
+            self.agent_executor = self._create_agent_executor(
+                self._compute_skill_block(message)
+            )
+            try:
+                result = self.agent_executor.invoke(
+                    {"messages": [HumanMessage(content=message)]},
+                    config=config
+                )
+            except UserRejectedCommandError:
+                self._repair_rejected_tool_calls(config)
+                self._clear_pending_interrupt()
+                return AgentTurnResult.cancelled("用户已拒绝执行危险命令，当前任务已取消。")
+        finally:
+            self.verbose = original_verbose
+
+        turn = self._parse_turn_result(result)
+        if turn.is_interrupted:
+            self._capture_pending_interrupt(config, "chat")
+        elif turn.is_completed:
+            self._clear_pending_interrupt()
+            self.memory.add("user", message)
+            self.memory.add("assistant", turn.output or "")
+        return turn
+
+    def resume_structured(self, payload: Dict[str, Any]) -> AgentTurnResult:
+        config = self._invoke_config()
+        pending_thread_id = getattr(self, "_pending_interrupt_thread_id", None)
+        current_thread_id = self._thread_id_from_config(config)
+        if pending_thread_id is not None and current_thread_id != pending_thread_id:
+            raise ValueError("Cannot resume interrupt on a different thread")
+
+        result = self.agent_executor.invoke(
+            Command(resume=payload),
+            config=config
+        )
+        turn = self._parse_turn_result(result)
+        if turn.is_interrupted:
+            self._capture_pending_interrupt(config, getattr(self, "_pending_interrupt_mode", "chat"))
+        elif turn.is_completed:
+            mode = getattr(self, "_pending_interrupt_mode", None)
+            self._clear_pending_interrupt()
+            if mode == "run":
+                self.memory.add("assistant", turn.output or "", {"important": True})
+        return turn
 
     def run(self, task: str) -> str:
         """
@@ -187,71 +400,19 @@ class AgentCore:
         print(f"{'='*50}\n")
 
         try:
-            # 长上下文裁剪(超阈值时自动摘要历史并开新会话)
-            self._maybe_compact()
-            # Checkpoint 模式: 只传当前消息, 自动从 checkpoint 恢复历史
-            config = {**self.memory.get_config(), "recursion_limit": self.max_iterations}
-            input_msg = HumanMessage(content=task)
-            # 重建 Agent,注入与本次任务相关的技能指引
-            self.agent_executor = self._create_agent_executor(
-                self._compute_skill_block(task)
-            )
-            result = self.agent_executor.invoke(
-                {"messages": [input_msg]},
-                config=config
-            )
-
-            # 解析结果
-            output = ""
-            result_messages = result.get("messages", [])
-
-            step_count = 0
-            for msg in result_messages:
-                # 跳过我们传入的历史消息
-                if msg in (input_msg,):
-                    continue
-
-                if isinstance(msg, AIMessage):
-                    # 检查是否有工具调用
-                    tool_calls = getattr(msg, "tool_calls", None)
-                    if tool_calls:
-                        for tc in tool_calls:
-                            step_count += 1
-                            if self.verbose:
-                                print(f"\n--- 步骤 {step_count} ---")
-                                print(f"工具: {tc.get('name', 'unknown')}")
-                                print(f"输入: {tc.get('args', {})}")
-                            self.execution_history.append({
-                                "step": step_count,
-                                "tool": tc.get("name"),
-                                "input": tc.get("args"),
-                                "observation": ""
-                            })
-                    # 普通文本回复作为最终输出
-                    if msg.content and not tool_calls:
-                        output = msg.content
-                elif hasattr(msg, "content") and hasattr(msg, "tool_call_id"):
-                    # ToolMessage - 工具返回结果
-                    if self.execution_history and step_count > 0:
-                        self.execution_history[-1]["observation"] = str(msg.content)[:500]
-                    if self.verbose and step_count > 0:
-                        print(f"结果: {str(msg.content)[:200]}...")
-
-            # 如果没有捕获到输出，取最后一条AI消息
-            if not output:
-                for msg in reversed(result_messages):
-                    if isinstance(msg, AIMessage) and msg.content:
-                        output = msg.content
-                        break
-
+            turn = self.run_structured(task)
+            if getattr(turn, "status", None) == "interrupted":
+                raise RuntimeError("Agent turn interrupted; resume with resume_structured().")
+            output = turn.output or ""
             print(f"\n最终答案: {output}")
-
-            # 存入记忆
-            self.memory.add("user", task)
-            self.memory.add("assistant", output, {"important": True})
-
             return output
 
+        except RuntimeError as e:
+            if "interrupt" in str(e):
+                raise
+            error_msg = f"任务执行失败: {str(e)}"
+            print(f"\n错误: {error_msg}")
+            return error_msg
         except Exception as e:
             error_msg = f"任务执行失败: {str(e)}"
             print(f"\n错误: {error_msg}")
@@ -270,38 +431,26 @@ class AgentCore:
             助手回复
         """
         try:
-            # 长上下文裁剪(超阈值时自动摘要历史并开新会话)
-            self._maybe_compact()
-            # Checkpoint 模式: 只传当前消息, 自动从 checkpoint 恢复历史
-            config = {**self.memory.get_config(), "recursion_limit": self.max_iterations}
-            original_verbose = self.verbose
-            self.verbose = False
-            # 重建 Agent,注入与本次对话相关的技能指引
-            self.agent_executor = self._create_agent_executor(
-                self._compute_skill_block(message)
-            )
+            turn = self.chat_structured(message)
+            if getattr(turn, "status", None) == "interrupted":
+                raise RuntimeError("Agent turn interrupted; resume with resume_structured().")
+            return turn.output or ""
 
-            result = self.agent_executor.invoke(
-                {"messages": [HumanMessage(content=message)]},
-                config=config
-            )
-
-            self.verbose = original_verbose
-
-            # 取最后一条 AI 消息作为输出
-            output = ""
-            result_messages = result.get("messages", [])
-            for msg in reversed(result_messages):
-                if isinstance(msg, AIMessage) and msg.content:
-                    output = msg.content
-                    break
-
-            # 存入短期记忆（不存长期）
+        except RuntimeError as e:
+            if "interrupt" in str(e):
+                raise
+            history = self.memory.get_short_term()
             self.memory.add("user", message)
-            self.memory.add("assistant", output)
-            return output
-
+            response = self.llm.chat_with_history(
+                user_input=message,
+                history=history,
+                system_prompt="你是一个有帮助的AI助手，请用中文回答。"
+            )
+            self.memory.add("assistant", response)
+            return response
         except Exception as e:
+            if e.__class__.__name__ in {"GraphInterrupt", "NodeInterrupt"}:
+                raise
             # 兜底：Agent 执行失败时降级为纯 LLM 对话
             history = self.memory.get_short_term()
             self.memory.add("user", message)
@@ -425,6 +574,7 @@ class AgentCore:
 
         keep = min(self.context_trim_keep, max(len(msgs) - 1, 0))
         old = msgs[:-keep] if keep > 0 else msgs
+        retained = msgs[-keep:] if keep > 0 else []
         summary = self._summarize_messages(old)
         if not summary:
             return
@@ -437,6 +587,12 @@ class AgentCore:
         self.agent_executor = self._create_agent_executor(
             self._compute_skill_block("")
         )
+        if retained:
+            # 摘要只覆盖旧消息；最近消息原样写入新线程，避免裁剪后丢失上下文。
+            self.agent_executor.update_state(
+                self.memory.get_config(),
+                {"messages": retained},
+            )
         if self.verbose:
             print(
                 f"\n[上下文裁剪] 会话过长({len(msgs)} 条),已自动摘要历史并开启新会话: "
@@ -489,6 +645,7 @@ class AgentCore:
     def clear_history(self):
         """清空执行历史"""
         self.execution_history.clear()
+        self._recorded_tool_call_ids = set()
 
     def get_memory_summary(self) -> Dict[str, Any]:
         """获取记忆摘要"""

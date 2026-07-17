@@ -110,13 +110,11 @@ class AgentMemory:
         if not self.use_sqlite:
             return [self.thread_id]
         try:
-            conn = sqlite3.connect(self.checkpoint_file, check_same_thread=False)
-            cursor = conn.execute(
-                "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
-            )
-            threads = [row[0] for row in cursor.fetchall()]
-            conn.close()
-            return threads
+            with sqlite3.connect(self.checkpoint_file, check_same_thread=False) as conn:
+                cursor = conn.execute(
+                    "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
+                )
+                return [row[0] for row in cursor.fetchall()]
         except Exception:
             return [self.thread_id]
 
@@ -134,19 +132,47 @@ class AgentMemory:
             # 内存模式:无法删除单个 thread,只能清空
             return False
         try:
-            conn = sqlite3.connect(self.checkpoint_file, check_same_thread=False)
-            cursor = conn.execute(
-                "DELETE FROM checkpoints WHERE thread_id = ?",
-                (thread_id,)
-            )
-            deleted_rows = cursor.rowcount
-            conn.commit()
-            conn.close()
+            with sqlite3.connect(self.checkpoint_file, check_same_thread=False) as conn:
+                cursor = conn.execute(
+                    "SELECT COUNT(*) FROM checkpoints WHERE thread_id = ?",
+                    (thread_id,)
+                )
+                checkpoint_rows = cursor.fetchone()[0]
+                cursor = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'writes'"
+                )
+                has_writes = cursor.fetchone() is not None
+                write_rows = 0
+                if has_writes:
+                    cursor = conn.execute(
+                        "SELECT COUNT(*) FROM writes WHERE thread_id = ?",
+                        (thread_id,)
+                    )
+                    write_rows = cursor.fetchone()[0]
+            deleted_rows = checkpoint_rows + write_rows
+            if deleted_rows == 0:
+                return False
+
+            # 优先使用 Saver 的删除契约，它会同步清理 checkpoints 与 writes。
+            delete_thread = getattr(self._checkpointer, "delete_thread", None)
+            if callable(delete_thread):
+                delete_thread(thread_id)
+            else:
+                with sqlite3.connect(self.checkpoint_file, check_same_thread=False) as conn:
+                    conn.execute(
+                        "DELETE FROM checkpoints WHERE thread_id = ?",
+                        (thread_id,)
+                    )
+                    if has_writes:
+                        conn.execute(
+                            "DELETE FROM writes WHERE thread_id = ?",
+                            (thread_id,)
+                        )
             # 如果删的是当前会话,自动切到一个剩余的会话(或新建)
             if thread_id == self.thread_id:
                 remaining = self.list_threads()
                 self.thread_id = remaining[0] if remaining else self.new_thread()
-            return deleted_rows > 0
+            return True
         except Exception as e:
             print(f"[删除会话失败] {e}")
             return False
