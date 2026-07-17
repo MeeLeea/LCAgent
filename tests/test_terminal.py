@@ -11,6 +11,7 @@ if ROOT not in sys.path:
 from tools.terminal_tools import (
     UserRejectedCommandError,
     _guard_command,
+    _redact_command,
     _truncate,
     run_shell,
 )
@@ -41,6 +42,40 @@ def test_guard_stops_turn_when_user_rejects(monkeypatch):
 
     with pytest.raises(UserRejectedCommandError):
         _guard_command("python cleanup.py")
+
+
+@pytest.mark.parametrize(
+    ("command", "secret"),
+    [
+        ("python deploy.py --api-key sk-secret", "sk-secret"),
+        ("python deploy.py --token=token-secret", "token-secret"),
+        ("PASSWORD=pass-secret python deploy.py", "pass-secret"),
+        ('python deploy.py --header "Authorization: Bearer bearer-secret"', "bearer-secret"),
+    ],
+)
+def test_redact_command_hides_sensitive_values(command, secret):
+    redacted = _redact_command(command)
+
+    assert secret not in redacted
+    assert "***" in redacted
+
+
+def test_guard_confirmation_shows_redacted_command_and_matching_reason(monkeypatch):
+    prompts = []
+
+    def reject(prompt):
+        prompts.append(prompt)
+        return False
+
+    monkeypatch.setattr("tools.terminal_tools.confirm", reject)
+
+    with pytest.raises(UserRejectedCommandError):
+        _guard_command("python deploy.py --api-key sk-secret")
+
+    assert len(prompts) == 1
+    assert "匹配危险模式:" in prompts[0]
+    assert "待执行命令：python deploy.py --api-key ***" in prompts[0]
+    assert "sk-secret" not in prompts[0]
 
 
 class _FakeResult:

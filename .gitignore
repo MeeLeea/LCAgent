@@ -57,3 +57,4 @@ data/
 .agents/
 config/*
 !config/*.exp.json
+docs/

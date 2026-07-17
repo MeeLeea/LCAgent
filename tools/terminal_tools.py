@@ -8,12 +8,26 @@ import os
 import subprocess
 import sys
 import platform
+import re
 
 from .safety import check_command, check_exec, confirm
 
 
 # Windows 默认超时（秒），防止命令卡死
 DEFAULT_TIMEOUT = 60
+
+# 覆盖常见命令行参数、环境变量和 Authorization Bearer 形式；只替换值，保留命令结构供用户判断。
+SENSITIVE_COMMAND_PATTERNS = (
+    re.compile(
+        r"(?i)(?P<prefix>(?:--?|/)(?:api[-_]?key|token|access[-_]?token|password|passwd|secret)\s*(?:=|\s)\s*)"
+        r"(?P<quote>[\"']?)(?P<value>[^\s\"']+)(?P=quote)"
+    ),
+    re.compile(
+        r"(?i)(?P<prefix>\b(?:api[-_]?key|token|access[-_]?token|password|passwd|secret)\s*=\s*)"
+        r"(?P<quote>[\"']?)(?P<value>[^\s\"']+)(?P=quote)"
+    ),
+    re.compile(r"(?i)(?P<prefix>Authorization\s*:\s*Bearer\s+)(?P<value>[^\s\"']+)"),
+)
 
 
 class UserRejectedCommandError(RuntimeError):
@@ -33,6 +47,14 @@ def _truncate(text: str, max_chars: int = 4000) -> str:
     return text[:max_chars] + f"\n... [输出已截断，共 {len(text)} 字符，仅显示前 {max_chars} 字符]"
 
 
+def _redact_command(command: str) -> str:
+    """隐藏命令中的常见密钥、令牌和密码，同时保留可审查的命令结构。"""
+    redacted = command
+    for pattern in SENSITIVE_COMMAND_PATTERNS:
+        redacted = pattern.sub(lambda match: f"{match.group('prefix')}***", redacted)
+    return redacted
+
+
 def _guard_command(command: str) -> Optional[Dict[str, Any]]:
     """
     命令安全护栏: 在执行前检查
@@ -48,7 +70,11 @@ def _guard_command(command: str) -> Optional[Dict[str, Any]]:
             "command": command,
         }
     if status == "confirm":
-        if not confirm(f"⚠ 检测到危险命令 [{reason}]\n确认执行? [y/N]: "):
+        if not confirm(
+            f"⚠ 检测到危险命令 [{reason}]\n"
+            f"待执行命令：{_redact_command(command)}\n"
+            "确认执行? [y/N]: "
+        ):
             # 普通失败结果会被 ReAct 模型当作可重试错误；异常交给 AgentCore 终止本轮。
             raise UserRejectedCommandError(command)
     return None
