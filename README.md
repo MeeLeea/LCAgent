@@ -1,6 +1,7 @@
 # LangChainAgent
 
 基于 **LangChain 1.x + LangGraph** 框架的智能 Agent 项目，支持：
+
 - 配置驱动的多 LLM 提供商（见 `config/llm_config.json`），运行时可切换提供商/模型
 - 本地工具调用（搜索、文件读写、计算、终端命令、文件打开、技能读取）
 - **MCP Server 工具动态加载**（已预置 workspace 文件夹管理服务，可扩展任意 MCP 服务）
@@ -52,23 +53,38 @@
 
 ### 1. 创建虚拟环境
 
-```powershell
-cd D:\work\LangChainAgent
+```bash
+cd <项目路径>
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
 ```
 
-> 如遇脚本执行限制：`Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned`
+| 平台   | 激活命令                                         |
+|--------|--------------------------------------------------|
+| Windows | `.\.venv\Scripts\Activate.ps1`                   |
+| Linux   | `source .venv/bin/activate`                      |
+
+> Windows 如遇脚本执行限制：`Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned`
 
 ### 2. 安装依赖
 
-```powershell
+```bash
 pip install -r requirements.txt
 ```
 
-### 3. 配置 API 密钥
+### 3. 准备配置文件
 
-编辑 [config/llm_config.json](config/llm_config.json)，填入你的密钥（提供商元数据也在此文件定义，代码不再硬编码）：
+项目克隆后 `config/` 目录下只有 `.exp.json` 模板，需手动复制为运行时配置：
+
+```bash
+cp config/agent_config.exp.json   config/agent_config.json
+cp config/llm_config.exp.json     config/llm_config.json
+cp config/mcp_servers.exp.json    config/mcp_servers.json
+cp config/safety.exp.json         config/safety.json
+```
+
+### 4. 配置 API 密钥
+
+编辑 `config/llm_config.json`，填入你要使用的提供商密钥。推荐通过环境变量配置，也可直接写在文件中：
 
 ```json
 {
@@ -77,9 +93,9 @@ pip install -r requirements.txt
             "name": "智谱AI",
             "base_url": "https://open.bigmodel.cn/api/paas/v4/",
             "env_key": "ZHIPU_API_KEY",
-            "model": "glm-4.7-flash",
-            "models": ["glm-4", "glm-4-flash", "glm-4-long", "glm-4.7-flash", "glm-4.7-long"],
-            "api_key": "你的智谱密钥"
+            "model": "glm-4-flash",
+            "models": ["glm-4", "glm-4-flash", "glm-4-long"],
+            "api_key": ""
         },
         "deepseek": {
             "name": "DeepSeek",
@@ -87,20 +103,21 @@ pip install -r requirements.txt
             "env_key": "DEEPSEEK_API_KEY",
             "model": "deepseek-chat",
             "models": ["deepseek-chat", "deepseek-reasoner"],
-            "api_key": "你的DeepSeek密钥"
+            "api_key": ""
         }
     },
     "tavily": {
-        "api_key": "你的Tavily密钥"
+        "api_key": ""
     }
 }
 ```
 
-> 增删提供商只需编辑 `config/llm_config.json` 的 `providers` 字段；密钥也可通过环境变量配置，例如 `set DEEPSEEK_API_KEY=sk-xxx`
+> **建议使用环境变量**：`set DEEPSEEK_API_KEY=sk-xxx`（Windows）或 `export DEEPSEEK_API_KEY=sk-xxx`（Linux）。`api_key` 留空即可，程序会自动读取对应环境变量。  
+> 增删提供商只需编辑 `config/llm_config.json` 的 `providers` 字段。每次新增/移除提供商后重启程序生效。
 
-### 4. 运行
+### 5. 运行
 
-```powershell
+```bash
 python main.py
 ```
 
@@ -114,7 +131,7 @@ python main.py
 LangChainAgent/
 ├── main.py                  # 入口文件，交互式命令行
 ├── llm_client.py            # 统一大模型封装（多提供商 + 多模型）
-├── config/                  # 配置目录
+├── config/                  # 配置目录（需从 *.exp.json 复制；见快速开始）
 │   ├── llm_config.json      # API密钥配置文件
 │   ├── agent_config.json    # 运行时配置(迭代上限/技能目录/长上下文裁剪等)
 │   ├── mcp_servers.json     # MCP Server 配置(已预置 workspace 本地服务器,enabled)
@@ -171,47 +188,47 @@ LangChainAgent/
 
 ### 模块职责
 
-| 模块 | 职责 |
-|------|------|
-| [main.py](main.py) | 交互式命令行入口：初始化运行时、读取输入并调用命令分发器 |
-| [llm_client.py](llm_client.py) | 从 `config/llm_config.json` 读取提供商配置，支持运行时切换提供商/模型 |
-| [config.py](config.py) | 加载 `config/agent_config.json`，统一运行时配置 |
-| [agent/memory.py](agent/memory.py) | 双层记忆：Checkpoint（自动）+ memory.json（手动）+ 对话导出 |
-| [agent/agent_core.py](agent/agent_core.py) | Agent 核心：`run()` / `chat()` / `cot()` 三种模式 + `AgentTurnResult` 结构化暂停/恢复 API + 技能注入 + 长上下文裁剪 |
-| [tools/skills.py](tools/skills.py) | `SkillManager`：扫描/匹配/渲染本地技能 |
-| [tools/skill_tool.py](tools/skill_tool.py) | `read_skill` 工具：LLM 在任务中自助读取技能指引 |
-| [tools/](tools/) | 本地工具 + MCP 工具加载 + 技能管理 |
-| [utils/cli_menu.py](utils/cli_menu.py) | 通用终端方向键选择菜单 |
-| [utils/human_input.py](utils/human_input.py) | `ask_human` 工具、interrupt 展示和循环恢复编排 |
-| [utils/commands/dispatcher.py](utils/commands/dispatcher.py) | 按兼容顺序匹配命令并路由到领域处理器 |
-| [utils/commands/types.py](utils/commands/types.py) | 命令依赖上下文、活动 LLM 状态和分发结果类型 |
-| [utils/commands/](utils/commands/) | 会话、记忆、模型、MCP、技能、安全及 Agent 执行命令 |
+| 模块                                                        | 职责                                                                                                                        |
+| ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| [main.py](main.py)                                           | 交互式命令行入口：初始化运行时、读取输入并调用命令分发器                                                                    |
+| [llm_client.py](llm_client.py)                               | 从`config/llm_config.json` 读取提供商配置，支持运行时切换提供商/模型                                                      |
+| [config.py](config.py)                                       | 加载`config/agent_config.json`，统一运行时配置                                                                            |
+| [agent/memory.py](agent/memory.py)                           | 双层记忆：Checkpoint（自动）+ memory.json（手动）+ 对话导出                                                                 |
+| [agent/agent_core.py](agent/agent_core.py)                   | Agent 核心：`run()` / `chat()` / `cot()` 三种模式 + `AgentTurnResult` 结构化暂停/恢复 API + 技能注入 + 长上下文裁剪 |
+| [tools/skills.py](tools/skills.py)                           | `SkillManager`：扫描/匹配/渲染本地技能                                                                                    |
+| [tools/skill_tool.py](tools/skill_tool.py)                   | `read_skill` 工具：LLM 在任务中自助读取技能指引                                                                           |
+| [tools/](tools/)                                             | 本地工具 + MCP 工具加载 + 技能管理                                                                                          |
+| [utils/cli_menu.py](utils/cli_menu.py)                       | 通用终端方向键选择菜单                                                                                                      |
+| [utils/human_input.py](utils/human_input.py)                 | `ask_human` 工具、interrupt 展示和循环恢复编排                                                                            |
+| [utils/commands/dispatcher.py](utils/commands/dispatcher.py) | 按兼容顺序匹配命令并路由到领域处理器                                                                                        |
+| [utils/commands/types.py](utils/commands/types.py)           | 命令依赖上下文、活动 LLM 状态和分发结果类型                                                                                 |
+| [utils/commands/](utils/commands/)                           | 会话、记忆、模型、MCP、技能、安全及 Agent 执行命令                                                                          |
 
 ### llm_client.py 主要 API
 
-| 类/函数 | 说明 |
-|---------|------|
-| `LLMClient` | 核心客户端类，支持配置文件中的所有提供商 |
-| `LLMClient.chat()` | 发送对话请求 |
-| `LLMClient.chat_with_history()` | 带历史记录的对话 |
-| `LLMClient.get_chat_model()` | 获取 LangChain `ChatOpenAI` 实例 |
-| `LLMClient.switch_provider()` | 运行时切换提供商 |
-| `LLMClient.switch_model(model)` | 运行时切换当前提供商的模型 |
-| `LLMClient.list_models()` | 列出当前提供商的可用模型 |
-| `create_client()` | 创建客户端的便捷函数 |
-| `list_providers()` | 列出所有支持的提供商 |
+| 类/函数                           | 说明                                     |
+| --------------------------------- | ---------------------------------------- |
+| `LLMClient`                     | 核心客户端类，支持配置文件中的所有提供商 |
+| `LLMClient.chat()`              | 发送对话请求                             |
+| `LLMClient.chat_with_history()` | 带历史记录的对话                         |
+| `LLMClient.get_chat_model()`    | 获取 LangChain`ChatOpenAI` 实例        |
+| `LLMClient.switch_provider()`   | 运行时切换提供商                         |
+| `LLMClient.switch_model(model)` | 运行时切换当前提供商的模型               |
+| `LLMClient.list_models()`       | 列出当前提供商的可用模型                 |
+| `create_client()`               | 创建客户端的便捷函数                     |
+| `list_providers()`              | 列出所有支持的提供商                     |
 
 **支持的提供商：**
 
 提供商不再硬编码在代码中，全部来自 [config/llm_config.json](config/llm_config.json) 的 `providers` 字段。当前配置包含：
 
-| 提供商 | 名称 | 环境变量 | 默认模型 |
-|--------|------|----------|----------|
-| `zhipu` | 智谱AI | `ZHIPU_API_KEY` | `glm-4.7-flash` |
-| `qwen` | 通义千问 | `DASHSCOPE_API_KEY` | `Qwen2.5-7B-Instruct` |
-| `deepseek` | DeepSeek | `DEEPSEEK_API_KEY` | `deepseek-chat` |
-| `kimi` | Kimi (Moonshot) | `MOONSHOT_API_KEY` | `moonshot-v1-8k` |
-| `yunwu` | 云雾 | `YUNWU_API_KEY` | `gpt-5.5` |
+| 提供商       | 名称            | 环境变量              | 默认模型                |
+| ------------ | --------------- | --------------------- | ----------------------- |
+| `zhipu`    | 智谱AI          | `ZHIPU_API_KEY`     | `glm-4.7-flash`       |
+| `qwen`     | 通义千问        | `DASHSCOPE_API_KEY` | `Qwen2.5-7B-Instruct` |
+| `deepseek` | DeepSeek        | `DEEPSEEK_API_KEY`  | `deepseek-chat`       |
+| `kimi`     | Kimi (Moonshot) | `MOONSHOT_API_KEY`  | `moonshot-v1-8k`      |
+| `yunwu`    | 云雾            | `YUNWU_API_KEY`     | `gpt-5.5`             |
 
 ---
 
@@ -219,11 +236,11 @@ LangChainAgent/
 
 Agent 有三种执行模式，对应三种不同的交互入口：
 
-| 模式 | 命令 | 调用方法 | 工具可用 | 步骤打印 | 适用场景 |
-|------|------|---------|---------|---------|---------|
-| **ReAct** | `react:任务` | `run()` | ✅ 有 | ✅ 打印每步 | 复杂任务、需观察推理过程 |
-| **CoT** | `cot:任务` | `cot()` | ❌ 无 | ❌ 静默 | 纯推理、分析类问题 |
-| **Chat** | 其他输入 | `chat()` | ✅ 有 | ❌ 静默 | 日常对话、轻量操作 |
+| 模式            | 命令           | 调用方法   | 工具可用 | 步骤打印    | 适用场景                 |
+| --------------- | -------------- | ---------- | -------- | ----------- | ------------------------ |
+| **ReAct** | `react:任务` | `run()`  | ✅ 有    | ✅ 打印每步 | 复杂任务、需观察推理过程 |
+| **CoT**   | `cot:任务`   | `cot()`  | ❌ 无    | ❌ 静默     | 纯推理、分析类问题       |
+| **Chat**  | 其他输入       | `chat()` | ✅ 有    | ❌ 静默     | 日常对话、轻量操作       |
 
 > **重要**：`chat()` 模式也走 Agent 执行，LLM 会自动判断是否调用工具。无需强制加 `react:` 前缀也能创建文件、目录等。`react:` 与 `chat()` 的区别仅在于**是否打印步骤 + 是否存长期记忆**。
 
@@ -307,36 +324,36 @@ self.agent_executor = self._create_agent_executor(
 
 因此除了 checkpoint 历史外，system prompt 还可能包含：
 
-| 来源 | 触发方式 | 说明 |
-|------|---------|------|
-| 手动技能 | `skill:<name>` | 后续对话都会注入该技能指引，直到 `skill:clear` |
-| 自动匹配技能 | `auto_match_skills=true` | 根据任务与技能描述的关键词重叠度自动注入相关技能 |
+| 来源         | 触发方式                                  | 说明                                              |
+| ------------ | ----------------------------------------- | ------------------------------------------------- |
+| 手动技能     | `skill:<name>`                          | 后续对话都会注入该技能指引，直到`skill:clear`   |
+| 自动匹配技能 | `auto_match_skills=true`                | 根据任务与技能描述的关键词重叠度自动注入相关技能  |
 | 长上下文摘要 | `max_context_messages > 0` 且消息超阈值 | 旧消息被摘要后注入 system prompt，并开启新 thread |
 
 #### 对比表
 
-| 模式 | checkpoint | memory.json | 技能指引 | 长上下文摘要 | 说明 |
-|------|-----------|-------------|----------|--------------|------|
-| `react:` | ✅ 自动注入 | ❌ 不参与 | ✅ 可注入 | ✅ 可注入 | LangGraph 自动恢复该 thread 历史 |
-| 普通对话 | ✅ 自动注入 | ❌ 不参与 | ✅ 可注入 | ✅ 可注入 | 同上，但不打印步骤、不存长期 |
-| `cot:` | ✅ 手动取 | ✅ 取最近 3 条 | ❌ 不注入 | ❌ 不注入 | 绕过 Agent，纯 LLM 推理 |
+| 模式       | checkpoint  | memory.json    | 技能指引  | 长上下文摘要 | 说明                             |
+| ---------- | ----------- | -------------- | --------- | ------------ | -------------------------------- |
+| `react:` | ✅ 自动注入 | ❌ 不参与      | ✅ 可注入 | ✅ 可注入    | LangGraph 自动恢复该 thread 历史 |
+| 普通对话   | ✅ 自动注入 | ❌ 不参与      | ✅ 可注入 | ✅ 可注入    | 同上，但不打印步骤、不存长期     |
+| `cot:`   | ✅ 手动取   | ✅ 取最近 3 条 | ❌ 不注入 | ❌ 不注入    | 绕过 Agent，纯 LLM 推理          |
 
 > ⚠️ **重要副作用**：由于 `react:` 和普通对话**不读 memory.json**，意味着你在会话 A 里用 `react:` 做的事（已存入 memory.json），切到会话 B 再用 `react:` 时，**LLM 看不到**会话 A 的关键信息。只有 `cot:` 模式或 `compress` 命令才会读 memory.json。也就是说 **memory.json 的跨会话"记忆"能力目前只对 cot 生效**。
 
 ### 两层存储对比
 
-| 类型 | 存储方式 | 触发时机 | 保存内容 | 持久化 | 用途 |
-|------|---------|---------|---------|--------|------|
-| **Checkpoint** | `data/checkpoints.sqlite` (SQLite) | Agent 每步执行后自动 | 完整状态(消息+工具调用链+中间变量) | ✅ 永久 | 程序重启恢复对话、多会话隔离 |
-| **长期记忆** | `data/memory.json` (JSON) | 手动标记 `important=True` | 仅 react/cot 的最终结果 | ✅ 永久 | 跨会话保留关键决策、用于 compress |
+| 类型                 | 存储方式                             | 触发时机                   | 保存内容                           | 持久化  | 用途                              |
+| -------------------- | ------------------------------------ | -------------------------- | ---------------------------------- | ------- | --------------------------------- |
+| **Checkpoint** | `data/checkpoints.sqlite` (SQLite) | Agent 每步执行后自动       | 完整状态(消息+工具调用链+中间变量) | ✅ 永久 | 程序重启恢复对话、多会话隔离      |
+| **长期记忆**   | `data/memory.json` (JSON)          | 手动标记`important=True` | 仅 react/cot 的最终结果            | ✅ 永久 | 跨会话保留关键决策、用于 compress |
 
 ### 三种模式的记忆行为
 
-| 模式 | 调用方法 | 写入 Checkpoint | 写入 memory.json | 说明 |
-|------|---------|----------------|------------------|------|
-| `react:任务` | `run()` | ✅ 自动 | ✅ 手动触发 | ReAct 结果重要，永久保存 |
-| `cot:任务` | `cot()` | ❌ 不写 | ✅ 手动触发 | CoT 不走 Agent，仅存结论 |
-| 普通输入 | `chat()` | ✅ 自动 | ❌ 不写 | 闲聊仅存 checkpoint，用完即丢 |
+| 模式           | 调用方法   | 写入 Checkpoint | 写入 memory.json | 说明                          |
+| -------------- | ---------- | --------------- | ---------------- | ----------------------------- |
+| `react:任务` | `run()`  | ✅ 自动         | ✅ 手动触发      | ReAct 结果重要，永久保存      |
+| `cot:任务`   | `cot()`  | ❌ 不写         | ✅ 手动触发      | CoT 不走 Agent，仅存结论      |
+| 普通输入       | `chat()` | ✅ 自动         | ❌ 不写          | 闲聊仅存 checkpoint，用完即丢 |
 
 > **关键区别**：Checkpoint 由 LangGraph 自动管理，无需手动干预；长期记忆需显式传 `metadata={"important": True}` 才会写入 `memory.json`。
 
@@ -362,13 +379,13 @@ result = self.agent_executor.invoke(
 
 **核心能力**：
 
-| 能力 | 说明 |
-|------|------|
-| 自动持久化 | Agent 每步执行后自动写入 SQLite，无需手动 |
-| 程序重启恢复 | 重启后用相同 `thread_id` 即可恢复完整对话历史 |
-| 多会话隔离 | 不同 `thread_id` 完全独立，可管理多个对话 |
-| 完整状态保存 | 保存消息、工具调用链、中间变量(不止文本) |
-| 图暂停/恢复 | `ask_human` 触发 interrupt 后，用同一 `thread_id` 的 checkpoint 继续当前图 |
+| 能力         | 说明                                                                           |
+| ------------ | ------------------------------------------------------------------------------ |
+| 自动持久化   | Agent 每步执行后自动写入 SQLite，无需手动                                      |
+| 程序重启恢复 | 重启后用相同`thread_id` 即可恢复完整对话历史                                 |
+| 多会话隔离   | 不同`thread_id` 完全独立，可管理多个对话                                     |
+| 完整状态保存 | 保存消息、工具调用链、中间变量(不止文本)                                       |
+| 图暂停/恢复  | `ask_human` 触发 interrupt 后，用同一 `thread_id` 的 checkpoint 继续当前图 |
 
 ### Human-in-the-loop 图暂停/恢复
 
@@ -395,12 +412,12 @@ CLI 目前支持这种结构化选择：`utils/human_input.py` 读取 `choices`�
 
 `AgentCore` 暴露结构化方法，让调用方能区分完成和暂停：
 
-| 名称 | 作用 |
-|------|------|
-| `AgentTurnResult` | 一轮图执行结果，`status` 为 `completed` 或 `interrupted`，完成时读 `output`，暂停时读 `interrupts` |
-| `run_structured(task)` | ReAct/任务模式入口，返回 `AgentTurnResult`，完成后写 checkpoint + 长期记忆 |
-| `chat_structured(message)` | 普通对话入口，返回 `AgentTurnResult`，完成后写 checkpoint，不写长期记忆 |
-| `resume_structured(payload)` | 对暂停中的图调用 `Command(resume=payload)`，继续同一个 checkpoint 线程 |
+| 名称                           | 作用                                                                                                         |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `AgentTurnResult`            | 一轮图执行结果，`status` 为 `completed` 或 `interrupted`，完成时读 `output`，暂停时读 `interrupts` |
+| `run_structured(task)`       | ReAct/任务模式入口，返回`AgentTurnResult`，完成后写 checkpoint + 长期记忆                                  |
+| `chat_structured(message)`   | 普通对话入口，返回`AgentTurnResult`，完成后写 checkpoint，不写长期记忆                                     |
+| `resume_structured(payload)` | 对暂停中的图调用`Command(resume=payload)`，继续同一个 checkpoint 线程                                      |
 
 当前封装要求在同一个 `AgentCore` 实例中恢复，并校验当前 `thread_id` 与产生 interrupt 的线程一致；`resume_structured()` 内部用 `Command(resume=payload)` 和 `self._invoke_config()` 接回对应的 LangGraph checkpoint。若恢复后又遇到新的 `ask_human`，`utils/human_input.py` 会继续循环处理 interrupt，直到 `AgentTurnResult.status == "completed"`。
 
@@ -452,10 +469,10 @@ CHECKPOINT_FILE = os.path.join(BASE_DIR, "data", "checkpoints.sqlite")  # Checkp
 MEMORY_FILE = os.path.join(BASE_DIR, "data", "memory.json")            # 长期记忆
 ```
 
-| 文件 | 格式 | 内容 |
-|------|------|------|
-| `data/checkpoints.sqlite` | SQLite | Agent 执行状态(按 thread_id 隔离) |
-| `data/memory.json` | JSON 数组 | react/cot 的最终结果(用于 compress) |
+| 文件                        | 格式      | 内容                                |
+| --------------------------- | --------- | ----------------------------------- |
+| `data/checkpoints.sqlite` | SQLite    | Agent 执行状态(按 thread_id 隔离)   |
+| `data/memory.json`        | JSON 数组 | react/cot 的最终结果(用于 compress) |
 
 `memory.json` 文件格式：
 
@@ -484,11 +501,11 @@ MEMORY_FILE = os.path.join(BASE_DIR, "data", "memory.json")            # 长期�
 
 基于 checkpoint 的 `thread_id` 机制，支持多会话管理：
 
-| 命令 | 作用 | 示例 |
-|------|------|------|
-| `thread` | 方向键选择切换会话(显示消息数预览) | `thread` |
-| `thread:new` | 开启新会话(原会话保留) | `thread:new` |
-| `thread:delete <id>` | 删除指定会话(二次确认,不可恢复) | `thread:delete thread-abc123` |
+| 命令                   | 作用                               | 示例                            |
+| ---------------------- | ---------------------------------- | ------------------------------- |
+| `thread`             | 方向键选择切换会话(显示消息数预览) | `thread`                      |
+| `thread:new`         | 开启新会话(原会话保留)             | `thread:new`                  |
+| `thread:delete <id>` | 删除指定会话(二次确认,不可恢复)    | `thread:delete thread-abc123` |
 
 > 切换会话统一走 `thread` 方向键菜单，无需手动输入 thread_id。
 >
@@ -527,15 +544,15 @@ MEMORY_FILE = os.path.join(BASE_DIR, "data", "memory.json")            # 长期�
 
 ### 记忆管理命令
 
-| 命令 | 作用 |
-|------|------|
-| `clear` 或 `clear long` | 清空长期记忆 + 删除 `memory.json` |
-| `clear short` | 清空当前会话(开启新 thread 替代删除) |
-| `clear all` | 全部清空 |
-| `compress` 或 `压缩` | 压缩长期记忆(LLM 摘要后替换原内容) |
-| `thread` | 方向键选择切换会话 |
-| `thread:new` | 开启新会话 |
-| `thread:delete <id>` | 删除指定会话(二次确认) |
+| 命令                        | 作用                                 |
+| --------------------------- | ------------------------------------ |
+| `clear` 或 `clear long` | 清空长期记忆 + 删除`memory.json`   |
+| `clear short`             | 清空当前会话(开启新 thread 替代删除) |
+| `clear all`               | 全部清空                             |
+| `compress` 或 `压缩`    | 压缩长期记忆(LLM 摘要后替换原内容)   |
+| `thread`                  | 方向键选择切换会话                   |
+| `thread:new`              | 开启新会话                           |
+| `thread:delete <id>`      | 删除指定会话(二次确认)               |
 
 用 `info` 命令可查看记忆状态：
 
@@ -629,39 +646,39 @@ LLM 生成摘要
 
 #### 特点与注意事项
 
-| 特性 | 说明 |
-|------|------|
-| 保留关键信息 | system prompt 要求 LLM 保留用户意图、决策、事实 |
-| 结构化输出 | 按主题分条，便于后续查阅 |
-| 可追溯 | `metadata` 保存原始条数和字符数 |
-| 可多次压缩 | 再次 `compress` 会对已有摘要再压缩 |
-| LLM 失败不丢数据 | 调用失败则原记忆不变，不会写回 |
-| **不可逆** | 压缩后原条目无法恢复，建议重要数据先备份 `memory.json` |
-| 不影响 checkpoint | 只压缩 memory.json，checkpoints.sqlite 保留完整历史 |
+| 特性              | 说明                                                    |
+| ----------------- | ------------------------------------------------------- |
+| 保留关键信息      | system prompt 要求 LLM 保留用户意图、决策、事实         |
+| 结构化输出        | 按主题分条，便于后续查阅                                |
+| 可追溯            | `metadata` 保存原始条数和字符数                       |
+| 可多次压缩        | 再次`compress` 会对已有摘要再压缩                     |
+| LLM 失败不丢数据  | 调用失败则原记忆不变，不会写回                          |
+| **不可逆**  | 压缩后原条目无法恢复，建议重要数据先备份`memory.json` |
+| 不影响 checkpoint | 只压缩 memory.json，checkpoints.sqlite 保留完整历史     |
 
 > 💡 **建议**：在长期记忆较多时（如 50+ 条）使用，平时少量记忆无需压缩。
 
 ### 记忆相关 API
 
-| 方法 | 说明 |
-|------|------|
-| `get_checkpointer()` | 获取 checkpointer 实例(传给 create_react_agent) |
-| `get_config()` | 返回 `{"configurable": {"thread_id": ...}}`(传给 invoke) |
-| `get_messages()` | 从 checkpoint 获取当前 thread 的所有消息 |
-| `get_langchain_messages()` | 等同于 get_messages()（兼容旧 API） |
-| `get_short_term(limit)` | 从 checkpoint 取消息转为 dict 格式 |
-| `get_long_term(limit)` | 获取最近 N 条长期记忆 |
-| `get_all_context(long_term_limit)` | 获取完整上下文(长期+短期) |
-| `add(role, content, metadata)` | 添加记忆，`important=True` 触发写 memory.json |
-| `new_thread()` | 开启新会话 |
-| `switch_thread(thread_id)` | 切换到指定会话(代码层 API,CLI 用 `thread` 菜单) |
-| `delete_thread(thread_id)` | 删除指定会话(删当前会话时自动切换到其他会话) |
-| `list_threads()` | 列出所有会话 ID |
-| `export_thread(thread_id, fmt)` | 导出指定会话为可读文本/Markdown |
-| `clear_short_term()` | 开启新会话(替代删除) |
-| `clear_long_term()` | 清空长期记忆并删除文件 |
-| `summarize()` | 返回记忆统计信息(含 thread_id、消息数、会话数) |
-| `compress_memory()` | 压缩长期记忆（LLM 摘要后替换原内容） |
+| 方法                                 | 说明                                                      |
+| ------------------------------------ | --------------------------------------------------------- |
+| `get_checkpointer()`               | 获取 checkpointer 实例(传给 create_react_agent)           |
+| `get_config()`                     | 返回`{"configurable": {"thread_id": ...}}`(传给 invoke) |
+| `get_messages()`                   | 从 checkpoint 获取当前 thread 的所有消息                  |
+| `get_langchain_messages()`         | 等同于 get_messages()（兼容旧 API）                       |
+| `get_short_term(limit)`            | 从 checkpoint 取消息转为 dict 格式                        |
+| `get_long_term(limit)`             | 获取最近 N 条长期记忆                                     |
+| `get_all_context(long_term_limit)` | 获取完整上下文(长期+短期)                                 |
+| `add(role, content, metadata)`     | 添加记忆，`important=True` 触发写 memory.json           |
+| `new_thread()`                     | 开启新会话                                                |
+| `switch_thread(thread_id)`         | 切换到指定会话(代码层 API,CLI 用`thread` 菜单)          |
+| `delete_thread(thread_id)`         | 删除指定会话(删当前会话时自动切换到其他会话)              |
+| `list_threads()`                   | 列出所有会话 ID                                           |
+| `export_thread(thread_id, fmt)`    | 导出指定会话为可读文本/Markdown                           |
+| `clear_short_term()`               | 开启新会话(替代删除)                                      |
+| `clear_long_term()`                | 清空长期记忆并删除文件                                    |
+| `summarize()`                      | 返回记忆统计信息(含 thread_id、消息数、会话数)            |
+| `compress_memory()`                | 压缩长期记忆（LLM 摘要后替换原内容）                      |
 
 ---
 
@@ -687,20 +704,20 @@ Agent 的工具分为两类：
 
 使用 LangChain `@tool` 装饰器定义，启动时直接加载：
 
-| 工具 | 文件 | 功能 | 参数 |
-|------|------|------|------|
-| `search` | [tools/search.py](tools/search.py) | 联网搜索(Tavily API) | `query`, `num_results`, `search_depth` |
-| `read_file` | [tools/file_tool.py](tools/file_tool.py) | 读取文件 | `file_path` |
-| `write_file` | [tools/file_tool.py](tools/file_tool.py) | 写入文件 | `file_path`, `content`, `mode` |
-| `calculate` | [tools/calculator.py](tools/calculator.py) | 数学计算 | `expression` |
-| `run_shell` | [tools/terminal_tools.py](tools/terminal_tools.py) | 执行 shell 命令 | `command`, `cwd`, `timeout` |
-| `run_python` | [tools/terminal_tools.py](tools/terminal_tools.py) | 执行 Python 脚本文件 | `file_path`, `script_args`, `cwd`, `timeout` |
-| `run_cmd` | [tools/terminal_tools.py](tools/terminal_tools.py) | 执行 .bat/.cmd/.ps1 文件 | `file_path`, `script_args`, `cwd`, `timeout` |
-| `get_local_time` | [tools/get_local_time.py](tools/get_local_time.py) | 获取本地时间 | 无 |
-| `open_file` | [tools/open_file.py](tools/open_file.py) | 用系统默认/指定程序打开文件或文件夹 | `file_path`, `app_path` |
-| `open_sqlite` | [tools/open_file.py](tools/open_file.py) | 用 DB Browser for SQLite 打开 .sqlite/.db | `file_path` |
-| `read_skill` | [tools/skill_tool.py](tools/skill_tool.py) | 读取本地技能(SKILL.md)的指引正文 | `skill_name`(可空) |
-| `ask_human` | [utils/human_input.py](utils/human_input.py) | 暂停 LangGraph 图并请求人工结构化选择 | `prompt`, `choices` |
+| 工具               | 文件                                              | 功能                                      | 参数                                                 |
+| ------------------ | ------------------------------------------------- | ----------------------------------------- | ---------------------------------------------------- |
+| `search`         | [tools/search.py](tools/search.py)                 | 联网搜索(Tavily API)                      | `query`, `num_results`, `search_depth`         |
+| `read_file`      | [tools/file_tool.py](tools/file_tool.py)           | 读取文件                                  | `file_path`                                        |
+| `write_file`     | [tools/file_tool.py](tools/file_tool.py)           | 写入文件                                  | `file_path`, `content`, `mode`                 |
+| `calculate`      | [tools/calculator.py](tools/calculator.py)         | 数学计算                                  | `expression`                                       |
+| `run_shell`      | [tools/terminal_tools.py](tools/terminal_tools.py) | 执行 shell 命令                           | `command`, `cwd`, `timeout`                    |
+| `run_python`     | [tools/terminal_tools.py](tools/terminal_tools.py) | 执行 Python 脚本文件                      | `file_path`, `script_args`, `cwd`, `timeout` |
+| `run_cmd`        | [tools/terminal_tools.py](tools/terminal_tools.py) | 执行 .bat/.cmd/.ps1 文件                  | `file_path`, `script_args`, `cwd`, `timeout` |
+| `get_local_time` | [tools/get_local_time.py](tools/get_local_time.py) | 获取本地时间                              | 无                                                   |
+| `open_file`      | [tools/open_file.py](tools/open_file.py)           | 用系统默认/指定程序打开文件或文件夹       | `file_path`, `app_path`                          |
+| `open_sqlite`    | [tools/open_file.py](tools/open_file.py)           | 用 DB Browser for SQLite 打开 .sqlite/.db | `file_path`                                        |
+| `read_skill`     | [tools/skill_tool.py](tools/skill_tool.py)         | 读取本地技能(SKILL.md)的指引正文          | `skill_name`(可空)                                 |
+| `ask_human`      | [utils/human_input.py](utils/human_input.py)       | 暂停 LangGraph 图并请求人工结构化选择     | `prompt`, `choices`                              |
 
 > `open_sqlite` 会自动查找 DB Browser for SQLite 路径（环境变量 `SQLITE_BROWSER_PATH` → 常见安装位置 → PATH），找不到则返回下载链接。
 
@@ -710,24 +727,24 @@ Agent 的工具分为两类：
 
 #### 已注册的 MCP Server
 
-| Server 名称 | 工具数 | 传输方式 | 说明 |
-|-------------|--------|---------|------|
-| `workspace` | 6 | stdio | 文件夹创建/删除/移动/复制/列举（Python 实现） |
-| `filesystem` | - | stdio | 可选官方文件系统服务（需手动添加/启用，需 Node.js） |
-| `fetch` | - | stdio | 可选官方网页抓取服务（需手动添加/启用，需 Node.js） |
+| Server 名称    | 工具数 | 传输方式 | 说明                                                |
+| -------------- | ------ | -------- | --------------------------------------------------- |
+| `workspace`  | 6      | stdio    | 文件夹创建/删除/移动/复制/列举（Python 实现）       |
+| `filesystem` | -      | stdio    | 可选官方文件系统服务（需手动添加/启用，需 Node.js） |
+| `fetch`      | -      | stdio    | 可选官方网页抓取服务（需手动添加/启用，需 Node.js） |
 
 #### workspace MCP Server 提供的工具
 
 由 [tools/workspace_tool.py](tools/workspace_tool.py) 实现，基于 `FastMCP`：
 
-| 工具 | 功能 | 参数 |
-|------|------|------|
-| `create_workspace` | 创建文件夹 | `folder_name`, `parent_dir` |
-| `get_current_workspace` | 获取当前工作目录 | 无 |
-| `list_directory` | 列出目录内容 | `path` |
-| `delete_workspace` | 删除文件夹 | `folder_path`, `recursive` |
-| `move_workspace` | 移动/重命名文件夹 | `src_path`, `dest_path` |
-| `copy_workspace` | 复制文件夹 | `src_path`, `dest_path` |
+| 工具                      | 功能              | 参数                            |
+| ------------------------- | ----------------- | ------------------------------- |
+| `create_workspace`      | 创建文件夹        | `folder_name`, `parent_dir` |
+| `get_current_workspace` | 获取当前工作目录  | 无                              |
+| `list_directory`        | 列出目录内容      | `path`                        |
+| `delete_workspace`      | 删除文件夹        | `folder_path`, `recursive`  |
+| `move_workspace`        | 移动/重命名文件夹 | `src_path`, `dest_path`     |
+| `copy_workspace`        | 复制文件夹        | `src_path`, `dest_path`     |
 
 #### MCP 配置文件
 
@@ -748,27 +765,27 @@ Agent 的工具分为两类：
 
 > 说明：配置文件中的 `command: "python"`（或 `"python3"`）会在加载时自动替换为**当前运行的解释器**（即激活的 venv），因此无需写死绝对路径。stdio 的 `args` 路径相对于项目根目录。
 
-| 字段 | 说明 |
-|------|------|
+| 字段          | 说明                                                |
+| ------------- | --------------------------------------------------- |
 | `transport` | 传输方式：`stdio` / `sse` / `streamable_http` |
-| `command` | stdio 模式下的启动命令 |
-| `args` | 命令参数列表 |
-| `enabled` | 是否启用（`false` 则不加载） |
-| `url` | sse/http 模式下的服务器地址 |
+| `command`   | stdio 模式下的启动命令                              |
+| `args`      | 命令参数列表                                        |
+| `enabled`   | 是否启用（`false` 则不加载）                      |
+| `url`       | sse/http 模式下的服务器地址                         |
 
 #### MCP 管理命令
 
 在交互界面中动态管理 MCP Server：
 
-| 命令 | 作用 | 示例 |
-|------|------|------|
-| `mcp` | 查看 MCP Server 状态 | `mcp` |
-| `mcp:reload` | 重新加载所有 MCP 工具 | `mcp:reload` |
-| `mcp:add` | 添加 stdio MCP Server | `mcp:add myserver npx -y @modelcontextprotocol/server-fetch` |
-| `mcp:add` | 添加 sse MCP Server | `mcp:add myserver sse:http://localhost:8000/sse` |
-| `mcp:add` | 添加 http MCP Server | `mcp:add myserver http:http://localhost:8000/mcp` |
-| `mcp:remove` | 删除 MCP Server | `mcp:remove fetch` |
-| `mcp:toggle` | 启用/禁用 | `mcp:toggle fetch on` / `mcp:toggle fetch off` |
+| 命令           | 作用                  | 示例                                                           |
+| -------------- | --------------------- | -------------------------------------------------------------- |
+| `mcp`        | 查看 MCP Server 状态  | `mcp`                                                        |
+| `mcp:reload` | 重新加载所有 MCP 工具 | `mcp:reload`                                                 |
+| `mcp:add`    | 添加 stdio MCP Server | `mcp:add myserver npx -y @modelcontextprotocol/server-fetch` |
+| `mcp:add`    | 添加 sse MCP Server   | `mcp:add myserver sse:http://localhost:8000/sse`             |
+| `mcp:add`    | 添加 http MCP Server  | `mcp:add myserver http:http://localhost:8000/mcp`            |
+| `mcp:remove` | 删除 MCP Server       | `mcp:remove fetch`                                           |
+| `mcp:toggle` | 启用/禁用             | `mcp:toggle fetch on` / `mcp:toggle fetch off`             |
 
 ### 3. 技能阅读（Skills）
 
@@ -776,31 +793,31 @@ Agent 的工具分为两类：
 
 Agent 可以在任务中**阅读并使用这些技能指引**，支持三种方式：
 
-| 方式 | 说明 |
-|------|------|
-| **工具自动调用** | `read_skill` 工具：LLM 在任务中自行决定何时读取某技能的完整指引（不传名称则列出全部可用技能） |
-| **命令行手动加载** | `skill:<name>` 把某技能注入当前会话的 system prompt；`skill` 列出全部；`skill:clear` 清空 |
-| **任务自动匹配** | 每次执行任务时，根据任务描述与技能 `description` 做关键词匹配（确定性打分，不调 LLM），自动注入相关技能指引（默认开启） |
+| 方式                     | 说明                                                                                                                     |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| **工具自动调用**   | `read_skill` 工具：LLM 在任务中自行决定何时读取某技能的完整指引（不传名称则列出全部可用技能）                          |
+| **命令行手动加载** | `skill:<name>` 把某技能注入当前会话的 system prompt；`skill` 列出全部；`skill:clear` 清空                          |
+| **任务自动匹配**   | 每次执行任务时，根据任务描述与技能`description` 做关键词匹配（确定性打分，不调 LLM），自动注入相关技能指引（默认开启） |
 
 #### 已注册的技能（本地）
 
 由 [tools/skills.py](tools/skills.py) 的 `SkillManager` 扫描 `.agents/skills/` 自动发现：
 
-| 技能 | 说明 |
-|------|------|
-| `find-skills` | 发现并安装 agent skills |
-| `git-commit` | 从 git diff 生成双语提交信息并执行提交 |
-| `pptx` | 创建/读取/编辑 `.pptx` 演示文稿 |
+| 技能            | 说明                                   |
+| --------------- | -------------------------------------- |
+| `find-skills` | 发现并安装 agent skills                |
+| `git-commit`  | 从 git diff 生成双语提交信息并执行提交 |
+| `pptx`        | 创建/读取/编辑`.pptx` 演示文稿       |
 
 > 中文任务通过内置中→英关键词扩展（如 提交→commit/git、演示→ppt/slides）实现与英文描述的匹配。
 
 #### 交互命令
 
-| 命令 | 作用 |
-|------|------|
-| `skill` 或 `skills` | 列出所有本地可用技能（名称 + 描述） |
-| `skill:<name>` | 将指定技能加载进当前会话（注入后续对话的 system prompt） |
-| `skill:clear` | 清空手动加载的技能 |
+| 命令                    | 作用                                                     |
+| ----------------------- | -------------------------------------------------------- |
+| `skill` 或 `skills` | 列出所有本地可用技能（名称 + 描述）                      |
+| `skill:<name>`        | 将指定技能加载进当前会话（注入后续对话的 system prompt） |
+| `skill:clear`         | 清空手动加载的技能                                       |
 
 #### `read_skill` 工具
 
@@ -828,23 +845,23 @@ SkillManager.match_skills(task)
 
 #### 技能相关 API
 
-| 方法 | 说明 |
-|------|------|
-| `agent.list_skills()` | 列出所有本地技能（名称 + 描述 + 路径） |
-| `agent.load_skill(name)` | 手动加载技能到当前会话（注入 system prompt + 重建 Agent） |
-| `agent.clear_skills()` | 清空手动加载的技能 |
-| `agent.set_auto_match(enabled)` | 开关自动匹配（默认开） |
-| `SkillManager.match_skills(task)` | 根据任务匹配相关技能（确定性打分） |
-| `SkillManager.render_block(names)` | 把若干技能渲染为可注入的指引块 |
+| 方法                                 | 说明                                                      |
+| ------------------------------------ | --------------------------------------------------------- |
+| `agent.list_skills()`              | 列出所有本地技能（名称 + 描述 + 路径）                    |
+| `agent.load_skill(name)`           | 手动加载技能到当前会话（注入 system prompt + 重建 Agent） |
+| `agent.clear_skills()`             | 清空手动加载的技能                                        |
+| `agent.set_auto_match(enabled)`    | 开关自动匹配（默认开）                                    |
+| `SkillManager.match_skills(task)`  | 根据任务匹配相关技能（确定性打分）                        |
+| `SkillManager.render_block(names)` | 把若干技能渲染为可注入的指引块                            |
 
 ### 4. 安全护栏（Safety）
 
 Agent 可自动执行终端命令与文件操作，为防止破坏性操作，内置两级安全策略（由 [tools/safety.py](tools/safety.py) 实现）：
 
-| 级别 | 规则 | 行为 |
-|------|------|------|
-| **BLOCKLIST（始终拒绝）** | `rm -rf /`、`format`、`mkfs`、`dd if=`、`shutdown`、`fork bomb`、`:(){`、``curl\|sh``/``wget\|sh``、`del /f /s`、`rd /s /q` 等灾难性命令 | 直接拦截，返回拒绝错误 |
-| **CONFIRM（需确认）** | `sudo`、`rm`、`chmod`、`chown`、`mv`、`kill`、`taskkill`、`schtasks` 等危险但有时需要的命令 | 交互式确认（输入 `y` 才执行，空/超时/EOF 默认拒绝） |
+| 级别                            | 规则                                                                                                                                                     | 行为                                                 |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| **BLOCKLIST（始终拒绝）** | `rm -rf /`、`format`、`mkfs`、`dd if=`、`shutdown`、`fork bomb`、`:(){`、``curl\|sh``/``wget\|sh``、`del /f /s`、`rd /s /q` 等灾难性命令 | 直接拦截，返回拒绝错误                               |
+| **CONFIRM（需确认）**     | `sudo`、`rm`、`chmod`、`chown`、`mv`、`kill`、`taskkill`、`schtasks` 等危险但有时需要的命令                                              | 交互式确认（输入`y` 才执行，空/超时/EOF 默认拒绝） |
 
 > 执行任意脚本文件（`.py` / `.ps1` / `.bat`）因无法静态分析内容，默认也需确认。
 
@@ -860,11 +877,11 @@ Agent 可自动执行终端命令与文件操作，为防止破坏性操作，�
 ```
 
 字段含义：
+
 - `mode`: `blacklist`(默认) 或 `whitelist`
 - `confirm_dangerous`: 是否对危险命令交互确认
 - `blacklist`: 追加的拒绝正则(与内置合并)
 - `whitelist`: 白名单模式下允许的首命令
-
 - `blacklist` 模式：仅拦截 BLOCKLIST + 追加黑名单，其余放行（危险命令需确认）
 - `whitelist` 模式：只有白名单内的首命令才允许，其余一律拒绝
 
@@ -874,11 +891,11 @@ Agent 可自动执行终端命令与文件操作，为防止破坏性操作，�
 
 #### 交互命令
 
-| 命令 | 作用 |
-|------|------|
-| `safety` | 查看当前安全策略（模式 / 确认开关 / 黑名单） |
-| `safety:mode <blacklist\|whitelist>` | 切换模式 |
-| `safety:confirm <on\|off>` | 开关危险命令确认 |
+| 命令                                  | 作用                                         |
+| ------------------------------------- | -------------------------------------------- |
+| `safety`                            | 查看当前安全策略（模式 / 确认开关 / 黑名单） |
+| `safety:mode <blacklist\|whitelist>` | 切换模式                                     |
+| `safety:confirm <on\|off>`           | 开关危险命令确认                             |
 
 ### 工具调用机制
 
@@ -921,37 +938,37 @@ LLM 决定是否调用工具
 
 ## 交互命令参考
 
-| 命令 | 说明 |
-|------|------|
-| `react:任务` | Agent 模式，自动调用工具，打印步骤，存长期记忆 |
-| `cot:任务` | 链式思考模式，纯推理不调用工具 |
-| `switch:提供商名` | 运行时切换 LLM 提供商（如 `switch:deepseek`） |
-| `model` | 方向键选择切换当前提供商的模型 |
-| `model:<name>` | 直接切换模型（如 `model:glm-4-flash`） |
-| `help` | 查看完整命令说明 |
-| `info` | 查看当前模型和记忆状态(含 thread_id、会话数) |
-| `tools` | 查看可用工具列表（含 MCP 工具） |
-| `clear [long\|short\|all]` | 清理记忆（默认 long） |
-| `compress` 或 `压缩` | 压缩长期记忆（LLM 摘要后替换原内容） |
-| `thread` | 方向键选择切换会话(显示消息数预览); `Enter` 切换, `Ctrl+D` 删除高亮会话 |
-| `thread:new` | 开启新会话(原会话保留) |
-| `thread:delete <id>` | 删除指定会话(二次确认,不可恢复) |
-| `mcp` | 查看 MCP Server 状态 |
-| `mcp:reload` | 重新加载 MCP 工具 |
-| `mcp:add <name> ...` | 添加 MCP Server |
-| `mcp:remove <name>` | 删除 MCP Server |
-| `mcp:toggle <name> <on\|off>` | 启用/禁用 MCP Server |
-| `skill` 或 `skills` | 查看所有本地可用技能 |
-| `skill:<name>` | 将某技能加载进当前会话(注入 system prompt) |
-| `skill:<name> <任务>` | 加载技能并立即以 Agent 模式执行该任务(如 `skill:git-commit 提交README`) |
-| `skill:clear` | 清空手动加载的技能 |
-| `safety` | 查看当前安全策略 |
-| `safety:mode <blacklist\|whitelist>` | 切换安全模式 |
-| `safety:confirm <on\|off>` | 开关危险命令确认 |
-| `export` 或 `export:<thread_id> [路径]` | 导出对话为 Markdown(默认存 `exports/`) |
-| `json:<任务>` | 让 Agent 以 JSON 对象返回结果并解析展示 |
-| `quit` / `exit` | 退出 |
-| 其他输入 | 普通对话模式（也支持工具调用，但不打印步骤） |
+| 命令                                        | 说明                                                                       |
+| ------------------------------------------- | -------------------------------------------------------------------------- |
+| `react:任务`                              | Agent 模式，自动调用工具，打印步骤，存长期记忆                             |
+| `cot:任务`                                | 链式思考模式，纯推理不调用工具                                             |
+| `switch:提供商名`                         | 运行时切换 LLM 提供商（如`switch:deepseek`）                             |
+| `model`                                   | 方向键选择切换当前提供商的模型                                             |
+| `model:<name>`                            | 直接切换模型（如`model:glm-4-flash`）                                    |
+| `help`                                    | 查看完整命令说明                                                           |
+| `info`                                    | 查看当前模型和记忆状态(含 thread_id、会话数)                               |
+| `tools`                                   | 查看可用工具列表（含 MCP 工具）                                            |
+| `clear [long\|short\|all]`                  | 清理记忆（默认 long）                                                      |
+| `compress` 或 `压缩`                    | 压缩长期记忆（LLM 摘要后替换原内容）                                       |
+| `thread`                                  | 方向键选择切换会话(显示消息数预览);`Enter` 切换, `Ctrl+D` 删除高亮会话 |
+| `thread:new`                              | 开启新会话(原会话保留)                                                     |
+| `thread:delete <id>`                      | 删除指定会话(二次确认,不可恢复)                                            |
+| `mcp`                                     | 查看 MCP Server 状态                                                       |
+| `mcp:reload`                              | 重新加载 MCP 工具                                                          |
+| `mcp:add <name> ...`                      | 添加 MCP Server                                                            |
+| `mcp:remove <name>`                       | 删除 MCP Server                                                            |
+| `mcp:toggle <name> <on\|off>`              | 启用/禁用 MCP Server                                                       |
+| `skill` 或 `skills`                     | 查看所有本地可用技能                                                       |
+| `skill:<name>`                            | 将某技能加载进当前会话(注入 system prompt)                                 |
+| `skill:<name> <任务>`                     | 加载技能并立即以 Agent 模式执行该任务(如`skill:git-commit 提交README`)   |
+| `skill:clear`                             | 清空手动加载的技能                                                         |
+| `safety`                                  | 查看当前安全策略                                                           |
+| `safety:mode <blacklist\|whitelist>`       | 切换安全模式                                                               |
+| `safety:confirm <on\|off>`                 | 开关危险命令确认                                                           |
+| `export` 或 `export:<thread_id> [路径]` | 导出对话为 Markdown(默认存`exports/`)                                    |
+| `json:<任务>`                             | 让 Agent 以 JSON 对象返回结果并解析展示                                    |
+| `quit` / `exit`                         | 退出                                                                       |
+| 其他输入                                    | 普通对话模式（也支持工具调用，但不打印步骤）                               |
 
 ---
 
@@ -1233,14 +1250,14 @@ if __name__ == "__main__":
 
 ### 本地工具 vs MCP 工具对比
 
-| 特性 | 本地工具 | MCP 工具 |
-|------|---------|---------|
-| 定义方式 | `@tool` 装饰器 | `@mcp.tool()` + FastMCP |
-| 运行位置 | Agent 同进程 | 独立子进程 |
-| 加载方式 | import 后直接使用 | 通过 MCP 协议动态加载 |
-| 增删 | 需改代码 + 重启 | 改配置 + `mcp:reload` 热加载 |
-| 跨语言支持 | 仅 Python | 任意语言（Node/Go 等） |
-| 适用场景 | 简单、轻量工具 | 复杂服务、第三方集成 |
+| 特性       | 本地工具          | MCP 工具                      |
+| ---------- | ----------------- | ----------------------------- |
+| 定义方式   | `@tool` 装饰器  | `@mcp.tool()` + FastMCP     |
+| 运行位置   | Agent 同进程      | 独立子进程                    |
+| 加载方式   | import 后直接使用 | 通过 MCP 协议动态加载         |
+| 增删       | 需改代码 + 重启   | 改配置 +`mcp:reload` 热加载 |
+| 跨语言支持 | 仅 Python         | 任意语言（Node/Go 等）        |
+| 适用场景   | 简单、轻量工具    | 复杂服务、第三方集成          |
 
 ---
 
@@ -1248,23 +1265,24 @@ if __name__ == "__main__":
 
 原先硬编码在 `main.py` 的运行时参数已外置到 `config/agent_config.json`，由 [config.py](config.py) 的 `load_agent_config` 加载并与默认值合并（缺省键不报错）。
 
-| 键 | 类型 | 默认值 | 说明 |
-|----|------|--------|------|
-| `max_iterations` | int | 15 | 单次 `invoke` 最大推理步数（即 `recursion_limit`） |
-| `skills_dir` | str | `.agents/skills` | 技能目录（相对项目根或绝对路径） |
-| `auto_match_skills` | bool | true | 任务自动匹配并注入相关技能 |
-| `enable_mcp` | bool | true | 是否加载 MCP 工具 |
-| `memory_size` | int | 10 | 兼容旧 API 的记忆容量 |
-| `verbose` | bool | true | 是否打印详细过程 |
-| `mcp_config_file` | str | `config/mcp_servers.json` | MCP 配置文件（相对项目根或绝对路径） |
-| `max_context_messages` | int | 0 | 长上下文裁剪阈值（0 = 关闭） |
-| `context_trim_keep` | int | 12 | 裁剪时保留的最近消息条数 |
+| 键                       | 类型 | 默认值                      | 说明                                                  |
+| ------------------------ | ---- | --------------------------- | ----------------------------------------------------- |
+| `max_iterations`       | int  | 15                          | 单次`invoke` 最大推理步数（即 `recursion_limit`） |
+| `skills_dir`           | str  | `.agents/skills`          | 技能目录（相对项目根或绝对路径）                      |
+| `auto_match_skills`    | bool | true                        | 任务自动匹配并注入相关技能                            |
+| `enable_mcp`           | bool | true                        | 是否加载 MCP 工具                                     |
+| `memory_size`          | int  | 10                          | 兼容旧 API 的记忆容量                                 |
+| `verbose`              | bool | true                        | 是否打印详细过程                                      |
+| `mcp_config_file`      | str  | `config/mcp_servers.json` | MCP 配置文件（相对项目根或绝对路径）                  |
+| `max_context_messages` | int  | 0                           | 长上下文裁剪阈值（0 = 关闭）                          |
+| `context_trim_keep`    | int  | 12                          | 裁剪时保留的最近消息条数                              |
 
 修改后重启 `main.py` 即可生效。
 
 ### 长上下文裁剪（Long-Context Trimming）
 
 当某个会话的消息数超过 `max_context_messages` 时，Agent 会自动：
+
 1. 用 LLM 将较早的消息压缩成一份中文摘要；
 2. 开启**新会话**，并把摘要注入后续 system prompt（保留上下文精华）；
 3. 仅保留最近 `context_trim_keep` 条消息，从而避免撞上 LLM 上下文窗口。
@@ -1295,21 +1313,20 @@ Agent 会按要求**只输出一个合法 JSON 对象**（不含 ``` 标记与�
 
 项目提供一套**离线**单元测试（无需 API Key、不联网），覆盖核心逻辑：
 
-| 测试文件 | 覆盖内容 |
-|----------|----------|
-| `tests/test_config.py` | 运行时配置：默认值合并、路径解析 |
-| `tests/test_safety.py` | 安全护栏：黑名单拒绝、白名单放行、危险命令确认、路径保护 |
-| `tests/test_skills.py` | `SkillManager`：列出/读取/匹配(中→英别名)/渲染技能 |
-| `tests/test_search.py` | `search` 工具：无 Key 降级、Tavily 返回结构(mock) |
-| `tests/test_cli_commands.py` | CLI 命令分发：路由优先级、状态变更和各领域处理器 |
-| `tests/test_human_input.py` | LangGraph HITL：interrupt、恢复、并行选择和线程隔离 |
-| `tests/test_terminal.py` | 终端工具：输出截断、护栏拒绝、安全执行(mock subprocess) |
-| `tests/test_memory.py` | `AgentMemory`：长期记忆、会话管理(SQLite) |
+| 测试文件                       | 覆盖内容                                                 |
+| ------------------------------ | -------------------------------------------------------- |
+| `tests/test_config.py`       | 运行时配置：默认值合并、路径解析                         |
+| `tests/test_safety.py`       | 安全护栏：黑名单拒绝、白名单放行、危险命令确认、路径保护 |
+| `tests/test_skills.py`       | `SkillManager`：列出/读取/匹配(中→英别名)/渲染技能    |
+| `tests/test_search.py`       | `search` 工具：无 Key 降级、Tavily 返回结构(mock)      |
+| `tests/test_cli_commands.py` | CLI 命令分发：路由优先级、状态变更和各领域处理器         |
+| `tests/test_human_input.py`  | LangGraph HITL：interrupt、恢复、并行选择和线程隔离      |
+| `tests/test_terminal.py`     | 终端工具：输出截断、护栏拒绝、安全执行(mock subprocess)  |
+| `tests/test_memory.py`       | `AgentMemory`：长期记忆、会话管理(SQLite)              |
 
 运行：
 
 ```powershell
-cd D:\work\LangChainAgent
 .\.venv\Scripts\pip.exe install -r requirements.txt
 .\.venv\Scripts\pytest.exe
 ```
