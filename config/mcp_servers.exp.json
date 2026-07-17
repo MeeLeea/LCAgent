@@ -1,0 +1,10 @@
+{
+  "servers": {
+    "workspace": {
+      "transport": "stdio",
+      "command": "python",
+      "args": ["tools/workspace_tool.py"],
+      "enabled": true
+    }
+  }
+}

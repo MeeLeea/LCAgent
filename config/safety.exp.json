@@ -1,0 +1,15 @@
+{
+  "mode": "blacklist",
+  "confirm_dangerous": true,
+  "blacklist": [],
+  "whitelist": [
+    "echo",
+    "dir",
+    "ls",
+    "python",
+    "pip",
+    "git",
+    "cat",
+    "type"
+  ]
+}

@@ -56,7 +56,7 @@ class LLMClient:
         self,
         provider: Optional[str] = "openai",
         api_key: Optional[str] = None,
-        model: Optional[str] = "gpt-5.5",
+        model: Optional[str] = None,
         config_file: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 2048

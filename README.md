@@ -5,6 +5,7 @@
 - 本地工具调用（搜索、文件读写、计算、终端命令、文件打开、技能读取）
 - **MCP Server 工具动态加载**（已预置 workspace 文件夹管理服务，可扩展任意 MCP 服务）
 - **LangGraph Checkpoint 持久化**（SQLite 自动保存，程序重启可恢复对话）
+- **LangGraph Human-in-the-loop**（`ask_human` 暂停图执行，CLI 结构化选择后 `Command(resume)` 继续）
 - 长期记忆管理（compress 压缩摘要）与长上下文自动裁剪
 - 多会话隔离（thread_id 机制，方向键菜单切换/删除/导出）
 - 安全护栏（危险终端命令拦截/确认、路径保护）
@@ -22,6 +23,7 @@
   - [两层存储对比](#两层存储对比)
   - [三种模式的记忆行为](#三种模式的记忆行为)
   - [Checkpoint 持久化原理](#checkpoint-持久化原理)
+  - [Human-in-the-loop 图暂停/恢复](#human-in-the-loop-图暂停恢复)
   - [长期记忆触发原理](#长期记忆触发原理)
   - [为什么 cot 不写入 checkpoint](#为什么-cot-不写入-checkpoint)
   - [文件位置](#文件位置)
@@ -140,6 +142,21 @@ LangChainAgent/
 │   ├── safety.py            # 安全护栏(黑名单/白名单/交互确认/路径保护)
 │   ├── mcp_loader.py        # MCP 工具加载器
 │   └── workspace_tool.py    # 工作目录管理 MCP Server
+├── utils/
+│   ├── __init__.py
+│   ├── cli_menu.py          # 通用终端方向键选择菜单
+│   ├── human_input.py       # ask_human 工具 + HITL 暂停/恢复编排
+│   └── commands/            # CLI 命令分发与领域处理器
+│       ├── types.py         # CommandContext / CommandOutcome
+│       ├── dispatcher.py    # 按既有优先级路由命令
+│       ├── core.py          # help / info / tools / 就绪信息
+│       ├── threads.py       # 会话切换、创建、删除、导出
+│       ├── memory.py        # clear / compress
+│       ├── provider.py      # 提供商与模型切换
+│       ├── mcp.py           # MCP 管理命令
+│       ├── skills.py        # Skill 管理命令
+│       ├── safety.py        # 安全策略命令
+│       └── execution.py     # json / react / cot / 普通对话
 ├── tests/                   # 离线单元测试(pytest)
 │   ├── conftest.py
 │   ├── test_config.py
@@ -156,14 +173,19 @@ LangChainAgent/
 
 | 模块 | 职责 |
 |------|------|
-| [main.py](main.py) | 交互式命令行：方向键选择提供商、解析命令、调用 Agent |
+| [main.py](main.py) | 交互式命令行入口：初始化运行时、读取输入并调用命令分发器 |
 | [llm_client.py](llm_client.py) | 从 `config/llm_config.json` 读取提供商配置，支持运行时切换提供商/模型 |
 | [config.py](config.py) | 加载 `config/agent_config.json`，统一运行时配置 |
 | [agent/memory.py](agent/memory.py) | 双层记忆：Checkpoint（自动）+ memory.json（手动）+ 对话导出 |
-| [agent/agent_core.py](agent/agent_core.py) | Agent 核心：`run()` / `chat()` / `cot()` 三种模式 + 技能注入 + 长上下文裁剪 |
+| [agent/agent_core.py](agent/agent_core.py) | Agent 核心：`run()` / `chat()` / `cot()` 三种模式 + `AgentTurnResult` 结构化暂停/恢复 API + 技能注入 + 长上下文裁剪 |
 | [tools/skills.py](tools/skills.py) | `SkillManager`：扫描/匹配/渲染本地技能 |
 | [tools/skill_tool.py](tools/skill_tool.py) | `read_skill` 工具：LLM 在任务中自助读取技能指引 |
 | [tools/](tools/) | 本地工具 + MCP 工具加载 + 技能管理 |
+| [utils/cli_menu.py](utils/cli_menu.py) | 通用终端方向键选择菜单 |
+| [utils/human_input.py](utils/human_input.py) | `ask_human` 工具、interrupt 展示和循环恢复编排 |
+| [utils/commands/dispatcher.py](utils/commands/dispatcher.py) | 按兼容顺序匹配命令并路由到领域处理器 |
+| [utils/commands/types.py](utils/commands/types.py) | 命令依赖上下文、活动 LLM 状态和分发结果类型 |
+| [utils/commands/](utils/commands/) | 会话、记忆、模型、MCP、技能、安全及 Agent 执行命令 |
 
 ### llm_client.py 主要 API
 
@@ -346,7 +368,43 @@ result = self.agent_executor.invoke(
 | 程序重启恢复 | 重启后用相同 `thread_id` 即可恢复完整对话历史 |
 | 多会话隔离 | 不同 `thread_id` 完全独立，可管理多个对话 |
 | 完整状态保存 | 保存消息、工具调用链、中间变量(不止文本) |
-| 中断恢复 | 程序崩溃可从最近 checkpoint 续跑 |
+| 图暂停/恢复 | `ask_human` 触发 interrupt 后，用同一 `thread_id` 的 checkpoint 继续当前图 |
+
+### Human-in-the-loop 图暂停/恢复
+
+当 Agent 需要人工确认、选择或补充信息才能继续时，会调用本地工具 `ask_human`。这不是普通多轮聊天：普通多轮聊天是“用户发一条新消息 → Agent 重新执行一轮”；Human-in-the-loop 是“同一次 LangGraph 执行在工具节点暂停 → CLI 收集选择 → 用 `Command(resume=...)` 恢复同一个图状态”。
+
+#### interrupt payload
+
+[utils/human_input.py](utils/human_input.py) 中的 `ask_human` 会发出 LangGraph interrupt，payload 固定为：
+
+```python
+{
+    "kind": "human_choice",
+    "prompt": "请选择要执行的操作",
+    "choices": [
+        {"id": "approve", "label": "确认执行"},
+        {"id": "cancel", "label": "取消"}
+    ]
+}
+```
+
+CLI 目前支持这种结构化选择：`utils/human_input.py` 读取 `choices`，并通过 `utils/cli_menu.py` 的 `select_menu(prompt, options)` 展示；用方向键移动、`Enter` 确认。按 `Esc` 会返回 `{"cancelled": True}` 作为 resume payload，选择成功时返回 `{"choice_id": "<id>"}`。如果 interrupt 不是 `human_choice`，才回退到普通文本输入 `{"text": "..."}`。
+
+#### 结构化 API 与恢复流程
+
+`AgentCore` 暴露结构化方法，让调用方能区分完成和暂停：
+
+| 名称 | 作用 |
+|------|------|
+| `AgentTurnResult` | 一轮图执行结果，`status` 为 `completed` 或 `interrupted`，完成时读 `output`，暂停时读 `interrupts` |
+| `run_structured(task)` | ReAct/任务模式入口，返回 `AgentTurnResult`，完成后写 checkpoint + 长期记忆 |
+| `chat_structured(message)` | 普通对话入口，返回 `AgentTurnResult`，完成后写 checkpoint，不写长期记忆 |
+| `resume_structured(payload)` | 对暂停中的图调用 `Command(resume=payload)`，继续同一个 checkpoint 线程 |
+
+当前封装要求在同一个 `AgentCore` 实例中恢复，并校验当前 `thread_id` 与产生 interrupt 的线程一致；`resume_structured()` 内部用 `Command(resume=payload)` 和 `self._invoke_config()` 接回对应的 LangGraph checkpoint。若恢复后又遇到新的 `ask_human`，`utils/human_input.py` 会继续循环处理 interrupt，直到 `AgentTurnResult.status == "completed"`。
+
+> 当前 CLI 只负责正在运行进程内的结构化选择与恢复；不要把它理解为重启后的自动 UI 恢复。重启后仍可通过 `thread` 菜单恢复历史对话上下文，但未完成的人工选择界面不会自动重建。
 
 ### 长期记忆触发原理
 
@@ -433,13 +491,15 @@ MEMORY_FILE = os.path.join(BASE_DIR, "data", "memory.json")            # 长期�
 | `thread:delete <id>` | 删除指定会话(二次确认,不可恢复) | `thread:delete thread-abc123` |
 
 > 切换会话统一走 `thread` 方向键菜单，无需手动输入 thread_id。
+>
+> 在 `thread` 菜单中，使用方向键移动高亮项，按 `Enter` 切换会话，按 `Esc` 取消；按 `Ctrl+D` 可删除当前高亮会话。删除前会要求输入 `y` 或 `yes` 确认。
 
 **示例**：
 
 ```
 你: thread
-选择会话 (共 2 个,↑↓ 选择,Enter 切换)
-  (↑↓ 选择, Enter 确认, Esc 取消)
+ 选择会话 (共 2 个,↑↓ 选择,Enter 切换)
+  (↑↓ 选择, Enter 切换, Ctrl+D 删除, Esc 取消)
     thread-a4d099d2  [6 条消息]
   ❯ thread-b1dc3b2a  [0 条消息] (当前)
 ----------------------------------------
@@ -452,6 +512,17 @@ MEMORY_FILE = os.path.join(BASE_DIR, "data", "memory.json")            # 长期�
 你: thread:delete thread-a4d099d2
 确认删除会话 'thread-a4d099d2'? 此操作不可恢复 [y/N]: y
 已删除会话: thread-a4d099d2
+```
+
+在会话菜单中删除高亮会话的操作示例：
+
+```
+你: thread
+  (↑↓ 选择, Enter 切换, Ctrl+D 删除, Esc 取消)
+  ❯ thread-b1dc3b2a  [0 条消息] (当前)
+
+确认删除会话 'thread-b1dc3b2a'? 此操作不可恢复 [y/N]: y
+已删除会话: thread-b1dc3b2a
 ```
 
 ### 记忆管理命令
@@ -629,6 +700,7 @@ Agent 的工具分为两类：
 | `open_file` | [tools/open_file.py](tools/open_file.py) | 用系统默认/指定程序打开文件或文件夹 | `file_path`, `app_path` |
 | `open_sqlite` | [tools/open_file.py](tools/open_file.py) | 用 DB Browser for SQLite 打开 .sqlite/.db | `file_path` |
 | `read_skill` | [tools/skill_tool.py](tools/skill_tool.py) | 读取本地技能(SKILL.md)的指引正文 | `skill_name`(可空) |
+| `ask_human` | [utils/human_input.py](utils/human_input.py) | 暂停 LangGraph 图并请求人工结构化选择 | `prompt`, `choices` |
 
 > `open_sqlite` 会自动查找 DB Browser for SQLite 路径（环境变量 `SQLITE_BROWSER_PATH` → 常见安装位置 → PATH），找不到则返回下载链接。
 
@@ -822,9 +894,11 @@ agent_executor.invoke({"messages": [...]})
 LLM 收到 system prompt + 工具列表 + 用户消息
    ↓
 LLM 决定是否调用工具
-   ├─ 是 → 返回 tool_call → Agent 执行工具 → 结果回传 LLM → 最终回复
-   └─ 否 → 直接返回文本回复
+    ├─ 是 → 返回 tool_call → Agent 执行工具 → 结果回传 LLM → 最终回复
+    └─ 否 → 直接返回文本回复
 ```
+
+若调用的是 `ask_human`，工具不会立即返回普通观察结果，而是通过 LangGraph interrupt 暂停图执行。CLI 收集选择后调用 `resume_structured()`，用 `Command(resume=...)` 把选择送回同一图状态，再继续后续工具调用或生成最终回复。
 
 ### System Prompt 强化
 
@@ -840,6 +914,7 @@ LLM 决定是否调用工具
 7. 测试/运行脚本时直接调用终端工具
 8. 危险命令会被安全策略拦截或要求确认
 9. 专业任务应优先用 read_skill 读取相关技能指引
+10. 需要人工确认、选择或补充信息时，应调用 ask_human 并提供结构化 choices
 ```
 
 ---
@@ -858,7 +933,7 @@ LLM 决定是否调用工具
 | `tools` | 查看可用工具列表（含 MCP 工具） |
 | `clear [long\|short\|all]` | 清理记忆（默认 long） |
 | `compress` 或 `压缩` | 压缩长期记忆（LLM 摘要后替换原内容） |
-| `thread` | 方向键选择切换会话(显示消息数预览) |
+| `thread` | 方向键选择切换会话(显示消息数预览); `Enter` 切换, `Ctrl+D` 删除高亮会话 |
 | `thread:new` | 开启新会话(原会话保留) |
 | `thread:delete <id>` | 删除指定会话(二次确认,不可恢复) |
 | `mcp` | 查看 MCP Server 状态 |
@@ -902,7 +977,7 @@ Agent 已就绪！
 当前提供商: DeepSeek
 当前模型:   deepseek-chat
 
-本地工具: search, read_file, write_file, calculate, run_shell, run_python, run_cmd, get_local_time, open_file, open_sqlite, read_skill
+本地工具: search, read_file, write_file, calculate, run_shell, run_python, run_cmd, get_local_time, open_file, open_sqlite, read_skill, ask_human
 MCP工具:  create_workspace, get_current_workspace, list_directory, delete_workspace, move_workspace, copy_workspace
 
 你: 在 D:\work 下创建一个叫 my_project 的文件夹
@@ -956,6 +1031,19 @@ Checkpoint: sqlite → D:\work\LangChainAgent\data\checkpoints.sqlite
 结果: {"success": true, "message": "已用 DB Browser for SQLite 打开数据库"}
 最终答案: 已为你打开 checkpoints.sqlite 数据库
 
+你: react:删除旧的临时文件前先让我确认
+--- 步骤 1 ---
+工具: ask_human
+输入: {'prompt': '是否删除旧的临时文件?', 'choices': [{'id': 'delete', 'label': '删除'}, {'id': 'skip', 'label': '跳过'}]}
+
+是否删除旧的临时文件?
+  (↑↓ 选择, Enter 确认, Esc 取消)
+  ❯ 删除
+    跳过
+----------------------------------------
+是否删除旧的临时文件? ❯ 删除
+最终答案: 已确认删除旧的临时文件。
+
 你: mcp
 MCP Servers:
 ------------------------------------------------------------
@@ -1002,6 +1090,21 @@ result = agent.run("计算 123 * 456 并把结果写入 result.txt")
 
 # CoT模式（纯推理，不调用工具，不写 checkpoint，存长期记忆）
 result = agent.cot("分析机器学习的应用场景")
+
+# Human-in-the-loop 结构化入口：chat_structured/run_structured 返回 AgentTurnResult
+turn = agent.chat_structured("需要人工选择时请先问我")
+while turn.is_interrupted:
+    # 单个 interrupt 可直接 resume；并行多个 interrupt 要按 interrupt.id 提交映射
+    if len(turn.interrupts) == 1:
+        resume = {"choice_id": "approve"}
+    else:
+        resume = {
+            interrupt.id: {"choice_id": "approve"}
+            for interrupt in turn.interrupts
+        }
+    # CLI 中由 select_menu 生成选择；Esc 会向 Agent 发送 {"cancelled": True}
+    turn = agent.resume_structured(resume)
+print(turn.output)
 
 # 切换LLM提供商
 from llm_client import create_client
@@ -1198,6 +1301,8 @@ Agent 会按要求**只输出一个合法 JSON 对象**（不含 ``` 标记与�
 | `tests/test_safety.py` | 安全护栏：黑名单拒绝、白名单放行、危险命令确认、路径保护 |
 | `tests/test_skills.py` | `SkillManager`：列出/读取/匹配(中→英别名)/渲染技能 |
 | `tests/test_search.py` | `search` 工具：无 Key 降级、Tavily 返回结构(mock) |
+| `tests/test_cli_commands.py` | CLI 命令分发：路由优先级、状态变更和各领域处理器 |
+| `tests/test_human_input.py` | LangGraph HITL：interrupt、恢复、并行选择和线程隔离 |
 | `tests/test_terminal.py` | 终端工具：输出截断、护栏拒绝、安全执行(mock subprocess) |
 | `tests/test_memory.py` | `AgentMemory`：长期记忆、会话管理(SQLite) |
 

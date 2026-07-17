@@ -8,12 +8,34 @@ import os
 import subprocess
 import sys
 import platform
+import re
 
 from .safety import check_command, check_exec, confirm
 
 
 # Windows 默认超时（秒），防止命令卡死
 DEFAULT_TIMEOUT = 60
+
+# 覆盖常见命令行参数、环境变量和 Authorization Bearer 形式；只替换值，保留命令结构供用户判断。
+SENSITIVE_COMMAND_PATTERNS = (
+    re.compile(
+        r"(?i)(?P<prefix>(?:--?|/)(?:api[-_]?key|token|access[-_]?token|password|passwd|secret)\s*(?:=|\s)\s*)"
+        r"(?P<quote>[\"']?)(?P<value>[^\s\"']+)(?P=quote)"
+    ),
+    re.compile(
+        r"(?i)(?P<prefix>\b(?:api[-_]?key|token|access[-_]?token|password|passwd|secret)\s*=\s*)"
+        r"(?P<quote>[\"']?)(?P<value>[^\s\"']+)(?P=quote)"
+    ),
+    re.compile(r"(?i)(?P<prefix>Authorization\s*:\s*Bearer\s+)(?P<value>[^\s\"']+)"),
+)
+
+
+class UserRejectedCommandError(RuntimeError):
+    """用户拒绝危险操作时终止当前 Agent turn，防止模型自动重试。"""
+
+    def __init__(self, command: str):
+        self.command = command
+        super().__init__("用户拒绝执行危险命令")
 
 
 def _truncate(text: str, max_chars: int = 4000) -> str:
@@ -23,6 +45,14 @@ def _truncate(text: str, max_chars: int = 4000) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + f"\n... [输出已截断，共 {len(text)} 字符，仅显示前 {max_chars} 字符]"
+
+
+def _redact_command(command: str) -> str:
+    """隐藏命令中的常见密钥、令牌和密码，同时保留可审查的命令结构。"""
+    redacted = command
+    for pattern in SENSITIVE_COMMAND_PATTERNS:
+        redacted = pattern.sub(lambda match: f"{match.group('prefix')}***", redacted)
+    return redacted
 
 
 def _guard_command(command: str) -> Optional[Dict[str, Any]]:
@@ -40,12 +70,13 @@ def _guard_command(command: str) -> Optional[Dict[str, Any]]:
             "command": command,
         }
     if status == "confirm":
-        if not confirm(f"⚠ 检测到危险命令 [{reason}]\n确认执行? [y/N]: "):
-            return {
-                "success": False,
-                "error": "用户拒绝执行危险命令",
-                "command": command,
-            }
+        if not confirm(
+            f"⚠ 检测到危险命令 [{reason}]\n"
+            f"待执行命令：{_redact_command(command)}\n"
+            "确认执行? [y/N]: "
+        ):
+            # 普通失败结果会被 ReAct 模型当作可重试错误；异常交给 AgentCore 终止本轮。
+            raise UserRejectedCommandError(command)
     return None
 
 
@@ -62,11 +93,8 @@ def _guard_exec(file_path: str) -> Optional[Dict[str, Any]]:
         }
     if status == "confirm":
         if not confirm(f"⚠ {reason} [{file_path}]\n确认执行? [y/N]: "):
-            return {
-                "success": False,
-                "error": "用户拒绝执行",
-                "file_path": file_path,
-            }
+            # 与 shell 命令保持一致：拒绝后终止整轮，而不是返回可重试错误。
+            raise UserRejectedCommandError(file_path)
     return None
 
 
@@ -137,6 +165,9 @@ def run_shell(command: str, cwd: Optional[str] = None, timeout: int = DEFAULT_TI
             "command": command,
             "cwd": cwd
         }
+    except UserRejectedCommandError:
+        # 用户拒绝不是可恢复的工具失败，必须穿透边界终止当前 Agent turn。
+        raise
     except Exception as e:
         return {
             "success": False,
@@ -214,6 +245,8 @@ def run_python(file_path: str, script_args: str = "", cwd: Optional[str] = None,
             "file_path": file_path,
             "script_args": script_args
         }
+    except UserRejectedCommandError:
+        raise
     except Exception as e:
         return {
             "success": False,
@@ -309,6 +342,8 @@ def run_cmd(file_path: str, script_args: str = "", cwd: Optional[str] = None, ti
             "file_path": file_path,
             "script_args": script_args
         }
+    except UserRejectedCommandError:
+        raise
     except Exception as e:
         return {
             "success": False,

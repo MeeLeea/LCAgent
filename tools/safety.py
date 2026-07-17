@@ -33,6 +33,11 @@ from typing import Tuple, Dict, Any, List, Optional
 BUILTIN_BLOCKLIST = [
     r"\brm\s+-rf\b", r"\brm\s+-fr\b", r"\brm\b.*--recursive",
     r"\brd\s+/[sq]", r"\bdeltree\b",
+    # 覆盖 Windows/PowerShell 的递归删除和编码命令，避免只拦截 Unix 写法。
+    r"\bremove-item\b(?=[^\r\n]*\s-(?:recurse|r)\b)(?=[^\r\n]*\s-(?:force|f)\b)",
+    r"\b(?:del|erase)\b[^\r\n]*\s/s\b",
+    r"\b(?:rd|rmdir)\b[^\r\n]*\s/s\b",
+    r"\b(?:powershell|pwsh)(?:\.exe)?\b[^\r\n]*\s-(?:e|enc|encodedcommand)\b",
     r"\bformat\b", r"\bmkfs", r"\bdd\b.*\bif=",
     r"\bshutdown\b", r"\breboot\b",
     r":\(\)\s*\{.*\}\s*;",                      # fork bomb :(){:|:&};:
@@ -45,6 +50,12 @@ BUILTIN_BLOCKLIST = [
 BUILTIN_CONFIRM = [
     r"\bsudo\b", r"\brm\b", r"\bchmod\b", r"\bchown\b",
     r"\bmv\b", r"\bkill\b", r"\btaskkill\b", r"\bschtasks\b",
+    r"\bremove-item\b", r"\b(?:del|erase|rd|rmdir)\b",
+    # 解释器可隐藏任意副作用，脚本、内联代码和命令包装器统一要求人工确认。
+    r"\b(?:python(?:3)?|py)(?:\.exe)?\b\s+(?:-[cmo]\b|[^\s;&|]+\.py\b)",
+    r"\b(?:powershell|pwsh)(?:\.exe)?\b[^\r\n]*\s-(?:command|file)\b",
+    r"\bcmd(?:\.exe)?\b\s+/(?:c|k)\b",
+    r"\b(?:bash|sh)\b\s+-c\b",
 ]
 
 # 默认配置

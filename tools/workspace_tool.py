@@ -43,9 +43,12 @@ def _is_protected_path(folder_path: str) -> Optional[str]:
     windir = os.path.abspath(os.environ.get("windir", "C:\\Windows"))
     home = os.path.abspath(os.path.expanduser("~"))
     project_root = os.path.abspath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    protected = [sys_root, windir, home, project_root]
-    for p in protected:
-        if abs_path == p or abs_path.startswith(p + os.sep):
+    # Windows 路径大小写不敏感，比较前统一规范化以防大小写绕过。
+    comparable_path = os.path.normcase(abs_path)
+    protected_trees = [sys_root, windir, home, project_root]
+    for p in protected_trees:
+        comparable_root = os.path.normcase(p)
+        if comparable_path == comparable_root or comparable_path.startswith(comparable_root + os.sep):
             return f"禁止操作系统/项目关键目录: {p}"
     return None
 
@@ -219,6 +222,11 @@ def move_workspace(src_path: str, dest_path: str) -> Dict[str, Any]:
         abs_src = os.path.abspath(src_path)
         abs_dest = os.path.abspath(dest_path)
 
+        # 源和目标都要先检查；否则可通过“移出”或“移入”关键目录绕过保护。
+        blocked = _is_protected_path(abs_src) or _is_protected_path(abs_dest)
+        if blocked:
+            return {"success": False, "error": blocked}
+
         if not os.path.exists(abs_src):
             return {"success": False, "error": f"源路径不存在: {abs_src}"}
         if not os.path.isdir(abs_src):
@@ -253,6 +261,11 @@ def copy_workspace(src_path: str, dest_path: str) -> Dict[str, Any]:
     try:
         abs_src = os.path.abspath(src_path)
         abs_dest = os.path.abspath(dest_path)
+
+        # 复制同样保护两端，防止导出敏感目录或覆盖关键目录树。
+        blocked = _is_protected_path(abs_src) or _is_protected_path(abs_dest)
+        if blocked:
+            return {"success": False, "error": blocked}
 
         if not os.path.exists(abs_src):
             return {"success": False, "error": f"源路径不存在: {abs_src}"}
