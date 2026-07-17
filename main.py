@@ -5,6 +5,7 @@ LangChain Agent 项目入口 - 支持多提供商(智谱/千问/DeepSeek/Kimi) +
 from __future__ import annotations
 
 import os
+import readline
 
 from agent import AgentCore
 from config import load_agent_config, resolve_path
