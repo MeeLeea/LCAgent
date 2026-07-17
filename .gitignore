@@ -54,6 +54,6 @@ llm_config.json
 
 node_modules/
 data/
-tests/
 .agents/
-config/
+config/*
+!config/*.exp.json
