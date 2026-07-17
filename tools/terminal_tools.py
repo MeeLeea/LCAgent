@@ -16,6 +16,14 @@ from .safety import check_command, check_exec, confirm
 DEFAULT_TIMEOUT = 60
 
 
+class UserRejectedCommandError(RuntimeError):
+    """用户拒绝危险操作时终止当前 Agent turn，防止模型自动重试。"""
+
+    def __init__(self, command: str):
+        self.command = command
+        super().__init__("用户拒绝执行危险命令")
+
+
 def _truncate(text: str, max_chars: int = 4000) -> str:
     """截断超长输出，避免回传给 LLM 时占用过多 token"""
     if not text:
@@ -41,11 +49,8 @@ def _guard_command(command: str) -> Optional[Dict[str, Any]]:
         }
     if status == "confirm":
         if not confirm(f"⚠ 检测到危险命令 [{reason}]\n确认执行? [y/N]: "):
-            return {
-                "success": False,
-                "error": "用户拒绝执行危险命令",
-                "command": command,
-            }
+            # 普通失败结果会被 ReAct 模型当作可重试错误；异常交给 AgentCore 终止本轮。
+            raise UserRejectedCommandError(command)
     return None
 
 
@@ -62,11 +67,8 @@ def _guard_exec(file_path: str) -> Optional[Dict[str, Any]]:
         }
     if status == "confirm":
         if not confirm(f"⚠ {reason} [{file_path}]\n确认执行? [y/N]: "):
-            return {
-                "success": False,
-                "error": "用户拒绝执行",
-                "file_path": file_path,
-            }
+            # 与 shell 命令保持一致：拒绝后终止整轮，而不是返回可重试错误。
+            raise UserRejectedCommandError(file_path)
     return None
 
 
@@ -137,6 +139,9 @@ def run_shell(command: str, cwd: Optional[str] = None, timeout: int = DEFAULT_TI
             "command": command,
             "cwd": cwd
         }
+    except UserRejectedCommandError:
+        # 用户拒绝不是可恢复的工具失败，必须穿透边界终止当前 Agent turn。
+        raise
     except Exception as e:
         return {
             "success": False,
@@ -214,6 +219,8 @@ def run_python(file_path: str, script_args: str = "", cwd: Optional[str] = None,
             "file_path": file_path,
             "script_args": script_args
         }
+    except UserRejectedCommandError:
+        raise
     except Exception as e:
         return {
             "success": False,
@@ -309,6 +316,8 @@ def run_cmd(file_path: str, script_args: str = "", cwd: Optional[str] = None, ti
             "file_path": file_path,
             "script_args": script_args
         }
+    except UserRejectedCommandError:
+        raise
     except Exception as e:
         return {
             "success": False,
