@@ -25,8 +25,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LLM_FILE = os.path.join(BASE_DIR, "config", "llm_config.json")
 MCP_CONFIG_FILE = os.path.join(BASE_DIR, "config", "mcp_servers.json")
 AGENT_CONFIG_FILE = os.path.join(BASE_DIR, "config", "agent_config.json")
-MEMORY_FILE = os.path.join(BASE_DIR, "data", "memory.json")
-CHECKPOINT_FILE = os.path.join(BASE_DIR, "data", "checkpoints.sqlite")
+MEMORY_FILE = os.path.join(BASE_DIR, "memory", "memory.json")
+CHECKPOINT_FILE = os.path.join(BASE_DIR, "memory", "checkpoints.sqlite")
 
 
 def render_print(value: str = "") -> None:

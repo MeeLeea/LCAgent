@@ -53,7 +53,7 @@ calibrate_*.png
 llm_config.json
 
 node_modules/
-data/
+memory/
 .agents/
 config/*
 !config/*.exp.json
