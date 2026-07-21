@@ -6,6 +6,11 @@ from __future__ import annotations
 
 import os
 
+try:
+    import readline
+except ImportError:
+    pass
+
 from agent import AgentCore
 from config import load_agent_config, resolve_path
 from llm_client import list_providers
@@ -26,7 +31,8 @@ CHECKPOINT_FILE = os.path.join(BASE_DIR, "data", "checkpoints.sqlite")
 
 def render_print(value: str = "") -> None:
     """输出命令处理器已经渲染好的文本。"""
-    print(value)
+    for line in str(value).split("\n"):
+        print(line.strip())
 
 
 def build_agent(provider: str) -> tuple[AgentCore, object]:
