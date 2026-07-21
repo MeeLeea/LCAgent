@@ -24,7 +24,6 @@
   - [两层存储对比](#两层存储对比)
   - [三种模式的记忆行为](#三种模式的记忆行为)
   - [Checkpoint 持久化原理](#checkpoint-持久化原理)
-  - [Human-in-the-loop 图暂停/恢复](#human-in-the-loop-图暂停恢复)
   - [长期记忆触发原理](#长期记忆触发原理)
   - [为什么 cot 不写入 checkpoint](#为什么-cot-不写入-checkpoint)
   - [文件位置](#文件位置)
@@ -39,6 +38,16 @@
   - [安全护栏 Safety](#4-安全护栏safety)
   - [工具调用机制](#工具调用机制)
   - [System Prompt 强化](#system-prompt-强化)
+- [Human-in-the-loop（HITL）](#human-in-the-loophitl)
+  - [执行流程](#执行流程)
+  - [ask_human 工具](#ask_human-工具)
+  - [结构化 API](#结构化-api)
+  - [CLI 编排](#cli-编排)
+  - [并行 interrupt 与多轮暂停](#并行-interrupt-与多轮暂停)
+  - [线程隔离](#线程隔离)
+  - [与普通多轮聊天、安全护栏的区别](#与普通多轮聊天安全护栏的区别)
+  - [代码示例](#代码示例)
+  - [限制与注意事项](#限制与注意事项)
 - [交互命令参考](#交互命令参考)
 - [运行示例](#运行示例)
 - [代码使用示例](#代码使用示例)
@@ -386,42 +395,6 @@ result = self.agent_executor.invoke(
 | 多会话隔离   | 不同`thread_id` 完全独立，可管理多个对话                                     |
 | 完整状态保存 | 保存消息、工具调用链、中间变量(不止文本)                                       |
 | 图暂停/恢复  | `ask_human` 触发 interrupt 后，用同一 `thread_id` 的 checkpoint 继续当前图 |
-
-### Human-in-the-loop 图暂停/恢复
-
-当 Agent 需要人工确认、选择或补充信息才能继续时，会调用本地工具 `ask_human`。这不是普通多轮聊天：普通多轮聊天是“用户发一条新消息 → Agent 重新执行一轮”；Human-in-the-loop 是“同一次 LangGraph 执行在工具节点暂停 → CLI 收集选择 → 用 `Command(resume=...)` 恢复同一个图状态”。
-
-#### interrupt payload
-
-[utils/human_input.py](utils/human_input.py) 中的 `ask_human` 会发出 LangGraph interrupt，payload 固定为：
-
-```python
-{
-    "kind": "human_choice",
-    "prompt": "请选择要执行的操作",
-    "choices": [
-        {"id": "approve", "label": "确认执行"},
-        {"id": "cancel", "label": "取消"}
-    ]
-}
-```
-
-CLI 目前支持这种结构化选择：`utils/human_input.py` 读取 `choices`，并通过 `utils/cli_menu.py` 的 `select_menu(prompt, options)` 展示；用方向键移动、`Enter` 确认。按 `Esc` 会返回 `{"cancelled": True}` 作为 resume payload，选择成功时返回 `{"choice_id": "<id>"}`。如果 interrupt 不是 `human_choice`，才回退到普通文本输入 `{"text": "..."}`。
-
-#### 结构化 API 与恢复流程
-
-`AgentCore` 暴露结构化方法，让调用方能区分完成和暂停：
-
-| 名称                           | 作用                                                                                                         |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------ |
-| `AgentTurnResult`            | 一轮图执行结果，`status` 为 `completed` 或 `interrupted`，完成时读 `output`，暂停时读 `interrupts` |
-| `run_structured(task)`       | ReAct/任务模式入口，返回`AgentTurnResult`，完成后写 checkpoint + 长期记忆                                  |
-| `chat_structured(message)`   | 普通对话入口，返回`AgentTurnResult`，完成后写 checkpoint，不写长期记忆                                     |
-| `resume_structured(payload)` | 对暂停中的图调用`Command(resume=payload)`，继续同一个 checkpoint 线程                                      |
-
-当前封装要求在同一个 `AgentCore` 实例中恢复，并校验当前 `thread_id` 与产生 interrupt 的线程一致；`resume_structured()` 内部用 `Command(resume=payload)` 和 `self._invoke_config()` 接回对应的 LangGraph checkpoint。若恢复后又遇到新的 `ask_human`，`utils/human_input.py` 会继续循环处理 interrupt，直到 `AgentTurnResult.status == "completed"`。
-
-> 当前 CLI 只负责正在运行进程内的结构化选择与恢复；不要把它理解为重启后的自动 UI 恢复。重启后仍可通过 `thread` 菜单恢复历史对话上下文，但未完成的人工选择界面不会自动重建。
 
 ### 长期记忆触发原理
 
@@ -933,6 +906,209 @@ LLM 决定是否调用工具
 9. 专业任务应优先用 read_skill 读取相关技能指引
 10. 需要人工确认、选择或补充信息时，应调用 ask_human 并提供结构化 choices
 ```
+
+---
+
+## Human-in-the-loop（HITL）
+
+当 Agent 在执行过程中需要**人工确认、二选一、补充信息**才能继续时，会调用本地工具 `ask_human` 触发 LangGraph **interrupt**，让图在工具节点暂停。CLI 收集到结构化选择后，用 `Command(resume=...)` 把答案送回**同一个 checkpoint 线程**继续执行。
+
+> 这不是普通多轮聊天。普通多轮聊天是「用户发一条新消息 → Agent 重新执行一轮」；HITL 是「**同一次 LangGraph 执行**在工具节点暂停 → CLI 收集选择 → 用 `Command(resume)` 恢复同一个图状态」。因此 HITL 不会丢失中间工具调用链，恢复后能直接接着执行后续步骤。
+
+### 执行流程
+
+```
+用户输入任务（react: / 普通对话）
+    ↓
+AgentCore.run_structured() / chat_structured()
+    ↓
+LangGraph invoke() 开始执行
+    ↓
+LLM 决定调用 ask_human 工具
+    ↓
+ask_human 内部调用 langgraph.types.interrupt(payload) → 图暂停
+    ↓
+invoke() 返回 __interrupt__ → AgentTurnResult.status = "interrupted"
+    ↓
+CLI 渲染 interrupt（render_human_interrupt）
+    ↓
+select_menu 展示结构化选项（↑↓ 选择，Enter 确认，Esc 取消）
+    ↓
+收集 resume payload（{"choice_id": "..."} 或 {"cancelled": True}）
+    ↓
+AgentCore.resume_structured(payload) → Command(resume=payload)
+    ↓
+同一 thread_id 的 checkpoint 继续执行
+    ↓
+（若再次遇到 ask_human → 回到「CLI 渲染 interrupt」循环）
+    ↓
+AgentTurnResult.status = "completed" → 输出最终答案
+```
+
+### ask_human 工具
+
+定义在 [utils/human_input.py](utils/human_input.py)，是一个 `StructuredTool`，LLM 把它当作普通工具调用：
+
+| 参数       | 类型             | 说明                         |
+| ---------- | ---------------- | ---------------------------- |
+| `prompt` | `str`          | 展示给用户的提问文本         |
+| `choices`| `list[Choice]` | 结构化选项列表（id + label） |
+
+工具内部不返回普通观察值，而是调用 `langgraph.types.interrupt()` 暂停图执行。**interrupt 的 payload 固定结构**：
+
+```python
+{
+    "kind": "human_choice",
+    "prompt": "请选择要执行的操作",
+    "choices": [
+        {"id": "approve", "label": "确认执行"},
+        {"id": "cancel", "label": "取消"}
+    ]
+}
+```
+
+`ask_human` 的返回值就是 resume 时传入的 payload（如 `{"choice_id": "approve"}`），LLM 在恢复后会读到这个返回值，从而知道用户的选择。
+
+### 结构化 API
+
+`AgentCore` 暴露结构化方法，让调用方能区分「完成」「暂停」「取消」三种状态：
+
+| 名称                           | 作用                                                                                                                  |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------- |
+| `AgentTurnResult`            | 一轮图执行结果，`status` 为 `completed` / `interrupted` / `cancelled`；完成时读 `output`，暂停时读 `interrupts` |
+| `run_structured(task)`       | ReAct/任务模式入口，返回 `AgentTurnResult`，完成后写 checkpoint + 长期记忆                                           |
+| `chat_structured(message)`   | 普通对话入口，返回 `AgentTurnResult`，完成后写 checkpoint，不写长期记忆                                              |
+| `resume_structured(payload)` | 对暂停中的图调用 `Command(resume=payload)`，继续同一个 checkpoint 线程                                               |
+
+`AgentTurnResult` 是 frozen dataclass，三种状态的语义：
+
+| 状态            | 触发条件                             | 后续动作                          |
+| --------------- | ------------------------------------ | --------------------------------- |
+| `completed`   | LLM 生成最终回复，无 interrupt       | 读 `output`，按模式写记忆         |
+| `interrupted` | `ask_human` 触发 interrupt           | 读 `interrupts`，收集答案后 resume |
+| `cancelled`   | 用户在安全护栏确认中拒绝了危险命令   | 读 `output`（取消提示），不 resume |
+
+### CLI 编排
+
+[utils/human_input.py](utils/human_input.py) 提供了一组辅助函数，把「invoke → 渲染 → 收集 → resume」封装成循环：
+
+| 函数                                                  | 作用                                                  |
+| ----------------------------------------------------- | ----------------------------------------------------- |
+| `run_human_input_loop(agent, message, render, read)` | 启动对话并持续恢复 interrupt，直到本轮完成          |
+| `run_structured_until_completion(agent, message)`    | ReAct 模式版本，同上                                 |
+| `chat_until_completion(agent, message)`              | 普通对话模式的默认入口                               |
+| `complete_human_input_turn(turn, render, read)`     | 循环处理 interrupt 直到 `status == "completed"`      |
+| `render_human_interrupt(interrupt)`                  | 把 interrupt payload 渲染成终端提示                  |
+| `read_human_resume(interrupt)`                       | 用 `select_menu` 收集结构化选择，返回 resume payload |
+
+#### 结构化选择的展示与收集
+
+`read_human_resume` 的逻辑：
+
+1. 校验 interrupt 是否为 `human_choice`，否则回退到自由文本输入 `{"text": "..."}`
+2. 从 `choices` 提取 `(label, id)` 对，调用 [utils/cli_menu.py](utils/cli_menu.py) 的 `select_menu(prompt, options)` 展示方向键菜单
+3. 用户 `Enter` 确认 → 返回 `{"choice_id": "<id>"}`
+4. 用户按 `Esc` → 返回 `{"cancelled": True}`（Agent 据此知道用户取消了）
+
+菜单展示效果：
+
+```
+是否删除旧的临时文件?
+  (↑↓ 选择, Enter 确认, Esc 取消)
+  ❯ 删除
+    跳过
+----------------------------------------
+是否删除旧的临时文件? ❯ 删除
+```
+
+### 并行 interrupt 与多轮暂停
+
+LangGraph 支持在同一轮执行中产生**多个并行 interrupt**（例如 LLM 一次调用了两个 `ask_human`）。CLI 必须一次性收集所有答案，并按 `interrupt.id` 映射后用**一次** `Command(resume=...)` 提交：
+
+```python
+# 单 interrupt：直接传值
+resume = {"choice_id": "approve"}
+
+# 并行 interrupt：必须按 interrupt.id 映射
+resume = {
+    interrupt.id: {"choice_id": "approve"}
+    for interrupt in turn.interrupts
+}
+```
+
+`_resume_payload_for_interrupts` 会自动区分这两种情况：单 interrupt 直接传值，多 interrupt 按 `interrupt.id` 映射，避免答案错配。
+
+**多轮暂停**也支持：恢复后若又遇到新的 `ask_human`，`complete_human_input_turn` 会继续循环处理，直到 `status == "completed"`。例如一个图节点里连续两次 `ask_human`，需要两次 resume 才能完成。
+
+### 线程隔离
+
+`resume_structured` 会校验当前 `thread_id` 与产生 interrupt 的线程一致，跨线程恢复会抛 `ValueError`：
+
+```python
+def resume_structured(self, payload):
+    config = self._invoke_config()
+    pending_thread_id = getattr(self, "_pending_interrupt_thread_id", None)
+    current_thread_id = self._thread_id_from_config(config)
+    if pending_thread_id is not None and current_thread_id != pending_thread_id:
+        raise ValueError("Cannot resume interrupt on a different thread")
+    ...
+```
+
+这是为了防止「在会话 A 触发 interrupt 后切到会话 B，再尝试 resume」导致的状态错乱。原会话的暂停状态仍保留在 checkpoint 中，切回原会话后可以继续 resume。
+
+### 与普通多轮聊天、安全护栏的区别
+
+| 机制              | 触发主体                  | 暂停层级              | 恢复方式                       | 中间状态保留           |
+| ----------------- | ------------------------- | --------------------- | ------------------------------ | ---------------------- |
+| **普通多轮聊天** | 用户主动发问              | 无暂停，每轮独立      | 用户发送下一条消息             | 仅靠 checkpoint 历史   |
+| **HITL**        | LLM 调用 `ask_human`    | 图执行暂停（interrupt）| `Command(resume=payload)`     | 保留完整工具调用链     |
+| **安全护栏确认** | 工具执行前拦截            | 工具内部抛异常        | 抛异常，整轮取消，不 resume    | 工具调用被标记为 error |
+
+> 安全护栏的确认（如 `rm` 命令需输入 `y`）与 HITL 是**两套独立机制**：安全护栏在工具执行**前**拦截，拒绝则抛 `UserRejectedCommandError` 让整轮取消（`status="cancelled"`）；HITL 是 LLM **主动**调用 `ask_human` 暂停图，恢复后继续执行。两者不互相调用。
+
+### 代码示例
+
+#### 直接调用结构化 API
+
+```python
+# 启动一轮可能触发 interrupt 的对话
+turn = agent.chat_structured("需要人工选择时请先问我")
+while turn.is_interrupted:
+    if len(turn.interrupts) == 1:
+        # 单 interrupt：直接传 choice_id
+        resume = {"choice_id": "approve"}
+    else:
+        # 并行 interrupt：按 interrupt.id 映射
+        resume = {
+            interrupt.id: {"choice_id": "approve"}
+            for interrupt in turn.interrupts
+        }
+    turn = agent.resume_structured(resume)
+print(turn.output)
+```
+
+#### 使用 CLI 辅助函数
+
+```python
+from utils.human_input import run_structured_until_completion, chat_until_completion
+
+# ReAct 模式（自动循环处理 interrupt 直到完成）
+output = run_structured_until_completion(agent, "react:删除旧文件前先让我确认")
+
+# 普通对话模式
+output = chat_until_completion(agent, "需要人工选择时请先问我")
+```
+
+### 限制与注意事项
+
+| 限制                      | 说明                                                                                                  |
+| ------------------------- | ----------------------------------------------------------------------------------------------------- |
+| **不跨进程恢复**        | CLI 只负责正在运行进程内的结构化选择与恢复；重启后未完成的人工选择界面不会自动重建                  |
+| **重启后可读历史**      | 重启后仍可通过 `thread` 菜单恢复历史对话上下文，但图执行不会自动续接                               |
+| **同一 AgentCore 实例** | `resume_structured` 要求在同一个 `AgentCore` 实例中调用，跨实例恢复不支持                          |
+| **跨线程拒绝**          | `resume_structured` 校验 `thread_id`，跨线程恢复会抛 `ValueError`                                  |
+| **与 cot 无关**         | `cot()` 模式不走 LangGraph，不会触发 interrupt；HITL 仅对 `run_structured`/`chat_structured` 生效 |
+| **测试覆盖**            | [tests/test_human_input.py](tests/test_human_input.py) 覆盖了 interrupt、resume、并行选择、线程隔离等场景 |
 
 ---
 
