@@ -73,7 +73,9 @@ def render_human_interrupt(interrupt):
     value = interrupt.value
     if isinstance(value, dict) and value.get("kind") == "human_choice":
         prompt = str(value.get("prompt") or "需要人工输入")
-        print(f"\n{prompt}")
+        print()
+        for line in prompt.split("\n"):
+            print(line.strip())
 
 
 def read_human_resume(interrupt):
