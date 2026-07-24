@@ -44,11 +44,6 @@ def load_providers(config_file: Optional[str] = None) -> Dict[str, Dict[str, Any
         return {}
 
 
-def list_providers(config_file: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
-    """列出所有支持的提供商(来自配置文件)"""
-    return load_providers(config_file)
-
-
 class LLMClient:
     """统一的大模型调用接口，基于LangChain，支持多提供商"""
 
@@ -261,17 +256,3 @@ class LLMClient:
             else:
                 result.append(HumanMessage(content=content))
         return result
-
-def create_client(
-    provider: str = "zhipu",
-    api_key: Optional[str] = None,
-    model: Optional[str] = None,
-    config_file: Optional[str] = None
-) -> LLMClient:
-    """创建LLM客户端的便捷函数"""
-    return LLMClient(
-        provider=provider,
-        api_key=api_key,
-        model=model,
-        config_file=config_file
-    )
