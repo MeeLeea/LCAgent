@@ -56,5 +56,6 @@ node_modules/
 memory/
 .agents/
 config/*
-!config/*.exp.json
+!config/*.json.example
 docs/
+*.json
