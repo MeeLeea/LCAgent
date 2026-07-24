@@ -3,17 +3,10 @@
 
 依赖 tools/skills.py 的 SkillManager。
 """
-import os
 from langchain_core.tools import tool
 from typing import Dict, Any
 
-from .skills import SkillManager
-
-
-def _default_skills_dir() -> str:
-    """默认技能目录: <项目根>/.agents/skills"""
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base_dir, ".agents", "skills")
+from .skills import SkillManager, default_skills_dir
 
 
 @tool
@@ -34,7 +27,7 @@ def read_skill(skill_name: str = "") -> Dict[str, Any]:
     Returns:
         包含技能内容或可用列表的字典
     """
-    manager = SkillManager(_default_skills_dir())
+    manager = SkillManager(default_skills_dir())
 
     if not skill_name or not skill_name.strip():
         skills = manager.list_skills()

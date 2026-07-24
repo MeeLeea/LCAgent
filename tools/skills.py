@@ -18,6 +18,12 @@ import re
 from typing import Dict, Any, List, Optional
 
 
+def default_skills_dir() -> str:
+    """返回默认技能目录(<项目根>/.agents/skills)的绝对路径"""
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_dir, ".agents", "skills")
+
+
 class SkillManager:
     """本地技能管理器(只读 .agents/skills 目录)"""
 
