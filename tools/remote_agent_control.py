@@ -37,6 +37,8 @@ from typing import Any, Dict, Optional
 import pyautogui
 
 import lark_oapi as lark
+from lark_oapi.api.im.v1.model.create_file_request import CreateFileRequest
+from lark_oapi.api.im.v1.model.create_file_request_body import CreateFileRequestBody
 from lark_oapi.api.im.v1.model.create_image_request import CreateImageRequest
 from lark_oapi.api.im.v1.model.create_image_request_body import CreateImageRequestBody
 from lark_oapi.api.im.v1.model.create_message_request import CreateMessageRequest
@@ -170,6 +172,53 @@ def _send_image_msg(chat_id: str, image_key: str) -> None:
     _http_client.im.v1.message.create(req)
 
 
+def _send_file(chat_id: str, path: str) -> bool:
+    """上传并发送本地文件到飞书。成功返回 True。"""
+    try:
+        if not os.path.isfile(path):
+            _send_text(chat_id, f"❌ 文件不存在: {path}")
+            return False
+        fname = os.path.basename(path)
+        fsize = os.path.getsize(path)
+        if fsize > 100 * 1024 * 1024:  # 飞书限制 100MB
+            _send_text(chat_id, f"❌ 文件过大 ({fsize / 1024 / 1024:.1f}MB)，上限 100MB")
+            return False
+        with open(path, "rb") as f:
+            req = CreateFileRequest.builder() \
+                .request_body(CreateFileRequestBody.builder()
+                              .file_name(fname)
+                              .file_type("stream")
+                              .file(f)
+                              .build()) \
+                .build()
+            resp = _http_client.im.v1.file.create(req)
+        if resp.success():
+            file_key = resp.data.file_key
+            _send_file_msg(chat_id, file_key, fname)
+            return True
+        else:
+            print(f"[文件] 上传失败: {path} → {resp.msg}")
+            _send_text(chat_id, f"❌ 上传失败: {resp.msg}")
+            return False
+    except Exception as e:
+        print(f"[文件] 上传异常: {path} → {e}")
+        _send_text(chat_id, f"❌ 发送失败: {str(e)}")
+        return False
+
+
+def _send_file_msg(chat_id: str, file_key: str, file_name: str) -> None:
+    """发送已上传的文件消息。"""
+    req = CreateMessageRequest.builder() \
+        .receive_id_type("chat_id") \
+        .request_body(CreateMessageRequestBody.builder()
+                      .content(json.dumps({"file_key": file_key}))
+                      .msg_type("file")
+                      .receive_id(chat_id)
+                      .build()) \
+        .build()
+    _http_client.im.v1.message.create(req)
+
+
 # ===================== Agent 生命周期 =====================
 
 
@@ -291,7 +340,7 @@ def get_agent() -> Optional[Any]:
 
 
 def _find_image_paths(text: str) -> list[str]:
-    """从文本中提取图片路径（匹配 .png/.jpg/.jpeg/.gif/.bmp），返回存在的绝对路径。"""
+    """从文本中提取图片路径，返回存在的绝对路径。"""
     import re
 
     IMG_PATTERN = re.compile(
@@ -302,49 +351,55 @@ def _find_image_paths(text: str) -> list[str]:
     found: list[str] = []
     for m in IMG_PATTERN.finditer(text):
         raw = m.group(1)
-        # 解析为绝对路径
         path = os.path.abspath(raw) if not os.path.isabs(raw) else raw
         if path in seen:
             continue
         seen.add(path)
         if os.path.isfile(path):
             found.append(path)
-            if len(found) >= 5:  # 最多发 5 张，防止刷屏
+            if len(found) >= 5:
                 break
     return found
 
 
-def _send_image_file(chat_id: str, path: str) -> bool:
-    """上传本地图片文件并通过飞书发送。成功返回 True。"""
-    try:
-        with open(path, "rb") as f:
-            req = CreateImageRequest.builder() \
-                .request_body(CreateImageRequestBody.builder()
-                              .image_type("message")
-                              .image(f)
-                              .build()) \
-                .build()
-            resp = _http_client.im.v1.image.create(req)
-        if resp.success():
-            _send_image_msg(chat_id, resp.data.image_key)
-            return True
-        else:
-            print(f"[图片] 上传失败: {path} → {resp.msg}")
-            return False
-    except Exception as e:
-        print(f"[图片] 上传异常: {path} → {e}")
-        return False
+def _find_other_files(text: str) -> list[str]:
+    """从文本中提取常见文件路径（非图片），返回存在的绝对路径。"""
+    import re
+
+    DOC_PATTERN = re.compile(
+        r"""(?:['"\s]|^)([\w\-\\\/:.]+\.(?:pdf|docx?|xlsx?|pptx?|\
+            txt|csv|log|json|yaml|yml|py|js|ts|html|css|\
+            zip|rar|7z|tar|gz|exe|msi))(?:['"\s]|$)""",
+        re.IGNORECASE | re.VERBOSE,
+    )
+    seen = set()
+    found: list[str] = []
+    for m in DOC_PATTERN.finditer(text):
+        raw = m.group(1)
+        path = os.path.abspath(raw) if not os.path.isabs(raw) else raw
+        if path in seen:
+            continue
+        seen.add(path)
+        if os.path.isfile(path):
+            found.append(path)
+            if len(found) >= 5:
+                break
+    return found
 
 
-def _send_images_from_output(chat_id: str, text: str) -> int:
-    """扫描输出文本中的图片路径并发送。返回成功发送的图片数量。"""
-    paths = _find_image_paths(text)
+def _send_files_from_output(chat_id: str, text: str) -> int:
+    """扫描输出文本中的图片和文件路径，自动发送。返回成功数量。"""
     sent = 0
-    for p in paths:
+    # 图片：用图片 API（更好的预览体验）
+    for p in _find_image_paths(text):
         if _send_image_file(chat_id, p):
             sent += 1
+    # 其他文件：用文件 API
+    for p in _find_other_files(text):
+        if _send_file(chat_id, p):
+            sent += 1
     if sent > 0:
-        print(f"[图片] 已发送 {sent} 张图片")
+        print(f"[文件] 已发送 {sent} 个文件")
     return sent
 
 
@@ -364,7 +419,7 @@ def _handle_run(chat_id: str, task: str) -> None:
         if len(output) > 4000:
             output = output[:4000] + "\n\n...(输出过长已截断)"
         _send_text(chat_id, f"✅ 任务完成\n\n{output}")
-        _send_images_from_output(chat_id, turn.output or "")
+        _send_files_from_output(chat_id, turn.output or "")
     elif turn.is_interrupted:
         _send_text(chat_id, "⏸️ 任务被中断，需人工输入，请在本机 CLI 处理。")
     elif turn.status == "cancelled":
@@ -387,7 +442,7 @@ def _handle_chat(chat_id: str, message: str) -> None:
         if len(output) > 4000:
             output = output[:4000] + "\n\n...(回复过长已截断)"
         _send_text(chat_id, output)
-        _send_images_from_output(chat_id, turn.output or "")
+        _send_files_from_output(chat_id, turn.output or "")
     elif turn.is_interrupted:
         _send_text(chat_id, "⏸️ Agent 需人工输入，请在本机 CLI 继续。")
     elif turn.status == "cancelled":
@@ -443,15 +498,11 @@ def _handle_help(chat_id: str) -> None:
         "  chat <消息> - 与 Agent 对话\n\n"
         "【系统控制】\n"
         "  截图       - 获取本机桌面截图\n"
+        "  文件 <路径> - 发送本地文件\n"
         "  cmd <命令> - 执行 CMD 命令\n"
         "  ps <命令>  - 执行 PowerShell 命令\n"
         "  帮助       - 显示此帮助"
     )) 
-
-
-
-
-
 
 
 # 模型菜单缓存：chat_id → [(provider_key, model_name), ...]
@@ -642,6 +693,16 @@ def _dispatch(chat_id: str, content: str) -> None:
     if low in ("截图", "screenshot", "snap"):
         _send_text(chat_id, "📸 正在截图...")
         _send_screenshot(chat_id)
+        return
+    if low.startswith("文件 ") or low.startswith("文件\n"):
+        file_path = content[3:].strip()
+        _send_text(chat_id, "📎 正在发送文件...")
+        _send_file(chat_id, file_path)
+        return
+    if low.startswith("file "):
+        file_path = content[5:].strip()
+        _send_text(chat_id, "📎 正在发送文件...")
+        _send_file(chat_id, file_path)
         return
     if low.startswith("cmd "):
         cmd = content[4:].strip()
