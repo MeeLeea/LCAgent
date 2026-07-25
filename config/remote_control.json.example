@@ -1,0 +1,11 @@
+{
+  "_comment": "飞书远程控制机器人配置文件 —— 将本文件复制为 remote_control.json 并填入真实值",
+  "feishu": {
+    "app_id": "cli_xxxxxx",
+    "app_secret": "xxxxxxxxxxxxxx",
+    "allow_open_id": ["ou_xxxxxxxxxxxx"]
+  },
+  "agent": {
+    "provider": ""
+  }
+}
