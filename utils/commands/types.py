@@ -20,6 +20,13 @@ class LlmLike(Protocol):
 
     def switch_model(self, model: str) -> None: ...
 
+    def chat(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> str: ...
+
     def extract_json(self, value: str) -> dict[str, JsonValue] | None: ...
 
 
