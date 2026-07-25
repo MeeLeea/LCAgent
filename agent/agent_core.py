@@ -15,7 +15,7 @@ from llm_client import LLMClient
 from .memory import AgentMemory
 from tools import all_tools as local_tools
 from tools.mcp_loader import load_mcp_tools, DEFAULT_CONFIG_FILE
-from tools.skills import SkillManager
+from tools.skills import SkillManager, default_skills_dir
 from tools.terminal_tools import UserRejectedCommandError
 
 
@@ -110,8 +110,7 @@ class AgentCore:
 
         # 技能阅读(本地 .agents/skills)
         if skills_dir is None:
-            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            skills_dir = os.path.join(base_dir, ".agents", "skills")
+            skills_dir = default_skills_dir()
         self.skill_manager = SkillManager(skills_dir)
         self.active_skills: set = set()      # 由 CLI (skill:<name>) 手动加载
         self.auto_match_skills = auto_match_skills  # 任务开始时自动匹配注入
@@ -439,28 +438,22 @@ class AgentCore:
         except RuntimeError as e:
             if "interrupt" in str(e):
                 raise
-            history = self.memory.get_short_term()
-            self.memory.add("user", message)
-            response = self.llm.chat_with_history(
-                user_input=message,
-                history=history,
-                system_prompt="你是一个有帮助的AI助手，请用中文回答。"
-            )
-            self.memory.add("assistant", response)
-            return response
         except Exception as e:
             if e.__class__.__name__ in {"GraphInterrupt", "NodeInterrupt"}:
                 raise
-            # 兜底：Agent 执行失败时降级为纯 LLM 对话
-            history = self.memory.get_short_term()
-            self.memory.add("user", message)
-            response = self.llm.chat_with_history(
-                user_input=message,
-                history=history,
-                system_prompt="你是一个有帮助的AI助手，请用中文回答。"
-            )
-            self.memory.add("assistant", response)
-            return response
+        return self._fallback_chat(message)
+
+    def _fallback_chat(self, message: str) -> str:
+        """Agent 执行失败时降级为纯 LLM 对话"""
+        history = self.memory.get_short_term()
+        self.memory.add("user", message)
+        response = self.llm.chat_with_history(
+            user_input=message,
+            history=history,
+            system_prompt="你是一个有帮助的AI助手，请用中文回答。"
+        )
+        self.memory.add("assistant", response)
+        return response
 
     def cot(self, task: str) -> str:
         """
@@ -599,6 +592,16 @@ class AgentCore:
                 f"{self.memory.thread_id} (原 {old_tid})"
             )
 
+    def _summarize_text(self, text: str, prompt: str) -> str:
+        """将文本发送给 LLM 生成摘要(失败返回空字符串)"""
+        try:
+            return self.llm.chat([
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": text},
+            ]).strip()
+        except Exception:
+            return ""
+
     def _summarize_messages(self, msgs: List[BaseMessage]) -> str:
         """将一批消息摘要为中文要点(失败返回空字符串)"""
         lines = []
@@ -624,15 +627,10 @@ class AgentCore:
             "请将以下对话历史压缩成一份简洁的中文摘要,保留关键决策、用户意图与事实,"
             "按主题分条列出,不要添加推测内容:"
         )
-        try:
-            return self.llm.chat([
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": "\n".join(lines)},
-            ]).strip()
-        except Exception as e:
-            if self.verbose:
-                print(f"[上下文摘要生成失败,跳过裁剪] {e}")
-            return ""
+        summary = self._summarize_text("\n".join(lines), prompt)
+        if not summary and self.verbose:
+            print("[上下文摘要生成失败,跳过裁剪]")
+        return summary
 
     def get_available_tools(self) -> List[str]:
         """获取可用工具名称列表"""
@@ -688,7 +686,7 @@ class AgentCore:
 
         history_text = "\n\n".join(history_lines)
 
-        # 2. 构建 LLM 请求
+        # 2. 调用 LLM 生成摘要
         system_prompt = (
             "你是一个记忆压缩助手。请将以下历史对话记录压缩成一份简洁的摘要，要求：\n"
             "1. 保留所有关键信息、用户意图、重要决策和事实\n"
@@ -697,19 +695,14 @@ class AgentCore:
             "4. 保持事实准确，不要添加推测内容\n"
             "5. 用中文输出"
         )
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"以下是历史对话记录，请压缩成摘要:\n\n{history_text}"}
-        ]
-
-        # 3. 调用 LLM 生成摘要
-        try:
-            summary = self.llm.chat(messages)
-        except Exception as e:
+        summary = self._summarize_text(
+            f"以下是历史对话记录，请压缩成摘要:\n\n{history_text}",
+            system_prompt,
+        )
+        if not summary:
             return {
                 "success": False,
-                "error": f"LLM 调用失败: {e}"
+                "error": "LLM 调用失败或返回空摘要"
             }
 
         # 4. 用摘要替换原长期记忆

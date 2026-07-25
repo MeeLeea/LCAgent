@@ -6,9 +6,14 @@ from __future__ import annotations
 
 import os
 
+try:
+    import readline
+except ImportError:
+    pass
+
 from agent import AgentCore
 from config import load_agent_config, resolve_path
-from llm_client import list_providers
+from llm_client import load_providers as list_providers
 from tools import safety as safety_module
 from utils.cli_menu import select_menu
 from utils.commands import CommandContext, dispatch_command
@@ -20,13 +25,14 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LLM_FILE = os.path.join(BASE_DIR, "config", "llm_config.json")
 MCP_CONFIG_FILE = os.path.join(BASE_DIR, "config", "mcp_servers.json")
 AGENT_CONFIG_FILE = os.path.join(BASE_DIR, "config", "agent_config.json")
-MEMORY_FILE = os.path.join(BASE_DIR, "data", "memory.json")
-CHECKPOINT_FILE = os.path.join(BASE_DIR, "data", "checkpoints.sqlite")
+MEMORY_FILE = os.path.join(BASE_DIR, "memory", "memory.json")
+CHECKPOINT_FILE = os.path.join(BASE_DIR, "memory", "checkpoints.sqlite")
 
 
 def render_print(value: str = "") -> None:
     """输出命令处理器已经渲染好的文本。"""
-    print(value)
+    for line in str(value).split("\n"):
+        print(line.strip())
 
 
 def build_agent(provider: str) -> tuple[AgentCore, object]:

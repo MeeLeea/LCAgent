@@ -237,10 +237,6 @@ class AgentMemory:
         header = f"# 对话导出 - {target}\n\n" if fmt == "markdown" else f"对话导出 - {target}\n{'='*40}\n"
         return header + sep.join(blocks)
 
-    def get_langchain_messages(self) -> List[BaseMessage]:
-        """兼容旧 API:等同于 get_messages()"""
-        return self.get_messages()
-
     def get_short_term(self, limit: Optional[int] = None) -> List[Dict[str, str]]:
         """兼容旧 API:从 checkpoint 取消息转为 dict 格式"""
         msgs = self.get_messages()
@@ -257,12 +253,6 @@ class AgentMemory:
                 role = "system"
             result.append({"role": role, "content": m.content})
         return result
-
-    def get_all_context(self, long_term_limit: int = 3) -> List[Dict[str, str]]:
-        """兼容旧 API:长期记忆 + 短期记忆"""
-        context = self.get_long_term(long_term_limit)
-        context.extend(self.get_short_term())
-        return context
 
     # ============ 长期记忆(用于 compress) ============
 

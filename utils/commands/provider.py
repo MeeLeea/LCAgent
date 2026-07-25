@@ -10,9 +10,9 @@ from .types import CommandContext, CommandOutcome, HANDLED, LlmLike
 
 
 def select_provider(config_file: str, select_menu) -> str:
-    from llm_client import list_providers
+    from llm_client import load_providers
 
-    providers = list_providers(config_file)
+    providers = load_providers(config_file)
     # 环境变量和本地配置文件任一提供密钥，都应在菜单中标记为已配置。
     configured_keys = _configured_provider_keys(config_file, providers)
     options = []
@@ -27,10 +27,10 @@ def select_provider(config_file: str, select_menu) -> str:
 
 
 def create_llm(provider: str, config_file: str) -> LlmLike:
-    from llm_client import create_client
+    from llm_client import LLMClient
 
     try:
-        return create_client(provider=provider, config_file=config_file)
+        return LLMClient(provider=provider, config_file=config_file)
     except ValueError as error:
         print(f"\n错误: {error}")
         sys.exit(1)
