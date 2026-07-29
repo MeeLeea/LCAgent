@@ -308,7 +308,7 @@ class AgentCore:
             )
 
     def run_structured(self, task: str) -> AgentTurnResult:
-        self._maybe_compact()
+        self._compact_if_needed()
         config = self._invoke_config()
         input_msg = HumanMessage(content=task)
         self.agent_executor = self._create_agent_executor(
@@ -334,7 +334,7 @@ class AgentCore:
         return turn
 
     def chat_structured(self, message: str) -> AgentTurnResult:
-        self._maybe_compact()
+        self._compact_if_needed()
         config = self._invoke_config()
         original_verbose = self.verbose
         self.verbose = False
@@ -551,86 +551,56 @@ class AgentCore:
 
     # ============ 长上下文裁剪 ============
 
-    def _maybe_compact(self):
-        """
-        长上下文裁剪: 当当前会话消息数超过 max_context_messages 时,
-        将较早的消息用 LLM 摘要,开启新会话并把摘要注入后续 system prompt,
-        从而避免撞上 LLM 上下文窗口。
-
-        阈值 max_context_messages <= 0 时关闭(默认)。
-        """
-        if not self.max_context_messages or self.max_context_messages <= 0:
-            return
-        msgs = self.memory.get_messages()
-        if len(msgs) <= self.max_context_messages:
-            return
-
-        keep = min(self.context_trim_keep, max(len(msgs) - 1, 0))
-        old = msgs[:-keep] if keep > 0 else msgs
-        retained = msgs[-keep:] if keep > 0 else []
-        summary = self._summarize_messages(old)
-        if not summary:
-            return
-
-        # 开启新会话,把历史摘要注入 system prompt(保留上下文精华)
-        old_tid = self.memory.thread_id
-        self.memory.new_thread()
-        self.compaction_summary = summary
-        # 重建 Agent,使新 prompt 包含摘要
-        self.agent_executor = self._create_agent_executor(
-            self._compute_skill_block("")
-        )
-        if retained:
-            # 摘要只覆盖旧消息；最近消息原样写入新线程，避免裁剪后丢失上下文。
-            self.agent_executor.update_state(
-                self.memory.get_config(),
-                {"messages": retained},
+    def _compact_if_needed(self):
+        """调用 memory.maybe_compact 执行上下文裁剪(阈值 <= 0 时自动跳过)。"""
+        def _summarize_messages(msgs: List[BaseMessage]) -> str:
+            lines = []
+            for m in msgs:
+                if isinstance(m, HumanMessage):
+                    role = "user"
+                elif isinstance(m, AIMessage):
+                    role = "assistant"
+                elif isinstance(m, SystemMessage):
+                    role = "system"
+                else:
+                    role = "tool"
+                content = getattr(m, "content", "")
+                if isinstance(content, list):
+                    content = " ".join(str(x) for x in content)
+                text = str(content).strip()
+                if text:
+                    lines.append(f"{role}: {text}")
+            if not lines:
+                return ""
+            prompt = (
+                "请将以下对话历史压缩成一份简洁的中文摘要,保留关键决策、用户意图与事实,"
+                "按主题分条列出,不要添加推测内容:"
             )
-        if self.verbose:
-            print(
-                f"\n[上下文裁剪] 会话过长({len(msgs)} 条),已自动摘要历史并开启新会话: "
-                f"{self.memory.thread_id} (原 {old_tid})"
+            try:
+                summary = self.llm.chat([
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": "\n".join(lines)},
+                ]).strip()
+            except Exception:
+                summary = ""
+            if not summary and self.verbose:
+                print("[上下文摘要生成失败,跳过裁剪]")
+            return summary
+
+        def _recreate(summary: str):
+            self.compaction_summary = summary
+            self.agent_executor = self._create_agent_executor(
+                self._compute_skill_block("")
             )
+            return self.agent_executor
 
-    def _summarize_text(self, text: str, prompt: str) -> str:
-        """将文本发送给 LLM 生成摘要(失败返回空字符串)"""
-        try:
-            return self.llm.chat([
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": text},
-            ]).strip()
-        except Exception:
-            return ""
-
-    def _summarize_messages(self, msgs: List[BaseMessage]) -> str:
-        """将一批消息摘要为中文要点(失败返回空字符串)"""
-        lines = []
-        for m in msgs:
-            if isinstance(m, HumanMessage):
-                role = "user"
-            elif isinstance(m, AIMessage):
-                role = "assistant"
-            elif isinstance(m, SystemMessage):
-                role = "system"
-            else:
-                role = "tool"
-            content = getattr(m, "content", "")
-            if isinstance(content, list):
-                content = " ".join(str(x) for x in content)
-            text = str(content).strip()
-            if text:
-                lines.append(f"{role}: {text}")
-        if not lines:
-            return ""
-
-        prompt = (
-            "请将以下对话历史压缩成一份简洁的中文摘要,保留关键决策、用户意图与事实,"
-            "按主题分条列出,不要添加推测内容:"
+        self.memory.maybe_compact(
+            max_context_messages=self.max_context_messages,
+            context_trim_keep=self.context_trim_keep,
+            summarize_callback=_summarize_messages,
+            recreate_agent_callback=_recreate,
+            verbose=self.verbose,
         )
-        summary = self._summarize_text("\n".join(lines), prompt)
-        if not summary and self.verbose:
-            print("[上下文摘要生成失败,跳过裁剪]")
-        return summary
 
     def get_available_tools(self) -> List[str]:
         """获取可用工具名称列表"""
@@ -650,85 +620,14 @@ class AgentCore:
         return self.memory.summarize()
 
     def compress_memory(self) -> Dict[str, Any]:
-        """
-        压缩长期记忆
+        """压缩长期记忆: 委托给 memory.compress_memory,用 LLM 生成摘要。"""
+        def _summarize_text(text: str, prompt: str) -> str:
+            try:
+                return self.llm.chat([
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": text},
+                ]).strip()
+            except Exception:
+                return ""
 
-        将 memory.json 中所有长期记忆发送给 LLM，生成摘要后替换原内容。
-        这样可以在保留关键信息的同时大幅减少 token 占用。
-
-        Returns:
-            {
-                "success": bool,
-                "original_count": int,      # 原记忆条数
-                "original_chars": int,      # 原字符数
-                "compressed_chars": int,    # 压缩后字符数
-                "summary": str,             # 摘要内容
-                "error": str (失败时)
-            }
-        """
-        from datetime import datetime
-
-        if not self.memory.long_term_memory:
-            return {
-                "success": False,
-                "error": "没有长期记忆可压缩"
-            }
-
-        # 1. 拼接所有长期记忆为文本
-        history_lines = []
-        original_chars = 0
-        for idx, item in enumerate(self.memory.long_term_memory, 1):
-            role = item.get("role", "unknown")
-            content = item.get("content", "")
-            ts = item.get("timestamp", "")
-            history_lines.append(f"[{idx}] ({ts}) {role}: {content}")
-            original_chars += len(content)
-
-        history_text = "\n\n".join(history_lines)
-
-        # 2. 调用 LLM 生成摘要
-        system_prompt = (
-            "你是一个记忆压缩助手。请将以下历史对话记录压缩成一份简洁的摘要，要求：\n"
-            "1. 保留所有关键信息、用户意图、重要决策和事实\n"
-            "2. 去除重复和冗余内容\n"
-            "3. 按主题分条目组织，使用 '- ' 开头\n"
-            "4. 保持事实准确，不要添加推测内容\n"
-            "5. 用中文输出"
-        )
-        summary = self._summarize_text(
-            f"以下是历史对话记录，请压缩成摘要:\n\n{history_text}",
-            system_prompt,
-        )
-        if not summary:
-            return {
-                "success": False,
-                "error": "LLM 调用失败或返回空摘要"
-            }
-
-        # 4. 用摘要替换原长期记忆
-        original_count = len(self.memory.long_term_memory)
-        compressed_chars = len(summary)
-
-        self.memory.long_term_memory = [{
-            "role": "system",
-            "content": f"[历史记忆摘要 {datetime.now().isoformat()}]\n{summary}",
-            "timestamp": datetime.now().isoformat(),
-            "metadata": {
-                "important": True,
-                "type": "summary",
-                "original_count": original_count,
-                "original_chars": original_chars,
-                "compressed_chars": compressed_chars
-            }
-        }]
-
-        # 5. 保存回 memory.json
-        self.memory._save_long_term_memory()
-
-        return {
-            "success": True,
-            "original_count": original_count,
-            "original_chars": original_chars,
-            "compressed_chars": compressed_chars,
-            "summary": summary
-        }
+        return self.memory.compress_memory(_summarize_text)
