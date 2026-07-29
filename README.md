@@ -36,8 +36,10 @@
   - [MCP 工具](#2-mcp-工具mcp-server-tools)
   - [技能阅读 Skills](#3-技能阅读skills)
   - [安全护栏 Safety](#4-安全护栏safety)
+  - [扩展工具](#5-扩展工具)
   - [工具调用机制](#工具调用机制)
   - [System Prompt 强化](#system-prompt-强化)
+- [定时任务调度（Scheduler）](#定时任务调度scheduler)
 - [Human-in-the-loop（HITL）](#human-in-the-loophitl)
   - [执行流程](#执行流程)
   - [ask_human 工具](#ask_human-工具)
@@ -50,9 +52,22 @@
   - [限制与注意事项](#限制与注意事项)
 - [交互命令参考](#交互命令参考)
 - [运行示例](#运行示例)
+  - [启动与基础对话](#1-启动与基础对话)
+  - [三种执行模式](#2-三种执行模式)
+  - [模型与状态管理](#3-模型与状态管理)
+  - [会话管理](#4-会话管理)
+  - [Human-in-the-loop](#5-human-in-the-loophitl)
+  - [对话导出](#6-对话导出)
+  - [JSON 模式](#7-json-模式)
+  - [MCP 管理](#8-mcp-管理)
 - [代码使用示例](#代码使用示例)
-- [扩展工具](#扩展工具)
-- [运行时配置（agent_config.json）](#运行时配置agent_configjson)
+- [运行时配置](#运行时配置)
+  - [agent_config.json — Agent 运行时参数](#1-agent_configjson--agent-运行时参数)
+  - [llm_config.json — LLM 服务商配置](#2-llm_configjson--llm-服务商配置)
+  - [mcp_servers.json — MCP 服务器配置](#3-mcp_serversjson--mcp-服务器配置)
+  - [safety.json — 安全护栏](#4-safetyjson--安全护栏)
+  - [remote_control.json — 远程控制（飞书）](#5-remote_controljson--远程控制飞书)
+  - [scheduler_config.json — 定时任务调度](#6-scheduler_configjson--定时任务调度)
 - [测试](#测试)
 - [技术栈](#技术栈)
 
@@ -82,13 +97,14 @@ pip install -r requirements.txt
 
 ### 3. 准备配置文件
 
-项目克隆后 `config/` 目录下只有 `.exp.json` 模板，需手动复制为运行时配置：
+项目克隆后 `config/` 目录下只有 `.example` 模板（不含真实密钥），需手动复制为运行时配置：
 
 ```bash
-cp config/agent_config.exp.json   config/agent_config.json
-cp config/llm_config.exp.json     config/llm_config.json
-cp config/mcp_servers.exp.json    config/mcp_servers.json
-cp config/safety.exp.json         config/safety.json
+cp config/agent_config.json.example   config/agent_config.json
+cp config/llm_config.json.example     config/llm_config.json
+cp config/mcp_servers.json.example    config/mcp_servers.json
+cp config/safety.json.example         config/safety.json
+cp config/scheduler_config.json.example config/scheduler_config.json
 ```
 
 ### 4. 配置 API 密钥
@@ -140,21 +156,26 @@ python main.py
 LangChainAgent/
 ├── main.py                  # 入口文件，交互式命令行
 ├── llm_client.py            # 统一大模型封装（多提供商 + 多模型）
-├── config/                  # 配置目录（需从 *.exp.json 复制；见快速开始）
-│   ├── llm_config.json      # API密钥配置文件
-│   ├── agent_config.json    # 运行时配置(迭代上限/技能目录/长上下文裁剪等)
-│   ├── mcp_servers.json     # MCP Server 配置(已预置 workspace 本地服务器,enabled)
-│   └── safety.json          # 安全护栏配置（运行时按需生成）
-├── requirements.txt         # 运行依赖(含开发/测试依赖 pytest)
-├── pytest.ini               # pytest 配置
-├── .agents/skills/          # 本地技能目录（每个子目录一个 SKILL.md）
-├── data/
-│   ├── checkpoints.sqlite   # Checkpoint 持久化数据库（运行时自动生成）
-│   └── memory.json          # 长期记忆文件（用于 compress 摘要）
+├── config/                  # 配置目录（需从 .example 复制；见快速开始）
+│   ├── llm_config.json      # API 密钥配置文件
+│   ├── agent_config.json    # Agent 运行时参数
+│   ├── mcp_servers.json     # MCP Server 配置
+│   ├── safety.json          # 安全护栏策略
+│   ├── remote_control.json  # 远程控制（飞书）配置
+│   └── scheduler_config.json# 定时任务调度配置
+├── scheduler/               # 定时任务调度模块
+│   ├── store.py             # SQLite CRUD + 原子抢占
+│   ├── executor.py          # AgentCore.run() 执行桥接
+│   ├── engine.py            # APScheduler 引擎
+│   └── run.py               # 独立进程入口
+├── memory/                  # 运行时数据库目录（自动生成）
+│   ├── checkpoints.sqlite   # Checkpoint 持久化数据库
+│   ├── memory.json          # 长期记忆文件（用于 compress 摘要）
+│   └── scheduled_tasks.sqlite# 定时任务数据库
 ├── agent/
 │   ├── __init__.py
-│   ├── memory.py            # 记忆模块（Checkpoint + 长期记忆）
-│   └── agent_core.py        # Agent核心调度
+│   ├── memory.py            # AgentMemory：checkpoint + 长期记忆 + 会话管理
+│   └── agent_core.py        # Agent 核心调度：run/chat/cot 三种模式 + HITL
 ├── tools/
 │   ├── __init__.py          # 本地工具注册
 │   ├── search.py            # 联网搜索工具(Tavily API)
@@ -167,7 +188,8 @@ LangChainAgent/
 │   ├── skill_tool.py        # read_skill 工具（LLM 自助读取技能指引）
 │   ├── safety.py            # 安全护栏(黑名单/白名单/交互确认/路径保护)
 │   ├── mcp_loader.py        # MCP 工具加载器
-│   └── workspace_tool.py    # 工作目录管理 MCP Server
+│   ├── workspace_tool.py    # 工作目录管理 MCP Server
+│   └── scheduler_tool.py    # 定时任务工具（schedule_task/list/cancel/delete/cleanup）
 ├── utils/
 │   ├── __init__.py
 │   ├── cli_menu.py          # 通用终端方向键选择菜单
@@ -190,9 +212,17 @@ LangChainAgent/
 │   ├── test_skills.py
 │   ├── test_search.py
 │   ├── test_terminal.py
-│   └── test_memory.py
+│   ├── test_memory.py
+│   ├── test_cli_commands.py
+│   ├── test_human_input.py
+│   ├── test_scheduler.py
+│   ├── test_agent_core_regressions.py
+│   ├── test_config_templates.py
+│   ├── test_calculator.py
+│   ├── test_provider_models.py
+│   └── test_workspace_tool_path_protection.py
 ├── config.py                # 运行时配置加载(config/agent_config.json)
-└── exports/                 # 对话导出目录(运行 export 时生成)
+└── exports/                 # 对话导出目录(运行 export 命令时生成)
 ```
 
 ### 模块职责
@@ -212,6 +242,7 @@ LangChainAgent/
 | [utils/commands/dispatcher.py](utils/commands/dispatcher.py) | 按兼容顺序匹配命令并路由到领域处理器                                                                                        |
 | [utils/commands/types.py](utils/commands/types.py)           | 命令依赖上下文、活动 LLM 状态和分发结果类型                                                                                 |
 | [utils/commands/](utils/commands/)                           | 会话、记忆、模型、MCP、技能、安全及 Agent 执行命令                                                                          |
+| [scheduler/](scheduler/)                                     | 定时任务调度：TaskStore（SQLite CRUD）、SchedulerEngine（APScheduler 轮询）、独立进程入口                                   |
 
 ### llm_client.py 主要 API
 
@@ -236,7 +267,7 @@ LangChainAgent/
 | `zhipu`    | 智谱AI          | `ZHIPU_API_KEY`     | `glm-4.7-flash`       |
 | `qwen`     | 通义千问        | `DASHSCOPE_API_KEY` | `Qwen2.5-7B-Instruct` |
 | `deepseek` | DeepSeek        | `DEEPSEEK_API_KEY`  | `deepseek-chat`       |
-| `kimi`     | Kimi (Moonshot) | `MOONSHOT_API_KEY`  | `moonshot-v1-8k`      |
+| `kimi`     | Kimi (Moonshot) | `MOONSHOT_API_KEY`  | `kimi-k3`             |
 | `yunwu`    | 云雾            | `YUNWU_API_KEY`     | `gpt-5.5`             |
 
 ---
@@ -353,8 +384,8 @@ self.agent_executor = self._create_agent_executor(
 
 | 类型                 | 存储方式                             | 触发时机                   | 保存内容                           | 持久化  | 用途                              |
 | -------------------- | ------------------------------------ | -------------------------- | ---------------------------------- | ------- | --------------------------------- |
-| **Checkpoint** | `data/checkpoints.sqlite` (SQLite) | Agent 每步执行后自动       | 完整状态(消息+工具调用链+中间变量) | ✅ 永久 | 程序重启恢复对话、多会话隔离      |
-| **长期记忆**   | `data/memory.json` (JSON)          | 手动标记`important=True` | 仅 react/cot 的最终结果            | ✅ 永久 | 跨会话保留关键决策、用于 compress |
+| **Checkpoint** | `memory/checkpoints.sqlite` (SQLite) | Agent 每步执行后自动       | 完整状态(消息+工具调用链+中间变量) | ✅ 永久 | 程序重启恢复对话、多会话隔离      |
+| **长期记忆**   | `memory/memory.json` (JSON)          | 手动标记`important=True` | 仅 react/cot 的最终结果            | ✅ 永久 | 跨会话保留关键决策、用于 compress |
 
 ### 三种模式的记忆行为
 
@@ -438,14 +469,14 @@ self.memory.add("assistant", output)  # ← 无 important,不写 memory.json
 
 ```python
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CHECKPOINT_FILE = os.path.join(BASE_DIR, "data", "checkpoints.sqlite")  # Checkpoint 数据库
-MEMORY_FILE = os.path.join(BASE_DIR, "data", "memory.json")            # 长期记忆
+CHECKPOINT_FILE = os.path.join(BASE_DIR, "memory", "checkpoints.sqlite")  # Checkpoint 数据库
+MEMORY_FILE = os.path.join(BASE_DIR, "memory", "memory.json")            # 长期记忆
 ```
 
 | 文件                        | 格式      | 内容                                |
 | --------------------------- | --------- | ----------------------------------- |
-| `data/checkpoints.sqlite` | SQLite    | Agent 执行状态(按 thread_id 隔离)   |
-| `data/memory.json`        | JSON 数组 | react/cot 的最终结果(用于 compress) |
+| `memory/checkpoints.sqlite` | SQLite    | Agent 执行状态(按 thread_id 隔离)   |
+| `memory/memory.json`        | JSON 数组 | react/cot 的最终结果(用于 compress) |
 
 `memory.json` 文件格式：
 
@@ -466,7 +497,7 @@ MEMORY_FILE = os.path.join(BASE_DIR, "data", "memory.json")            # 长期�
 ]
 ```
 
-> 两个文件都会**自动创建父目录**，无需手动建 `data/` 文件夹。
+> 两个文件都会**自动创建父目录**，无需手动建 `memory/` 文件夹。
 >
 > **查看 checkpoints.sqlite**：可用 [DB Browser for SQLite](https://sqlitebrowser.org/dl/) 打开，或让 Agent 调用 `open_sqlite` 工具自动打开。
 
@@ -537,7 +568,7 @@ API地址:    https://api.deepseek.com
 
 --- 记忆状态 ---
 当前会话:   thread-a4d099d2
-Checkpoint: sqlite → D:\work\LangChainAgent\data\checkpoints.sqlite
+Checkpoint: sqlite → D:\work\LangChainAgent\memory\checkpoints.sqlite
 已存消息:   8 条
 长期记忆:   5 条
 总会话数:   2
@@ -907,6 +938,183 @@ LLM 决定是否调用工具
 10. 需要人工确认、选择或补充信息时，应调用 ask_human 并提供结构化 choices
 ```
 
+### 5. 扩展工具
+
+#### 方式 1：添加本地工具
+
+在 `tools/` 目录新建文件，使用 `@tool` 装饰器定义工具：
+
+```python
+# tools/my_tool.py
+from langchain_core.tools import tool
+
+@tool
+def my_tool(param: str) -> str:
+    """工具描述（Agent会读取这个docstring来理解工具用途）"""
+    return f"处理结果: {param}"
+```
+
+在 [tools/__init__.py](tools/__init__.py) 中导入并添加到 `all_tools`：
+
+```python
+from .my_tool import my_tool
+all_tools = [search, read_file, write_file, calculate, my_tool]
+```
+
+重启后 Agent 即可自动调用新工具。
+
+#### 方式 2：添加 MCP Server
+
+**A. 使用现有 MCP Server**（如官方提供的）：
+
+在交互界面输入：
+
+```
+mcp:add fetch npx -y @modelcontextprotocol/server-fetch
+```
+
+或直接编辑 [config/mcp_servers.json](config/mcp_servers.json)：
+
+```json
+{
+    "servers": {
+        "fetch": {
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-fetch"],
+            "enabled": true
+        }
+    }
+}
+```
+
+然后输入 `mcp:reload` 热加载。
+
+**B. 自定义 MCP Server**（Python + FastMCP）：
+
+```python
+# tools/my_server.py
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("my-server")
+
+@mcp.tool()
+def my_tool(param: str) -> dict:
+    """工具描述"""
+    return {"result": param}
+
+if __name__ == "__main__":
+    mcp.run()
+```
+
+注册到 `config/mcp_servers.json`：
+
+```json
+{
+    "servers": {
+        "myserver": {
+            "transport": "stdio",
+            "command": "python",
+            "args": ["tools/my_server.py"],
+            "enabled": true
+        }
+    }
+}
+```
+
+运行 `mcp:reload` 即可加载。
+
+#### 本地工具 vs MCP 工具对比
+
+| 特性       | 本地工具          | MCP 工具                      |
+| ---------- | ----------------- | ----------------------------- |
+| 定义方式   | `@tool` 装饰器  | `@mcp.tool()` + FastMCP     |
+| 运行位置   | Agent 同进程      | 独立子进程                    |
+| 加载方式   | import 后直接使用 | 通过 MCP 协议动态加载         |
+| 增删       | 需改代码 + 重启   | 改配置 +`mcp:reload` 热加载 |
+| 跨语言支持 | 仅 Python         | 任意语言（Node/Go 等）        |
+| 适用场景   | 简单、轻量工具    | 复杂服务、第三方集成          |
+
+---
+
+## 定时任务调度（Scheduler）
+
+让 Agent 能"定闹钟"——用户说"明天下午3点生成报告"或"每天9点发送日报"，Agent 登记任务后直接回复，后台调度器在时间到达时自动唤起 Agent 执行。
+
+核心思路是**拆分逻辑 A（对话理解）与逻辑 B（时间调度）**，通过 SQLite 解耦：
+
+```
+对话阶段（Agent 进程）                   后台调度（独立进程）
+──────────────────                      ──────────────────
+用户："明天下午3点生成报告"                 调度器轮询 pending + 到期任务
+  │                                          │
+  ▼                                          ▼
+Agent 解析意图，计算 execute_time        claim_task 原子抢占
+  │                                          │
+  ▼                                          ▼
+schedule_task 工具入库                   ThreadPoolExecutor 并发执行
+  │                                          │
+  ▼                                          ▼
+SQLite (status=pending) ◄── 共享库 ───► AgentCore.run()
+  │
+  ▼
+回复"任务已登记"
+```
+
+### 工具接口
+
+Agent 在对话中通过以下 `@tool` 函数与调度系统交互：
+
+| 工具 | 作用 | 关键参数 |
+|------|------|----------|
+| `schedule_task` | 登记一次性/周期任务 | `task_text`（自然语言描述，不要含代码）、`task_type`（`one_time`/`periodic`）、`execute_time`（ISO 8601）、`cron_expr`（5字段） |
+| `list_scheduled_tasks` | 查询任务列表 | `status`（可选：`pending`/`running`/`done`/`failed`/`cancelled`） |
+| `cancel_scheduled_task` | 取消 pending 状态的任务 | `task_id` |
+| `delete_scheduled_task` | 删除已完成的单个任务 | `task_id` |
+| `cleanup_finished_tasks` | 批量清理 done/failed/cancelled 任务 | 无 |
+
+### 快速开始
+
+**1. 初始化工具依赖**
+
+在 `main.py` 启动时调用一次（也可不调，使用默认 DB 路径）：
+
+```python
+from tools.scheduler_tool import configure
+
+configure(db_path="memory/scheduled_tasks.sqlite")
+```
+
+**2. 启动后台调度器**（独立进程，与主对话进程分离）
+
+```bash
+python -m scheduler.run
+```
+
+**3. 在对话中登记任务**
+
+Agent 会自动处理，无需记忆参数。示例：
+
+```
+你: 2分钟后帮我生成一个简介文本放到 tests 目录
+助手: 任务已登记，将于 2026-07-29T17:48:57 自动执行。
+
+你: 每天9点整理 tests 目录
+助手: 周期任务已登记（cron: 0 9 * * *），将按计划自动执行。
+```
+
+### 模块结构
+
+```
+scheduler/
+├── store.py       # SQLite CRUD + 原子抢占 + 重试
+├── executor.py    # agent_factory → AgentCore.run() 执行桥接
+├── engine.py      # APScheduler 引擎（轮询一次性 + cron 周期 + 线程池）
+└── run.py         # 独立进程入口
+```
+
+详细技术文档见 [scheduler/README.md](scheduler/README.md)。
+
 ---
 
 ## Human-in-the-loop（HITL）
@@ -1150,6 +1358,10 @@ output = chat_until_completion(agent, "需要人工选择时请先问我")
 
 ## 运行示例
 
+### 1. 启动与基础对话
+
+运行 `python main.py`，选择提供商后进入交互界面：
+
 ```
 ==================================================
   LangChain Agent (基于LangChain框架)
@@ -1159,41 +1371,68 @@ output = chat_until_completion(agent, "需要人工选择时请先问我")
   (↑↓ 选择, Enter 确认, Esc 取消)
     [✓] zhipu      (智谱AI)
         qwen       (通义千问)
-  ❯   [✓] deepseek   (DeepSeek)        ← 绿色高亮,方向键移动
+  ❯   [✓] deepseek   (DeepSeek)
         kimi       (Kimi (Moonshot))
 ----------------------------------------
 
 [MCP] workspace: 加载了 6 个工具
-[MCP] 已加载 6 个工具: create_workspace, get_current_workspace, list_directory, delete_workspace, move_workspace, copy_workspace
+[MCP] 已加载 6 个工具: create_workspace, get_current_workspace, ...
 
 Agent 已就绪！
 当前提供商: DeepSeek
 当前模型:   deepseek-chat
 
-本地工具: search, read_file, write_file, calculate, run_shell, run_python, run_cmd, get_local_time, open_file, open_sqlite, read_skill, ask_human
-MCP工具:  create_workspace, get_current_workspace, list_directory, delete_workspace, move_workspace, copy_workspace
+本地工具: search, read_file, write_file, calculate, run_shell, ...
+MCP工具:  create_workspace, get_current_workspace, ...
 
 你: 在 D:\work 下创建一个叫 my_project 的文件夹
 助手: 已为你创建文件夹 my_project，路径：D:\work\my_project
+```
 
+### 2. 三种执行模式
+
+**ReAct 模式**（自动调用工具，打印中间步骤，存长期记忆）：
+
+```
 你: react:计算 (123 + 456) * 2
 --- 步骤 1 ---
 工具: calculate
 输入: {'expression': '(123 + 456) * 2'}
 结果: 1158
 最终答案: (123 + 456) * 2 = 1158
+```
 
+**CoT 推理模式**（纯推理，不调用工具）：
+
+```
 你: cot:分析Python和Java的区别
 最终答案: Python和Java的区别在于...
+```
 
+**普通对话**（自动判断是否调用工具，不打印步骤）：
+
+```
+你: 帮我创建一个叫 test 的文件夹
+助手: 已为你创建文件夹 test，路径：D:\work\LangChainAgent\test
+```
+
+### 3. 模型与状态管理
+
+切换模型：
+
+```
 你: model
 当前提供商 [DeepSeek] 可用模型:
   (↑↓ 选择, Enter 确认, Esc 取消)
     deepseek-chat
-  ❯ deepseek-reasoner     ← 切换到推理模型
+  ❯ deepseek-reasoner
 ----------------------------------------
 已切换模型: deepseek-reasoner (提供商: DeepSeek)
+```
 
+查看当前状态：
+
+```
 你: info
 当前提供商: DeepSeek
 当前模型:   deepseek-reasoner
@@ -1201,11 +1440,15 @@ API地址:    https://api.deepseek.com
 
 --- 记忆状态 ---
 当前会话:   thread-a4d099d2
-Checkpoint: sqlite → D:\work\LangChainAgent\data\checkpoints.sqlite
+Checkpoint: sqlite → D:\work\LangChainAgent\memory\checkpoints.sqlite
 已存消息:   8 条
 长期记忆:   2 条
 总会话数:   1
+```
 
+### 4. 会话管理
+
+```
 你: thread:new
 已开启新会话: thread-c7e8f1a3
 原会话 thread-a4d099d2 已保留,可用 'thread' 切回
@@ -1216,14 +1459,13 @@ Checkpoint: sqlite → D:\work\LangChainAgent\data\checkpoints.sqlite
     thread-a4d099d2  [8 条消息]
   ❯ thread-c7e8f1a3  [0 条消息] (当前)
 ----------------------------------------
+```
 
-你: react:帮我打开 checkpoints.sqlite 数据库
---- 步骤 1 ---
-工具: open_sqlite
-输入: {'file_path': 'data/checkpoints.sqlite'}
-结果: {"success": true, "message": "已用 DB Browser for SQLite 打开数据库"}
-最终答案: 已为你打开 checkpoints.sqlite 数据库
+### 5. Human-in-the-loop（HITL）
 
+Agent 调用 `ask_human` 暂停图执行，等待人工选择后继续：
+
+```
 你: react:删除旧的临时文件前先让我确认
 --- 步骤 1 ---
 工具: ask_human
@@ -1236,7 +1478,42 @@ Checkpoint: sqlite → D:\work\LangChainAgent\data\checkpoints.sqlite
 ----------------------------------------
 是否删除旧的临时文件? ❯ 删除
 最终答案: 已确认删除旧的临时文件。
+```
 
+### 6. 对话导出
+
+```
+你: export
+已导出当前会话到 exports/thread-a4d099d2.md
+
+你: export:thread-b1dc3b2a 我的导出/backup.md
+已导出会话 thread-b1dc3b2a 到 我的导出/backup.md
+```
+
+由 [agent/memory.py](agent/memory.py) 的 `AgentMemory.export_thread()` 实现，将 checkpoint 中的对话渲染为可读 Markdown。
+
+### 7. JSON 模式
+
+```
+你: json:帮我规划一个Python项目的目录结构，输出JSON
+{
+  "project": "my_project",
+  "structure": [
+    {"name": "src", "type": "dir", "children": [
+      {"name": "__init__.py", "type": "file"},
+      {"name": "main.py", "type": "file"}
+    ]},
+    {"name": "tests", "type": "dir"},
+    {"name": "README.md", "type": "file"}
+  ]
+}
+```
+
+Agent 按要求**只输出一个合法 JSON 对象**（不含 ``` 标记与解释文字），执行后自动用 `LLMClient.extract_json` 解析并美化打印；解析失败则回退显示原始输出。适用于需要结构化返回（如生成配置、报表、API 响应）的场景。
+
+### 8. MCP 管理
+
+```
 你: mcp
 MCP Servers:
 ------------------------------------------------------------
@@ -1244,7 +1521,11 @@ MCP Servers:
            python tools/workspace_tool.py
 ------------------------------------------------------------
 已加载 MCP 工具数: 6
+```
 
+### 9. 退出
+
+```
 你: quit
 再见!
 ```
@@ -1264,8 +1545,8 @@ llm = create_client(provider="deepseek", config_file="config/llm_config.json")
 agent = AgentCore(
     llm_client=llm,
     memory_size=10,
-    long_term_memory_file="data/memory.json",        # 长期记忆(用于 compress)
-    checkpoint_file="data/checkpoints.sqlite",       # Checkpoint 持久化
+    long_term_memory_file="memory/memory.json",        # 长期记忆(用于 compress)
+    checkpoint_file="memory/checkpoints.sqlite",       # Checkpoint 持久化
     max_iterations=15,
     mcp_config_file="config/mcp_servers.json",
     enable_mcp=True,
@@ -1336,126 +1617,29 @@ agent.clear_skills()             # 清空手动加载的技能
 agent.set_auto_match(False)      # 关闭任务自动匹配
 ```
 
----
+## 运行时配置
 
-## 扩展工具
+项目所有外置配置均位于 `config/` 目录下，每个配置文件有对应的 `.example` 模板（不含真实密钥），适合纳入版本控制。
 
-### 方式 1：添加本地工具
+### 1. `agent_config.json` — Agent 运行时参数
 
-在 `tools/` 目录新建文件，使用 `@tool` 装饰器定义工具：
+原先硬编码在 `main.py` 的运行时参数已外置到此文件，由 [config.py](config.py) 的 `load_agent_config` 加载并与默认值合并（缺省键不报错）。
 
-```python
-# tools/my_tool.py
-from langchain_core.tools import tool
-
-@tool
-def my_tool(param: str) -> str:
-    """工具描述（Agent会读取这个docstring来理解工具用途）"""
-    return f"处理结果: {param}"
-```
-
-在 [tools/__init__.py](tools/__init__.py) 中导入并添加到 `all_tools`：
-
-```python
-from .my_tool import my_tool
-all_tools = [search, read_file, write_file, calculate, my_tool]
-```
-
-重启后 Agent 即可自动调用新工具。
-
-### 方式 2：添加 MCP Server
-
-**A. 使用现有 MCP Server**（如官方提供的）：
-
-在交互界面输入：
-
-```
-mcp:add fetch npx -y @modelcontextprotocol/server-fetch
-```
-
-或直接编辑 [config/mcp_servers.json](config/mcp_servers.json)：
-
-```json
-{
-    "servers": {
-        "fetch": {
-            "transport": "stdio",
-            "command": "npx",
-            "args": ["-y", "@modelcontextprotocol/server-fetch"],
-            "enabled": true
-        }
-    }
-}
-```
-
-然后输入 `mcp:reload` 热加载。
-
-**B. 自定义 MCP Server**（Python + FastMCP）：
-
-```python
-# tools/my_server.py
-from mcp.server.fastmcp import FastMCP
-
-mcp = FastMCP("my-server")
-
-@mcp.tool()
-def my_tool(param: str) -> dict:
-    """工具描述"""
-    return {"result": param}
-
-if __name__ == "__main__":
-    mcp.run()
-```
-
-注册到 `config/mcp_servers.json`：
-
-```json
-{
-    "servers": {
-        "myserver": {
-            "transport": "stdio",
-            "command": "python",
-            "args": ["tools/my_server.py"],
-            "enabled": true
-        }
-    }
-}
-```
-
-运行 `mcp:reload` 即可加载。
-
-### 本地工具 vs MCP 工具对比
-
-| 特性       | 本地工具          | MCP 工具                      |
-| ---------- | ----------------- | ----------------------------- |
-| 定义方式   | `@tool` 装饰器  | `@mcp.tool()` + FastMCP     |
-| 运行位置   | Agent 同进程      | 独立子进程                    |
-| 加载方式   | import 后直接使用 | 通过 MCP 协议动态加载         |
-| 增删       | 需改代码 + 重启   | 改配置 +`mcp:reload` 热加载 |
-| 跨语言支持 | 仅 Python         | 任意语言（Node/Go 等）        |
-| 适用场景   | 简单、轻量工具    | 复杂服务、第三方集成          |
-
----
-
-## 运行时配置（agent_config.json）
-
-原先硬编码在 `main.py` 的运行时参数已外置到 `config/agent_config.json`，由 [config.py](config.py) 的 `load_agent_config` 加载并与默认值合并（缺省键不报错）。
-
-| 键                       | 类型 | 默认值                      | 说明                                                  |
-| ------------------------ | ---- | --------------------------- | ----------------------------------------------------- |
-| `max_iterations`       | int  | 15                          | 单次`invoke` 最大推理步数（即 `recursion_limit`） |
-| `skills_dir`           | str  | `.agents/skills`          | 技能目录（相对项目根或绝对路径）                      |
-| `auto_match_skills`    | bool | true                        | 任务自动匹配并注入相关技能                            |
-| `enable_mcp`           | bool | true                        | 是否加载 MCP 工具                                     |
-| `memory_size`          | int  | 10                          | 兼容旧 API 的记忆容量                                 |
-| `verbose`              | bool | true                        | 是否打印详细过程                                      |
-| `mcp_config_file`      | str  | `config/mcp_servers.json` | MCP 配置文件（相对项目根或绝对路径）                  |
-| `max_context_messages` | int  | 0                           | 长上下文裁剪阈值（0 = 关闭）                          |
-| `context_trim_keep`    | int  | 12                          | 裁剪时保留的最近消息条数                              |
+| 键 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `max_iterations` | int | 15 | 单次 `invoke` 最大推理步数（即 `recursion_limit`） |
+| `skills_dir` | str | `.agents/skills` | 技能目录（相对项目根或绝对路径） |
+| `auto_match_skills` | bool | true | 任务自动匹配并注入相关技能 |
+| `enable_mcp` | bool | true | 是否加载 MCP 工具 |
+| `memory_size` | int | 10 | 兼容旧 API 的记忆容量 |
+| `verbose` | bool | true | 是否打印详细过程 |
+| `mcp_config_file` | str | `config/mcp_servers.json` | MCP 配置文件（相对项目根或绝对路径） |
+| `max_context_messages` | int | 0 | 长上下文裁剪阈值（0 = 关闭） |
+| `context_trim_keep` | int | 12 | 裁剪时保留的最近消息条数 |
 
 修改后重启 `main.py` 即可生效。
 
-### 长上下文裁剪（Long-Context Trimming）
+#### 长上下文裁剪（Long-Context Trimming）
 
 当某个会话的消息数超过 `max_context_messages` 时，Agent 会自动：
 
@@ -1465,23 +1649,146 @@ if __name__ == "__main__":
 
 > 触发时会在终端打印提示（含新旧 `thread_id`）。默认 `max_context_messages=0`（关闭），需要时在 `config/agent_config.json` 中设一个合理值（如 60）即可开启。
 
-### 对话导出（Export）
+### 2. `llm_config.json` — LLM 服务商配置
 
+定义多个 LLM 服务商的接入信息，由 [LLMClient](llm_client.py) 按名称引用加载。
+
+```json
+{
+  "providers": {
+    "deepseek": {
+      "name": "DeepSeek",
+      "base_url": "https://api.deepseek.com",
+      "env_key": "DEEPSEEK_API_KEY",
+      "model": "deepseek-chat",
+      "models": ["deepseek-chat", "deepseek-reasoner"],
+      "api_key": ""
+    }
+  },
+  "tavily": {
+    "api_key": "tvly-..."
+  }
+}
 ```
-export                 # 导出当前会话到 exports/<thread_id>.md
-export:<thread_id>     # 导出指定会话
-export:<thread_id> 路径/文件.md   # 导出到指定路径
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `providers` | object | 服务商字典，键为唯一标识（如 `deepseek`），值为配置项 |
+| `providers.{id}.name` | string | 显示名称 |
+| `providers.{id}.base_url` | string | OpenAI 兼容 API 地址 |
+| `providers.{id}.env_key` | string | 环境变量名（`api_key` 为空时回退读取该变量） |
+| `providers.{id}.model` | string | 默认模型 |
+| `providers.{id}.models` | string[] | 可选模型列表（交互式切换使用，如 `chat`/`reasoner`） |
+| `providers.{id}.api_key` | string | API 密钥（留空则从 `env_key` 读取） |
+| `tavily` | object | 联网搜索配置；`api_key` 值或 `env_key` 字段名 |
+
+> **安全提醒**：`.example` 文件中不含真实密钥，提交代码前请确保 `llm_config.json` 在 `.gitignore` 中。
+
+### 3. `mcp_servers.json` — MCP 服务器配置
+
+定义 MCP（Model Context Protocol）服务器，由 `agent_config.json` 的 `mcp_config_file` 指向。
+
+```json
+{
+  "servers": {
+    "workspace": {
+      "transport": "stdio",
+      "command": "python",
+      "args": ["tools/workspace_tool.py"],
+      "enabled": true
+    }
+  }
+}
 ```
 
-由 [agent/memory.py](agent/memory.py) 的 `AgentMemory.export_thread()` 实现，将 checkpoint 中的对话渲染为可读文本/Markdown。
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `servers` | object | 服务器字典，键为服务器名 |
+| `servers.{name}.transport` | `"stdio"` | 传输协议（目前仅支持 stdio） |
+| `servers.{name}.command` | string | 启动命令 |
+| `servers.{name}.args` | string[] | 命令参数 |
+| `servers.{name}.enabled` | bool | 是否默认启用 |
 
-### JSON 模式（Structured Output）
+运行时可通过 `mcp` 交互命令查看/开关服务器。
 
+### 4. `safety.json` — 安全护栏
+
+Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/safety.py) 加载。
+
+```json
+{
+  "mode": "blacklist",
+  "confirm_dangerous": true,
+  "blacklist": [],
+  "whitelist": ["echo", "dir", "ls", "python", "pip", "git", "cat", "type"]
+}
 ```
-json:<任务描述>
+
+| 键 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `mode` | `"blacklist"` / `"whitelist"` | `"blacklist"` | `blacklist` 默认放行（仅拦截匹配项）；`whitelist` 仅放行白名单命令 |
+| `confirm_dangerous` | bool | true | 是否对危险模式操作弹确认（匹配内置危险规则如格式化磁盘、删除系统目录等） |
+| `blacklist` | string[] | `[]` | 自定义禁止命令列表（正则表达式） |
+| `whitelist` | string[] | — | 白名单模式下允许的首命令列表 |
+
+内置黑名单覆盖 `rm -rf /`、`format`、`dd` 等破坏性操作；内置危险模式覆盖 `chmod`、`regedit`、`sc delete` 等操作。运行时可通过 `safety` 交互命令查看/修改。
+
+### 5. `remote_control.json` — 远程控制（飞书）
+
+飞书机器人远程控制配置。
+
+```json
+{
+  "feishu": {
+    "app_id": "cli_xxxxxxxxxxxxxx",
+    "app_secret": "xxxxxxxxxxxxxxxxxxxx",
+    "allow_open_id": ["ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxx"]
+  },
+  "agent": {
+    "provider": ""
+  },
+  "safety": {
+    "mode": "blacklist",
+    "confirm_dangerous": false,
+    "blacklist": [],
+    "whitelist": ["echo", "dir", "ls", "python", "pip", "git", "cat", "type", "powershell", "pwsh"]
+  }
+}
 ```
 
-Agent 会按要求**只输出一个合法 JSON 对象**（不含 ``` 标记与解释文字），执行后自动用 `LLMClient.extract_json` 解析并美化打印；解析失败则回退显示原始输出。适用于需要结构化返回（如生成配置、报表、API 响应）的场景。
+| 键 | 类型 | 说明 |
+| --- | --- | --- |
+| `feishu.app_id` | string | 飞书应用 App ID |
+| `feishu.app_secret` | string | 飞书应用 App Secret |
+| `feishu.allow_open_id` | string[] | 允许远程控制的飞书用户 Open ID 列表 |
+| `agent.provider` | string | 远程控制使用的服务商标识（空则用默认） |
+| `safety` | object | 远程控制下的独立安全配置（与 `safety.json` 结构一致，不影响本地运行） |
+
+### 6. `scheduler_config.json` — 定时任务调度
+
+定时任务调度服务的运行配置，由 [scheduler/run.py](scheduler/run.py) 加载。
+
+```json
+{
+  "db_path": "memory/scheduled_tasks.sqlite",
+  "poll_interval": 30,
+  "timezone": "Asia/Shanghai",
+  "max_retries": 3,
+  "max_workers": 5,
+  "provider": null,
+  "blocking": true
+}
+```
+
+| 键 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `db_path` | string | `memory/scheduled_tasks.sqlite` | 任务数据库路径（相对项目根） |
+| `poll_interval` | int | 30 | 轮询间隔（秒），调度器每隔此时间检查是否有到期任务 |
+| `timezone` | string | `Asia/Shanghai` | 任务时区，影响 cron 表达式解析 |
+| `max_retries` | int | 3 | 任务执行失败最大重试次数 |
+| `max_workers` | int | 5 | 并发执行任务的最大工作线程数 |
+| `provider` | string\|null | null | 调度器使用的 LLM 服务商标识（null = 默认） |
+| `blocking` | bool | true | 是否阻塞主进程（`false` 时调度器在后台运行） |
 
 ---
 
@@ -1499,6 +1806,7 @@ Agent 会按要求**只输出一个合法 JSON 对象**（不含 ``` 标记与�
 | `tests/test_human_input.py`  | LangGraph HITL：interrupt、恢复、并行选择和线程隔离      |
 | `tests/test_terminal.py`     | 终端工具：输出截断、护栏拒绝、安全执行(mock subprocess)  |
 | `tests/test_memory.py`       | `AgentMemory`：长期记忆、会话管理(SQLite)              |
+| `tests/test_scheduler.py`  | 定时任务调度：TaskStore CRUD、原子抢占、重试逻辑       |
 
 运行：
 
