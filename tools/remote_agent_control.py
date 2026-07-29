@@ -155,11 +155,15 @@ def _has_api_key(key: str) -> bool:
 
 def _patch_safety_config() -> None:
     import tools.safety as m
-    p = os.path.join(BASE_DIR, "config", "safety_remote.json")
-    if os.path.exists(p):
-        m.CONFIG_PATH = p
-        m.reload_config()
-        print("[Agent] 安全: config/safety_remote.json")
+    if not os.path.exists(REMOTE_CONFIG_FILE):
+        return
+    with open(REMOTE_CONFIG_FILE, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    safety_cfg = cfg.get("safety")
+    if safety_cfg:
+        m._config_cache = dict(m.DEFAULT_CONFIG)
+        m._config_cache.update(safety_cfg)
+        print(f"[Agent] 安全: {REMOTE_CONFIG_FILE} -> safety")
 
 def start_agent() -> str:
     """初始化或重启 Agent。在独立线程中运行以避免 asyncio 事件循环冲突。"""

@@ -7,5 +7,11 @@
   },
   "agent": {
     "provider": ""
+  },
+  "safety": {
+    "mode": "blacklist",
+    "confirm_dangerous": false,
+    "blacklist": [],
+    "whitelist": ["echo", "dir", "ls", "python", "pip", "git", "cat", "type", "powershell", "pwsh"]
   }
 }
