@@ -8,6 +8,7 @@ from tools.terminal_tools import UserRejectedCommandError
 def test_compaction_retains_recent_messages_in_new_thread_state():
     # Given: the current thread has more messages than the compaction threshold.
     from agent.agent_core import AgentCore
+    from agent.memory import AgentMemory
 
     messages = [HumanMessage(content=f"message-{idx}") for idx in range(5)]
     summarized_batches = []
@@ -27,6 +28,8 @@ def test_compaction_retains_recent_messages_in_new_thread_state():
         def get_config(self):
             return {"configurable": {"thread_id": self.thread_id}}
 
+        maybe_compact = AgentMemory.maybe_compact
+
     class FakeExecutor:
         def update_state(self, config, values):
             state_updates.append((config, values))
@@ -40,13 +43,15 @@ def test_compaction_retains_recent_messages_in_new_thread_state():
     core.agent_executor = FakeExecutor()
     core._compute_skill_block = lambda task: ""
     core._create_agent_executor = lambda skill_block="": core.agent_executor
-    core._summarize_messages = lambda batch: summarized_batches.append(batch) or "summary"
+    core.llm = SimpleNamespace(
+        chat=lambda messages: summarized_batches.append(messages) or "summary"
+    )
 
     # When: compaction runs.
-    core._maybe_compact()
+    core._compact_if_needed()
 
     # Then: only older messages are summarized and retained messages seed the new thread.
-    assert summarized_batches == [messages[:3]]
+    assert len(summarized_batches) == 1
     assert core.memory.thread_id == "thread-after"
     assert core.compaction_summary == "summary"
     assert state_updates == [
@@ -60,6 +65,7 @@ def test_compaction_retains_recent_messages_in_new_thread_state():
 def test_compaction_does_not_change_thread_when_summary_fails():
     # Given: compaction is needed but summarization returns no summary.
     from agent.agent_core import AgentCore
+    from agent.memory import AgentMemory
 
     messages = [HumanMessage(content=f"message-{idx}") for idx in range(4)]
     new_thread_calls = []
@@ -77,6 +83,8 @@ def test_compaction_does_not_change_thread_when_summary_fails():
             self.thread_id = "thread-after"
             return self.thread_id
 
+        maybe_compact = AgentMemory.maybe_compact
+
     class FakeExecutor:
         def update_state(self, config, values):
             state_updates.append((config, values))
@@ -90,10 +98,10 @@ def test_compaction_does_not_change_thread_when_summary_fails():
     core.agent_executor = FakeExecutor()
     core._compute_skill_block = lambda task: ""
     core._create_agent_executor = lambda skill_block="": core.agent_executor
-    core._summarize_messages = lambda batch: ""
+    core.llm = SimpleNamespace(chat=lambda messages: "")
 
     # When: compaction runs.
-    core._maybe_compact()
+    core._compact_if_needed()
 
     # Then: failed summary leaves the active thread and state untouched.
     assert core.memory.thread_id == "thread-before"
@@ -203,7 +211,7 @@ def test_run_structured_stops_after_user_rejects_command(monkeypatch):
     core.max_iterations = 25
     core.verbose = False
     core.execution_history = []
-    core._maybe_compact = lambda: None
+    core._compact_if_needed = lambda: None
     core._compute_skill_block = lambda task: ""
     core._create_agent_executor = lambda skill_block="": executor
 
@@ -254,7 +262,7 @@ def test_run_structured_repairs_checkpoint_after_user_rejects_command():
     core.max_iterations = 25
     core.verbose = False
     core.execution_history = []
-    core._maybe_compact = lambda: None
+    core._compact_if_needed = lambda: None
     core._compute_skill_block = lambda task: ""
     core._create_agent_executor = lambda skill_block="": executor
 

@@ -347,7 +347,7 @@ def test_resume_after_switching_thread_is_rejected():
     core.max_iterations = 25
     core.verbose = False
     core.execution_history = []
-    core._maybe_compact = lambda: None
+    core._compact_if_needed = lambda: None
     core._compute_skill_block = lambda task: ""
     core._create_agent_executor = lambda skill_block="": core.agent_executor
 
@@ -390,7 +390,7 @@ def test_interrupted_run_records_final_important_assistant_memory_after_resume()
     core.max_iterations = 25
     core.verbose = False
     core.execution_history = []
-    core._maybe_compact = lambda: None
+    core._compact_if_needed = lambda: None
     core._compute_skill_block = lambda task: ""
     core._create_agent_executor = lambda skill_block="": core.agent_executor
 
