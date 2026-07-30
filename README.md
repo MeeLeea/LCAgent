@@ -174,6 +174,7 @@ LangChainAgent/
 │   └── scheduled_tasks.sqlite# 定时任务数据库
 ├── agent/
 │   ├── __init__.py
+│   ├── config.py            # 运行时配置加载(config/agent_config.json)
 │   ├── memory.py            # AgentMemory：checkpoint + 长期记忆 + 会话管理
 │   └── agent_core.py        # Agent 核心调度：run/chat/cot 三种模式 + HITL
 ├── tools/
@@ -190,7 +191,7 @@ LangChainAgent/
 │   ├── mcp_loader.py        # MCP 工具加载器
 │   ├── workspace_tool.py    # 工作目录管理 MCP Server
 │   └── scheduler_tool.py    # 定时任务工具（schedule_task/list/cancel/delete/cleanup）
-├── utils/
+├── cli/
 │   ├── __init__.py
 │   ├── cli_menu.py          # 通用终端方向键选择菜单
 │   ├── human_input.py       # ask_human 工具 + HITL 暂停/恢复编排
@@ -221,7 +222,6 @@ LangChainAgent/
 │   ├── test_calculator.py
 │   ├── test_provider_models.py
 │   └── test_workspace_tool_path_protection.py
-├── config.py                # 运行时配置加载(config/agent_config.json)
 └── exports/                 # 对话导出目录(运行 export 命令时生成)
 ```
 
@@ -231,17 +231,17 @@ LangChainAgent/
 | ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
 | [main.py](main.py)                                           | 交互式命令行入口：初始化运行时、读取输入并调用命令分发器                                                                    |
 | [llm_client.py](llm_client.py)                               | 从`config/llm_config.json` 读取提供商配置，支持运行时切换提供商/模型                                                      |
-| [config.py](config.py)                                       | 加载`config/agent_config.json`，统一运行时配置                                                                            |
+| [agent/config.py](agent/config.py)                           | 加载`config/agent_config.json`，统一运行时配置                                                                            |
 | [agent/memory.py](agent/memory.py)                           | 双层记忆：Checkpoint（自动）+ memory.json（手动）+ 对话导出                                                                 |
 | [agent/agent_core.py](agent/agent_core.py)                   | Agent 核心：`run()` / `chat()` / `cot()` 三种模式 + `AgentTurnResult` 结构化暂停/恢复 API + 技能注入 + 长上下文裁剪 |
 | [tools/skills.py](tools/skills.py)                           | `SkillManager`：扫描/匹配/渲染本地技能                                                                                    |
 | [tools/skill_tool.py](tools/skill_tool.py)                   | `read_skill` 工具：LLM 在任务中自助读取技能指引                                                                           |
 | [tools/](tools/)                                             | 本地工具 + MCP 工具加载 + 技能管理                                                                                          |
-| [utils/cli_menu.py](utils/cli_menu.py)                       | 通用终端方向键选择菜单                                                                                                      |
-| [utils/human_input.py](utils/human_input.py)                 | `ask_human` 工具、interrupt 展示和循环恢复编排                                                                            |
-| [utils/commands/dispatcher.py](utils/commands/dispatcher.py) | 按兼容顺序匹配命令并路由到领域处理器                                                                                        |
-| [utils/commands/types.py](utils/commands/types.py)           | 命令依赖上下文、活动 LLM 状态和分发结果类型                                                                                 |
-| [utils/commands/](utils/commands/)                           | 会话、记忆、模型、MCP、技能、安全及 Agent 执行命令                                                                          |
+| [cli/cli_menu.py](cli/cli_menu.py)                       | 通用终端方向键选择菜单                                                                                                      |
+| [cli/human_input.py](cli/human_input.py)                 | `ask_human` 工具、interrupt 展示和循环恢复编排                                                                            |
+| [cli/commands/dispatcher.py](cli/commands/dispatcher.py) | 按兼容顺序匹配命令并路由到领域处理器                                                                                        |
+| [cli/commands/types.py](cli/commands/types.py)           | 命令依赖上下文、活动 LLM 状态和分发结果类型                                                                                 |
+| [cli/commands/](cli/commands/)                           | 会话、记忆、模型、MCP、技能、安全及 Agent 执行命令                                                                          |
 | [scheduler/](scheduler/)                                     | 定时任务调度：TaskStore（SQLite CRUD）、SchedulerEngine（APScheduler 轮询）、独立进程入口                                   |
 
 ### llm_client.py 主要 API
@@ -721,7 +721,7 @@ Agent 的工具分为两类：
 | `open_file`      | [tools/open_file.py](tools/open_file.py)           | 用系统默认/指定程序打开文件或文件夹       | `file_path`, `app_path`                          |
 | `open_sqlite`    | [tools/open_file.py](tools/open_file.py)           | 用 DB Browser for SQLite 打开 .sqlite/.db | `file_path`                                        |
 | `read_skill`     | [tools/skill_tool.py](tools/skill_tool.py)         | 读取本地技能(SKILL.md)的指引正文          | `skill_name`(可空)                                 |
-| `ask_human`      | [utils/human_input.py](utils/human_input.py)       | 暂停 LangGraph 图并请求人工结构化选择     | `prompt`, `choices`                              |
+| `ask_human`      | [cli/human_input.py](cli/human_input.py)       | 暂停 LangGraph 图并请求人工结构化选择     | `prompt`, `choices`                              |
 
 > `open_sqlite` 会自动查找 DB Browser for SQLite 路径（环境变量 `SQLITE_BROWSER_PATH` → 常见安装位置 → `shutil.which`），找不到则返回下载链接。Linux 下安装 `sqlitebrowser` 包即可使用。
 
@@ -1155,7 +1155,7 @@ AgentTurnResult.status = "completed" → 输出最终答案
 
 ### ask_human 工具
 
-定义在 [utils/human_input.py](utils/human_input.py)，是一个 `StructuredTool`，LLM 把它当作普通工具调用：
+定义在 [cli/human_input.py](cli/human_input.py)，是一个 `StructuredTool`，LLM 把它当作普通工具调用：
 
 | 参数       | 类型             | 说明                         |
 | ---------- | ---------------- | ---------------------------- |
@@ -1198,7 +1198,7 @@ AgentTurnResult.status = "completed" → 输出最终答案
 
 ### CLI 编排
 
-[utils/human_input.py](utils/human_input.py) 提供了一组辅助函数，把「invoke → 渲染 → 收集 → resume」封装成循环：
+[cli/human_input.py](cli/human_input.py) 提供了一组辅助函数，把「invoke → 渲染 → 收集 → resume」封装成循环：
 
 | 函数                                                  | 作用                                                  |
 | ----------------------------------------------------- | ----------------------------------------------------- |
@@ -1214,7 +1214,7 @@ AgentTurnResult.status = "completed" → 输出最终答案
 `read_human_resume` 的逻辑：
 
 1. 校验 interrupt 是否为 `human_choice`，否则回退到自由文本输入 `{"text": "..."}`
-2. 从 `choices` 提取 `(label, id)` 对，调用 [utils/cli_menu.py](utils/cli_menu.py) 的 `select_menu(prompt, options)` 展示方向键菜单
+2. 从 `choices` 提取 `(label, id)` 对，调用 [cli/cli_menu.py](cli/cli_menu.py) 的 `select_menu(prompt, options)` 展示方向键菜单
 3. 用户 `Enter` 确认 → 返回 `{"choice_id": "<id>"}`
 4. 用户按 `Esc` → 返回 `{"cancelled": True}`（Agent 据此知道用户取消了）
 
@@ -1623,7 +1623,7 @@ agent.set_auto_match(False)      # 关闭任务自动匹配
 
 ### 1. `agent_config.json` — Agent 运行时参数
 
-原先硬编码在 `main.py` 的运行时参数已外置到此文件，由 [config.py](config.py) 的 `load_agent_config` 加载并与默认值合并（缺省键不报错）。
+原先硬编码在 `main.py` 的运行时参数已外置到此文件，由 [agent/config.py](agent/config.py) 的 `load_agent_config` 加载并与默认值合并（缺省键不报错）。
 
 | 键 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
