@@ -4,6 +4,7 @@ Agent核心调度模块 - 基于LangChain 1.x + LangGraph
 支持动态加载本地工具 + MCP Server工具
 """
 import asyncio
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional, Literal
 from langchain.agents import create_agent
@@ -176,9 +177,7 @@ class AgentCore:
             self.tools = list(self.local_tools) + list(self.mcp_tools)
             # 重建Agent(保留已加载的技能)
             if hasattr(self, "agent_executor"):
-                self.agent_executor = self._create_agent_executor(
-                    self._compute_skill_block("")
-                )
+                self._rebuild_agent_executor("")
             return count
         except Exception as e:
             print(f"[MCP] 重新加载失败: {e}")
@@ -209,6 +208,63 @@ class AgentCore:
         )
         return agent
 
+    def _rebuild_agent_executor(self, task: str = "") -> None:
+        """统一的 Agent 重建入口
+
+        根据当前技能状态和任务内容重新创建 agent_executor。
+
+        Args:
+            task: 任务描述，用于自动匹配技能（为空时不自动匹配）
+        """
+        skill_block = self._compute_skill_block(task)
+        self.agent_executor = self._create_agent_executor(skill_block)
+
+    def _handle_rejected_command(self, config: Dict[str, Any]) -> AgentTurnResult:
+        """处理用户拒绝执行危险命令的情况
+
+        当工具调用被用户拒绝时，修复 checkpoint 状态并返回取消结果。
+
+        Args:
+            config: LangGraph 配置对象
+
+        Returns:
+            状态为 'cancelled' 的 AgentTurnResult
+        """
+        self._repair_rejected_tool_calls(config)
+        self._clear_pending_interrupt()
+        return AgentTurnResult.cancelled("用户已拒绝执行危险命令，当前任务已取消。")
+
+    def _handle_turn_completion(
+        self,
+        turn: AgentTurnResult,
+        config: Dict[str, Any],
+        mode: str,
+        user_message: Optional[str] = None,
+        save_assistant: bool = True,
+        important: bool = False
+    ) -> None:
+        """统一处理 turn 完成后的状态更新和记忆存储
+
+        根据 turn 状态更新 interrupt 状态，并选择性地保存消息到记忆。
+
+        Args:
+            turn: Agent 执行结果
+            config: LangGraph 配置对象
+            mode: 执行模式 ('run', 'chat', 等)
+            user_message: 用户消息（如需保存到记忆）
+            save_assistant: 是否保存 assistant 消息到记忆
+            important: assistant 消息是否标记为重要
+        """
+        if turn.is_interrupted:
+            self._capture_pending_interrupt(config, mode)
+        elif turn.is_completed:
+            self._clear_pending_interrupt()
+            if user_message:
+                self.memory.add("user", user_message)
+            if save_assistant and turn.output:
+                metadata = {"important": True} if important else {}
+                self.memory.add("assistant", turn.output, metadata)
+
     def _get_system_prompt(self, skill_block: str = "") -> str:
         """获取系统提示词(可附加技能指引块)"""
         base = _AGENT_CORE_PROMPT
@@ -231,6 +287,29 @@ class AgentCore:
             if isinstance(thread_id, str):
                 return thread_id
         return None
+
+    @contextmanager
+    def _temp_verbose(self, verbose: bool):
+        """临时设置 verbose 状态的上下文管理器
+        
+        Args:
+            verbose: 临时要设置的 verbose 值
+            
+        Yields:
+            None
+            
+        Example:
+            with self._temp_verbose(False):
+                # 这里 self.verbose 为 False
+                self._do_something()
+            # 这里 self.verbose 恢复原值
+        """
+        original = self.verbose
+        self.verbose = verbose
+        try:
+            yield
+        finally:
+            self.verbose = original
 
     def _capture_pending_interrupt(self, config: Dict[str, Any], mode: str) -> None:
         self._pending_interrupt_thread_id = self._thread_id_from_config(config)
@@ -281,12 +360,26 @@ class AgentCore:
                 if self.verbose and entry is not None:
                     print(f"结果: {str(msg.content)[:200]}...")
 
+    def _check_and_raise_if_interrupted(self, turn: AgentTurnResult) -> None:
+        """检查 turn 是否被中断，如果是则抛出异常
+        
+        Args:
+            turn: Agent 执行结果
+            
+        Raises:
+            RuntimeError: 如果 turn 状态为 interrupted
+        """
+        if turn.status == "interrupted":
+            raise RuntimeError("Agent turn interrupted; resume with resume_structured().")
+
     def _parse_turn_result(self, result: Dict[str, Any]) -> AgentTurnResult:
         interrupts = result.get("__interrupt__")
         if interrupts:
             return AgentTurnResult.interrupted(list(interrupts))
 
-        for msg in reversed(result.get("messages", [])):
+        # 找到最后一条有内容的 AIMessage
+        messages = result.get("messages", [])
+        for msg in reversed(messages):
             if isinstance(msg, AIMessage) and msg.content:
                 return AgentTurnResult.completed(str(msg.content))
         return AgentTurnResult.completed("")
@@ -326,77 +419,70 @@ class AgentCore:
         self._compact_if_needed()
         config = self._invoke_config()
         input_msg = HumanMessage(content=task)
-        self.agent_executor = self._create_agent_executor(
-            self._compute_skill_block(task)
-        )
+        
+        self._rebuild_agent_executor(task)
+        
         try:
             result = self.agent_executor.invoke(
                 {"messages": [input_msg]},
                 config=config
             )
         except UserRejectedCommandError:
-            self._repair_rejected_tool_calls(config)
-            self._clear_pending_interrupt()
-            return AgentTurnResult.cancelled("用户已拒绝执行危险命令，当前任务已取消。")
+            return self._handle_rejected_command(config)
+        
         self._record_tool_steps(result.get("messages", []), input_msg)
         turn = self._parse_turn_result(result)
-        if turn.is_interrupted:
-            self._capture_pending_interrupt(config, "run")
-        elif turn.is_completed:
-            self._clear_pending_interrupt()
-            self.memory.add("user", task)
-            self.memory.add("assistant", turn.output or "", {"important": True})
+        self._handle_turn_completion(turn, config, "run", task, important=True)
+        
         return turn
 
     def chat_structured(self, message: str) -> AgentTurnResult:
         self._compact_if_needed()
         config = self._invoke_config()
-        original_verbose = self.verbose
-        self.verbose = False
-        try:
-            self.agent_executor = self._create_agent_executor(
-                self._compute_skill_block(message)
-            )
+        
+        with self._temp_verbose(False):
+            self._rebuild_agent_executor(message)
             try:
                 result = self.agent_executor.invoke(
                     {"messages": [HumanMessage(content=message)]},
                     config=config
                 )
             except UserRejectedCommandError:
-                self._repair_rejected_tool_calls(config)
-                self._clear_pending_interrupt()
-                return AgentTurnResult.cancelled("用户已拒绝执行危险命令，当前任务已取消。")
-        finally:
-            self.verbose = original_verbose
-
+                return self._handle_rejected_command(config)
+        
         turn = self._parse_turn_result(result)
-        if turn.is_interrupted:
-            self._capture_pending_interrupt(config, "chat")
-        elif turn.is_completed:
-            self._clear_pending_interrupt()
-            self.memory.add("user", message)
-            self.memory.add("assistant", turn.output or "")
+        self._handle_turn_completion(turn, config, "chat", message)
+        
         return turn
 
     def resume_structured(self, payload: Dict[str, Any]) -> AgentTurnResult:
         config = self._invoke_config()
         pending_thread_id = getattr(self, "_pending_interrupt_thread_id", None)
         current_thread_id = self._thread_id_from_config(config)
+        
         if pending_thread_id is not None and current_thread_id != pending_thread_id:
             raise ValueError("Cannot resume interrupt on a different thread")
-
+        
         result = self.agent_executor.invoke(
             Command(resume=payload),
             config=config
         )
+        
         turn = self._parse_turn_result(result)
+        
+        # resume 的特殊处理：不添加用户消息，只在 run 模式时保存 assistant 消息
         if turn.is_interrupted:
-            self._capture_pending_interrupt(config, getattr(self, "_pending_interrupt_mode", "chat"))
+            self._capture_pending_interrupt(
+                config,
+                getattr(self, "_pending_interrupt_mode", "chat")
+            )
         elif turn.is_completed:
+            # 先取出 mode，再清理状态：_clear_pending_interrupt 会把 mode 置为 None
             mode = getattr(self, "_pending_interrupt_mode", None)
             self._clear_pending_interrupt()
-            if mode == "run":
-                self.memory.add("assistant", turn.output or "", {"important": True})
+            if mode == "run" and turn.output:
+                self.memory.add("assistant", turn.output, {"important": True})
+        
         return turn
 
     # ============ 流式接口（委托给 StreamHandler） ============
@@ -427,15 +513,16 @@ class AgentCore:
 
         try:
             turn = self.run_structured(task)
-            if getattr(turn, "status", None) == "interrupted":
-                raise RuntimeError("Agent turn interrupted; resume with resume_structured().")
+            self._check_and_raise_if_interrupted(turn)
             output = turn.output or ""
             print(f"\n最终答案: {output}")
             return output
 
         except RuntimeError as e:
+            # interrupt 相关异常需要重新抛出
             if "interrupt" in str(e):
                 raise
+            # 其他异常返回错误信息
             error_msg = f"任务执行失败: {str(e)}"
             print(f"\n错误: {error_msg}")
             return error_msg
@@ -458,17 +545,22 @@ class AgentCore:
         """
         try:
             turn = self.chat_structured(message)
-            if getattr(turn, "status", None) == "interrupted":
-                raise RuntimeError("Agent turn interrupted; resume with resume_structured().")
+            self._check_and_raise_if_interrupted(turn)
             return turn.output or ""
-
+        
         except RuntimeError as e:
+            # interrupt 相关异常需要重新抛出
             if "interrupt" in str(e):
                 raise
+            # 其他 RuntimeError 降级到 fallback
+            return self._fallback_chat(message)
+        
         except Exception as e:
+            # LangGraph 特定的 interrupt 异常也需要重新抛出
             if e.__class__.__name__ in {"GraphInterrupt", "NodeInterrupt"}:
                 raise
-        return self._fallback_chat(message)
+            # 其他异常降级到 fallback
+            return self._fallback_chat(message)
 
     def _fallback_chat(self, message: str) -> str:
         """Agent 执行失败时降级为纯 LLM 对话"""
@@ -528,7 +620,7 @@ class AgentCore:
         """
         self.llm = llm_client
         # 重新创建Agent(保留已加载的技能)
-        self.agent_executor = self._create_agent_executor(self._compute_skill_block(""))
+        self._rebuild_agent_executor("")
 
     # ============ 技能阅读(Skills) ============
 
@@ -550,13 +642,13 @@ class AgentCore:
             return False
         self.active_skills.add(name)
         # 立即重建 Agent,使后续对话带上该技能指引
-        self.agent_executor = self._create_agent_executor(self._compute_skill_block(""))
+        self._rebuild_agent_executor("")
         return True
 
     def clear_skills(self):
         """清空手动加载的技能"""
         self.active_skills.clear()
-        self.agent_executor = self._create_agent_executor(self._compute_skill_block(""))
+        self._rebuild_agent_executor("")
 
     def set_auto_match(self, enabled: bool):
         """开关任务自动匹配技能"""
@@ -616,9 +708,7 @@ class AgentCore:
 
         def _recreate(summary: str):
             self.compaction_summary = summary
-            self.agent_executor = self._create_agent_executor(
-                self._compute_skill_block("")
-            )
+            self._rebuild_agent_executor("")
             return self.agent_executor
 
         self.memory.maybe_compact(

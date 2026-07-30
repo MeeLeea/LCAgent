@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from tools.terminal_tools import UserRejectedCommandError
 
@@ -280,3 +281,198 @@ def test_run_structured_repairs_checkpoint_after_user_rejects_command():
     rejected = [message for message in repaired if message.tool_call_id == "call-rejected"]
     assert len(rejected) == 1
     assert rejected[0].status == "error"
+
+
+# ============ _check_and_raise_if_interrupted ============
+
+
+def test_check_and_raise_if_interrupted_raises_only_for_interrupted_status():
+    # Given: 三种 turn 状态分别对应中断/正常完成/取消。
+    from agent.agent_core import AgentCore, AgentTurnResult
+
+    core = object.__new__(AgentCore)
+
+    # When/Then: 只有 interrupted 状态触发异常，且异常信息包含 resume 指引。
+    with pytest.raises(RuntimeError, match="resume_structured"):
+        core._check_and_raise_if_interrupted(AgentTurnResult.interrupted([]))
+
+    assert core._check_and_raise_if_interrupted(AgentTurnResult.completed("ok")) is None
+    assert core._check_and_raise_if_interrupted(AgentTurnResult.cancelled("no")) is None
+
+
+def test_run_and_chat_share_the_same_interrupt_error(monkeypatch, capsys):
+    # Given: run_structured 与 chat_structured 都返回 interrupted turn。
+    from agent.agent_core import AgentCore, AgentTurnResult
+
+    interrupted = AgentTurnResult.interrupted([])
+    core = object.__new__(AgentCore)
+    core.run_structured = lambda task: interrupted
+    core.chat_structured = lambda message: interrupted
+    core._fallback_chat = lambda message: pytest.fail("中断不应降级到 fallback")
+
+    # When: 两个公开入口分别执行。
+    with pytest.raises(RuntimeError) as run_error:
+        core.run("task")
+    with pytest.raises(RuntimeError) as chat_error:
+        core.chat("hello")
+
+    # Then: 统一的检查方法让两条路径抛出完全相同的错误信息。
+    assert str(run_error.value) == str(chat_error.value)
+    assert "resume with resume_structured()" in str(run_error.value)
+    capsys.readouterr()
+
+
+# ============ run() / chat() 异常处理 ============
+
+
+def test_run_returns_error_message_for_runtime_and_generic_failures(capsys):
+    # Given: run_structured 分别抛出非中断 RuntimeError 和普通 Exception。
+    from agent.agent_core import AgentCore
+
+    core = object.__new__(AgentCore)
+
+    def _raise(exc):
+        core.run_structured = lambda task: (_ for _ in ()).throw(exc)
+        return core.run("task")
+
+    # When: 两类异常先后发生。
+    runtime_result = _raise(RuntimeError("boom"))
+    generic_result = _raise(ValueError("bad value"))
+
+    # Then: 两类异常都被转换成同一格式的错误文本而不是向外抛出。
+    assert runtime_result == "任务执行失败: boom"
+    assert generic_result == "任务执行失败: bad value"
+    assert "错误: 任务执行失败: boom" in capsys.readouterr().out
+
+
+def test_run_reraises_runtime_error_mentioning_interrupt(capsys):
+    # Given: run_structured 抛出内部包含 interrupt 字样的 RuntimeError。
+    from agent.agent_core import AgentCore
+
+    core = object.__new__(AgentCore)
+    core.run_structured = lambda task: (_ for _ in ()).throw(
+        RuntimeError("Agent turn interrupted; resume with resume_structured().")
+    )
+
+    # When/Then: 中断异常必须原样抛出，不能被降级成错误字符串。
+    with pytest.raises(RuntimeError, match="interrupted"):
+        core.run("task")
+    capsys.readouterr()
+
+
+def test_chat_falls_back_for_non_interrupt_failures():
+    # Given: chat_structured 抛出非中断的 RuntimeError 与普通 Exception。
+    from agent.agent_core import AgentCore
+
+    core = object.__new__(AgentCore)
+    core._fallback_chat = lambda message: f"fallback:{message}"
+
+    def _raise(exc):
+        core.chat_structured = lambda message: (_ for _ in ()).throw(exc)
+        return core.chat("hello")
+
+    # When: 两类异常先后发生。
+    runtime_result = _raise(RuntimeError("model unavailable"))
+    generic_result = _raise(ValueError("bad payload"))
+
+    # Then: 两类异常都降级为纯 LLM 对话。
+    assert runtime_result == "fallback:hello"
+    assert generic_result == "fallback:hello"
+
+
+def test_chat_reraises_langgraph_interrupt_exceptions():
+    # Given: LangGraph 抛出 GraphInterrupt 这类按类名识别的中断异常。
+    from agent.agent_core import AgentCore
+
+    class GraphInterrupt(Exception):
+        pass
+
+    core = object.__new__(AgentCore)
+    core._fallback_chat = lambda message: pytest.fail("中断不应降级到 fallback")
+    core.chat_structured = lambda message: (_ for _ in ()).throw(GraphInterrupt("paused"))
+
+    # When/Then: 中断异常原样抛出。
+    with pytest.raises(GraphInterrupt):
+        core.chat("hello")
+
+
+# ============ _parse_turn_result ============
+
+
+def test_parse_turn_result_prefers_interrupts_over_messages():
+    # Given: 结果里同时存在 __interrupt__ 和可用的 AIMessage。
+    from agent.agent_core import AgentCore
+
+    core = object.__new__(AgentCore)
+
+    # When: 解析该结果。
+    turn = core._parse_turn_result(
+        {"__interrupt__": ["pause"], "messages": [AIMessage(content="ignored")]}
+    )
+
+    # Then: 中断优先，输出不被填充。
+    assert turn.status == "interrupted"
+    assert turn.interrupts == ["pause"]
+    assert turn.output is None
+
+
+def test_parse_turn_result_returns_last_ai_message_with_content():
+    # Given: 消息历史里有多条 AIMessage，末尾还有空内容的 AIMessage 和工具消息。
+    from agent.agent_core import AgentCore
+
+    core = object.__new__(AgentCore)
+    messages = [
+        SystemMessage(content="system"),
+        HumanMessage(content="question"),
+        AIMessage(content="first answer"),
+        AIMessage(content="final answer"),
+        AIMessage(content="", tool_calls=[{"name": "t", "args": {}, "id": "call-1"}]),
+        ToolMessage(content="tool output", tool_call_id="call-1"),
+    ]
+
+    # When: 解析该结果。
+    turn = core._parse_turn_result({"messages": messages})
+
+    # Then: 取最后一条有内容的 AIMessage，忽略空内容与非 AI 消息。
+    assert turn.status == "completed"
+    assert turn.output == "final answer"
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {},
+        {"messages": []},
+        {"__interrupt__": [], "messages": []},
+        {"messages": [HumanMessage(content="only human")]},
+        {"messages": [AIMessage(content="")]},
+    ],
+    ids=["no-keys", "empty-messages", "empty-interrupt", "no-ai-message", "blank-ai-content"],
+)
+def test_parse_turn_result_completes_with_empty_output_when_no_answer(result):
+    # Given: 结果中没有可用的 AI 回答，且 __interrupt__ 为空或缺失。
+    from agent.agent_core import AgentCore
+
+    core = object.__new__(AgentCore)
+
+    # When: 解析该结果。
+    turn = core._parse_turn_result(result)
+
+    # Then: 视为 completed 且输出为空字符串，避免 None 泄漏给调用方。
+    assert turn.status == "completed"
+    assert turn.output == ""
+
+
+def test_parse_turn_result_stringifies_non_string_content():
+    # Given: AIMessage 的 content 是结构化的内容块列表。
+    from agent.agent_core import AgentCore
+
+    core = object.__new__(AgentCore)
+    blocks = [{"type": "text", "text": "hello"}]
+
+    # When: 解析该结果。
+    turn = core._parse_turn_result({"messages": [AIMessage(content=blocks)]})
+
+    # Then: 输出被转成字符串，保证返回类型稳定。
+    assert turn.status == "completed"
+    assert turn.output == str(blocks)
