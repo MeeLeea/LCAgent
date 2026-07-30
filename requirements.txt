@@ -17,7 +17,7 @@ langgraph-checkpoint-sqlite>=3.0.0,<4.0.0
 langchain-mcp-adapters>=0.3.0,<1.0.0
 mcp>=1.9.0,<2.0.0
 fastmcp>=2.0.0,<3.0.0
-pywin32>=312  # mcp 在 Windows 上的运行时依赖（pywintypes）
+pywin32>=312; sys_platform == "win32"  # mcp 在 Windows 上的运行时依赖（pywintypes）
 
 # ---------- LLM SDK ----------
 openai>=1.0.0,<3.0.0

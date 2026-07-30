@@ -260,7 +260,7 @@ LangChainAgent/
 
 **支持的提供商：**
 
-提供商不再硬编码在代码中，全部来自 [config/llm_config.json](config/llm_config.json) 的 `providers` 字段。当前配置包含：
+提供商不再硬编码在代码中，全部来自 [config/llm_config.json](config/llm_config.json) 的 `providers` 字段。当前配置包含（实际内容以文件为准）：
 
 | 提供商       | 名称            | 环境变量              | 默认模型                |
 | ------------ | --------------- | --------------------- | ----------------------- |
@@ -716,14 +716,14 @@ Agent 的工具分为两类：
 | `calculate`      | [tools/calculator.py](tools/calculator.py)         | 数学计算                                  | `expression`                                       |
 | `run_shell`      | [tools/terminal_tools.py](tools/terminal_tools.py) | 执行 shell 命令                           | `command`, `cwd`, `timeout`                    |
 | `run_python`     | [tools/terminal_tools.py](tools/terminal_tools.py) | 执行 Python 脚本文件                      | `file_path`, `script_args`, `cwd`, `timeout` |
-| `run_cmd`        | [tools/terminal_tools.py](tools/terminal_tools.py) | 执行 .bat/.cmd/.ps1 文件                  | `file_path`, `script_args`, `cwd`, `timeout` |
+| `run_cmd`        | [tools/terminal_tools.py](tools/terminal_tools.py) | 执行 Shell / .bat / .ps1 脚本文件                       | `file_path`, `script_args`, `cwd`, `timeout` |
 | `get_local_time` | [tools/get_local_time.py](tools/get_local_time.py) | 获取本地时间                              | 无                                                   |
 | `open_file`      | [tools/open_file.py](tools/open_file.py)           | 用系统默认/指定程序打开文件或文件夹       | `file_path`, `app_path`                          |
 | `open_sqlite`    | [tools/open_file.py](tools/open_file.py)           | 用 DB Browser for SQLite 打开 .sqlite/.db | `file_path`                                        |
 | `read_skill`     | [tools/skill_tool.py](tools/skill_tool.py)         | 读取本地技能(SKILL.md)的指引正文          | `skill_name`(可空)                                 |
 | `ask_human`      | [utils/human_input.py](utils/human_input.py)       | 暂停 LangGraph 图并请求人工结构化选择     | `prompt`, `choices`                              |
 
-> `open_sqlite` 会自动查找 DB Browser for SQLite 路径（环境变量 `SQLITE_BROWSER_PATH` → 常见安装位置 → PATH），找不到则返回下载链接。
+> `open_sqlite` 会自动查找 DB Browser for SQLite 路径（环境变量 `SQLITE_BROWSER_PATH` → 常见安装位置 → `shutil.which`），找不到则返回下载链接。Linux 下安装 `sqlitebrowser` 包即可使用。
 
 ### 2. MCP 工具（MCP Server Tools）
 
@@ -1810,7 +1810,14 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 
 运行：
 
+```bash
+# Linux / macOS
+.venv/bin/pip install -r requirements.txt
+.venv/bin/pytest
+```
+
 ```powershell
+# Windows
 .\.venv\Scripts\pip.exe install -r requirements.txt
 .\.venv\Scripts\pytest.exe
 ```
