@@ -1,0 +1,37 @@
+[project]
+name = "langchainagent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "MeeLeea", email = "MeeLeea@github.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "apscheduler>=3.10,<4.0",
+    "fastmcp>=2.0.0,<3.0.0",
+    "langchain>=1.0.0,<2.0.0",
+    "langchain-core>=1.0.0,<2.0.0",
+    "langchain-mcp-adapters>=0.3.0,<1.0.0",
+    "langchain-openai>=1.0.0,<2.0.0",
+    "langgraph>=1.0.0,<2.0.0",
+    "langgraph-checkpoint>=4.0.0,<5.0.0",
+    "langgraph-checkpoint-sqlite>=3.0.0,<4.0.0",
+    "langgraph-prebuilt>=1.0.0,<2.0.0",
+    "lark-oapi>=1.7,<2.0",
+    "mcp>=1.9.0,<2.0.0",
+    "openai>=1.0.0,<3.0.0",
+    "pyautogui>=0.9,<1.0",
+    "pytest>=7.0,<9.0",
+    "pywin32>=312 ; sys_platform == 'win32'",
+    "tavily-python>=0.5.0,<1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.11",
+]
+
+# ⚠️删掉 [project.scripts]！
+# 因为 --no-install‑project 模式，scripts不会注册。
+# 启动只能 uv run python main.py
