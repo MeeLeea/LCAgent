@@ -1,18 +1,20 @@
 """
 Agent核心调度模块 - 基于LangChain 1.x + LangGraph
-使用 langgraph.prebuilt.create_react_agent 实现工具调用，支持ReAct式推理
+使用 langchain.agents.create_agent 实现工具调用，支持ReAct式推理
 支持动态加载本地工具 + MCP Server工具
 """
 import asyncio
-import os
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional, Literal
-from langgraph.prebuilt import create_react_agent
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage, BaseMessage
+from langchain.agents import create_agent
+from langchain_core.messages import (
+    HumanMessage, AIMessage, SystemMessage, ToolMessage, BaseMessage,
+)
 from langchain_core.tools import BaseTool
 from langgraph.types import Command, Interrupt
 from llm_client import LLMClient
 from .memory import AgentMemory
+from .message_utils import StreamHandler
 from tools.mcp_loader import load_mcp_tools, DEFAULT_CONFIG_FILE
 from tools.skills import SkillManager, default_skills_dir
 from tools.terminal_tools import UserRejectedCommandError
@@ -158,6 +160,9 @@ class AgentCore:
         self.execution_history: List[Dict[str, Any]] = []
         self._recorded_tool_call_ids: set[str] = set()
 
+        # 流式事件处理器（组合模式）
+        self.stream = StreamHandler(self)
+
     def reload_mcp_tools(self) -> int:
         """
         重新加载 MCP 工具(同步入口)
@@ -193,13 +198,13 @@ class AgentCore:
         """创建LangGraph ReAct Agent"""
         chat_model = self.llm.get_chat_model()
 
-        # create_react_agent 直接返回可调用的agent
-        # prompt 参数作为系统提示词
+        # create_agent 直接返回可调用的agent
+        # system_prompt 参数作为系统提示词
         # checkpointer 让 Agent 自动持久化状态到 SQLite
-        agent = create_react_agent(
+        agent = create_agent(
             model=chat_model,
             tools=self.tools,
-            prompt=self._get_system_prompt(skill_block),
+            system_prompt=self._get_system_prompt(skill_block),
             checkpointer=self.memory.get_checkpointer(),
         )
         return agent
@@ -393,6 +398,18 @@ class AgentCore:
             if mode == "run":
                 self.memory.add("assistant", turn.output or "", {"important": True})
         return turn
+
+    # ============ 流式接口（委托给 StreamHandler） ============
+
+    async def astream_chat(self, message: str):
+        """流式对话，委托给 self.stream。事件格式见 StreamHandler.astream_chat。"""
+        async for ev in self.stream.astream_chat(message):
+            yield ev
+
+    async def astream_resume(self, payload: Dict[str, Any]):
+        """流式恢复中断会话，委托给 self.stream。"""
+        async for ev in self.stream.astream_resume(payload):
+            yield ev
 
     def run(self, task: str) -> str:
         """
