@@ -13,11 +13,42 @@ from langchain_core.tools import BaseTool
 from langgraph.types import Command, Interrupt
 from llm_client import LLMClient
 from .memory import AgentMemory
-from tools import all_tools as local_tools
 from tools.mcp_loader import load_mcp_tools, DEFAULT_CONFIG_FILE
 from tools.skills import SkillManager, default_skills_dir
 from tools.terminal_tools import UserRejectedCommandError
 
+_AGENT_CORE_PROMPT = (
+    "你是一个智能助手，配备了多种工具（文件读写、目录管理、搜索、计算、定时任务等）。\n"
+    "\n"
+    "【重要规则】\n"
+    "1. 你有能力调用各种工具在用户本地真正执行操作。当用户要求操作文件/搜索/测试/创建目录等时，你【必须】"
+    "调用相应工具完成，不要回复'我无法访问文件系统'、'我没有权限'、'请你自己保存'之类的话。"
+    "只有当用户进行纯知识性问答（不需要操作文件/搜索/计算）时才直接回答，不调用工具。\n"
+    "2. 创建文件、脚本、文件夹的默认位置是项目根目录下的 'tests/' 目录（即 main.py 所在目录）。\n"
+    "3. 多步任务（如先创建目录再写文件）请依次调用多个工具。"
+    "如果用户要求跑一下或测试一下，直接执行相应工具或测试文件。\n"
+    "4. 如果用户要求生成新的工具文件，直接在 tools 目录下创建，使用 @tool 装饰器，不要修改 __init__.py。\n"
+    "5. 危险命令（如 rm -rf、format、shutdown 等）会被安全策略拦截或要求用户确认，"
+    "不要尝试使用破坏性命令；删除/移动文件时优先使用专门的文件工具。\n"
+    "6. 当任务涉及专业领域（如提交 git、生成 pptx、查找技能等）时，"
+    "优先用 read_skill 工具读取对应技能的详细指引并按指引完成。\n"
+    "7. 当需要人工确认、选择或补充信息才能继续时，调用 ask_human 工具并提供结构化 choices，"
+    "等待返回的结构化选择后再继续；不要用普通文本假装等待人工输入。\n"
+    "8. 当用户要求在某个时间点（如'2分钟后'、'明天下午3点'、'下周一'）或按周期"
+    "（如'每天9点'、'每周一'、'工作日下午5点半'）执行任务时，【必须】按以下流程操作，"
+    "不要立即执行任务本身：\n"
+    "    ① 调用 get_local_time 获取当前精确时间\n"
+    "    ② 计算出 execute_time（ISO 8601，如 '2026-07-29T17:36:00'）或 cron 表达式\n"
+    "    ③ 调用 schedule_task 登记任务，完成后回复'任务已登记，将于[时间]自动执行'\n"
+    "    要点：\n"
+    "    - task_text 只写任务本身（自然语言，去掉时间），【不要写代码或函数调用】\n"
+    "    - 一次性 → task_type='one_time' + execute_time；周期 → task_type='periodic' + cron_expr\n"
+    "    - cron 示例：'0 9 * * *'=每天9点，'30 8 * * 1-5'=工作日8:30，'0 17 * * 5'=每周五17点\n"
+    "    - 查询/管理任务 → list_scheduled_tasks / cancel_scheduled_task\n"
+    "    - 清理历史任务 → delete_scheduled_task（删单个）/ cleanup_finished_tasks（批量清理已完成/失败/取消的）\n"
+    "\n"
+    "请用中文回答。"
+)
 
 @dataclass(frozen=True, slots=True)
 class AgentTurnResult:
@@ -97,8 +128,9 @@ class AgentCore:
         self.context_trim_keep = context_trim_keep
         self.compaction_summary = ""  # 长上下文裁剪后的历史摘要(注入 system prompt)
 
-        # 本地工具
-        self.local_tools: List[BaseTool] = list(local_tools)
+        # 本地工具（lazy import 打破潜在循环依赖）
+        from tools import all_tools as _local_tools
+        self.local_tools: List[BaseTool] = list(_local_tools)
         # MCP 工具(从 MCP Server 加载)
         self.mcp_tools: List[BaseTool] = []
         # 合并后的完整工具列表
@@ -174,29 +206,7 @@ class AgentCore:
 
     def _get_system_prompt(self, skill_block: str = "") -> str:
         """获取系统提示词(可附加技能指引块)"""
-        base = (
-            "你是一个智能助手，配备了多种工具（包括文件读写、目录管理、搜索、计算等）。\n"
-            "\n"
-            "【重要规则】\n"
-            "1. 当用户要求创建文件、读写文件、创建目录、搜索信息等操作时，你【必须】调用相应工具来完成，"
-            "绝对不要回复'我无法访问你的文件系统'、'我没有权限'、'请你自己保存'之类的话。\n"
-            "2. 你确实拥有这些工具的能力，工具会在用户本地执行，可以真正创建和修改文件。\n"
-            "3. 对话过程中创建文件、脚本、文件夹默认位置是：'./tests/'。\n"
-            "4. 如果用户要保存内容到文件，或创建文件，直接调用 write_file 工具，不要把内容贴出来让用户自己保存。\n"
-            "5. 如果用户要创建目录，直接调用 create_workspace 工具，不要让用户手动操作\n"
-            "6. 只有纯知识性问答（不需要操作文件/搜索/计算）才直接回答，不调用工具。\n"
-            "7. 调用工具时，如果一次任务需要多步操作（例如先创建目录再写文件），请依次调用多个工具。\n"
-            "8. 如果用户要求跑一下或者测试一下，直接调用相应工具，不要让用户手动操作。\n"
-            "9. 如果用户要求生成工具,直接在tools目录下创建，并使用@tool装饰器，不修改__init__.py文件。\n"
-            "10. 危险命令(如 rm -rf、format、shutdown 等)会被安全策略拦截或要求用户确认，"
-            "不要尝试使用破坏性命令；需要删除/移动文件时优先使用专门的文件工具。\n"
-            "11. 当任务涉及某个专业领域(如提交 git、生成 pptx、查找技能等)时，"
-            "应优先用 read_skill 工具读取对应技能的详细指引,并按指引完成。\n"
-            "12. 当需要人工确认、选择或补充信息才能继续时，调用 ask_human 工具并提供结构化 choices，"
-            "等待返回的结构化选择后再继续；不要用普通文本假装等待人工输入。\n"
-            "\n"
-            "请用中文回答。"
-        )
+        base = _AGENT_CORE_PROMPT
         if skill_block:
             base = base + "\n" + skill_block
         if self.compaction_summary:
@@ -308,7 +318,7 @@ class AgentCore:
             )
 
     def run_structured(self, task: str) -> AgentTurnResult:
-        self._maybe_compact()
+        self._compact_if_needed()
         config = self._invoke_config()
         input_msg = HumanMessage(content=task)
         self.agent_executor = self._create_agent_executor(
@@ -334,7 +344,7 @@ class AgentCore:
         return turn
 
     def chat_structured(self, message: str) -> AgentTurnResult:
-        self._maybe_compact()
+        self._compact_if_needed()
         config = self._invoke_config()
         original_verbose = self.verbose
         self.verbose = False
@@ -551,86 +561,56 @@ class AgentCore:
 
     # ============ 长上下文裁剪 ============
 
-    def _maybe_compact(self):
-        """
-        长上下文裁剪: 当当前会话消息数超过 max_context_messages 时,
-        将较早的消息用 LLM 摘要,开启新会话并把摘要注入后续 system prompt,
-        从而避免撞上 LLM 上下文窗口。
-
-        阈值 max_context_messages <= 0 时关闭(默认)。
-        """
-        if not self.max_context_messages or self.max_context_messages <= 0:
-            return
-        msgs = self.memory.get_messages()
-        if len(msgs) <= self.max_context_messages:
-            return
-
-        keep = min(self.context_trim_keep, max(len(msgs) - 1, 0))
-        old = msgs[:-keep] if keep > 0 else msgs
-        retained = msgs[-keep:] if keep > 0 else []
-        summary = self._summarize_messages(old)
-        if not summary:
-            return
-
-        # 开启新会话,把历史摘要注入 system prompt(保留上下文精华)
-        old_tid = self.memory.thread_id
-        self.memory.new_thread()
-        self.compaction_summary = summary
-        # 重建 Agent,使新 prompt 包含摘要
-        self.agent_executor = self._create_agent_executor(
-            self._compute_skill_block("")
-        )
-        if retained:
-            # 摘要只覆盖旧消息；最近消息原样写入新线程，避免裁剪后丢失上下文。
-            self.agent_executor.update_state(
-                self.memory.get_config(),
-                {"messages": retained},
+    def _compact_if_needed(self):
+        """调用 memory.maybe_compact 执行上下文裁剪(阈值 <= 0 时自动跳过)。"""
+        def _summarize_messages(msgs: List[BaseMessage]) -> str:
+            lines = []
+            for m in msgs:
+                if isinstance(m, HumanMessage):
+                    role = "user"
+                elif isinstance(m, AIMessage):
+                    role = "assistant"
+                elif isinstance(m, SystemMessage):
+                    role = "system"
+                else:
+                    role = "tool"
+                content = getattr(m, "content", "")
+                if isinstance(content, list):
+                    content = " ".join(str(x) for x in content)
+                text = str(content).strip()
+                if text:
+                    lines.append(f"{role}: {text}")
+            if not lines:
+                return ""
+            prompt = (
+                "请将以下对话历史压缩成一份简洁的中文摘要,保留关键决策、用户意图与事实,"
+                "按主题分条列出,不要添加推测内容:"
             )
-        if self.verbose:
-            print(
-                f"\n[上下文裁剪] 会话过长({len(msgs)} 条),已自动摘要历史并开启新会话: "
-                f"{self.memory.thread_id} (原 {old_tid})"
+            try:
+                summary = self.llm.chat([
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": "\n".join(lines)},
+                ]).strip()
+            except Exception:
+                summary = ""
+            if not summary and self.verbose:
+                print("[上下文摘要生成失败,跳过裁剪]")
+            return summary
+
+        def _recreate(summary: str):
+            self.compaction_summary = summary
+            self.agent_executor = self._create_agent_executor(
+                self._compute_skill_block("")
             )
+            return self.agent_executor
 
-    def _summarize_text(self, text: str, prompt: str) -> str:
-        """将文本发送给 LLM 生成摘要(失败返回空字符串)"""
-        try:
-            return self.llm.chat([
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": text},
-            ]).strip()
-        except Exception:
-            return ""
-
-    def _summarize_messages(self, msgs: List[BaseMessage]) -> str:
-        """将一批消息摘要为中文要点(失败返回空字符串)"""
-        lines = []
-        for m in msgs:
-            if isinstance(m, HumanMessage):
-                role = "user"
-            elif isinstance(m, AIMessage):
-                role = "assistant"
-            elif isinstance(m, SystemMessage):
-                role = "system"
-            else:
-                role = "tool"
-            content = getattr(m, "content", "")
-            if isinstance(content, list):
-                content = " ".join(str(x) for x in content)
-            text = str(content).strip()
-            if text:
-                lines.append(f"{role}: {text}")
-        if not lines:
-            return ""
-
-        prompt = (
-            "请将以下对话历史压缩成一份简洁的中文摘要,保留关键决策、用户意图与事实,"
-            "按主题分条列出,不要添加推测内容:"
+        self.memory.maybe_compact(
+            max_context_messages=self.max_context_messages,
+            context_trim_keep=self.context_trim_keep,
+            summarize_callback=_summarize_messages,
+            recreate_agent_callback=_recreate,
+            verbose=self.verbose,
         )
-        summary = self._summarize_text("\n".join(lines), prompt)
-        if not summary and self.verbose:
-            print("[上下文摘要生成失败,跳过裁剪]")
-        return summary
 
     def get_available_tools(self) -> List[str]:
         """获取可用工具名称列表"""
@@ -650,85 +630,14 @@ class AgentCore:
         return self.memory.summarize()
 
     def compress_memory(self) -> Dict[str, Any]:
-        """
-        压缩长期记忆
+        """压缩长期记忆: 委托给 memory.compress_memory,用 LLM 生成摘要。"""
+        def _summarize_text(text: str, prompt: str) -> str:
+            try:
+                return self.llm.chat([
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": text},
+                ]).strip()
+            except Exception:
+                return ""
 
-        将 memory.json 中所有长期记忆发送给 LLM，生成摘要后替换原内容。
-        这样可以在保留关键信息的同时大幅减少 token 占用。
-
-        Returns:
-            {
-                "success": bool,
-                "original_count": int,      # 原记忆条数
-                "original_chars": int,      # 原字符数
-                "compressed_chars": int,    # 压缩后字符数
-                "summary": str,             # 摘要内容
-                "error": str (失败时)
-            }
-        """
-        from datetime import datetime
-
-        if not self.memory.long_term_memory:
-            return {
-                "success": False,
-                "error": "没有长期记忆可压缩"
-            }
-
-        # 1. 拼接所有长期记忆为文本
-        history_lines = []
-        original_chars = 0
-        for idx, item in enumerate(self.memory.long_term_memory, 1):
-            role = item.get("role", "unknown")
-            content = item.get("content", "")
-            ts = item.get("timestamp", "")
-            history_lines.append(f"[{idx}] ({ts}) {role}: {content}")
-            original_chars += len(content)
-
-        history_text = "\n\n".join(history_lines)
-
-        # 2. 调用 LLM 生成摘要
-        system_prompt = (
-            "你是一个记忆压缩助手。请将以下历史对话记录压缩成一份简洁的摘要，要求：\n"
-            "1. 保留所有关键信息、用户意图、重要决策和事实\n"
-            "2. 去除重复和冗余内容\n"
-            "3. 按主题分条目组织，使用 '- ' 开头\n"
-            "4. 保持事实准确，不要添加推测内容\n"
-            "5. 用中文输出"
-        )
-        summary = self._summarize_text(
-            f"以下是历史对话记录，请压缩成摘要:\n\n{history_text}",
-            system_prompt,
-        )
-        if not summary:
-            return {
-                "success": False,
-                "error": "LLM 调用失败或返回空摘要"
-            }
-
-        # 4. 用摘要替换原长期记忆
-        original_count = len(self.memory.long_term_memory)
-        compressed_chars = len(summary)
-
-        self.memory.long_term_memory = [{
-            "role": "system",
-            "content": f"[历史记忆摘要 {datetime.now().isoformat()}]\n{summary}",
-            "timestamp": datetime.now().isoformat(),
-            "metadata": {
-                "important": True,
-                "type": "summary",
-                "original_count": original_count,
-                "original_chars": original_chars,
-                "compressed_chars": compressed_chars
-            }
-        }]
-
-        # 5. 保存回 memory.json
-        self.memory._save_long_term_memory()
-
-        return {
-            "success": True,
-            "original_count": original_count,
-            "original_chars": original_chars,
-            "compressed_chars": compressed_chars,
-            "summary": summary
-        }
+        return self.memory.compress_memory(_summarize_text)

@@ -1,6 +1,7 @@
 """LangGraph human-input tool and CLI pause/resume orchestration."""
 
-from typing import Any, TypedDict
+from typing import Any
+from typing_extensions import TypedDict
 
 import langgraph.types
 from langchain_core.tools import StructuredTool

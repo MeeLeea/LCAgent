@@ -1,0 +1,9 @@
+{
+  "db_path": "memory/scheduled_tasks.sqlite",
+  "poll_interval": 30,
+  "timezone": "Asia/Shanghai",
+  "max_retries": 3,
+  "max_workers": 5,
+  "provider": null,
+  "blocking": true
+}

@@ -7,10 +7,10 @@ from typing import TypeAlias
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = ROOT / "config"
 EXPECTED_TEMPLATES = {
-    "agent_config.exp.json",
-    "llm_config.exp.json",
-    "mcp_servers.exp.json",
-    "safety.exp.json",
+    "agent_config.json.example",
+    "llm_config.json.example",
+    "mcp_servers.json.example",
+    "safety.json.example",
 }
 JsonScalar: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]

@@ -322,3 +322,150 @@ class AgentMemory:
             "long_term_count": len(self.long_term_memory),
             "total_threads": len(self.list_threads())
         }
+
+    # ============ 长上下文裁剪与压缩 ============
+
+    def maybe_compact(
+        self,
+        max_context_messages: int,
+        context_trim_keep: int,
+        summarize_callback,
+        recreate_agent_callback,
+        verbose: bool = False
+    ):
+        """
+        长上下文裁剪: 当当前会话消息数超过 max_context_messages 时,
+        将较早的消息用 LLM 摘要,开启新会话并把摘要注入后续 system prompt,
+        从而避免撞上 LLM 上下文窗口。
+
+        阈值 max_context_messages <= 0 时关闭(默认)。
+
+        Args:
+            max_context_messages: 最大消息数阈值
+            context_trim_keep: 裁剪时保留最近 N 条消息
+            summarize_callback: 生成摘要的回调函数(接收消息列表,返回摘要字符串)
+            recreate_agent_callback: 重建 Agent 的回调函数(接收摘要,返回新 executor)
+            verbose: 是否打印裁剪信息
+
+        Returns:
+            摘要字符串(未触发裁剪时返回 None)
+        """
+        if not max_context_messages or max_context_messages <= 0:
+            return None
+
+        msgs = self.get_messages()
+        if len(msgs) <= max_context_messages:
+            return None
+
+        keep = min(context_trim_keep, max(len(msgs) - 1, 0))
+        old = msgs[:-keep] if keep > 0 else msgs
+        retained = msgs[-keep:] if keep > 0 else []
+        summary = summarize_callback(old)
+        if not summary:
+            return None
+
+        # 开启新会话,把历史摘要注入 system prompt(保留上下文精华)
+        old_tid = self.thread_id
+        self.new_thread()
+
+        # 通过回调重建 Agent
+        new_executor = recreate_agent_callback(summary)
+        if retained:
+            # 摘要只覆盖旧消息；最近消息原样写入新线程，避免裁剪后丢失上下文。
+            new_executor.update_state(
+                self.get_config(),
+                {"messages": retained},
+            )
+
+        if verbose:
+            print(
+                f"\n[上下文裁剪] 会话过长({len(msgs)} 条),已自动摘要历史并开启新会话: "
+                f"{self.thread_id} (原 {old_tid})"
+            )
+
+        return summary
+
+    def compress_memory(self, summarize_callback) -> Dict[str, Any]:
+        """
+        压缩长期记忆
+
+        将 memory.json 中所有长期记忆发送给 LLM，生成摘要后替换原内容。
+        这样可以在保留关键信息的同时大幅减少 token 占用。
+
+        Args:
+            summarize_callback: 生成摘要的回调函数(接收文本与提示,返回摘要字符串)
+
+        Returns:
+            {
+                "success": bool,
+                "original_count": int,      # 原记忆条数
+                "original_chars": int,      # 原字符数
+                "compressed_chars": int,    # 压缩后字符数
+                "summary": str,             # 摘要内容
+                "error": str (失败时)
+            }
+        """
+        if not self.long_term_memory:
+            return {
+                "success": False,
+                "error": "没有长期记忆可压缩"
+            }
+
+        # 1. 拼接所有长期记忆为文本
+        history_lines = []
+        original_chars = 0
+        for idx, item in enumerate(self.long_term_memory, 1):
+            role = item.get("role", "unknown")
+            content = item.get("content", "")
+            ts = item.get("timestamp", "")
+            history_lines.append(f"[{idx}] ({ts}) {role}: {content}")
+            original_chars += len(content)
+
+        history_text = "\n\n".join(history_lines)
+
+        # 2. 调用 LLM 生成摘要
+        system_prompt = (
+            "你是一个记忆压缩助手。请将以下历史对话记录压缩成一份简洁的摘要，要求：\n"
+            "1. 保留所有关键信息、用户意图、重要决策和事实\n"
+            "2. 去除重复和冗余内容\n"
+            "3. 按主题分条目组织，使用 '- ' 开头\n"
+            "4. 保持事实准确，不要添加推测内容\n"
+            "5. 用中文输出"
+        )
+        summary = summarize_callback(
+            f"以下是历史对话记录，请压缩成摘要:\n\n{history_text}",
+            system_prompt,
+        )
+        if not summary:
+            return {
+                "success": False,
+                "error": "LLM 调用失败或返回空摘要"
+            }
+
+        # 4. 用摘要替换原长期记忆
+        original_count = len(self.long_term_memory)
+        compressed_chars = len(summary)
+
+        self.long_term_memory = [{
+            "role": "system",
+            "content": f"[历史记忆摘要 {datetime.now().isoformat()}]\n{summary}",
+            "timestamp": datetime.now().isoformat(),
+            "metadata": {
+                "important": True,
+                "type": "summary",
+                "original_count": original_count,
+                "original_chars": original_chars,
+                "compressed_chars": compressed_chars
+            }
+        }]
+
+        # 5. 保存回 memory.json
+        self._save_long_term_memory()
+
+        return {
+            "success": True,
+            "original_count": original_count,
+            "original_chars": original_chars,
+            "compressed_chars": compressed_chars,
+            "summary": summary
+        }
