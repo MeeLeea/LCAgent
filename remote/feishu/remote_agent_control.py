@@ -4,7 +4,7 @@ LangChainAgent 飞书远程控制机器人 (lark-oapi v2)
 通过飞书 WebSocket 长连接远程控制 LangChainAgent。
 直接复用 main.py 的 build_agent()，所有 tools/skills/MCP 与 CLI 一致。
 
-用法: cd LangChainAgent && python tools/remote_agent_control.py
+用法: cd LangChainAgent && python -m remote.feishu.remote_agent_control
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
 from lark_oapi.ws import Client as LarkWSClient
 
 # ── 项目路径 ──
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, BASE_DIR)
 from main import BASE_DIR as _, LLM_FILE, AGENT_CONFIG_FILE, MEMORY_FILE, CHECKPOINT_FILE, build_agent  # noqa: E402
 
