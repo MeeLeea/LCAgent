@@ -13,7 +13,6 @@ from langchain_core.tools import BaseTool
 from langgraph.types import Command, Interrupt
 from llm_client import LLMClient
 from .memory import AgentMemory
-from tools import all_tools as local_tools
 from tools.mcp_loader import load_mcp_tools, DEFAULT_CONFIG_FILE
 from tools.skills import SkillManager, default_skills_dir
 from tools.terminal_tools import UserRejectedCommandError
@@ -129,8 +128,9 @@ class AgentCore:
         self.context_trim_keep = context_trim_keep
         self.compaction_summary = ""  # 长上下文裁剪后的历史摘要(注入 system prompt)
 
-        # 本地工具
-        self.local_tools: List[BaseTool] = list(local_tools)
+        # 本地工具（lazy import 打破潜在循环依赖）
+        from tools import all_tools as _local_tools
+        self.local_tools: List[BaseTool] = list(_local_tools)
         # MCP 工具(从 MCP Server 加载)
         self.mcp_tools: List[BaseTool] = []
         # 合并后的完整工具列表
