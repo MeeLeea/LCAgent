@@ -83,11 +83,9 @@ def export_thread(context: CommandContext, user_input: str) -> CommandOutcome:
 
 
 def _thread_option(context: CommandContext, thread_id: str, current: str) -> tuple[str, str]:
-    saved = context.agent.memory.thread_id
     try:
-        # 只为读取消息数临时切换线程，finally 必须恢复真实的当前会话。
-        context.agent.memory.thread_id = thread_id
-        messages = context.agent.memory.get_messages() or []
+        # 直接读取目标会话消息，不再临时变异 thread_id
+        messages = context.agent.memory.get_messages(thread_id=thread_id) or []
         message_count = len(messages)
         # 标题缓存挂在 agent 实例上,同一次运行内不重复调 LLM
         cache = getattr(context.agent, "_thread_title_cache", None)
@@ -102,8 +100,6 @@ def _thread_option(context: CommandContext, thread_id: str, current: str) -> tup
     except (AttributeError, OSError, RuntimeError):
         message_count = 0
         preview = ""
-    finally:
-        context.agent.memory.thread_id = saved
     mark = " (当前)" if thread_id == current else ""
     # 有缩略时用缩略作为主标题,否则回退到 thread_id
     label_main = preview if preview else thread_id

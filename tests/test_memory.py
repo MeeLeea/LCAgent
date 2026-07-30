@@ -1,4 +1,5 @@
 import os
+import json
 import sqlite3
 import sys
 import tempfile
@@ -66,13 +67,17 @@ def test_memory_basic():
         # 导出指定会话
         exported2 = mem.export_thread(thread_id=old)
         assert "对话导出" in exported2
+        
+        # 关闭连接
+        mem.close()
     finally:
-        # SqliteSaver 仍持有连接,删除可能报 PermissionError(Windows),忽略即可
+        # 连接已关闭，文件应可删除(Windows 上是泄漏的标志性测试)
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)
-        except OSError:
-            pass
+        except OSError as error:
+            # 删除失败说明连接仍被持有，这是泄漏，必须失败
+            raise AssertionError(f"文件删除失败，连接可能未关闭: {error}") from error
 
 
 def test_delete_thread_removes_checkpoints_and_writes_when_thread_exists(tmp_path):
@@ -93,3 +98,134 @@ def test_delete_thread_removes_checkpoints_and_writes_when_thread_exists(tmp_pat
     assert _count_rows(db_path, "checkpoints", "other") == 1
     assert _count_rows(db_path, "writes", "other") == 1
     assert mem.thread_id == "other"
+    
+    mem.close()
+
+
+def test_switch_thread_returns_true_only_when_checkpoint_exists(tmp_path):
+    # Given: 数据库中有一个 thread 有 checkpoint，另一个没有。
+    db_path = str(tmp_path / "switch.sqlite")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE checkpoints (thread_id TEXT NOT NULL)")
+        conn.execute("INSERT INTO checkpoints (thread_id) VALUES ('existing')")
+    
+    mem = AgentMemory(checkpoint_file=db_path, thread_id="current", use_sqlite=True)
+    
+    # When: 切换到有历史和无历史的 thread。
+    has_history = mem.switch_thread("existing")
+    no_history = mem.switch_thread("brand_new")
+    
+    # Then: 只有已存在的返回 True。
+    assert has_history is True
+    assert no_history is False
+    assert mem.thread_id == "brand_new"
+    
+    mem.close()
+
+
+def test_get_messages_with_thread_id_does_not_mutate_current_thread(monkeypatch):
+    # Given: 当前会话为 t1，monkeypatch 让 get_tuple 对 t2 返回假消息。
+    from langchain_core.messages import HumanMessage
+    
+    mem = AgentMemory(checkpoint_file=None, use_sqlite=False)
+    mem.thread_id = "t1"
+    original = mem.thread_id
+    
+    # monkeypatch get_tuple: t2 有消息，t1 没有
+    def fake_get_tuple(config):
+        tid = config.get("configurable", {}).get("thread_id")
+        if tid == "t2":
+            from types import SimpleNamespace
+            return SimpleNamespace(
+                checkpoint={"channel_values": {"messages": [HumanMessage(content="hello")]}}
+            )
+        return None
+    
+    monkeypatch.setattr(mem._checkpointer, "get_tuple", fake_get_tuple)
+    
+    # When: 读取另一个 thread 的消息。
+    msgs = mem.get_messages(thread_id="t2")
+    
+    # Then: thread_id 不变，但成功读到了 t2 的消息。
+    assert mem.thread_id == original
+    assert mem.thread_id == "t1"
+    assert len(msgs) == 1
+    assert msgs[0].content == "hello"
+
+
+def test_save_long_term_memory_is_atomic(tmp_path):
+    # Given: 一个长期记忆文件路径。
+    ltm_file = str(tmp_path / "ltm.json")
+    mem = AgentMemory(checkpoint_file=None, long_term_file=ltm_file, use_sqlite=False)
+    
+    # When: 保存一条记忆。
+    mem.add("user", "important thing", {"important": True})
+    
+    # Then: 文件存在且内容正确，临时文件已被清理。
+    assert os.path.exists(ltm_file)
+    with open(ltm_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert len(data) == 1
+    assert data[0]["content"] == "important thing"
+    
+    # 临时文件应已被原子替换，不留残留
+    tmp_files = [f for f in os.listdir(tmp_path) if ".memory_" in f or ".tmp" in f]
+    assert len(tmp_files) == 0
+
+
+def test_get_short_term_maps_tool_message_to_assistant_with_prefix(monkeypatch):
+    # Given: checkpoint 里有 user, assistant, tool 三种消息。
+    from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+    
+    mem = AgentMemory(checkpoint_file=None, use_sqlite=False)
+    
+    messages = [
+        HumanMessage(content="请搜索"),
+        AIMessage(content="", tool_calls=[{"name": "search", "args": {}, "id": "c1"}]),
+        ToolMessage(content="找到了答案", tool_call_id="c1"),
+        AIMessage(content="好的"),
+    ]
+    
+    def fake_get_tuple(config):
+        from types import SimpleNamespace
+        return SimpleNamespace(checkpoint={"channel_values": {"messages": messages}})
+    
+    monkeypatch.setattr(mem._checkpointer, "get_tuple", fake_get_tuple)
+    
+    # When: 调用 get_short_term。
+    history = mem.get_short_term()
+    
+    # Then: ToolMessage 被映射为 assistant 且带前缀。
+    assert len(history) == 4
+    assert history[0] == {"role": "user", "content": "请搜索"}
+    assert history[1]["role"] == "assistant"
+    assert history[2]["role"] == "assistant"
+    assert history[2]["content"].startswith("[工具结果] ")
+    assert "找到了答案" in history[2]["content"]
+    assert history[3] == {"role": "assistant", "content": "好的"}
+
+
+def test_export_thread_does_not_add_tool_result_prefix(monkeypatch):
+    # Given: 同样的 ToolMessage，export_thread 应该不加前缀(导出给人看，不混淆)。
+    from langchain_core.messages import HumanMessage, ToolMessage
+    
+    mem = AgentMemory(checkpoint_file=None, use_sqlite=False)
+    
+    messages = [
+        HumanMessage(content="查询"),
+        ToolMessage(content="结果是42", tool_call_id="c1", name="calc"),
+    ]
+    
+    def fake_get_tuple(config):
+        from types import SimpleNamespace
+        return SimpleNamespace(checkpoint={"channel_values": {"messages": messages}})
+    
+    monkeypatch.setattr(mem._checkpointer, "get_tuple", fake_get_tuple)
+    
+    # When: 导出。
+    exported = mem.export_thread()
+    
+    # Then: 工具消息内容直接呈现，不带 [工具结果] 前缀。
+    assert "结果是42" in exported
+    assert "[工具结果]" not in exported
+    assert "工具" in exported  # 角色标签应是"工具"

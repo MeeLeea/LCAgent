@@ -14,14 +14,52 @@
 """
 import os
 import json
+import logging
 import sqlite3
+import tempfile
 import uuid
-from typing import List, Dict, Any, Optional
+from contextlib import closing
+from typing import Callable, List, Dict, Any, Optional, Tuple
 from datetime import datetime
 
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
+from langchain_core.messages import (
+    HumanMessage,
+    AIMessage,
+    SystemMessage,
+    ToolMessage,
+    BaseMessage,
+)
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.memory import MemorySaver
+
+logger = logging.getLogger(__name__)
+
+# 工具输出在降级对话历史中的前缀:标明来源,避免以用户口吻混入上下文
+TOOL_RESULT_PREFIX = "[工具结果] "
+
+
+def _message_role(msg: BaseMessage) -> str:
+    """把 LangChain 消息对象映射为 OpenAI 风格的 role 字符串。
+
+    ToolMessage 与 AIMessage 无继承关系,但仍显式前置判断以防未来变动。
+    未知类型统一归为 'user',与历史行为保持一致。
+    """
+    if isinstance(msg, ToolMessage):
+        return "assistant"
+    if isinstance(msg, AIMessage):
+        return "assistant"
+    if isinstance(msg, SystemMessage):
+        return "system"
+    return "user"
+
+
+def _message_text(msg: BaseMessage) -> str:
+    """取消息文本内容。多模态 content 为 list 时归一化为字符串。"""
+    content = getattr(msg, "content", "")
+    if isinstance(content, list):
+        return " ".join(str(x) for x in content)
+    return str(content)
 
 
 class AgentMemory:
@@ -68,7 +106,7 @@ class AgentMemory:
 
     # ============ Checkpointer 管理 ============
 
-    def _init_checkpointer(self):
+    def _init_checkpointer(self) -> BaseCheckpointSaver:
         """初始化 checkpointer"""
         if self.use_sqlite:
             parent = os.path.dirname(os.path.abspath(self.checkpoint_file))
@@ -82,9 +120,39 @@ class AgentMemory:
         else:
             return MemorySaver()
 
-    def get_checkpointer(self):
+    def get_checkpointer(self) -> BaseCheckpointSaver:
         """获取 checkpointer 实例(传给 create_agent)"""
         return self._checkpointer
+
+    def _connect(self) -> sqlite3.Connection:
+        """为一次性查询打开连接。调用方必须负责关闭(用 closing 包裹)。
+
+        与 _init_checkpointer 保持相同的 timeout/busy_timeout 设置,
+        避免并发写入时短连接立刻抛 database is locked。
+        """
+        conn = sqlite3.connect(self.checkpoint_file, check_same_thread=False, timeout=10)
+        conn.execute("PRAGMA busy_timeout=10000")
+        return conn
+
+    def close(self) -> None:
+        """关闭 checkpointer 持有的 SQLite 连接。
+
+        sqlite3 的 connection 上下文管理器只提交事务、不关闭连接,
+        因此长驻连接必须显式关闭,否则 WAL 无法回收、Windows 上文件也删不掉。
+        """
+        conn = getattr(self._checkpointer, "conn", None)
+        if conn is None:
+            return
+        try:
+            conn.close()
+        except sqlite3.Error as error:
+            logger.warning("关闭 checkpoint 连接失败: %s", error)
+
+    def __enter__(self) -> "AgentMemory":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
 
     def get_config(self) -> Dict[str, Any]:
         """获取 invoke 需要传入的 config"""
@@ -104,22 +172,42 @@ class AgentMemory:
         Returns:
             True=该 thread 有 checkpoint 记录, False=新会话(无历史)
         """
+        # 必须先查存量再赋值:否则当前 thread_id 总会出现在列表里,返回值恒为 True
+        existed = thread_id in self._stored_thread_ids()
         self.thread_id = thread_id
-        # 如果数据库里有记录,返回 True;否则是新建会话
-        return thread_id in self.list_threads()
+        return existed
 
-    def list_threads(self) -> List[str]:
-        """列出数据库中所有 thread_id"""
+    def _stored_thread_ids(self) -> List[str]:
+        """数据库中真实存在的 thread_id(不含尚未落盘的当前会话)。
+
+        Raises:
+            sqlite3.Error: 数据库损坏、权限或磁盘错误。表尚未创建(全新库)
+                不算错误,返回空列表。
+        """
         if not self.use_sqlite:
-            return [self.thread_id]
+            return []
         try:
-            with sqlite3.connect(self.checkpoint_file, check_same_thread=False) as conn:
+            with closing(self._connect()) as conn:
                 cursor = conn.execute(
                     "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
                 )
                 return [row[0] for row in cursor.fetchall()]
-        except Exception:
-            return [self.thread_id]
+        except sqlite3.OperationalError as error:
+            # 全新数据库尚未建表,视为无存量会话;其余 OperationalError 照常抛出
+            if "no such table" in str(error).lower():
+                return []
+            raise
+
+    def list_threads(self) -> List[str]:
+        """列出所有可见 thread_id(数据库存量 ∪ 当前会话)。
+
+        当前会话可能还没写入 checkpoint,但对用户而言它是存在的,
+        因此并入结果,保持 CLI/API 的显示语义不变。
+        """
+        stored = self._stored_thread_ids()
+        if self.thread_id in stored:
+            return stored
+        return sorted(stored + [self.thread_id])
 
     def delete_thread(self, thread_id: str) -> bool:
         """
@@ -134,57 +222,60 @@ class AgentMemory:
         if not self.use_sqlite:
             # 内存模式:无法删除单个 thread,只能清空
             return False
-        try:
-            with sqlite3.connect(self.checkpoint_file, check_same_thread=False) as conn:
-                cursor = conn.execute(
-                    "SELECT COUNT(*) FROM checkpoints WHERE thread_id = ?",
-                    (thread_id,)
-                )
-                checkpoint_rows = cursor.fetchone()[0]
-                cursor = conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'writes'"
-                )
-                has_writes = cursor.fetchone() is not None
-                write_rows = 0
-                if has_writes:
+
+        # 优先走 SqliteSaver 自带的 delete_thread 契约,用其长驻连接和锁
+        delete_fn = getattr(self._checkpointer, "delete_thread", None)
+        if callable(delete_fn):
+            conn = getattr(self._checkpointer, "conn", None)
+            if conn is None:
+                return False
+            try:
+                before = conn.total_changes
+                delete_fn(thread_id)
+                deleted = conn.total_changes > before
+            except sqlite3.Error as error:
+                logger.error("删除会话失败(通过 Saver 契约): %s", error)
+                return False
+        else:
+            # 兜底:直接用 SQL 删除(开新连接,单事务)
+            try:
+                with closing(self._connect()) as conn:
                     cursor = conn.execute(
-                        "SELECT COUNT(*) FROM writes WHERE thread_id = ?",
-                        (thread_id,)
+                        "DELETE FROM checkpoints WHERE thread_id = ?", (thread_id,)
                     )
-                    write_rows = cursor.fetchone()[0]
-            deleted_rows = checkpoint_rows + write_rows
-            if deleted_rows == 0:
+                    deleted = cursor.rowcount > 0
+                    # writes 表可能不存在(老版本 LangGraph 或未初始化的库)
+                    try:
+                        conn.execute("DELETE FROM writes WHERE thread_id = ?", (thread_id,))
+                    except sqlite3.OperationalError:
+                        pass
+                    conn.commit()
+            except sqlite3.Error as error:
+                logger.error("删除会话失败(兜底路径): %s", error)
                 return False
 
-            # 优先使用 Saver 的删除契约，它会同步清理 checkpoints 与 writes。
-            delete_thread = getattr(self._checkpointer, "delete_thread", None)
-            if callable(delete_thread):
-                delete_thread(thread_id)
-            else:
-                with sqlite3.connect(self.checkpoint_file, check_same_thread=False) as conn:
-                    conn.execute(
-                        "DELETE FROM checkpoints WHERE thread_id = ?",
-                        (thread_id,)
-                    )
-                    if has_writes:
-                        conn.execute(
-                            "DELETE FROM writes WHERE thread_id = ?",
-                            (thread_id,)
-                        )
-            # 如果删的是当前会话,自动切到一个剩余的会话(或新建)
-            if thread_id == self.thread_id:
-                remaining = self.list_threads()
-                self.thread_id = remaining[0] if remaining else self.new_thread()
-            return True
-        except Exception as e:
-            print(f"[删除会话失败] {e}")
+        if not deleted:
             return False
+
+        # 如果删的是当前会话,自动切到一个剩余的会话(或新建)
+        if thread_id == self.thread_id:
+            remaining = self._stored_thread_ids()
+            self.thread_id = remaining[0] if remaining else self.new_thread()
+        return True
 
     # ============ 消息获取 ============
 
-    def get_messages(self) -> List[BaseMessage]:
-        """从 checkpoint 获取当前 thread 的所有消息"""
-        config = self.get_config()
+    def get_messages(self, thread_id: Optional[str] = None) -> List[BaseMessage]:
+        """从 checkpoint 获取指定会话(默认当前会话)的所有消息
+
+        Args:
+            thread_id: 要读取的会话 ID。为 None 时读取当前会话。
+
+        Returns:
+            消息列表。无 checkpoint 或会话不存在时返回空列表。
+        """
+        target = thread_id if thread_id is not None else self.thread_id
+        config = {"configurable": {"thread_id": target}}
         try:
             # langgraph 1.x: 用 get_tuple 获取 CheckpointTuple
             tup = self._checkpointer.get_tuple(config)
@@ -207,13 +298,8 @@ class AgentMemory:
         Returns:
             格式化后的对话文本
         """
-        target = thread_id or self.thread_id
-        saved = self.thread_id
-        self.thread_id = target
-        try:
-            msgs = self.get_messages() or []
-        finally:
-            self.thread_id = saved
+        target = thread_id if thread_id is not None else self.thread_id
+        msgs = self.get_messages(thread_id=target) or []
 
         blocks = []
         for m in msgs:
@@ -225,10 +311,7 @@ class AgentMemory:
                 role = "系统"
             else:
                 role = "工具"
-            content = getattr(m, "content", "")
-            if isinstance(content, list):
-                content = " ".join(str(x) for x in content)
-            text = str(content).strip()
+            text = _message_text(m).strip()
             if not text:
                 continue
             if fmt == "markdown":
@@ -241,7 +324,10 @@ class AgentMemory:
         return header + sep.join(blocks)
 
     def get_short_term(self, limit: Optional[int] = None) -> List[Dict[str, str]]:
-        """兼容旧 API:从 checkpoint 取消息转为 dict 格式"""
+        """兼容旧 API:从 checkpoint 取消息转为 dict 格式
+
+        工具输出映射为 assistant 角色并加前缀,避免在降级对话中冒充用户。
+        """
         msgs = self.get_messages()
         if limit:
             msgs = msgs[-limit:]
@@ -249,12 +335,12 @@ class AgentMemory:
             msgs = msgs[-self.short_term_size:]
         result = []
         for m in msgs:
-            role = "user"
-            if isinstance(m, AIMessage):
-                role = "assistant"
-            elif isinstance(m, SystemMessage):
-                role = "system"
-            result.append({"role": role, "content": m.content})
+            role = _message_role(m)
+            content = _message_text(m)
+            # ToolMessage 输出标注来源,避免以用户口吻混入 LLM 上下文
+            if isinstance(m, ToolMessage):
+                content = TOOL_RESULT_PREFIX + content
+            result.append({"role": role, "content": content})
         return result
 
     # ============ 长期记忆(用于 compress) ============
@@ -296,14 +382,24 @@ class AgentMemory:
             os.remove(self.long_term_file)
 
     def _save_long_term_memory(self):
-        """保存长期记忆到文件"""
+        """保存长期记忆到文件(原子写,崩溃时不产生坏 JSON)"""
         if not self.long_term_file:
             return
         parent = os.path.dirname(os.path.abspath(self.long_term_file))
         if parent:
             os.makedirs(parent, exist_ok=True)
-        with open(self.long_term_file, 'w', encoding='utf-8') as f:
-            json.dump(self.long_term_memory, f, ensure_ascii=False, indent=2)
+        # 先写临时文件,成功后原子替换;中途崩溃不会损坏现有文件
+        fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=".memory_", suffix=".json.tmp")
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(self.long_term_memory, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self.long_term_file)
+        except Exception:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def _load_long_term_memory(self):
         """从文件加载长期记忆"""
@@ -332,10 +428,10 @@ class AgentMemory:
         self,
         max_context_messages: int,
         context_trim_keep: int,
-        summarize_callback,
-        recreate_agent_callback,
+        summarize_callback: Callable[[List[BaseMessage]], str],
+        recreate_agent_callback: Callable[[str], Any],
         verbose: bool = False
-    ):
+    ) -> Optional[str]:
         """
         长上下文裁剪: 当当前会话消息数超过 max_context_messages 时,
         将较早的消息用 LLM 摘要,开启新会话并把摘要注入后续 system prompt,
@@ -388,7 +484,7 @@ class AgentMemory:
 
         return summary
 
-    def compress_memory(self, summarize_callback) -> Dict[str, Any]:
+    def compress_memory(self, summarize_callback: Callable[[str, str], str]) -> Dict[str, Any]:
         """
         压缩长期记忆
 
