@@ -22,7 +22,6 @@ import argparse
 import asyncio
 import json
 import os
-import sqlite3
 import sys
 from typing import Any, Dict, List, Optional
 
@@ -38,10 +37,9 @@ if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
 from agent import AgentCore
-from agent.message_utils import stringify_content  # 复用消息内容序列化
+from agent.message_utils import stringify_content  # 消息内容序列化
 from agent.config import load_agent_config, resolve_path
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
-from langgraph.checkpoint.sqlite import SqliteSaver
 from llm_client import LLMClient, load_providers
 from tools import safety as safety_module
 
@@ -118,26 +116,6 @@ def pick_default_provider() -> str:
     return "zhipu" if "zhipu" in providers else (next(iter(providers), "zhipu"))
 
 
-# --------------------------------------------------------------------------- #
-# 只读会话读取（用独立连接，不干扰 Agent 的 checkpointer，无需加锁）
-# --------------------------------------------------------------------------- #
-def read_thread_messages(thread_id: str) -> List[Any]:
-    """用独立 SQLite 连接读取某个 thread 的最新消息列表。"""
-    if not os.path.exists(CHECKPOINT_FILE):
-        return []
-    conn = sqlite3.connect(CHECKPOINT_FILE, check_same_thread=False)
-    try:
-        saver = SqliteSaver(conn)
-        tup = saver.get_tuple({"configurable": {"thread_id": thread_id}})
-        if tup and tup.checkpoint:
-            return list(tup.checkpoint.get("channel_values", {}).get("messages", []))
-        return []
-    except Exception:
-        return []
-    finally:
-        conn.close()
-
-
 def serialize_messages(messages: List[Any]) -> List[Dict[str, Any]]:
     """把 LangGraph 消息对象序列化为前端可消费的 JSON。"""
     out: List[Dict[str, Any]] = []
@@ -170,7 +148,7 @@ def serialize_messages(messages: List[Any]) -> List[Dict[str, Any]]:
 
 def thread_summary(thread_id: str) -> Dict[str, Any]:
     """单个会话的摘要信息（消息数 + 预览）。"""
-    msgs = read_thread_messages(thread_id)
+    msgs = agent.memory.get_messages(thread_id=thread_id) if agent else []
     preview = ""
     for m in msgs:
         if isinstance(m, HumanMessage):
@@ -312,7 +290,7 @@ async def delete_thread(thread_id: str):
 
 @app.get("/api/threads/{thread_id}/messages")
 async def get_thread_messages(thread_id: str):
-    msgs = read_thread_messages(thread_id)
+    msgs = agent.memory.get_messages(thread_id=thread_id) if agent else []
     return {"thread_id": thread_id, "messages": serialize_messages(msgs)}
 
 
