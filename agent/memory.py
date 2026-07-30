@@ -74,13 +74,16 @@ class AgentMemory:
             parent = os.path.dirname(os.path.abspath(self.checkpoint_file))
             if parent:
                 os.makedirs(parent, exist_ok=True)
-            conn = sqlite3.connect(self.checkpoint_file, check_same_thread=False)
+            conn = sqlite3.connect(self.checkpoint_file, check_same_thread=False, timeout=10)
+            # 启用 WAL 模式 + 忙等待：多进程(server/scheduler/remote)并发读写更友好
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=10000")
             return SqliteSaver(conn)
         else:
             return MemorySaver()
 
     def get_checkpointer(self):
-        """获取 checkpointer 实例(传给 create_react_agent)"""
+        """获取 checkpointer 实例(传给 create_agent)"""
         return self._checkpointer
 
     def get_config(self) -> Dict[str, Any]:
