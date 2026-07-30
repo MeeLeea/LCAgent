@@ -180,7 +180,7 @@ def start_agent() -> str:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 tid = _load_remote_thread_id()
-                agent, llm = build_agent(_auto_detect_provider())
+                agent, llm = build_agent(_auto_detect_provider(), process_type="feishu")
                 agent.verbose = False
                 if tid:
                     agent.memory.switch_thread(tid)

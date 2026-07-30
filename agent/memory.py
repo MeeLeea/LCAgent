@@ -76,7 +76,8 @@ class AgentMemory:
         long_term_file: Optional[str] = None,
         thread_id: Optional[str] = None,
         short_term_size: int = 10,  # 仅兼容旧 API
-        use_sqlite: bool = True
+        use_sqlite: bool = True,
+        process_type: Optional[str] = None
     ):
         """
         初始化记忆系统
@@ -87,10 +88,12 @@ class AgentMemory:
             thread_id: 会话线程 ID(为 None 时自动生成)
             short_term_size: 仅兼容旧 API(checkpoint 不限容量)
             use_sqlite: True=SQLite持久化, False=内存(调试用)
+            process_type: 进程类型标识(server/scheduler/feishu)，用于多进程隔离
         """
         self.checkpoint_file = checkpoint_file
         self.long_term_file = long_term_file
-        self.thread_id = thread_id or f"thread-{uuid.uuid4().hex[:8]}"
+        self.process_type = process_type
+        self.thread_id = thread_id or self._generate_thread_id()
         self.short_term_size = short_term_size
         self.use_sqlite = use_sqlite and checkpoint_file is not None
 
@@ -103,6 +106,23 @@ class AgentMemory:
         # 加载长期记忆
         if long_term_file and os.path.exists(long_term_file):
             self._load_long_term_memory()
+
+    def _generate_thread_id(self) -> str:
+        """生成新的 thread_id，自动加上 process_type 前缀（如有）"""
+        suffix = uuid.uuid4().hex[:8]
+        if self.process_type:
+            return f"{self.process_type}-thread-{suffix}"
+        return f"thread-{suffix}"
+
+    def _matches_process_type(self, thread_id: str) -> bool:
+        """判断 thread_id 是否属于当前 process_type
+        
+        - 如果未设置 process_type，匹配所有 thread
+        - 如果设置了 process_type，只匹配 "{type}-" 前缀的 thread
+        """
+        if not self.process_type:
+            return True
+        return thread_id.startswith(f"{self.process_type}-")
 
     # ============ Checkpointer 管理 ============
 
@@ -162,7 +182,7 @@ class AgentMemory:
 
     def new_thread(self) -> str:
         """开启新会话(原会话保留在数据库)"""
-        self.thread_id = f"thread-{uuid.uuid4().hex[:8]}"
+        self.thread_id = self._generate_thread_id()
         return self.thread_id
 
     def switch_thread(self, thread_id: str) -> bool:
@@ -177,8 +197,12 @@ class AgentMemory:
         self.thread_id = thread_id
         return existed
 
-    def _stored_thread_ids(self) -> List[str]:
+    def _stored_thread_ids(self, all_types: bool = False) -> List[str]:
         """数据库中真实存在的 thread_id(不含尚未落盘的当前会话)。
+
+        Args:
+            all_types: True=返回所有进程类型的 thread(跨 type 查询),
+                       False=只返回当前 process_type 的 thread(默认)
 
         Raises:
             sqlite3.Error: 数据库损坏、权限或磁盘错误。表尚未创建(全新库)
@@ -191,20 +215,28 @@ class AgentMemory:
                 cursor = conn.execute(
                     "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
                 )
-                return [row[0] for row in cursor.fetchall()]
+                rows = [row[0] for row in cursor.fetchall()]
         except sqlite3.OperationalError as error:
             # 全新数据库尚未建表,视为无存量会话;其余 OperationalError 照常抛出
             if "no such table" in str(error).lower():
                 return []
             raise
+        if all_types:
+            return rows
+        return [tid for tid in rows if self._matches_process_type(tid)]
 
-    def list_threads(self) -> List[str]:
+    def list_threads(self, all_types: bool = False) -> List[str]:
         """列出所有可见 thread_id(数据库存量 ∪ 当前会话)。
+
+        Args:
+            all_types: True=列出所有进程类型的 thread(跨 type 查询),
+                       False=只列出当前 process_type 的 thread(默认)
 
         当前会话可能还没写入 checkpoint,但对用户而言它是存在的,
         因此并入结果,保持 CLI/API 的显示语义不变。
         """
-        stored = self._stored_thread_ids()
+        stored = self._stored_thread_ids(all_types=all_types)
+        # 当前 thread 始终可见，即使它不匹配 all_types 的查询范围
         if self.thread_id in stored:
             return stored
         return sorted(stored + [self.thread_id])

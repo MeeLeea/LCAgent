@@ -103,6 +103,7 @@ def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
         auto_match_skills=cfg["auto_match_skills"],
         max_context_messages=cfg["max_context_messages"],
         context_trim_keep=cfg["context_trim_keep"],
+        process_type="server"
     )
     return new_agent, new_llm
 

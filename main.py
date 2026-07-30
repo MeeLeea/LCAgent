@@ -35,8 +35,14 @@ def render_print(value: str = "") -> None:
         print(line.strip())
 
 
-def build_agent(provider: str) -> tuple[AgentCore, object]:
-    """根据提供商和运行时配置初始化 LLM 与 Agent。"""
+def build_agent(provider: str, process_type: str = None) -> tuple[AgentCore, object]:
+    """根据提供商和运行时配置初始化 LLM 与 Agent。
+    
+    Args:
+        provider: LLM 提供商名称
+        process_type: 进程类型标识(feishu/None)，用于多进程隔离。
+                      CLI 模式传 None(单进程不需要隔离)
+    """
     print(f"\n初始化 {list_providers(LLM_FILE)[provider]['name']} 客户端...")
     llm = create_llm(provider, LLM_FILE)
     print("加载运行时配置...")
@@ -58,6 +64,7 @@ def build_agent(provider: str) -> tuple[AgentCore, object]:
         auto_match_skills=config["auto_match_skills"],
         max_context_messages=config["max_context_messages"],
         context_trim_keep=config["context_trim_keep"],
+        process_type=process_type
     )
     return agent, llm
 

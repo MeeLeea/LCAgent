@@ -99,7 +99,8 @@ class AgentCore:
         skills_dir: Optional[str] = None,
         auto_match_skills: bool = True,
         max_context_messages: int = 0,
-        context_trim_keep: int = 12
+        context_trim_keep: int = 12,
+        process_type: Optional[str] = None
     ):
         """
         初始化Agent核心
@@ -116,6 +117,7 @@ class AgentCore:
             enable_mcp: 是否启用 MCP 工具加载
             max_context_messages: 长上下文裁剪阈值(0=关闭);超过则自动摘要并开新会话
             context_trim_keep: 裁剪时保留的最近消息条数
+            process_type: 进程类型标识(server/scheduler/feishu)，用于多进程隔离
         """
         self.llm = llm_client
         self.memory = AgentMemory(
@@ -123,7 +125,8 @@ class AgentCore:
             long_term_file=long_term_memory_file,
             thread_id=thread_id,
             short_term_size=memory_size,
-            use_sqlite=checkpoint_file is not None
+            use_sqlite=checkpoint_file is not None,
+            process_type=process_type
         )
         self.max_iterations = max_iterations
         self.verbose = verbose

@@ -107,6 +107,7 @@ def make_agent_factory(provider: str):
             auto_match_skills=agent_config["auto_match_skills"],
             max_context_messages=agent_config["max_context_messages"],
             context_trim_keep=agent_config["context_trim_keep"],
+            process_type="scheduler"
         )
 
     return factory
