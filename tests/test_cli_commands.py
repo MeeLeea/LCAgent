@@ -4,8 +4,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from utils.commands.dispatcher import dispatch_command
-from utils.commands.types import CommandContext
+from cli.commands.dispatcher import dispatch_command
+from cli.commands.types import CommandContext
 
 import pytest
 

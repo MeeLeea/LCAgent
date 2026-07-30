@@ -25,7 +25,7 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from config import load_agent_config, resolve_path
+from agent.config import load_agent_config, resolve_path
 from llm_client import LLMClient, load_providers
 from agent import AgentCore
 from scheduler import TaskStore, SchedulerEngine

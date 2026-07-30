@@ -12,14 +12,14 @@ except ImportError:
     pass
 
 from agent import AgentCore
-from config import load_agent_config, resolve_path
+from agent.config import load_agent_config, resolve_path
 from llm_client import load_providers as list_providers
 from tools import safety as safety_module
-from utils.cli_menu import select_menu
-from utils.commands import CommandContext, dispatch_command
-from utils.commands.core import show_ready
-from utils.commands.provider import create_llm, select_provider
-from utils.human_input import chat_until_completion, run_structured_until_completion
+from cli.cli_menu import select_menu
+from cli.commands import CommandContext, dispatch_command
+from cli.commands.core import show_ready
+from cli.commands.provider import create_llm, select_provider
+from cli.human_input import chat_until_completion, run_structured_until_completion
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LLM_FILE = os.path.join(BASE_DIR, "config", "llm_config.json")

@@ -27,7 +27,7 @@ def test_ask_human_invokes_interrupt_with_structured_choice_payload(monkeypatch)
     import langgraph.types
 
     monkeypatch.setattr(langgraph.types, "interrupt", fake_interrupt)
-    human_input = importlib.import_module("utils.human_input")
+    human_input = importlib.import_module("cli.human_input")
 
     # When: the human-input tool asks for a structured choice.
     result = human_input.ask_human(
@@ -154,7 +154,7 @@ def test_resume_structured_invokes_command_resume_with_same_thread_config():
 
 def test_cli_helper_renders_and_resumes_until_completion():
     # Given: an agent that interrupts twice before completing.
-    from utils import human_input
+    from cli import human_input
 
     interrupts = [
         Interrupt(value={"kind": "human_choice", "prompt": "First?", "choices": []}, id="i-1"),
@@ -200,7 +200,7 @@ def test_cli_helper_renders_and_resumes_until_completion():
 
 def test_real_state_graph_ask_human_interrupts_and_resumes_on_same_thread():
     # Given: a real offline LangGraph with MemorySaver and the production ask_human tool.
-    from utils.human_input import ask_human
+    from cli.human_input import ask_human
 
     class State(TypedDict, total=False):
         answer: dict
@@ -232,7 +232,7 @@ def test_real_state_graph_ask_human_interrupts_and_resumes_on_same_thread():
 
 def test_real_state_graph_two_sequential_interrupts_require_two_resumes():
     # Given: a real graph node that asks twice in sequence.
-    from utils.human_input import ask_human
+    from cli.human_input import ask_human
 
     class State(TypedDict, total=False):
         first: dict
@@ -274,7 +274,7 @@ def test_real_state_graph_two_sequential_interrupts_require_two_resumes():
 
 def test_cli_helper_collects_simultaneous_interrupts_before_one_resume():
     # Given: one interrupted turn with multiple simultaneous interrupts.
-    from utils import human_input
+    from cli import human_input
 
     interrupts = [
         Interrupt(value={"kind": "human_choice", "choices": []}, id="interrupt-a"),
