@@ -1826,6 +1826,49 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 
 ---
 
+## 已知问题与修复
+
+### Web 前端命令执行统一架构（已修复 2026-07-31）
+
+**问题：** 用户在 Web 前端发送 `/skill:pptx 读取...做个ppt` 等执行型命令后没有反应。
+
+**根本原因：**
+1. 前端将 `/` 开头的消息路由到非流式 `/api/command` endpoint
+2. 后端 `execute_command` 调用 CLI 的 `dispatch_command`，但将 `run_structured_until_completion` 和 `chat_until_completion` 替换成空函数
+3. 执行型命令（`skill:<task>`、`json:`、`react:`、`cot:`、裸对话）需要工具调用、流式输出和中断恢复（ask_human），必须走流式通道
+4. 结果：所有执行型命令在 Web 端失效（仅管理型命令如 `help`/`info`/`threads` 正常）
+
+**架构矛盾：**
+- CLI 的 `dispatch_command` 混合了两类命令：管理型（同步文本输出）和执行型（需流式 + 中断恢复）
+- `/api/command` 是同步 JSON endpoint，无法支持流式输出和 `ask_human` 中断
+- 之前的方案把执行型命令"屏蔽"掉，导致功能缺失
+
+**解决方案（统一架构）：**
+所有命令（管理型 + 执行型）统一走 **`/api/chat` 流式通道**，内部通过 `dispatch_command` 分发：
+
+1. **后端** (`api/server.py`)：
+   - `/api/chat` 检测消息是否以 `/` 开头
+   - 是命令 → 判断类型：
+     - 执行型（`json:`/`react:`/`cot:`/`skill:<task>`）→ 直接调用 `agent.astream_chat(command)`
+     - 管理型（`help`/`info`/`threads`...）→ 调用 `dispatch_command`，输出包成 `token` 事件推送
+   - 非命令 → 普通对话，走 `astream_chat`
+
+2. **前端** (`web/src/store.ts`)：
+   - 删除 `/api/command` 分支
+   - 所有消息（含 `/` 命令）统一走流式 `api.streamChat`
+
+**技术细节：**
+- 执行型命令通过 `astream_chat` 获得流式输出、工具调用显示、`ask_human` 中断恢复
+- 管理型命令的文本输出包装成 `{"type": "token", "content": "..."}` 事件，前端体验一致
+- 命令路由逻辑收敛到 `/api/chat` 一处，CLI 和 Web 共用 `dispatch_command`
+
+**相关文件：**
+- `api/server.py` - `/api/chat` endpoint 增加命令检测和分发
+- `web/src/store.ts` - 删除命令/对话二分支，统一走流式通道
+- `cli/commands/dispatcher.py` - 命令分发器（CLI 和 Web 共用）
+
+---
+
 ## 技术栈
 
 - Python 3.10+

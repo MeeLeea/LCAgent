@@ -21,9 +21,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import sys
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger("api.server")
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -42,6 +45,9 @@ from agent.config import load_agent_config, resolve_path
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 from llm_client import LLMClient, load_providers
 from tools import safety as safety_module
+from cli.commands import CommandContext, dispatch_command
+from cli.cli_menu import select_menu
+from cli.commands.provider import create_llm
 
 # --------------------------------------------------------------------------- #
 # 路径常量（与 main.py 保持一致）
@@ -181,6 +187,11 @@ class SwitchModelRequest(BaseModel):
     model: str
 
 
+class CommandRequest(BaseModel):
+    command: str
+    thread_id: Optional[str] = None
+
+
 # --------------------------------------------------------------------------- #
 # FastAPI 应用
 # --------------------------------------------------------------------------- #
@@ -229,33 +240,33 @@ async def get_providers():
 
 @app.post("/api/providers/switch")
 async def switch_provider(req: SwitchProviderRequest):
-    print(f"\n[切换] 收到切换提供商请求: {req.provider}", flush=True)
+    logger.info("切换提供商: %s", req.provider)
     async with chat_lock:
         global agent, llm
         try:
             new_llm = LLMClient(provider=req.provider, config_file=LLM_FILE)
         except Exception as e:
-            print(f"[切换] 提供商切换失败: {e}", flush=True)
+            logger.error("切换失败: %s", e)
             raise HTTPException(status_code=400, detail=str(e))
         agent.switch_llm(new_llm)
         llm = new_llm
     info = llm.get_info()
-    print(f"[切换] 提供商已切换 → {info['provider_name']} / {info['model']}", flush=True)
+    logger.info("已切换 → %s / %s", info["provider_name"], info["model"])
     return info
 
 
 @app.post("/api/models/switch")
 async def switch_model(req: SwitchModelRequest):
-    print(f"\n[切换] 收到切换模型请求: {req.model}", flush=True)
+    logger.info("切换模型: %s", req.model)
     async with chat_lock:
         try:
             llm.switch_model(req.model)
             agent.switch_llm(llm)
         except Exception as e:
-            print(f"[切换] 模型切换失败: {e}", flush=True)
+            logger.error("切换失败: %s", e)
             raise HTTPException(status_code=400, detail=str(e))
     info = llm.get_info()
-    print(f"[切换] 模型已切换 → {info['provider_name']} / {info['model']}", flush=True)
+    logger.info("已切换 → %s / %s", info["provider_name"], info["model"])
     return info
 
 
@@ -278,13 +289,16 @@ async def create_thread():
     """新建会话，返回 thread_id。"""
     async with chat_lock:
         tid = agent.memory.new_thread()
+    logger.info("创建会话: %s", tid)
     return {"thread_id": tid}
 
 
 @app.delete("/api/threads/{thread_id}")
 async def delete_thread(thread_id: str):
+    logger.info("删除会话: %s", thread_id)
     ok = agent.memory.delete_thread(thread_id)
     if not ok:
+        logger.warning("删除失败: %s", thread_id)
         raise HTTPException(status_code=404, detail="会话不存在或删除失败")
     return {"deleted": True, "thread_id": thread_id}
 
@@ -299,9 +313,51 @@ def _sse(data: Dict[str, Any]) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _format_help_as_table(help_text: str) -> str:
+    """将帮助文本转换成 Markdown 表格格式。"""
+    lines = help_text.strip().split('\n')
+
+    # 提取命令行（以 "- 输入" 开头的行）
+    commands = []
+    for line in lines:
+        line = line.strip()
+        if line.startswith("- 输入"):
+            # 移除 "- 输入 " 前缀
+            cmd_desc = line[5:].strip()
+            # 分割命令和描述：命令通常用单引号包裹
+            if cmd_desc.startswith("'"):
+                end_quote = cmd_desc.find("'", 1)
+                if end_quote != -1:
+                    cmd = cmd_desc[1:end_quote]
+                    desc = cmd_desc[end_quote + 1:].strip()
+                else:
+                    cmd, desc = cmd_desc, ""
+            else:
+                parts = cmd_desc.split(" ", 1)
+                cmd = parts[0]
+                desc = parts[1] if len(parts) > 1 else ""
+            commands.append((cmd, desc))
+
+    if not commands:
+        return help_text
+
+    # 构建 Markdown 表格
+    table_lines = [
+        "## 可用命令\n",
+        "| 命令 | 说明 |",
+        "|------|------|",
+    ]
+    for cmd, desc in commands:
+        cmd = cmd.replace('|', '\\|')
+        desc = desc.replace('|', '\\|')
+        table_lines.append(f"| `{cmd}` | {desc} |")
+
+    return "\n".join(table_lines)
+
+
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
-    """SSE 流式聊天。"""
+    """SSE 流式聊天。支持普通对话和命令执行（如 /skill:pptx <task>、/json:、/react: 等）。"""
 
     async def event_stream():
         async with chat_lock:
@@ -311,10 +367,90 @@ async def chat(req: ChatRequest):
             else:
                 tid = agent.memory.new_thread()
                 yield _sse({"type": "thread_created", "thread_id": tid})
+            preview = req.message.strip().replace("\n", " ")[:50]
+            logger.info("收到聊天 [%s]: %s", tid, preview)
+            
+            # 检测是否为命令（以 / 开头）
+            message = req.message.strip()
+            if message.startswith('/'):
+                # 命令模式：通过 dispatch_command 处理
+                command = message.lstrip('/')
+                logger.info("检测到命令 [%s]: %s", tid, command)
+                
+                # 文本输出包装器：管理型命令的输出包成 token 事件
+                output_buffer = []
+                def capture_output(text: str):
+                    output_buffer.append(text)
+                
+                try:
+                    context = CommandContext(
+                        agent=agent,
+                        llm=llm,
+                        print_fn=capture_output,
+                        input_fn=lambda prompt="": "",  # 不支持交互输入
+                        select_menu=lambda title, choices: choices[0] if choices else "",
+                        create_llm=lambda provider: create_llm(provider, LLM_FILE),
+                        list_providers=lambda: load_providers(LLM_FILE),
+                        run_structured_until_completion=lambda agent_obj, text: None,  # 占位，实际用 stream_runner
+                        chat_until_completion=lambda agent_obj, text: None,  # 占位
+                        safety_backend=safety_module,
+                        base_dir=BASE_DIR,
+                        config_file=AGENT_CONFIG_FILE,
+                        mcp_config_file=MCP_CONFIG_FILE,
+                    )
+                    
+                    # 检测执行型命令（json:/react:/cot:/skill:<task>）
+                    low = command.lower()
+                    is_execution = False
+                    
+                    if low.startswith("json:") or low.startswith("react:") or low.startswith("cot:"):
+                        is_execution = True
+                    elif low.startswith("skill:"):
+                        # skill:<name> <task> 是执行型，skill:clear 或 skill:<name>（无任务）是管理型
+                        rest = command[6:].strip()
+                        parts = rest.split(None, 1)
+                        skill_name = parts[0].strip() if parts else ""
+                        task_text = parts[1].strip() if len(parts) > 1 else ""
+                        # 有技能名且有任务文本，且不是 clear
+                        if skill_name and task_text and skill_name.lower() not in ("clear", "清空", "reset"):
+                            is_execution = True
+                    
+                    if is_execution:
+                        # 执行型命令：走流式 runner
+                        logger.info("执行型命令 [%s]，走流式通道", tid)
+                        # 把命令原文传给 astream_chat（它会自动匹配技能）
+                        async for ev in agent.astream_chat(command):
+                            yield _sse(ev)
+                        logger.info("完成 [%s]", tid)
+                        return
+                    else:
+                        # 管理型命令：调用 dispatch_command，输出包成 token
+                        logger.info("管理型命令 [%s]", tid)
+                        outcome = dispatch_command(context, command)
+                        output = "\n".join(output_buffer)
+                        
+                        if command.lower() == "help":
+                            output = _format_help_as_table(output)
+                        
+                        # 输出包成 token 事件推送
+                        if output:
+                            yield _sse({"type": "token", "content": output})
+                        yield _sse({"type": "done"})
+                        logger.info("命令完成 [%s]: %s", tid, outcome)
+                        return
+                        
+                except Exception as e:
+                    logger.error("命令执行异常 [%s]: %s", tid, e)
+                    yield _sse({"type": "error", "content": f"命令执行失败: {e}"})
+                    return
+            
+            # 普通对话模式
             try:
                 async for event in agent.astream_chat(req.message):
                     yield _sse(event)
+                logger.info("完成 [%s]", tid)
             except Exception as e:
+                logger.error("异常 [%s]: %s", tid, e)
                 yield _sse({"type": "error", "content": f"内部错误: {e}"})
 
     return StreamingResponse(
@@ -336,10 +472,14 @@ async def chat_resume(req: ResumeRequest):
         async with chat_lock:
             if req.thread_id:
                 agent.memory.thread_id = req.thread_id
+            tid = req.thread_id or agent.memory.thread_id
+            logger.info("恢复会话 [%s]", tid)
             try:
                 async for event in agent.astream_resume(req.payload):
                     yield _sse(event)
+                logger.info("恢复完成 [%s]", tid)
             except Exception as e:
+                logger.error("恢复异常 [%s]: %s", tid, e)
                 yield _sse({"type": "error", "content": f"内部错误: {e}"})
 
     return StreamingResponse(
@@ -349,12 +489,112 @@ async def chat_resume(req: ResumeRequest):
     )
 
 
+@app.post("/api/command")
+async def execute_command(req: CommandRequest):
+    """执行 CLI 命令（如 /help, /info, /threads 等）。"""
+    async with chat_lock:
+        if req.thread_id:
+            agent.memory.thread_id = req.thread_id
+        tid = req.thread_id or agent.memory.thread_id
+        
+        # 去掉前导 / 符号（CLI 命令不需要 /）
+        command = req.command.lstrip('/')
+        logger.info("执行命令 [%s]: %s", tid, command)
+        
+        # 构造命令上下文（模拟 CLI 环境）
+        output_lines = []
+        def capture_output(text: str):
+            output_lines.append(text)
+        
+        # 对于需要交互的命令，提供一个假的 input 函数（返回空字符串或默认值）
+        def fake_input(prompt: str = "") -> str:
+            output_lines.append(f"[交互提示] {prompt}")
+            return ""
+        
+        # 对于菜单选择，返回第一项
+        def fake_select_menu(title: str, choices: List[str]) -> str:
+            if choices:
+                return choices[0]
+            return ""
+        
+        # 不支持的命令会 fallback 到聊天模式，提示用户用正常对话
+        def unsupported_runner(agent_obj, text: str) -> str:
+            capture_output("未知命令。请直接发送消息进行对话，或输入 /help 查看可用命令。")
+            return ""
+        
+        try:
+            context = CommandContext(
+                agent=agent,
+                llm=llm,
+                print_fn=capture_output,
+                input_fn=fake_input,
+                select_menu=fake_select_menu,
+                create_llm=lambda provider: create_llm(provider, LLM_FILE),
+                list_providers=lambda: load_providers(LLM_FILE),
+                run_structured_until_completion=unsupported_runner,
+                chat_until_completion=unsupported_runner,
+                safety_backend=safety_module,
+                base_dir=BASE_DIR,
+                config_file=AGENT_CONFIG_FILE,
+                mcp_config_file=MCP_CONFIG_FILE,
+            )
+            
+            outcome = dispatch_command(context, command)
+            output = "\n".join(output_lines)
+            
+            # 如果是 help 命令，将输出转换成表格格式
+            if command.lower() == "help":
+                output = _format_help_as_table(output)
+            
+            logger.info("命令完成 [%s]: %s", tid, outcome)
+            return {
+                "success": outcome != "quit",
+                "outcome": outcome,
+                "output": output,
+                "thread_id": tid,
+            }
+        except Exception as e:
+            import traceback
+            error_trace = traceback.format_exc()
+            logger.error("命令执行异常 [%s]: %s\n%s", tid, e, error_trace)
+            raise HTTPException(status_code=500, detail=f"{e}\n\n{error_trace}")
+
+
 # 生产环境：如果前端已构建（web/dist），则由本服务直接托管静态文件
 if os.path.isdir(WEB_DIST):
     app.mount("/", StaticFiles(directory=WEB_DIST, html=True), name="web")
 
 
 def main():
+    # 配置日志 - 必须在 uvicorn.run() 之前
+    # 1. 生成日志文件名：按日期分目录，文件名为时间 + 哈希
+    from datetime import datetime
+    import hashlib
+    
+    now = datetime.now()
+    date_str = now.strftime("%Y%m%d")
+    time_str = now.strftime("%H%M%S")
+    time_hash = hashlib.md5(str(now.timestamp()).encode()).hexdigest()[:8]
+    
+    log_date_dir = os.path.join(BASE_DIR, "api", "log", date_str)
+    os.makedirs(log_date_dir, exist_ok=True)
+    
+    log_file = os.path.join(log_date_dir, f"{time_str}_{time_hash}.log")
+    
+    # 2. 配置日志：同时输出到终端（stderr）和文件
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[
+            logging.StreamHandler(sys.stderr),  # 终端输出
+            logging.FileHandler(log_file, encoding="utf-8"),  # 文件输出
+        ],
+        force=True,  # 强制重新配置
+    )
+    
+    logger.info("日志文件: %s", log_file)
+    
     server_cfg = load_server_config()
     parser = argparse.ArgumentParser(description="LangChainAgent API Server")
     parser.add_argument("--provider", default=None, help="初始 LLM 提供商")
@@ -364,15 +604,21 @@ def main():
 
     global agent, llm
     provider = args.provider or pick_default_provider()
-    print(f"[API] 初始化提供商: {provider}")
+    logger.info("初始化提供商: %s", provider)
     agent, llm = build_agent(provider)
     info = llm.get_info()
-    print(f"[API] 模型: {info['provider_name']} / {info['model']}")
-    print(f"[API] 工具: {', '.join(agent.get_available_tools())}")
-    print(f"[API] 服务启动: http://{args.host}:{args.port}")
+    logger.info("模型: %s / %s", info["provider_name"], info["model"])
+    logger.info("工具: %s", ", ".join(agent.get_available_tools()))
+    logger.info("服务启动: http://%s:%s", args.host, args.port)
 
     import uvicorn
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    uvicorn.run(
+        app, 
+        host=args.host, 
+        port=args.port, 
+        log_level="info",
+        access_log=False  # 关闭访问日志（GET/POST 请求）
+    )
 
 
 if __name__ == "__main__":
