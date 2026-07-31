@@ -1796,76 +1796,77 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 
 项目提供一套**离线**单元测试（无需 API Key、不联网），覆盖核心逻辑：
 
-| 测试文件                       | 覆盖内容                                                 |
-| ------------------------------ | -------------------------------------------------------- |
-| `tests/test_config.py`       | 运行时配置：默认值合并、路径解析                         |
-| `tests/test_safety.py`       | 安全护栏：黑名单拒绝、白名单放行、危险命令确认、路径保护 |
-| `tests/test_skills.py`       | `SkillManager`：列出/读取/匹配(中→英别名)/渲染技能    |
-| `tests/test_search.py`       | `search` 工具：无 Key 降级、Tavily 返回结构(mock)      |
-| `tests/test_cli_commands.py` | CLI 命令分发：路由优先级、状态变更和各领域处理器         |
-| `tests/test_human_input.py`  | LangGraph HITL：interrupt、恢复、并行选择和线程隔离      |
-| `tests/test_terminal.py`     | 终端工具：输出截断、护栏拒绝、安全执行(mock subprocess)  |
-| `tests/test_memory.py`       | `AgentMemory`：长期记忆、会话管理(SQLite)              |
-| `tests/test_scheduler.py`  | 定时任务调度：TaskStore CRUD、原子抢占、重试逻辑       |
+| 测试文件                                   | 覆盖内容                                                 |
+| ------------------------------------------ | -------------------------------------------------------- |
+| `tests/test_config.py`                     | 运行时配置：默认值合并、路径解析                         |
+| `tests/test_config_templates.py`           | 配置模板验证：.example 文件完整性检查                    |
+| `tests/test_safety.py`                     | 安全护栏：黑名单拒绝、白名单放行、危险命令确认、路径保护 |
+| `tests/test_skills.py`                     | `SkillManager`：列出/读取/匹配(中→英别名)/渲染技能      |
+| `tests/test_search.py`                     | `search` 工具：无 Key 降级、Tavily 返回结构(mock)        |
+| `tests/test_cli_commands.py`               | CLI 命令分发：路由优先级、状态变更和各领域处理器         |
+| `tests/test_human_input.py`                | LangGraph HITL：interrupt、恢复、并行选择和线程隔离      |
+| `tests/test_terminal.py`                   | 终端工具：输出截断、护栏拒绝、安全执行(mock subprocess)  |
+| `tests/test_calculator.py`                 | 计算器工具：表达式求值、错误处理                         |
+| `tests/test_memory.py`                     | `AgentMemory`：长期记忆、会话管理(SQLite)               |
+| `tests/test_agent_core_regressions.py`     | Agent 核心回归测试：HITL 恢复、会话隔离、技能匹配        |
+| `tests/test_scheduler.py`                  | 定时任务调度：TaskStore CRUD、原子抢占、重试逻辑         |
+| `tests/test_provider_models.py`            | 提供商模型切换：配置加载、模型列表                       |
+| `tests/test_workspace_tool_path_protection`| 工作目录工具：路径保护、越界检测                         |
+| `tests/test_api.py`                        | API Server：端点路由、流式聊天、命令执行                 |
 
-运行：
+### 运行测试
+
+**运行全部测试：**
 
 ```bash
 # Linux / macOS
-.venv/bin/pip install -r requirements.txt
 .venv/bin/pytest
-```
 
-```powershell
 # Windows
-.\.venv\Scripts\pip.exe install -r requirements.txt
 .\.venv\Scripts\pytest.exe
 ```
 
+**运行单个测试文件：**
+
+```bash
+# Linux / macOS
+.venv/bin/pytest tests/test_safety.py
+
+# Windows
+.\.venv\Scripts\pytest.exe tests/test_safety.py
+```
+
+**运行单个测试函数：**
+
+```bash
+# Linux / macOS
+.venv/bin/pytest tests/test_safety.py::test_blacklist_blocks_commands
+
+# Windows
+.\.venv\Scripts\pytest.exe tests/test_safety.py::test_blacklist_blocks_commands
+```
+
+**显示详细输出（-v）和打印信息（-s）：**
+
+```bash
+# Linux / macOS
+.venv/bin/pytest -v -s tests/test_memory.py
+
+# Windows
+.\.venv\Scripts\pytest.exe -v -s tests/test_memory.py
+```
+
+**运行特定模式匹配的测试：**
+
+```bash
+# 运行所有包含 "safety" 的测试
+pytest -k safety
+
+# 运行所有包含 "memory" 或 "thread" 的测试
+pytest -k "memory or thread"
+```
+
 测试配置见 `pytest.ini`（`pythonpath = .` 保证 `import tools`/`import agent` 可用），`conftest.py` 提供安全配置缓存隔离的 autouse fixture。
-
----
-
-## 已知问题与修复
-
-### Web 前端命令执行统一架构（已修复 2026-07-31）
-
-**问题：** 用户在 Web 前端发送 `/skill:pptx 读取...做个ppt` 等执行型命令后没有反应。
-
-**根本原因：**
-1. 前端将 `/` 开头的消息路由到非流式 `/api/command` endpoint
-2. 后端 `execute_command` 调用 CLI 的 `dispatch_command`，但将 `run_structured_until_completion` 和 `chat_until_completion` 替换成空函数
-3. 执行型命令（`skill:<task>`、`json:`、`react:`、`cot:`、裸对话）需要工具调用、流式输出和中断恢复（ask_human），必须走流式通道
-4. 结果：所有执行型命令在 Web 端失效（仅管理型命令如 `help`/`info`/`threads` 正常）
-
-**架构矛盾：**
-- CLI 的 `dispatch_command` 混合了两类命令：管理型（同步文本输出）和执行型（需流式 + 中断恢复）
-- `/api/command` 是同步 JSON endpoint，无法支持流式输出和 `ask_human` 中断
-- 之前的方案把执行型命令"屏蔽"掉，导致功能缺失
-
-**解决方案（统一架构）：**
-所有命令（管理型 + 执行型）统一走 **`/api/chat` 流式通道**，内部通过 `dispatch_command` 分发：
-
-1. **后端** (`api/server.py`)：
-   - `/api/chat` 检测消息是否以 `/` 开头
-   - 是命令 → 判断类型：
-     - 执行型（`json:`/`react:`/`cot:`/`skill:<task>`）→ 直接调用 `agent.astream_chat(command)`
-     - 管理型（`help`/`info`/`threads`...）→ 调用 `dispatch_command`，输出包成 `token` 事件推送
-   - 非命令 → 普通对话，走 `astream_chat`
-
-2. **前端** (`web/src/store.ts`)：
-   - 删除 `/api/command` 分支
-   - 所有消息（含 `/` 命令）统一走流式 `api.streamChat`
-
-**技术细节：**
-- 执行型命令通过 `astream_chat` 获得流式输出、工具调用显示、`ask_human` 中断恢复
-- 管理型命令的文本输出包装成 `{"type": "token", "content": "..."}` 事件，前端体验一致
-- 命令路由逻辑收敛到 `/api/chat` 一处，CLI 和 Web 共用 `dispatch_command`
-
-**相关文件：**
-- `api/server.py` - `/api/chat` endpoint 增加命令检测和分发
-- `web/src/store.ts` - 删除命令/对话二分支，统一走流式通道
-- `cli/commands/dispatcher.py` - 命令分发器（CLI 和 Web 共用）
 
 ---
 
