@@ -61,3 +61,16 @@ docs/
 *.json
 /tests/*
 !tests/test_*
+
+# Rust / Cargo
+src-tauri/target/
+**/*.rs.bk
+*.pdb
+
+# Tauri
+src-tauri/tauri.conf.json
+
+# Frontend build
+web/dist/
+web/node_modules/
+*.tsbuildinfo
