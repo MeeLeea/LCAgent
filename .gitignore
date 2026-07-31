@@ -74,3 +74,5 @@ src-tauri/tauri.conf.json
 web/dist/
 web/node_modules/
 *.tsbuildinfo
+web/vite.config.js
+web/vite.config.d.ts
