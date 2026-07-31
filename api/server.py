@@ -511,11 +511,31 @@ async def execute_command(req: CommandRequest):
             output_lines.append(f"[交互提示] {prompt}")
             return ""
         
-        # 对于菜单选择，返回第一项
-        def fake_select_menu(title: str, choices: List[str]) -> str:
+        # 对于菜单选择，优先返回当前项，否则返回第一项
+        def fake_select_menu(
+            title: str,
+            choices: List[str],
+            current: str | None = None,
+            action_keys: dict | None = None,
+            hint: str | None = None,
+        ) -> str | tuple[str, str] | None:
+            if action_keys:
+                # 命令模式下不模拟二次动作，直接忽略快捷键分支
+                action_keys = None
+            if current is not None:
+                for choice in choices:
+                    if isinstance(choice, tuple) and len(choice) == 2:
+                        label, value = choice
+                        if value == current or str(label) == current:
+                            return value
+                    elif choice == current:
+                        return choice
             if choices:
-                return choices[0]
-            return ""
+                first = choices[0]
+                if isinstance(first, tuple) and len(first) == 2:
+                    return first[1]
+                return first
+            return None
         
         # 不支持的命令会 fallback 到聊天模式，提示用户用正常对话
         def unsupported_runner(agent_obj, text: str) -> str:
