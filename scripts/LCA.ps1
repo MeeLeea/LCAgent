@@ -112,6 +112,39 @@ function Start-Backend {
     }
 }
 
+function Start-FrontendDev {
+    Write-Step "Start Web Frontend Dev Server"
+    Write-Hint "Launching Vite dev server on port 5173..."
+
+    wt -w 0 `
+        nt -d "$WebDir" --title "Web Frontend" cmd /k "npm run dev"
+}
+
+function Wait-For-WebFrontend {
+    $maxWait = 30
+    $waited = 0
+    $ready = $false
+
+    while ($waited -lt $maxWait) {
+        Start-Sleep -Seconds 1
+        $waited++
+        try {
+            $null = Invoke-WebRequest -Uri "http://127.0.0.1:5173" -Method Get -TimeoutSec 2 -ErrorAction Stop
+            $ready = $true
+            break
+        } catch {
+            # 继续等待
+        }
+    }
+
+    if ($ready) {
+        Write-OK "Web frontend ready (took ${waited}s)"
+    } else {
+        Write-Fail "Web frontend not ready after ${maxWait}s"
+        Write-Hint "Check the Web Frontend tab for errors"
+    }
+}
+
 function Start-Desktop {
     Write-Step "Start Desktop App"
     
@@ -133,9 +166,14 @@ function Start-Desktop {
         Write-Hint "Run: .\LCA.ps1 build"
         exit 1
     }
-    
+
     Start-Process -FilePath $exePath -WorkingDirectory $ProjectRoot
     Write-OK "Desktop app started ($version mode)"
+
+    if ($version -eq "Debug") {
+        Start-FrontendDev
+        Wait-For-WebFrontend
+    }
 }
 
 Write-Host "`n========================================" -ForegroundColor Cyan

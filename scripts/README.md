@@ -27,6 +27,7 @@ LangChainAgent/
 - ⚡ 快速增量编译（10-30 秒）
 - 📦 Debug 模式（体积大但构建快）
 - 🔄 支持快速迭代开发
+- 🌐 启动桌面应用时会自动拉起 Vite 开发服务器，避免页面不存在
 
 ### 生产模式（发布打包）
 
@@ -126,12 +127,15 @@ LangChainAgent/
    └─ cargo build（target/debug/langchainagent.exe）
 
 3. 启动后端服务（3 个标签页）
-   ├─ API Server（8001 端口）
-   ├─ Scheduler（定时任务）
-   └─ Feishu Remote（飞书远程控制）
+    ├─ API Server（8001 端口）
+    ├─ Scheduler（定时任务）
+    └─ Feishu Remote（飞书远程控制）
 
 4. 启动桌面应用
-   └─ target/debug/langchainagent.exe
+    └─ target/debug/langchainagent.exe
+
+5. 启动前端开发服务器（Debug 模式额外 1 个标签页）
+   └─ Web Frontend（5173 端口，桌面应用会先启动）
 ```
 
 ### 生产模式 (`LCA-Release.ps1`)
@@ -144,12 +148,12 @@ LangChainAgent/
    └─ cargo build --release（target/release/langchainagent.exe）
 
 3. 启动后端服务（3 个标签页）
-   ├─ API Server（8001 端口）
-   ├─ Scheduler（定时任务）
-   └─ Feishu Remote（飞书远程控制）
+    ├─ API Server（8001 端口）
+    ├─ Scheduler（定时任务）
+    └─ Feishu Remote（飞书远程控制）
 
 4. 启动桌面应用
-   └─ target/release/langchainagent.exe
+    └─ target/release/langchainagent.exe
 ```
 
 ## ⚙️ 环境要求
@@ -187,6 +191,7 @@ python -m venv .venv
 2. **后端独立**：桌面应用不内置后端，需独立运行 `api.server`
 3. **端口配置**：确保 `config/server_config.json` 中的端口与前端一致
 4. **Windows Terminal**：如果没有 `wt` 命令，脚本会失败（需要安装 Windows Terminal）
+5. **端口占用**：脚本不再自动清理占用进程，若端口被占用请先手动处理后再运行
 
 ## 🔧 故障排查
 
