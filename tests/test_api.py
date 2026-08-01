@@ -342,34 +342,41 @@ def test_delete_thread_not_found(client, mock_agent):
     assert response.status_code == 404
 
 
-def test_get_thread_messages(client, temp_checkpoint_db):
+def test_get_thread_messages(client, mock_agent, temp_checkpoint_db):
     """测试读取会话消息"""
-    response = client.get("/api/threads/thread-1/messages")
-    assert response.status_code == 200
-    
-    data = response.json()
-    assert data["thread_id"] == "thread-1"
-    assert "messages" in data
-    
-    messages = data["messages"]
-    assert len(messages) == 5
-    
-    # 验证消息结构
-    assert messages[0]["role"] == "user"
-    assert messages[0]["content"] == "测试消息1"
-    
-    assert messages[1]["role"] == "assistant"
-    assert messages[1]["content"] == "回复1"
-    
-    # 验证工具调用消息
-    assert messages[3]["role"] == "assistant"
-    assert "tool_calls" in messages[3]
-    assert len(messages[3]["tool_calls"]) == 1
-    assert messages[3]["tool_calls"][0]["name"] == "calculator"
-    
-    assert messages[4]["role"] == "tool"
-    assert messages[4]["name"] == "calculator"
-    assert messages[4]["content"] == "2"
+    from agent.memory import AgentMemory
+
+    memory = AgentMemory(checkpoint_file=temp_checkpoint_db)
+    mock_agent.memory.get_messages.side_effect = memory.get_messages
+    try:
+        response = client.get("/api/threads/thread-1/messages")
+        assert response.status_code == 200
+
+        data = response.json()
+        assert data["thread_id"] == "thread-1"
+        assert "messages" in data
+
+        messages = data["messages"]
+        assert len(messages) == 5
+
+        # 验证消息结构
+        assert messages[0]["role"] == "user"
+        assert messages[0]["content"] == "测试消息1"
+
+        assert messages[1]["role"] == "assistant"
+        assert messages[1]["content"] == "回复1"
+
+        # 验证工具调用消息
+        assert messages[3]["role"] == "assistant"
+        assert "tool_calls" in messages[3]
+        assert len(messages[3]["tool_calls"]) == 1
+        assert messages[3]["tool_calls"][0]["name"] == "calculator"
+
+        assert messages[4]["role"] == "tool"
+        assert messages[4]["name"] == "calculator"
+        assert messages[4]["content"] == "2"
+    finally:
+        memory.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -670,14 +677,21 @@ def test_serialize_messages():
 
 def test_thread_summary(temp_checkpoint_db):
     """测试会话摘要生成"""
+    from types import SimpleNamespace
+
+    from agent.memory import AgentMemory
     from api.server import thread_summary
-    
-    with patch("api.server.CHECKPOINT_FILE", temp_checkpoint_db):
-        summary = thread_summary("thread-1")
-        
-        assert summary["thread_id"] == "thread-1"
-        assert summary["message_count"] == 5
-        assert len(summary["preview"]) > 0
+
+    memory = AgentMemory(checkpoint_file=temp_checkpoint_db)
+    try:
+        with patch("api.server.agent", SimpleNamespace(memory=memory)):
+            summary = thread_summary("thread-1")
+
+            assert summary["thread_id"] == "thread-1"
+            assert summary["message_count"] == 5
+            assert len(summary["preview"]) > 0
+    finally:
+        memory.close()
 
 
 # --------------------------------------------------------------------------- #
