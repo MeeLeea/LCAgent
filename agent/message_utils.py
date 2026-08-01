@@ -8,6 +8,7 @@
 import asyncio
 import re
 import threading
+import time
 from typing import Any, Dict
 
 from langchain_core.messages import (
@@ -18,17 +19,40 @@ from langchain_core.messages import (
 )
 from langgraph.types import Command
 
+from llm_client import RETRY_ATTEMPTS, RETRY_MAX_DELAY, should_retry
 from tools.terminal_tools import UserRejectedCommandError
 
-
 # ============ LLM 异常提取 ============
+
+def _extract_status_code(raw: str) -> str:
+    """从异常字符串中尽力提取 HTTP 状态码。
+
+    Args:
+        raw: 异常字符串
+
+    Returns:
+        HTTP 状态码字符串，未匹配到则返回空字符串
+    """
+    # 常见格式: "Error code: 429" / "status_code: 503" / "status 503"
+    for pattern in (
+        r"Error code:\s*(\d{3})",
+        r"status[_ ]?code\s*[:=]\s*(\d{3})",
+        r"status\s+(\d{3})",
+    ):
+        m = re.search(pattern, raw, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return ""
+
 
 def extract_llm_error(e: Exception) -> str:
     """从 LLM API 异常中提取对用户友好的错误信息，如实返回给前端。
 
     智谱/DeepSeek 等返回的异常字符串形如:
       Error code: 429 - {'error': {'code': '1305', 'message': '该模型当前访问量过大，请您稍后再试'}}
-    本函数把其中真正的 message 提取出来，附带 HTTP 状态码。
+    某些网关过载时会返回纯文本，形如 "Service temporarily unavailable"。
+    本函数把其中真正的 message 提取出来，附带 HTTP 状态码，并对常见的瞬时错误
+    (429 限流 / 5xx 过载) 给出「稍后重试或切换提供商」的友好提示。
 
     Args:
         e: LLM API 抛出的异常对象
@@ -37,19 +61,42 @@ def extract_llm_error(e: Exception) -> str:
         对用户友好的错误信息字符串
     """
     raw = str(e)
-    # 提取 HTTP 状态码（如 "Error code: 429"）
-    code_match = re.search(r"Error code:\s*(\d+)", raw)
-    status_code = code_match.group(1) if code_match else ""
+    status_code = _extract_status_code(raw)
+    low = raw.lower()
 
     # 尝试从 {'message': '...'} 结构中提取真正的错误文案
-    msg_match = re.search(r"['\"]message['\"]\s*[:=]\s*['\"](.+?)['\"]\s*[,}]", raw, re.S)
+    msg_match = re.search(r"['\"]message['\"]\s*[:=]\s*['\"](.+?)['\"]\s*[,}]", raw, re.DOTALL)
     if msg_match:
         message = msg_match.group(1).strip()
         prefix = f"[HTTP {status_code}] " if status_code else ""
         return f"{prefix}{message}"
 
+    # 429 / 限流类错误
+    if status_code == "429" or "too many requests" in low or "访问量过大" in raw:
+        code_hint = f"[HTTP {status_code}] " if status_code else ""
+        return f"{code_hint}模型当前访问量过大或触发限流(429)，请稍后重试，或切换模型/提供商。"
+
+    # 5xx / 服务过载类错误(含纯文本网关提示)
+    transient_keywords = (
+        "service temporarily unavailable",
+        "service unavailable",
+        "temporarily unavailable",
+        "internal server error",
+        "bad gateway",
+        "gateway timeout",
+        "server overloaded",
+        "temporary failure",
+    )
+    is_server_error = (
+        status_code.startswith("5")
+        or any(k in low for k in transient_keywords)
+    )
+    if is_server_error:
+        code_hint = f"[HTTP {status_code}] " if status_code else ""
+        return f"{code_hint}模型服务暂时不可用，请稍后重试，或切换提供商。"
+
     # 401 / 鉴权类错误
-    if "401" in raw or "Unauthorized" in raw or "authentication" in raw.lower():
+    if status_code == "401" or "unauthorized" in low or "authentication" in low:
         return "LLM 鉴权失败(401)，请检查 API Key 是否正确配置。"
 
     # 兜底：返回原始信息，不再吞掉
@@ -112,42 +159,57 @@ class StreamHandler:
         self.agent = agent
 
     def _stream_events(self, input_or_command, config: Dict[str, Any]):
-        """同步流式生成事件（在线程中执行，配合 SqliteSaver 的同步接口）。"""
-        for mode, payload in self.agent.agent_executor.stream(
-            input_or_command,
-            config=config,
-            stream_mode=["messages", "updates"],
-        ):
-            if mode == "messages":
-                chunk, metadata = payload
-                node = metadata.get("langgraph_node", "") if isinstance(metadata, dict) else ""
-                # 兼容不同 LangGraph 版本：token 可能从 agent 或 model 节点产出
-                if isinstance(chunk, AIMessageChunk) and node in ("agent", "model"):
-                    text = stringify_content(chunk.content)
-                    if text:
-                        yield {"type": "token", "content": text}
-            elif mode == "updates":
-                if not isinstance(payload, dict):
-                    continue
-                for _node_name, state in payload.items():
-                    if not isinstance(state, dict):
-                        continue
-                    for m in state.get("messages", []):
-                        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
-                            for tc in m.tool_calls:
-                                yield {
-                                    "type": "tool_call",
-                                    "id": tc.get("id"),
-                                    "name": tc.get("name"),
-                                    "args": tc.get("args"),
-                                }
-                        elif isinstance(m, ToolMessage):
-                            yield {
-                                "type": "tool_result",
-                                "id": getattr(m, "tool_call_id", ""),
-                                "name": getattr(m, "name", "") or "",
-                                "content": stringify_content(m.content),
-                            }
+        """同步流式生成事件（在线程中执行，配合 SqliteSaver 的同步接口）。
+
+        对 LLM 提供的瞬时错误(429/5xx/连接超时)做自动重试：仅当错误发生在
+        任何事件输出之前才从头重试，避免工具副作用被重复执行或产出重复 token。
+        """
+        for attempt in range(RETRY_ATTEMPTS):
+            emitted = False
+            try:
+                for mode, payload in self.agent.agent_executor.stream(
+                    input_or_command,
+                    config=config,
+                    stream_mode=["messages", "updates"],
+                ):
+                    emitted = True
+                    if mode == "messages":
+                        chunk, metadata = payload
+                        node = metadata.get("langgraph_node", "") if isinstance(metadata, dict) else ""
+                        # 兼容不同 LangGraph 版本：token 可能从 agent 或 model 节点产出
+                        if isinstance(chunk, AIMessageChunk) and node in ("agent", "model"):
+                            text = stringify_content(chunk.content)
+                            if text:
+                                yield {"type": "token", "content": text}
+                    elif mode == "updates":
+                        if not isinstance(payload, dict):
+                            continue
+                        for _node_name, state in payload.items():
+                            if not isinstance(state, dict):
+                                continue
+                            for m in state.get("messages", []):
+                                if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+                                    for tc in m.tool_calls:
+                                        yield {
+                                            "type": "tool_call",
+                                            "id": tc.get("id"),
+                                            "name": tc.get("name"),
+                                            "args": tc.get("args"),
+                                        }
+                                elif isinstance(m, ToolMessage):
+                                    yield {
+                                        "type": "tool_result",
+                                        "id": getattr(m, "tool_call_id", ""),
+                                        "name": getattr(m, "name", "") or "",
+                                        "content": stringify_content(m.content),
+                                    }
+                return
+            except Exception as e:
+                # 已产出事件(部分 token/工具调用)或非瞬时错误：不再重试，交给上层处理
+                if emitted or not should_retry(e) or attempt == RETRY_ATTEMPTS - 1:
+                    raise
+                delay = min(RETRY_MAX_DELAY, 2**attempt)
+                time.sleep(delay)
 
     async def _astream_from_sync(self, input_or_command, config: Dict[str, Any]):
         """把同步 .stream() 跑在后台线程，异步吐出事件。

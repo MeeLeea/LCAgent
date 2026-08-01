@@ -2,20 +2,95 @@
 统一大模型封装 - 基于LangChain，支持多提供商(智谱/千问/DeepSeek/Kimi)
 所有提供商均兼容 OpenAI API 格式，使用 langchain.chat_models.init_chat_model 统一调用
 """
-import os
 import json
-from typing import Optional, Dict, List, Any
+import os
+import re
+from typing import Any, Dict, List, Optional
+
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
-
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from tenacity import (
+    Retrying,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 # 提供商配置(单一来源: 见 config/llm_config.json 的 providers 字段)
 DEFAULT_CONFIG_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "config",
-    "llm_config.json"
+    "llm_config.json",
 )
+
+# ============ 瞬时错误自动重试 ============
+
+# 可安全自动重试的 HTTP 状态码(限流/服务过载)
+RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+RETRY_ATTEMPTS = 3  # 含首次在内最多尝试次数
+RETRY_BASE_DELAY = 1.0  # 指数退避基数(秒)
+RETRY_MAX_DELAY = 8.0  # 单次最长等待(秒)
+
+# 网关/模型服务过载时常见的纯文本关键字
+_RETRYABLE_KEYWORDS = (
+    "service temporarily unavailable",
+    "service unavailable",
+    "temporarily unavailable",
+    "internal server error",
+    "bad gateway",
+    "gateway timeout",
+    "too many requests",
+    "server overloaded",
+    "temporary failure",
+)
+
+
+def should_retry(e: Exception) -> bool:
+    """判断异常是否属于可安全自动重试的瞬时错误(限流/服务过载/网络抖动)。
+
+    覆盖场景:
+      - 429 / 5xx 等可重试状态码(异常对象带 status_code，或字符串中出现状态码)
+      - 连接/超时类异常(ConnectionError / TimeoutError 等)
+      - 网关纯文本提示(如 "Service temporarily unavailable")
+
+    Args:
+        e: 待判断的异常对象
+
+    Returns:
+        是否应自动重试
+    """
+    # 连接/超时类异常
+    if isinstance(e, (ConnectionError, TimeoutError, OSError)):
+        return True
+
+    # 异常对象直接暴露状态码
+    status = getattr(e, "status_code", None)
+    if status is not None:
+        try:
+            if int(status) in RETRYABLE_STATUS:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+    text = str(e)
+    low = text.lower()
+
+    # 字符串中标注的状态码，如 "Error code: 500" / "status code: 429" / "HTTP 503"
+    status_match = re.search(
+        r"(?:error code|status[ _-]?code|http[ _-]?status|status)\s*[:=]?\s*(\d{3})",
+        text,
+        re.IGNORECASE,
+    )
+    if status_match:
+        try:
+            if int(status_match.group(1)) in RETRYABLE_STATUS:
+                return True
+        except ValueError:
+            pass
+
+    # 纯文本网关提示关键字
+    return any(k in low for k in _RETRYABLE_KEYWORDS)
 
 
 def load_providers(config_file: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
@@ -42,6 +117,24 @@ def load_providers(config_file: Optional[str] = None) -> Dict[str, Dict[str, Any
         return data.get("providers", {})
     except (json.JSONDecodeError, IOError):
         return {}
+
+
+def _make_retryer() -> Retrying:
+    """构建针对瞬时错误(429/5xx/连接超时)的指数退避重试器。
+
+    Returns:
+        配置好的 tenacity.Retrying 实例，失败最终会原样抛出原始异常
+    """
+    return Retrying(
+        retry=retry_if_exception(should_retry),
+        wait=wait_exponential(
+            multiplier=RETRY_BASE_DELAY,
+            min=RETRY_BASE_DELAY,
+            max=RETRY_MAX_DELAY,
+        ),
+        stop=stop_after_attempt(RETRY_ATTEMPTS),
+        reraise=True,
+    )
 
 
 class LLMClient:
@@ -148,7 +241,7 @@ class LLMClient:
             client = client.bind(**overrides)
 
         try:
-            response = client.invoke(langchain_messages)
+            response = _make_retryer()(client.invoke, langchain_messages)
             return response.content
         except Exception as e:
             raise RuntimeError(f"[{self.provider_config['name']}] 调用失败: {str(e)}")
