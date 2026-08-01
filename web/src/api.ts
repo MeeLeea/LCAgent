@@ -69,7 +69,9 @@ async function consumeSSE(
         if (TERMINAL_TYPES.has(ev.type)) gotTerminal = true
         onEvent(ev)
       } catch {
-        /* 跳过无法解析的事件 */
+        // 事件损坏：不能静默吞掉，否则流卡死时 isStreaming 无法复位
+        gotTerminal = true
+        onEvent({ type: 'error', content: '服务端事件解析失败，连接可能已损坏。' })
       }
     }
   }
