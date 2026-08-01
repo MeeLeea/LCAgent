@@ -90,6 +90,33 @@ function clearWatchdog() {
   }
 }
 
+/**
+ * 构造看门狗超时处理器：把最后一条仍在流式中的 assistant 消息标记为超时错误，
+ * 并强制复位 isStreaming。所有事件循环中重挂看门狗时都必须复用同一个处理器，
+ * 否则一旦换成空函数，流卡死时 isStreaming 将永久为 true，输入框被锁死。
+ */
+function makeWatchdogHandler(
+  get: () => AppState,
+  set: (partial: Partial<AppState>) => void,
+  finish: () => void,
+) {
+  return () => {
+    const msgs = [...get().messages]
+    const lastIndex = msgs.length - 1
+    const last = msgs[lastIndex]
+    if (last && last.role === 'assistant' && last.streaming) {
+      msgs[lastIndex] = {
+        ...last,
+        streaming: false,
+        error: true,
+        content: last.content + (last.content ? '\n\n' : '') + '> ⏱️ 响应超时，请重试。',
+      }
+      set({ messages: msgs })
+    }
+    finish()
+  }
+}
+
 /** 把后端原始消息列表转换为前端回合结构 */
 function rawToMessages(raw: RawMessage[]): ChatMessage[] {
   const turns: ChatMessage[] = []
@@ -252,25 +279,12 @@ export const useStore = create<AppState>((set, get) => ({
       console.log('[前端] 消息接收完成')
     }
 
-    armWatchdog(() => {
-      const msgs = [...get().messages]
-      const lastIndex = msgs.length - 1
-      const last = msgs[lastIndex]
-      if (last && last.role === 'assistant' && last.streaming) {
-        msgs[lastIndex] = {
-          ...last,
-          streaming: false,
-          error: true,
-          content: last.content + (last.content ? '\n\n' : '') + '> ⏱️ 响应超时，请重试。',
-        }
-        set({ messages: msgs })
-      }
-      finish()
-    })
+    const watchdogHandler = makeWatchdogHandler(get, set, finish)
+    armWatchdog(watchdogHandler)
 
     abortFn = api.streamChat({ message: trimmed, thread_id: threadId }, (ev) => {
-      // 每收到任意事件，重置看门狗
-      if (!terminated) armWatchdog(() => {})
+      // 每收到任意事件，重置看门狗（复用同一超时处理器，保持兜底有效）
+      if (!terminated) armWatchdog(watchdogHandler)
       const msgs = [...get().messages]
       const lastIndex = msgs.length - 1
       const last = msgs[lastIndex]
@@ -364,24 +378,11 @@ export const useStore = create<AppState>((set, get) => ({
       console.log('[前端] 会话恢复完成')
     }
 
-    armWatchdog(() => {
-      const msgs = [...get().messages]
-      const lastIndex = msgs.length - 1
-      const last = msgs[lastIndex]
-      if (last && last.role === 'assistant' && last.streaming) {
-        msgs[lastIndex] = {
-          ...last,
-          streaming: false,
-          error: true,
-          content: last.content + (last.content ? '\n\n' : '') + '> ⏱️ 响应超时，请重试。',
-        }
-        set({ messages: msgs })
-      }
-      finish()
-    })
+    const watchdogHandler = makeWatchdogHandler(get, set, finish)
+    armWatchdog(watchdogHandler)
 
     abortFn = api.streamResume({ payload, thread_id: threadId }, (ev) => {
-      if (!terminated) armWatchdog(() => {})
+      if (!terminated) armWatchdog(watchdogHandler)
       const msgs = [...get().messages]
       const lastIndex = msgs.length - 1
       const last = msgs[lastIndex]
