@@ -1747,12 +1747,6 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
   },
   "agent": {
     "provider": ""
-  },
-  "safety": {
-    "mode": "blacklist",
-    "confirm_dangerous": false,
-    "blacklist": [],
-    "whitelist": ["echo", "dir", "ls", "python", "pip", "git", "cat", "type", "powershell", "pwsh"]
   }
 }
 ```
@@ -1763,7 +1757,6 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 | `feishu.app_secret` | string | 飞书应用 App Secret |
 | `feishu.allow_open_id` | string[] | 允许远程控制的飞书用户 Open ID 列表 |
 | `agent.provider` | string | 远程控制使用的服务商标识（空则用默认） |
-| `safety` | object | 远程控制下的独立安全配置（与 `safety.json` 结构一致，不影响本地运行） |
 
 ### 6. `scheduler_config.json` — 定时任务调度
 

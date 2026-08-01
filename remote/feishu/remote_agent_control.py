@@ -153,22 +153,9 @@ def _has_api_key(key: str) -> bool:
     except Exception:
         return False
 
-def _patch_safety_config() -> None:
-    import tools.safety as m
-    if not os.path.exists(REMOTE_CONFIG_FILE):
-        return
-    with open(REMOTE_CONFIG_FILE, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    safety_cfg = cfg.get("safety")
-    if safety_cfg:
-        m._config_cache = dict(m.DEFAULT_CONFIG)
-        m._config_cache.update(safety_cfg)
-        print(f"[Agent] 安全: {REMOTE_CONFIG_FILE} -> safety")
-
 def start_agent() -> str:
     """初始化或重启 Agent。在独立线程中运行以避免 asyncio 事件循环冲突。"""
     global _agent, _agent_info
-    _patch_safety_config()
     try:
         # 在独立线程中构建 Agent，解决 MCP 加载的 asyncio.run() 与 WS 事件循环冲突
         result_container: list[tuple] = []
@@ -182,6 +169,9 @@ def start_agent() -> str:
                 tid = _load_remote_thread_id()
                 agent, llm = build_agent(_auto_detect_provider(), process_type="feishu")
                 agent.verbose = False
+                # 非交互环境：危险命令确认改为通过 LangGraph interrupt 抛给飞书交互，而不是终端 input()
+                import tools.safety as _safety
+                _safety.set_confirm_backend(_safety.interrupt_confirm)
                 if tid:
                     agent.memory.switch_thread(tid)
                 else:
@@ -269,7 +259,7 @@ def _handle_turn_result(chat_id: str, agent: Any, turn: Any, mode: str) -> None:
         interrupts = getattr(turn, "interrupts", []) or []
         if not interrupts: return _send_text(chat_id, "⏸️ 中断，无选项")
         v = getattr(interrupts[0], "value", {})
-        if not isinstance(v, dict) or v.get("kind") != "human_choice":
+        if not isinstance(v, dict) or v.get("kind") not in ("human_choice", "dangerous_command"):
             _interrupt_cache[chat_id] = {"agent": agent, "is_text": True}
             return _send_text(chat_id, "⏸️ 需要人工输入，发送消息回复")
         choices = v.get("choices", [])
