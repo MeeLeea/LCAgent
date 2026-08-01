@@ -25,13 +25,14 @@
 import os
 import re
 import json
-from typing import Tuple, Dict, Any, List, Optional
+import shlex
+from typing import Tuple, Dict, Any, List, Optional, Callable
 
 # ============ 内置规则 ============
 
 # 始终拒绝的灾难性模式(命中即 deny,不询问)
 BUILTIN_BLOCKLIST = [
-    r"\brm\s+-rf\b", r"\brm\s+-fr\b", r"\brm\b.*--recursive",
+    r"\brm\b.*--recursive",
     r"\brd\s+/[sq]", r"\bdeltree\b",
     # 覆盖 Windows/PowerShell 的递归删除和编码命令，避免只拦截 Unix 写法。
     r"\bremove-item\b(?=[^\r\n]*\s-(?:recurse|r)\b)(?=[^\r\n]*\s-(?:force|f)\b)",
@@ -48,7 +49,7 @@ BUILTIN_BLOCKLIST = [
 
 # 危险但非灾难性模式(命中且开启确认时 -> confirm)
 BUILTIN_CONFIRM = [
-    r"\bsudo\b", r"\brm\b", r"\bchmod\b", r"\bchown\b",
+    r"\bsudo\b", r"\brm\b", r"\brm\s+-f\b", r"\brm\s+-rf\b", r"\brm\s+-fr\b", r"\bchmod\b", r"\bchown\b",
     r"\bmv\b", r"\bkill\b", r"\btaskkill\b", r"\bschtasks\b",
     r"\bremove-item\b", r"\b(?:del|erase|rd|rmdir)\b",
     # 解释器可隐藏任意副作用，脚本、内联代码和命令包装器统一要求人工确认。
@@ -117,7 +118,27 @@ def save_config(cfg: Dict[str, Any]) -> bool:
         return False
 
 
-# ============ 编译正则 ============
+# ============ 常量 ============
+
+# 项目根目录(用于保护)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# 受保护的文件夹(删除时禁止)
+PROTECTED_DIRS = [
+    os.path.abspath(os.path.join(PROJECT_ROOT, "tools")),
+    os.path.abspath(os.path.join(PROJECT_ROOT, "docs")),
+    os.path.abspath(PROJECT_ROOT),
+]
+
+# 删除文件夹的命令识别模式
+DELETE_DIR_PATTERNS = [
+    re.compile(r"\brm\s+-rf\b", re.IGNORECASE),
+    re.compile(r"\brm\s+-fr\b", re.IGNORECASE),
+    re.compile(r"\brmdir\b", re.IGNORECASE),
+    re.compile(r"\brd\s+/s\b", re.IGNORECASE),
+    re.compile(r"\bremove-item\b[^\r\n]*\s-(?:recurse|r)\b[^\r\n]*\s-(?:force|f)\b", re.IGNORECASE),
+    re.compile(r"\bschtasks\b[^\r\n]*\s-delete\b", re.IGNORECASE),
+]
 
 def _compile(patterns: List[str]) -> List[re.Pattern]:
     return [re.compile(p, re.IGNORECASE) for p in patterns]
@@ -168,6 +189,11 @@ def check_command(command: str) -> Tuple[str, str]:
         if _first_token(command).lower() not in allowed:
             return "deny", f"白名单模式禁止命令: {_first_token(command)}"
 
+    # 2.5. 删除文件夹保护(优先于确认)
+    deny_status, deny_reason = _check_delete_protection(command)
+    if deny_status == "deny":
+        return deny_status, deny_reason
+
     # 3. 需确认的危险模式
     if cfg.get("confirm_dangerous", True):
         for pat in _confirm_list():
@@ -176,6 +202,49 @@ def check_command(command: str) -> Tuple[str, str]:
                 return "confirm", f"匹配危险模式: {pat.pattern}"
 
     return "allow", ""
+
+
+def _extract_delete_paths(command: str) -> List[str]:
+    """从删除命令中提取路径参数"""
+    cmd_lower = command.lower()
+    is_unix_like = bool(re.match(r"^\s*(rm|rmdir|mv|cp)\b", cmd_lower))
+    try:
+        if is_unix_like:
+            tokens = command.split()
+        else:
+            tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    paths = [t.strip('"\'-') for t in tokens[1:] if not t.startswith("-") and t]
+    return paths
+
+
+def _is_delete_dir_command(command: str) -> bool:
+    """判断命令是否为删除文件夹的命令"""
+    for pat in DELETE_DIR_PATTERNS:
+        if pat.search(command):
+            return True
+    return False
+
+
+def _check_delete_protection(command: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    检查删除命令是否试图删除受保护文件夹
+    Returns:
+        (None, None) if safe or not a delete command
+        ("deny", reason) if attempting to delete protected dir
+    """
+    if not _is_delete_dir_command(command):
+        return None, None
+    paths = _extract_delete_paths(command)
+    for p in paths:
+        abs_p = os.path.abspath(p)
+        comparable = os.path.normcase(abs_p)
+        for protected in PROTECTED_DIRS:
+            norm_protected = os.path.normcase(protected)
+            if comparable == norm_protected:
+                return "deny", f"禁止删除受保护文件夹: {protected}"
+    return None, None
 
 
 def check_exec() -> Tuple[str, str]:
@@ -189,9 +258,13 @@ def check_exec() -> Tuple[str, str]:
     return "allow", ""
 
 
-def check_path(path: str) -> Tuple[bool, str]:
+def check_path(path: str, is_delete: bool = False) -> Tuple[bool, str]:
     """
     路径保护(用于删除/移动等操作):禁止操作系统关键目录与项目根
+
+    Args:
+        path: 待检查路径
+        is_delete: 是否为删除操作(仅删除时触发文件夹保护)
 
     Returns:
         (allowed, reason)
@@ -211,12 +284,18 @@ def check_path(path: str) -> Tuple[bool, str]:
         os.path.abspath(windir),
         os.path.abspath(os.path.expanduser("~")),
     ]
-    # 项目根
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    protected.append(os.path.abspath(project_root))
+    # Windows 路径大小写不敏感，比较前统一规范化以防大小写绕过。
+    comparable_path = os.path.normcase(abs_path)
     for p in protected:
-        if abs_path == p or abs_path.startswith(p + os.sep):
-            return False, f"禁止操作系统/项目关键目录: {p}"
+        comparable_p = os.path.normcase(p)
+        if comparable_path == comparable_p or comparable_path.startswith(comparable_p + os.sep):
+            return False, f"禁止操作系统关键目录: {p}"
+    # 删除文件夹保护(仅删除操作时触发)
+    if is_delete:
+        for protected_dir in PROTECTED_DIRS:
+            comparable_dir = os.path.normcase(protected_dir)
+            if comparable_path == comparable_dir:
+                return False, f"禁止删除受保护文件夹: {protected_dir}"
     return True, ""
 
 

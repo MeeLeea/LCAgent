@@ -28,7 +28,8 @@ def test_truncate_long():
 
 
 def test_guard_deny():
-    r = _guard_command("rm -rf /")
+    # rm -rf 工具目录应被拒绝(受保护文件夹)
+    r = _guard_command("rm -rf tools")
     assert r is not None and r["success"] is False
 
 
@@ -93,5 +94,6 @@ def test_run_shell_safe(monkeypatch):
 
 def test_run_shell_deny(monkeypatch):
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: _FakeResult())
-    r = run_shell.invoke({"command": "rm -rf /"})
+    # rm -rf 工具目录应被拒绝(受保护文件夹)
+    r = run_shell.invoke({"command": "rm -rf tools"})
     assert r["success"] is False

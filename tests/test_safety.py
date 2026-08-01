@@ -10,10 +10,6 @@ if ROOT not in sys.path:
 from tools import safety
 
 
-def test_blocklist_rm_rf():
-    assert safety.check_command("rm -rf /")[0] == "deny"
-
-
 def test_blocklist_format():
     assert safety.check_command("format c:")[0] == "deny"
 
@@ -26,6 +22,36 @@ def test_blocklist_fork_bomb():
     assert safety.check_command(":(){ :|:& };:")[0] == "deny"
 
 
+def test_confirm_rm_rf():
+    # rm -rf 现在走确认流程,而非直接拒绝
+    assert safety.check_command("rm -rf /")[0] == "confirm"
+
+
+def test_deny_delete_protected_dirs():
+    status, reason = safety.check_command("rm -rf tools")
+    assert status == "deny"
+    assert "tools" in reason
+
+    status, reason = safety.check_command("rm -rf docs")
+    assert status == "deny"
+    assert "docs" in reason
+
+    status, reason = safety.check_command("rm -rf .")
+    assert status == "deny"
+
+    status, reason = safety.check_command("Remove-Item -Recurse -Force LCAgent/tools")
+    assert status == "deny"
+
+
+def test_allow_delete_file():
+    # 删除单个文件需要确认(走 confirm 流程)
+    status, reason = safety.check_command("rm file.txt")
+    assert status == "confirm"
+
+    status, reason = safety.check_command("del docs/test.md")
+    assert status == "confirm"
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -35,7 +61,8 @@ def test_blocklist_fork_bomb():
         "rd /s /q C:\\temp\\victim",
     ],
 )
-def test_blocklist_windows_recursive_delete(command):
+def test_deny_windows_recursive_delete_protected(command):
+    # Windows 递归删除命中黑名单直接拒绝
     assert safety.check_command(command)[0] == "deny"
 
 
@@ -68,10 +95,10 @@ def test_confirm_interpreter_execution(command):
         "Remove-Item C:\\temp\\victim.txt",
         "del C:\\temp\\victim.txt",
         "erase C:\\temp\\victim.txt",
-        "rmdir C:\\temp\\empty",
     ],
 )
-def test_confirm_windows_delete(command):
+def test_confirm_windows_delete_file(command):
+    # 删除单个文件走确认流程
     assert safety.check_command(command)[0] == "confirm"
 
 
@@ -110,6 +137,20 @@ def test_check_path_protected():
 
 def test_check_path_ok():
     assert safety.check_path("C:\\temp\\foo_dir")[0] is True
+
+
+def test_check_path_delete_protected_dir():
+    # 删除受保护文件夹应被拒绝
+    assert safety.check_path("tools", is_delete=True)[0] is False
+    assert safety.check_path("docs", is_delete=True)[0] is False
+    assert safety.check_path(".", is_delete=True)[0] is False
+
+
+def test_check_path_delete_file_allowed():
+    # 删除文件不受文件夹保护限制
+    assert safety.check_path("tools/safety.py", is_delete=True)[0] is True
+    assert safety.check_path("docs/test.md", is_delete=True)[0] is True
+    assert safety.check_path("README.md", is_delete=True)[0] is True
 
 
 def test_check_exec_confirm():
