@@ -21,7 +21,7 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
           <MessagesSquare size={18} />
         </div>
         <div>
-          <div className="logo-title">LangChain Agent</div>
+          <div className="logo-title">LC Agent</div>
           <div className="logo-sub">Work 模式</div>
         </div>
       </div>

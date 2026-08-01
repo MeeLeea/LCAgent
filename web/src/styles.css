@@ -179,7 +179,7 @@ button {
 
 /* ---------- 侧边栏 ---------- */
 .sidebar {
-  width: 264px;
+  position: relative;
   flex-shrink: 0;
   background: var(--bg-sidebar);
   border-right: 1px solid var(--border);
@@ -192,6 +192,27 @@ button {
 .sidebar.collapsed {
   width: 0;
   border-right: none;
+}
+
+.sidebar.resizing {
+  transition: none;
+}
+
+/* 侧边栏右缘拖拽手柄 */
+.sidebar-resizer {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 5px;
+  cursor: col-resize;
+  z-index: 10;
+  transition: background 0.12s;
+}
+
+.sidebar-resizer:hover,
+.sidebar.resizing .sidebar-resizer {
+  background: var(--accent);
 }
 
 .sidebar-header {
