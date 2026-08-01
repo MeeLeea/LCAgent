@@ -3,6 +3,7 @@
 使用 LangChain @tool 装饰器，支持 .py / .ps1 / .bat 文件
 """
 from langchain_core.tools import tool
+from langgraph.errors import GraphInterrupt
 from typing import Dict, Any, Optional
 import os
 import subprocess
@@ -168,6 +169,9 @@ def run_shell(command: str, cwd: Optional[str] = None, timeout: int = DEFAULT_TI
     except UserRejectedCommandError:
         # 用户拒绝不是可恢复的工具失败，必须穿透边界终止当前 Agent turn。
         raise
+    except GraphInterrupt:
+        # 前端确认（interrupt_confirm）是图中断，必须穿透，让 LangGraph 暂停并等待 resume。
+        raise
     except Exception as e:
         return {
             "success": False,
@@ -246,6 +250,8 @@ def run_python(file_path: str, script_args: str = "", cwd: Optional[str] = None,
             "script_args": script_args
         }
     except UserRejectedCommandError:
+        raise
+    except GraphInterrupt:
         raise
     except Exception as e:
         return {
@@ -343,6 +349,8 @@ def run_cmd(file_path: str, script_args: str = "", cwd: Optional[str] = None, ti
             "script_args": script_args
         }
     except UserRejectedCommandError:
+        raise
+    except GraphInterrupt:
         raise
     except Exception as e:
         return {

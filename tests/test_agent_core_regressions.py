@@ -225,6 +225,44 @@ def test_run_structured_stops_after_user_rejects_command(monkeypatch):
     assert turn.output == "用户已拒绝执行危险命令，当前任务已取消。"
 
 
+def test_resume_structured_stops_after_user_rejects_command():
+    # Given: 中断恢复期间（如飞书 deny 选择）用户拒绝危险命令。
+    from agent.agent_core import AgentCore
+
+    class FakeMemory:
+        def get_config(self):
+            return {"configurable": {"thread_id": "thread-resume-rejected"}}
+
+        def add(self, role, content, metadata=None):
+            raise AssertionError("取消的任务不应写入长期记忆")
+
+    class RejectingExecutor:
+        def invoke(self, value, config):
+            raise UserRejectedCommandError("python cleanup.py")
+
+        def get_state(self, config):
+            return SimpleNamespace(values={"messages": []})
+
+    executor = RejectingExecutor()
+    core = object.__new__(AgentCore)
+    core.memory = FakeMemory()
+    core.max_iterations = 25
+    core.verbose = False
+    core.execution_history = []
+    core.agent_executor = executor
+    core._pending_interrupt_thread_id = "thread-resume-rejected"
+    core._pending_interrupt_mode = "chat"
+
+    # When: 用户以 deny 恢复中断。
+    turn = core.resume_structured({"choice_id": "deny"})
+
+    # Then: 本轮取消并清理中断状态，而不是抛异常给调用方。
+    assert turn.status == "cancelled"
+    assert turn.output == "用户已拒绝执行危险命令，当前任务已取消。"
+    assert core._pending_interrupt_thread_id is None
+    assert core._pending_interrupt_mode is None
+
+
 def test_run_structured_repairs_checkpoint_after_user_rejects_command():
     # Given: 工具拒绝前，LangGraph 已把包含 tool_calls 的 AIMessage 写入 checkpoint。
     from agent.agent_core import AgentCore

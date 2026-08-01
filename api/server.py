@@ -626,6 +626,8 @@ def main():
     provider = args.provider or pick_default_provider()
     logger.info("初始化提供商: %s", provider)
     agent, llm = build_agent(provider)
+    # 非交互环境：危险命令确认改为通过 LangGraph interrupt 抛给前端，而不是终端 input()
+    safety_module.set_confirm_backend(safety_module.interrupt_confirm)
     info = llm.get_info()
     logger.info("模型: %s / %s", info["provider_name"], info["model"])
     logger.info("工具: %s", ", ".join(agent.get_available_tools()))

@@ -466,10 +466,14 @@ class AgentCore:
         if pending_thread_id is not None and current_thread_id != pending_thread_id:
             raise ValueError("Cannot resume interrupt on a different thread")
         
-        result = self.agent_executor.invoke(
-            Command(resume=payload),
-            config=config
-        )
+        try:
+            result = self.agent_executor.invoke(
+                Command(resume=payload),
+                config=config
+            )
+        except UserRejectedCommandError:
+            # 用户拒绝危险命令确认（如飞书/CLI 的 deny 选择），终止本轮并修复 checkpoint。
+            return self._handle_rejected_command(config)
         
         turn = self._parse_turn_result(result)
         

@@ -25,7 +25,7 @@
 import os
 import re
 import json
-from typing import Tuple, Dict, Any, List, Optional
+from typing import Tuple, Dict, Any, List, Optional, Callable
 
 # ============ 内置规则 ============
 
@@ -74,6 +74,9 @@ CONFIG_PATH = os.path.join(
 
 # 模块级缓存配置
 _config_cache: Optional[Dict[str, Any]] = None
+
+# 交互确认后端：None 时使用终端 input()；server 等非交互环境可替换为 interrupt 后端。
+_confirm_backend: Optional[Callable[[str], bool]] = None
 
 
 def load_config() -> Dict[str, Any]:
@@ -214,17 +217,61 @@ def check_path(path: str) -> Tuple[bool, str]:
     # 项目根
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     protected.append(os.path.abspath(project_root))
+    # Windows 路径大小写不敏感，比较前统一规范化以防大小写绕过。
+    comparable_path = os.path.normcase(abs_path)
     for p in protected:
-        if abs_path == p or abs_path.startswith(p + os.sep):
+        comparable_root = os.path.normcase(p)
+        if comparable_path == comparable_root or comparable_path.startswith(comparable_root + os.sep):
             return False, f"禁止操作系统/项目关键目录: {p}"
     return True, ""
 
 
+def set_confirm_backend(backend: Optional[Callable[[str], bool]]) -> None:
+    """替换危险命令的交互确认后端。
+
+    - None（默认）：使用终端 input()，CLI 场景。
+    - interrupt_confirm：通过 LangGraph interrupt 把确认抛给前端（server 场景）。
+    """
+    global _confirm_backend
+    _confirm_backend = backend
+
+
+def interrupt_confirm(prompt: str) -> bool:
+    """
+    server 模式的确认后端：用 LangGraph interrupt 暂停图执行，把危险命令发给前端确认。
+
+    resume payload 约定（与 ask_human 一致）：
+        {"choice_id": "approve"} -> True
+        {"choice_id": "deny"} / {"cancelled": True} / 其他 -> False
+    """
+    from langgraph.types import interrupt
+
+    answer = interrupt(
+        {
+            "kind": "dangerous_command",
+            "prompt": prompt,
+            "choices": [
+                {"id": "approve", "label": "确认执行"},
+                {"id": "deny", "label": "拒绝执行"},
+            ],
+        }
+    )
+    if isinstance(answer, dict):
+        if answer.get("cancelled"):
+            return False
+        return answer.get("choice_id") == "approve"
+    return False
+
+
 def confirm(prompt: str) -> bool:
     """
-    交互式确认:读取终端输入,默认拒绝
+    交互式确认:默认读取终端输入(默认拒绝)
     空输入 / 'n' / EOF(非交互) / 异常 均视为拒绝
+
+    若已通过 set_confirm_backend 注册后端(如 server 的 interrupt 后端),则委托给它。
     """
+    if _confirm_backend is not None:
+        return _confirm_backend(prompt)
     try:
         ans = input(prompt).strip().lower()
         return ans in ("y", "yes", "是")

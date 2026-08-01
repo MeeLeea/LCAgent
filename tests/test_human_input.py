@@ -272,6 +272,167 @@ def test_real_state_graph_two_sequential_interrupts_require_two_resumes():
     assert completed["final"] == "one:two"
 
 
+def test_real_state_graph_dangerous_command_confirm_interrupts_and_resumes():
+    # Given: 真实离线 LangGraph + interrupt 确认后端(模拟 server 模式)。
+    from tools import safety
+
+    class State(TypedDict, total=False):
+        approved: bool
+        final: str
+
+    def guard_node(state):
+        ok = safety.confirm("⚠ 检测到危险命令 [匹配危险模式: \\brm\\b]\n待执行命令：git rm x\n确认执行? [y/N]: ")
+        return {"approved": ok, "final": f"executed:{ok}"}
+
+    builder = StateGraph(State)
+    builder.add_node("guard", guard_node)
+    builder.add_edge(START, "guard")
+    builder.add_edge("guard", END)
+    graph = builder.compile(checkpointer=MemorySaver())
+    config = {"configurable": {"thread_id": "thread-dangerous-cmd"}}
+
+    safety.set_confirm_backend(safety.interrupt_confirm)
+    try:
+        # When: 首次执行被 interrupt 暂停，携带危险命令信息。
+        interrupted = graph.invoke({}, config)
+        interrupt = interrupted["__interrupt__"][0]
+        assert interrupt.value["kind"] == "dangerous_command"
+        assert "检测到危险命令" in interrupt.value["prompt"]
+        assert [c["id"] for c in interrupt.value["choices"]] == ["approve", "deny"]
+
+        # And: resume approve → 命令放行执行。
+        approved = graph.invoke(Command(resume={"choice_id": "approve"}), config)
+        assert approved["approved"] is True
+        assert approved["final"] == "executed:True"
+
+        # And: 同一节点再次 interrupt，resume deny → 拒绝执行。
+        interrupted_again = graph.invoke({}, config)
+        assert "__interrupt__" in interrupted_again
+        denied = graph.invoke(Command(resume={"choice_id": "deny"}), config)
+        assert denied["approved"] is False
+        assert denied["final"] == "executed:False"
+    finally:
+        safety.set_confirm_backend(None)
+
+
+def test_run_shell_dangerous_command_interrupts_via_real_tool_and_resumes_approve():
+    # 回归测试：interrupt_confirm 抛出的 GraphInterrupt 必须穿透 run_shell 的
+    # except Exception，由 ToolNode/运行时记录为图中断（而不是变成工具错误字符串）。
+    from langgraph.prebuilt import ToolNode
+
+    from tools import safety
+    from tools.terminal_tools import run_shell
+
+    class State(TypedDict, total=False):
+        messages: list
+
+    def model_node(state):
+        return {
+            "messages": [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "run_shell",
+                            "args": {"command": 'python -c "print(1)"'},
+                            "id": "call1",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ]
+        }
+
+    builder = StateGraph(State)
+    builder.add_node("model", model_node)
+    builder.add_node("tools", ToolNode([run_shell]))
+    builder.add_edge(START, "model")
+    builder.add_edge("model", "tools")
+    builder.add_edge("tools", END)
+    graph = builder.compile(checkpointer=MemorySaver())
+    config = {"configurable": {"thread_id": "thread-tool-danger-approve"}}
+
+    safety.set_confirm_backend(safety.interrupt_confirm)
+    try:
+        list(graph.stream({"messages": []}, config, stream_mode=["updates"]))
+        state = graph.get_state(config)
+        interrupt = [i.value for t in state.tasks for i in t.interrupts]
+        assert interrupt, "危险命令应暂停图中断，而不是作为工具错误返回"
+        assert interrupt[0]["kind"] == "dangerous_command"
+        assert [c["id"] for c in interrupt[0]["choices"]] == ["approve", "deny"]
+
+        result = graph.invoke(Command(resume={"choice_id": "approve"}), config)
+        last = result["messages"][-1]
+        assert last.type == "tool"
+        assert "执行失败" not in str(last.content)
+        assert '"success": true' in str(last.content)
+        assert '"stdout": "1' in str(last.content)
+    finally:
+        safety.set_confirm_backend(None)
+
+
+def test_run_shell_dangerous_command_deny_raises_rejection_via_real_tool():
+    from langgraph.prebuilt import ToolNode
+
+    from tools import safety
+    from tools.terminal_tools import UserRejectedCommandError, run_shell
+
+    class State(TypedDict, total=False):
+        messages: list
+
+    def model_node(state):
+        return {
+            "messages": [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "run_shell",
+                            "args": {"command": 'python -c "print(1)"'},
+                            "id": "call1",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ]
+        }
+
+    builder = StateGraph(State)
+    builder.add_node("model", model_node)
+    builder.add_node("tools", ToolNode([run_shell]))
+    builder.add_edge(START, "model")
+    builder.add_edge("model", "tools")
+    builder.add_edge("tools", END)
+    graph = builder.compile(checkpointer=MemorySaver())
+    config = {"configurable": {"thread_id": "thread-tool-danger-deny"}}
+
+    safety.set_confirm_backend(safety.interrupt_confirm)
+    try:
+        list(graph.stream({"messages": []}, config, stream_mode=["updates"]))
+        state = graph.get_state(config)
+        assert [i.value for t in state.tasks for i in t.interrupts]
+
+        with pytest.raises(UserRejectedCommandError):
+            graph.invoke(Command(resume={"choice_id": "deny"}), config)
+    finally:
+        safety.set_confirm_backend(None)
+
+
+def test_build_interrupt_event_dangerous_command_renders_prompt_and_choices():
+    from agent.message_utils import build_interrupt_event
+
+    ev = build_interrupt_event(
+        {
+            "kind": "dangerous_command",
+            "prompt": "⚠ 检测到危险命令",
+            "choices": [{"id": "approve", "label": "确认执行"}],
+        }
+    )
+    assert ev["type"] == "interrupt"
+    assert ev["prompt"] == "⚠ 检测到危险命令"
+    assert ev["choices"] == [{"id": "approve", "label": "确认执行"}]
+
+
 def test_cli_helper_collects_simultaneous_interrupts_before_one_resume():
     # Given: one interrupted turn with multiple simultaneous interrupts.
     from cli import human_input

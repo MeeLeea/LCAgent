@@ -106,6 +106,9 @@ def test_whitelist_mode(tmp_path, monkeypatch):
 def test_check_path_protected():
     assert safety.check_path("C:\\Windows")[0] is False
     assert safety.check_path(os.path.expanduser("~"))[0] is False
+    # Windows 路径大小写不敏感，防止大小写变体绕过保护。
+    assert safety.check_path("c:\\windows\\system32")[0] is False
+    assert safety.check_path("C:\\WINDOWS")[0] is False
 
 
 def test_check_path_ok():
@@ -114,3 +117,78 @@ def test_check_path_ok():
 
 def test_check_exec_confirm():
     assert safety.check_exec()[0] == "confirm"
+
+
+def _reset_backend():
+    safety.set_confirm_backend(None)
+
+
+def test_confirm_backend_delegation(monkeypatch):
+    # Given: 注册了一个自定义确认后端
+    calls = []
+    backend = lambda prompt: calls.append(prompt) or True
+    safety.set_confirm_backend(backend)
+    try:
+        # When: 调用 confirm
+        ok = safety.confirm("确认?")
+        # Then: 委托给后端而不是读终端
+        assert ok is True
+        assert calls == ["确认?"]
+    finally:
+        _reset_backend()
+
+
+def test_confirm_backend_reset_uses_terminal(monkeypatch):
+    # Given: 后端先注册再清除
+    safety.set_confirm_backend(lambda prompt: True)
+    safety.set_confirm_backend(None)
+    # When: 无后端时回退到终端输入(模拟输入 'n')
+    monkeypatch.setattr("builtins.input", lambda prompt: "n")
+    # Then: 返回 False
+    assert safety.confirm("确认?") is False
+
+
+def test_interrupt_confirm_approve(monkeypatch):
+    # Given: interrupt 返回 {choice_id: approve}
+    monkeypatch.setattr(
+        "langgraph.types.interrupt",
+        lambda value: {"choice_id": "approve"},
+    )
+    # Then: 放行
+    assert safety.interrupt_confirm("危险命令") is True
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"choice_id": "deny"},
+        {"cancelled": True},
+        {"text": "随便"},
+        "approve",
+        None,
+    ],
+)
+def test_interrupt_confirm_rejects(monkeypatch, payload):
+    # Given: interrupt 返回非 approve 的负载
+    monkeypatch.setattr("langgraph.types.interrupt", lambda value: payload)
+    # Then: 一律拒绝
+    assert safety.interrupt_confirm("危险命令") is False
+
+
+def test_interrupt_confirm_payload_shape(monkeypatch):
+    # Given: 记录传给 interrupt 的 value
+    captured = {}
+    def fake_interrupt(value):
+        captured["value"] = value
+        return {"choice_id": "approve"}
+
+    monkeypatch.setattr("langgraph.types.interrupt", fake_interrupt)
+    safety.interrupt_confirm("⚠ 检测到危险命令 [匹配危险模式: \\brm\\b]\n待执行命令：git rm x\n确认执行? [y/N]: ")
+
+    value = captured["value"]
+    assert value["kind"] == "dangerous_command"
+    assert "检测到危险命令" in value["prompt"]
+    assert value["choices"] == [
+        {"id": "approve", "label": "确认执行"},
+        {"id": "deny", "label": "拒绝执行"},
+    ]
