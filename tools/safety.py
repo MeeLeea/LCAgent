@@ -32,27 +32,29 @@ from typing import Tuple, Dict, Any, List, Optional, Callable
 
 # 始终拒绝的灾难性模式(命中即 deny,不询问)
 BUILTIN_BLOCKLIST = [
-    r"\brm\b.*--recursive",
-    r"\brd\s+/[sq]", r"\bdeltree\b",
-    # 覆盖 Windows/PowerShell 的递归删除和编码命令，避免只拦截 Unix 写法。
-    r"\bremove-item\b(?=[^\r\n]*\s-(?:recurse|r)\b)(?=[^\r\n]*\s-(?:force|f)\b)",
-    r"\b(?:del|erase)\b[^\r\n]*\s/s\b",
-    r"\b(?:rd|rmdir)\b[^\r\n]*\s/s\b",
-    r"\b(?:powershell|pwsh)(?:\.exe)?\b[^\r\n]*\s-(?:e|enc|encodedcommand)\b",
-    r"\bformat\b", r"\bmkfs", r"\bdd\b.*\bif=",
-    r"\bshutdown\b", r"\breboot\b",
     r":\(\)\s*\{.*\}\s*;",                      # fork bomb :(){:|:&};:
-    r"curl\b[^\n|]*\|\s*(sh|bash)", r"wget\b[^\n|]*\|\s*(sh|bash)",
-    r">\s*/dev/(sd|hd|nvme|sda)",
-    r"\breg\s+(delete|add)\b", r"\bnetsh\b",
+    r"\bformat\b", r"\bmkfs\b",                  # 磁盘格式化
+    r"\bdd\b.*\bif=",                            # 直接写入硬盘
+    r"curl\b[^\n|]*\|\s*(sh|bash)", r"wget\b[^\n|]*\|\s*(sh|bash)",  # 管道执行远程脚本
+    r">\s*/dev/(sd|hd|nvme|sda)",                # 直接写入设备文件
+    r"\bshutdown\b", r"\breboot\b",              # 系统关机/重启
+    r"\breg\s+(delete|add)\b", r"\bnetsh\b",     # 注册表和网络配置危险操作
+    r"\b(?:powershell|pwsh)(?:\.exe)?\b[^\r\n]*\s-(?:e|enc|encodedcommand)\b",  # 编码命令执行
 ]
 
 # 危险但非灾难性模式(命中且开启确认时 -> confirm)
 BUILTIN_CONFIRM = [
-    r"\bsudo\b", r"\brm\b", r"\brm\s+-f\b", r"\brm\s+-rf\b", r"\brm\s+-fr\b", r"\bchmod\b", r"\bchown\b",
+    # 删除操作（包含递归删除）
+    r"\brm\b", r"\brm\s+-f\b", r"\brm\s+-rf\b", r"\brm\s+-fr\b", r"\brm\b.*--recursive",
+    r"\bremove-item\b", 
+    r"\bremove-item\b(?=[^\r\n]*\s-(?:recurse|r)\b)(?=[^\r\n]*\s-(?:force|f)\b)",  # Remove-Item -Recurse -Force
+    r"\b(?:del|erase)\b", r"\b(?:del|erase)\b[^\r\n]*\s/s\b",  # del/erase 包括递归
+    r"\b(?:rd|rmdir)\b", r"\b(?:rd|rmdir)\b[^\r\n]*\s/s\b",     # rd/rmdir 包括递归
+    r"\brd\s+/[sq]", r"\bdeltree\b",
+    # 权限和进程管理
+    r"\bsudo\b", r"\bchmod\b", r"\bchown\b",
     r"\bmv\b", r"\bkill\b", r"\btaskkill\b", r"\bschtasks\b",
-    r"\bremove-item\b", r"\b(?:del|erase|rd|rmdir)\b",
-    # 解释器可隐藏任意副作用，脚本、内联代码和命令包装器统一要求人工确认。
+    # 解释器可隐藏任意副作用，脚本、内联代码和命令包装器统一要求人工确认
     r"\b(?:python(?:3)?|py)(?:\.exe)?\b\s+(?:-[cmo]\b|[^\s;&|]+\.py\b)",
     r"\b(?:powershell|pwsh)(?:\.exe)?\b[^\r\n]*\s-(?:command|file)\b",
     r"\bcmd(?:\.exe)?\b\s+/(?:c|k)\b",
@@ -65,6 +67,25 @@ DEFAULT_CONFIG = {
     "confirm_dangerous": True,
     "blacklist": [],
     "whitelist": ["echo", "dir", "ls", "python", "pip", "git", "cat", "type"],
+    "path_protection": {
+        "enabled": True,
+        "protected_paths": [
+            "{system_root}", "{user_home}",
+            "{project_root}",
+            "{project_root}/agent", "{project_root}/api", "{project_root}/cli",
+            "{project_root}/config", "{project_root}/memory", "{project_root}/scheduler",
+            "{project_root}/web", "{project_root}/remote", "{project_root}/.agents",
+            "{project_root}/main.py", "{project_root}/llm_client.py",
+            "{project_root}/requirements.txt", "{project_root}/pyproject.toml",
+            "{project_root}/uv.lock", "{project_root}/skills-lock.json",
+        ],
+        "confirm_paths": [
+            "{project_root}/tests", "{project_root}/tools", "{project_root}/docs",
+            "{project_root}/README.md", "{project_root}/.venv",
+            "{project_root}/__pycache__", "{project_root}/.pytest_cache",
+            "{project_root}/.ruff_cache",
+        ],
+    },
 }
 
 CONFIG_PATH = os.path.join(
@@ -84,13 +105,25 @@ def load_config() -> Dict[str, Any]:
         return _config_cache
 
     cfg = dict(DEFAULT_CONFIG)
+    # 深拷贝嵌套字典
+    if "path_protection" in cfg:
+        cfg["path_protection"] = dict(cfg["path_protection"])
+        cfg["path_protection"]["protected_paths"] = list(cfg["path_protection"]["protected_paths"])
+        cfg["path_protection"]["confirm_paths"] = list(cfg["path_protection"]["confirm_paths"])
+    
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            for k in DEFAULT_CONFIG:
-                if k in data:
-                    cfg[k] = data[k]
+            # 合并所有键（不只是 DEFAULT_CONFIG 中的键）
+            for k, v in data.items():
+                if k == "path_protection" and isinstance(v, dict):
+                    # 深度合并 path_protection
+                    if "path_protection" not in cfg:
+                        cfg["path_protection"] = {}
+                    cfg["path_protection"].update(v)
+                else:
+                    cfg[k] = v
         except (json.JSONDecodeError, IOError):
             pass
     _config_cache = cfg
@@ -99,8 +132,10 @@ def load_config() -> Dict[str, Any]:
 
 def reload_config() -> Dict[str, Any]:
     """强制重新加载配置(修改配置后调用)"""
-    global _config_cache
+    global _config_cache, _protected_paths_cache, _confirm_paths_cache
     _config_cache = None
+    _protected_paths_cache = None
+    _confirm_paths_cache = None
     return load_config()
 
 
@@ -118,27 +153,206 @@ def save_config(cfg: Dict[str, Any]) -> bool:
         return False
 
 
+# ============ 路径分类系统 ============
+
+def _resolve_placeholder(path_template: str) -> List[str]:
+    """
+    解析路径模板中的占位符
+    
+    占位符:
+        {project_root} - 项目根目录
+        {system_root}  - 系统根目录 (Windows: C:\\Windows)
+        {user_home}    - 用户主目录
+        {drive_roots}  - 所有盘符根 (Windows: C:\\, D:\\, etc.)
+    
+    Returns:
+        解析后的路径列表（{drive_roots} 会展开为多个路径）
+    """
+    # {project_root}
+    if "{project_root}" in path_template:
+        return [path_template.replace("{project_root}", PROJECT_ROOT)]
+    
+    # {system_root}
+    if "{system_root}" in path_template:
+        sys_root = os.environ.get("SystemRoot", os.environ.get("windir", "C:\\Windows"))
+        return [path_template.replace("{system_root}", sys_root)]
+    
+    # {user_home}
+    if "{user_home}" in path_template:
+        return [path_template.replace("{user_home}", os.path.expanduser("~"))]
+    
+    # {drive_roots} - Windows 盘符根
+    if "{drive_roots}" in path_template:
+        import string
+        drives = []
+        for letter in string.ascii_uppercase:
+            drive = f"{letter}:\\"
+            if os.path.exists(drive):
+                drives.append(path_template.replace("{drive_roots}", drive))
+        return drives if drives else [path_template]
+    
+    # 无占位符，直接返回
+    return [path_template]
+
+
+def _normalize_path(path: str) -> str:
+    """
+    规范化路径：转为绝对路径 + Windows 大小写统一
+    
+    处理:
+        - 相对路径 -> 绝对路径
+        - Windows 大小写不敏感 (normcase)
+        - 符号链接解析 (realpath)
+    """
+    try:
+        # 转为绝对路径
+        abs_path = os.path.abspath(path)
+        # 解析符号链接
+        real_path = os.path.realpath(abs_path)
+        # Windows 大小写统一
+        return os.path.normcase(real_path)
+    except (OSError, ValueError):
+        # 路径不存在或无效，按字面值处理
+        return os.path.normcase(os.path.abspath(path))
+
+
+def _path_matches(target: str, rule: str) -> bool:
+    """
+    判断目标路径是否匹配规则
+    
+    匹配规则:
+        - 精确匹配: target == rule
+        - 前缀匹配: target 是 rule 的子路径
+    
+    Args:
+        target: 已规范化的目标路径
+        rule: 已规范化的规则路径
+    
+    Returns:
+        是否匹配
+    """
+    # 精确匹配
+    if target == rule:
+        return True
+    
+    # 前缀匹配（rule 是目录，target 在其下）
+    # 确保 rule 以分隔符结尾，避免误匹配 (如 /home 匹配到 /home2)
+    rule_with_sep = rule if rule.endswith(os.sep) else rule + os.sep
+    return target.startswith(rule_with_sep)
+
+
+def _get_protected_paths() -> List[str]:
+    """获取并缓存保护级路径列表（已解析占位符和规范化）"""
+    global _protected_paths_cache
+    
+    if _protected_paths_cache is not None:
+        return _protected_paths_cache
+    
+    cfg = load_config()
+    path_protection = cfg.get("path_protection", {})
+    
+    if not path_protection.get("enabled", True):
+        _protected_paths_cache = []
+        return []
+    
+    templates = path_protection.get("protected_paths", [])
+    paths = []
+    for template in templates:
+        resolved = _resolve_placeholder(template)
+        for p in resolved:
+            normalized = _normalize_path(p)
+            if normalized not in paths:
+                paths.append(normalized)
+    
+    _protected_paths_cache = paths
+    return paths
+
+
+def _get_confirm_paths() -> List[str]:
+    """获取并缓存询问级路径列表（已解析占位符和规范化）"""
+    global _confirm_paths_cache
+    
+    if _confirm_paths_cache is not None:
+        return _confirm_paths_cache
+    
+    cfg = load_config()
+    path_protection = cfg.get("path_protection", {})
+    
+    if not path_protection.get("enabled", True):
+        _confirm_paths_cache = []
+        return []
+    
+    templates = path_protection.get("confirm_paths", [])
+    paths = []
+    for template in templates:
+        resolved = _resolve_placeholder(template)
+        for p in resolved:
+            normalized = _normalize_path(p)
+            if normalized not in paths:
+                paths.append(normalized)
+    
+    _confirm_paths_cache = paths
+    return paths
+
+
+def _classify_path(path: str) -> str:
+    """
+    分类路径为保护级、询问级或普通级别（最长匹配原则）
+    
+    决策逻辑:
+        1. 收集所有匹配的规则（保护级和询问级）
+        2. 选择最长（最具体）的匹配规则
+        3. 如果没有匹配，返回 normal
+    
+    Args:
+        path: 待分类的路径
+    
+    Returns:
+        "protected" - 保护级，禁止任何修改
+        "confirm"   - 询问级，需要用户确认
+        "normal"    - 普通路径
+    """
+    if not path:
+        return "normal"
+    
+    normalized = _normalize_path(path)
+    
+    # 收集所有匹配的规则及其长度
+    matches = []
+    
+    # 检查保护级
+    for protected in _get_protected_paths():
+        if _path_matches(normalized, protected):
+            matches.append(("protected", len(protected)))
+    
+    # 检查询问级
+    for confirm in _get_confirm_paths():
+        if _path_matches(normalized, confirm):
+            matches.append(("confirm", len(confirm)))
+    
+    # 返回最长匹配（最具体的规则）
+    if matches:
+        matches.sort(key=lambda x: x[1], reverse=True)
+        return matches[0][0]
+    
+    return "normal"
+
+
 # ============ 常量 ============
 
 # 项目根目录(用于保护)
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# 受保护的文件夹(删除时禁止)
-PROTECTED_DIRS = [
-    os.path.abspath(os.path.join(PROJECT_ROOT, "tools")),
-    os.path.abspath(os.path.join(PROJECT_ROOT, "docs")),
-    os.path.abspath(PROJECT_ROOT),
-]
+# 文件操作命令集合（用于判断是否需要路径分类保护）
+FILE_OPERATION_COMMANDS = {
+    'rm', 'rmdir', 'del', 'erase', 'rd',
+    'mv', 'move', 'cp', 'copy',
+    'chmod', 'chown', 'remove-item'
+}
 
-# 删除文件夹的命令识别模式
-DELETE_DIR_PATTERNS = [
-    re.compile(r"\brm\s+-rf\b", re.IGNORECASE),
-    re.compile(r"\brm\s+-fr\b", re.IGNORECASE),
-    re.compile(r"\brmdir\b", re.IGNORECASE),
-    re.compile(r"\brd\s+/s\b", re.IGNORECASE),
-    re.compile(r"\bremove-item\b[^\r\n]*\s-(?:recurse|r)\b[^\r\n]*\s-(?:force|f)\b", re.IGNORECASE),
-    re.compile(r"\bschtasks\b[^\r\n]*\s-delete\b", re.IGNORECASE),
-]
+# 模块级缓存：解析后的保护级和询问级路径
+_protected_paths_cache: Optional[List[str]] = None
+_confirm_paths_cache: Optional[List[str]] = None
 
 def _compile(patterns: List[str]) -> List[re.Pattern]:
     return [re.compile(p, re.IGNORECASE) for p in patterns]
@@ -165,11 +379,91 @@ def _first_token(command: str) -> str:
     return tokens[0] if tokens else ""
 
 
+def _is_file_operation(command: str) -> bool:
+    """
+    判断命令是否为文件操作命令
+    
+    文件操作命令需要进行路径分类保护
+    """
+    first = _first_token(command).lower()
+    return first in FILE_OPERATION_COMMANDS
+
+
+def _extract_paths_from_command(command: str) -> List[str]:
+    """
+    从命令中提取所有路径参数（通用版本）
+    
+    支持的命令:
+        - 删除: rm, del, erase, rd, rmdir, Remove-Item
+        - 移动: mv, move
+        - 复制: cp, copy
+        - 权限: chmod, chown
+    
+    Returns:
+        路径列表（已转为绝对路径）
+    """
+    if not command:
+        return []
+    
+    cmd_lower = command.lower()
+    first = _first_token(command).lower()
+    
+    # 不是文件操作命令，返回空
+    if first not in FILE_OPERATION_COMMANDS:
+        return []
+    
+    # Unix-like 命令使用简单分割
+    is_unix_like = first in {'rm', 'rmdir', 'mv', 'cp', 'chmod', 'chown'}
+    
+    try:
+        if is_unix_like:
+            tokens = command.split()
+        else:
+            # Windows 命令使用 shlex 处理引号，但要注意 Windows 路径中的反斜杠
+            # 在 Windows 上，shlex 会把反斜杠当作转义字符，导致路径损坏
+            # 所以对于 Windows 命令，也使用简单分割
+            tokens = command.split()
+    except ValueError:
+        tokens = command.split()
+    
+    # 提取路径参数（跳过命令本身和选项）
+    paths = []
+    skip_next = False
+    for i, token in enumerate(tokens):
+        if i == 0:  # 跳过命令本身
+            continue
+        
+        if skip_next:
+            skip_next = False
+            continue
+        
+        # 跳过选项
+        if token.startswith('-') or token.startswith('/'):
+            # 某些选项后面跟参数，需要跳过
+            if token in {'-o', '-t', '--output', '--target'}:
+                skip_next = True
+            continue
+        
+        # 清理引号
+        cleaned = token.strip('"\'-')
+        if cleaned:
+            paths.append(cleaned)
+    
+    return paths
+
+
 # ============ 决策函数 ============
 
 def check_command(command: str) -> Tuple[str, str]:
     """
-    判断命令是否允许执行
+    判断命令是否允许执行（基于两级路径分类保护）
+
+    决策矩阵:
+        命令类型          保护级路径        询问级路径        普通路径
+        ─────────────────────────────────────────────────────
+        BLOCKLIST         deny            deny             deny
+        CONFIRM           deny            confirm          confirm
+        普通命令          allow           allow            allow
 
     Returns:
         (status, reason)
@@ -189,62 +483,49 @@ def check_command(command: str) -> Tuple[str, str]:
         if _first_token(command).lower() not in allowed:
             return "deny", f"白名单模式禁止命令: {_first_token(command)}"
 
-    # 2.5. 删除文件夹保护(优先于确认)
-    deny_status, deny_reason = _check_delete_protection(command)
-    if deny_status == "deny":
-        return deny_status, deny_reason
-
-    # 3. 需确认的危险模式
-    if cfg.get("confirm_dangerous", True):
+    # 3. 检查是否命中危险命令模式
+    confirm_dangerous = cfg.get("confirm_dangerous", True)
+    is_confirm_cmd = False
+    matched_pattern = None
+    
+    if confirm_dangerous:
         for pat in _confirm_list():
             m = pat.search(command or "")
             if m:
-                return "confirm", f"匹配危险模式: {pat.pattern}"
+                is_confirm_cmd = True
+                matched_pattern = pat.pattern
+                break
+    
+    # 4. 如果是危险命令且是文件操作，检查路径分类
+    if is_confirm_cmd and _is_file_operation(command):
+        paths = _extract_paths_from_command(command)
+        
+        if paths:
+            # 检查所有路径，取最严格的保护级别
+            has_protected = False
+            has_confirm = False
+            
+            for path in paths:
+                classification = _classify_path(path)
+                if classification == "protected":
+                    has_protected = True
+                    # 保护级路径 + CONFIRM 命令 -> deny
+                    return "deny", f"禁止操作保护级路径: {path}"
+                elif classification == "confirm":
+                    has_confirm = True
+            
+            # 所有路径都是询问级或普通级 + CONFIRM 命令 -> confirm
+            if has_confirm:
+                return "confirm", f"操作询问级路径，需要确认"
+            
+            # 所有路径都是普通级 + CONFIRM 命令 -> confirm
+            return "confirm", f"匹配危险模式: {matched_pattern}"
+    
+    # 5. 非文件操作的危险命令 -> confirm
+    if is_confirm_cmd:
+        return "confirm", f"匹配危险模式: {matched_pattern}"
 
     return "allow", ""
-
-
-def _extract_delete_paths(command: str) -> List[str]:
-    """从删除命令中提取路径参数"""
-    cmd_lower = command.lower()
-    is_unix_like = bool(re.match(r"^\s*(rm|rmdir|mv|cp)\b", cmd_lower))
-    try:
-        if is_unix_like:
-            tokens = command.split()
-        else:
-            tokens = shlex.split(command)
-    except ValueError:
-        tokens = command.split()
-    paths = [t.strip('"\'-') for t in tokens[1:] if not t.startswith("-") and t]
-    return paths
-
-
-def _is_delete_dir_command(command: str) -> bool:
-    """判断命令是否为删除文件夹的命令"""
-    for pat in DELETE_DIR_PATTERNS:
-        if pat.search(command):
-            return True
-    return False
-
-
-def _check_delete_protection(command: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    检查删除命令是否试图删除受保护文件夹
-    Returns:
-        (None, None) if safe or not a delete command
-        ("deny", reason) if attempting to delete protected dir
-    """
-    if not _is_delete_dir_command(command):
-        return None, None
-    paths = _extract_delete_paths(command)
-    for p in paths:
-        abs_p = os.path.abspath(p)
-        comparable = os.path.normcase(abs_p)
-        for protected in PROTECTED_DIRS:
-            norm_protected = os.path.normcase(protected)
-            if comparable == norm_protected:
-                return "deny", f"禁止删除受保护文件夹: {protected}"
-    return None, None
 
 
 def check_exec() -> Tuple[str, str]:
@@ -260,42 +541,33 @@ def check_exec() -> Tuple[str, str]:
 
 def check_path(path: str, is_delete: bool = False) -> Tuple[bool, str]:
     """
-    路径保护(用于删除/移动等操作):禁止操作系统关键目录与项目根
+    路径保护(用于删除/移动等操作)
+    
+    使用新的两级路径分类系统进行判断
 
     Args:
         path: 待检查路径
-        is_delete: 是否为删除操作(仅删除时触发文件夹保护)
+        is_delete: 是否为删除操作
 
     Returns:
         (allowed, reason)
     """
     if not path:
         return False, "路径为空"
-    abs_path = os.path.abspath(path)
-    # 根目录 / 盘符根
-    parent = os.path.dirname(abs_path)
-    if abs_path == parent or abs_path.endswith(":\\") or abs_path in ("/", "\\"):
-        return False, "禁止操作系统根目录"
-    # 系统目录
-    sys_root = os.environ.get("SystemRoot", "C:\\Windows")
-    windir = os.environ.get("windir", "C:\\Windows")
-    protected = [
-        os.path.abspath(sys_root),
-        os.path.abspath(windir),
-        os.path.abspath(os.path.expanduser("~")),
-    ]
-    # Windows 路径大小写不敏感，比较前统一规范化以防大小写绕过。
-    comparable_path = os.path.normcase(abs_path)
-    for p in protected:
-        comparable_p = os.path.normcase(p)
-        if comparable_path == comparable_p or comparable_path.startswith(comparable_p + os.sep):
-            return False, f"禁止操作系统关键目录: {p}"
-    # 删除文件夹保护(仅删除操作时触发)
-    if is_delete:
-        for protected_dir in PROTECTED_DIRS:
-            comparable_dir = os.path.normcase(protected_dir)
-            if comparable_path == comparable_dir:
-                return False, f"禁止删除受保护文件夹: {protected_dir}"
+    
+    # 使用新的路径分类系统
+    classification = _classify_path(path)
+    
+    # 保护级路径：禁止操作
+    if classification == "protected":
+        return False, f"禁止操作保护级路径: {path}"
+    
+    # 询问级路径：需要上层调用者处理确认逻辑
+    # 这里返回 True，由调用者决定是否需要确认
+    if classification == "confirm":
+        return True, f"询问级路径，需要确认: {path}"
+    
+    # 普通路径：允许操作
     return True, ""
 
 

@@ -28,9 +28,27 @@ def test_truncate_long():
 
 
 def test_guard_deny():
-    # rm -rf 工具目录应被拒绝(受保护文件夹)
-    r = _guard_command("rm -rf tools")
+    # rm -rf tools 目录是询问级路径，会请求确认
+    # 模拟用户拒绝确认
+    import tools.terminal_tools
+    original_confirm = tools.terminal_tools.confirm
+    
+    def reject_confirm(prompt):
+        return False
+    
+    tools.terminal_tools.confirm = reject_confirm
+    try:
+        with pytest.raises(UserRejectedCommandError):
+            _guard_command("rm -rf tools")
+    finally:
+        tools.terminal_tools.confirm = original_confirm
+
+
+def test_guard_deny_protected_path():
+    # rm -rf agent/ 是保护级路径，应直接拒绝（不需要确认）
+    r = _guard_command("rm -rf agent")
     assert r is not None and r["success"] is False
+    assert "保护级路径" in r.get("error", "")
 
 
 def test_guard_allow():
@@ -94,6 +112,10 @@ def test_run_shell_safe(monkeypatch):
 
 def test_run_shell_deny(monkeypatch):
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: _FakeResult())
-    # rm -rf 工具目录应被拒绝(受保护文件夹)
-    r = run_shell.invoke({"command": "rm -rf tools"})
-    assert r["success"] is False
+    # rm -rf tools 目录是询问级路径，会请求确认
+    # 模拟用户拒绝确认
+    monkeypatch.setattr("tools.terminal_tools.confirm", lambda prompt: False)
+    
+    # 用户拒绝时应该抛出异常
+    with pytest.raises(UserRejectedCommandError):
+        run_shell.invoke({"command": "rm -rf tools"})

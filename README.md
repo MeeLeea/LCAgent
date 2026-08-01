@@ -904,14 +904,42 @@ SkillManager.match_skills(task)
 
 ### 4. 安全护栏（Safety）
 
-Agent 可自动执行终端命令与文件操作，为防止破坏性操作，内置两级安全策略（由 [tools/safety.py](tools/safety.py) 实现）：
+Agent 可自动执行终端命令与文件操作，为防止破坏性操作，内置**命令分类 + 两级路径保护**策略（由 [tools/safety.py](tools/safety.py) 实现）：
 
-| 级别                            | 规则                                                                                                                                                     | 行为                                                 |
-| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
-| **BLOCKLIST（始终拒绝）** | `format`、`mkfs`、`dd if=`、`shutdown`、`fork bomb`、`:(){`、``curl\|sh``/``wget\|sh``、`del /f /s`、`rd /s /q` 等灾机器命令 | 直接拦截，返回拒绝错误                               |
-| **CONFIRM（需确认）**     | `rm`、`rm -rf`、`sudo`、`chmod`、`chown`、`mv`、`kill`、`taskkill`、`schtasks` 等危险但有时需要的命令                                              | 交互式确认（输入`y` 才执行，空/超时/EOF 默认拒绝） |
+#### 命令分类
 
-> `rm -rf` 已移入 **CONFIRM** 级别（之前为 BLOCKLIST），执行前将检查目标路径是否为受保护文件夹。
+| 级别                            | 规则                                                                                                                       | 行为                                                 |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| **BLOCKLIST（始终拒绝）** | `format`、`mkfs`、`dd if=`、`shutdown`、`fork bomb`、`:(){`、``curl\|sh``/``wget\|sh``、编码执行的 PowerShell 等灾难性命令 | 直接拦截，返回拒绝错误（不论路径）                   |
+| **CONFIRM（需确认）**     | `rm`、`rm -rf`、`sudo`、`chmod`、`mv`、`kill`、`Remove-Item`、脚本执行等危险但可能需要的命令                       | 根据**路径分类**决定：保护级→拒绝，询问级→确认       |
+
+> **重要变更**：`rm -rf`、`Remove-Item -Recurse -Force` 等递归删除命令已从 BLOCKLIST 移至 CONFIRM，通过**路径分类系统**实现精细化保护。
+
+#### 两级路径保护
+
+对于文件操作命令（`rm`、`del`、`mv`、`chmod` 等），系统会提取命令中的路径并分类为两个级别：
+
+| 级别                | 说明                                               | 包含路径                                                                                                       | 行为                                       |
+| ------------------- | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
+| **保护级** | 项目核心文件/目录 + 系统关键目录，禁止任何修改操作 | 系统目录（`C:\Windows`、用户主目录）、项目核心（`agent/`、`config/`、`main.py`、`requirements.txt` 等） | CONFIRM 命令 → **拒绝**，普通命令 → 允许  |
+| **询问级** | 可操作但需要用户确认的路径                         | `tests/`、`tools/`、`docs/`、`README.md`、`.venv/`、缓存目录等                                          | CONFIRM 命令 → **需确认**，普通命令 → 允许 |
+
+**决策矩阵**：
+
+```
+命令类型          保护级路径        询问级路径        普通路径
+─────────────────────────────────────────────────────
+BLOCKLIST         ❌ deny          ❌ deny          ❌ deny
+CONFIRM           ❌ deny          ⚠️ confirm       ⚠️ confirm
+普通命令          ✅ allow         ✅ allow         ✅ allow
+```
+
+**示例**：
+
+- `rm -rf agent/` → ❌ **拒绝**（保护级路径）
+- `rm -rf tests/` → ⚠️ **需确认**（询问级路径）
+- `rm -rf /tmp/foo` → ⚠️ **需确认**（普通路径 + 危险命令）
+- `ls agent/` → ✅ **允许**（保护级路径 + 普通命令）
 
 #### 配置（config/safety.json）
 
@@ -920,29 +948,53 @@ Agent 可自动执行终端命令与文件操作，为防止破坏性操作，�
     "mode": "blacklist",
     "confirm_dangerous": true,
     "blacklist": [],
-    "whitelist": ["echo", "dir", "ls", "python", "pip", "git", "cat", "type"]
+    "whitelist": ["echo", "dir", "ls", "python", "pip", "git", "cat", "type"],
+    "path_protection": {
+        "enabled": true,
+        "protected_paths": [
+            "{system_root}",
+            "{user_home}",
+            "{project_root}",
+            "{project_root}/agent",
+            "{project_root}/config",
+            "..."
+        ],
+        "confirm_paths": [
+            "{project_root}/tests",
+            "{project_root}/tools",
+            "{project_root}/docs",
+            "{project_root}/README.md",
+            "..."
+        ]
+    }
 }
 ```
 
-字段含义：
+**字段说明**：
 
-- `mode`: `blacklist`(默认) 或 `whitelist`
-- `confirm_dangerous`: 是否对危险命令交互确认
-- `blacklist`: 追加的拒绝正则(与内置合并)
-- `whitelist`: 白名单模式下允许的首命令
-- `blacklist` 模式：仅拦截 BLOCKLIST + 追加黑名单，其余放行（危险命令需确认）
-- `whitelist` 模式：只有白名单内的首命令才允许，其余一律拒绝
+| 字段                                      | 说明                                                                 |
+| ----------------------------------------- | -------------------------------------------------------------------- |
+| `mode`                                  | `blacklist`(默认) 或 `whitelist`                                   |
+| `confirm_dangerous`                     | 是否对危险命令交互确认                                               |
+| `blacklist`                             | 追加的拒绝正则（与内置 BLOCKLIST 合并）                              |
+| `whitelist`                             | 白名单模式下允许的首命令                                             |
+| `path_protection.enabled`               | 是否启用路径保护（默认 `true`）                                    |
+| `path_protection.protected_paths`       | 保护级路径列表（支持占位符 `{project_root}`、`{system_root}` 等） |
+| `path_protection.confirm_paths`         | 询问级路径列表（支持占位符）                                         |
 
-#### 路径保护
+**占位符**：
 
-`check_path(path, is_delete=True)` 禁止删除以下受保护文件夹：
+- `{project_root}` - 项目根目录（`E:\work\LCAgent`）
+- `{system_root}` - 系统根目录（Windows: `C:\Windows`）
+- `{user_home}` - 用户主目录（`C:\Users\username`）
 
-- `LCAgent/tools` - 工具包目录
-- `LCAgent/docs` - 文档目录
-- 项目根目录 (`LCAgent`)
+**路径匹配规则**：
 
-删除单个文件（如 `README.md`, `docs/test.md`）依然允许，但需正常确认流程。
-
+1. **最长匹配原则**：更具体的规则优先生效
+   - 例如：`{project_root}` 是保护级，`{project_root}/tests` 是询问级 → `tests/` 目录匹配到询问级
+2. **前缀匹配**：规则会匹配其所有子路径
+   - 例如：`{project_root}/config` 保护 → `config/safety.json` 也受保护
+3. **Windows 大小写不敏感**：`agent/` 和 `AGENT/` 视为同一路径
 
 #### 交互命令
 
@@ -951,6 +1003,32 @@ Agent 可自动执行终端命令与文件操作，为防止破坏性操作，�
 | `safety`                            | 查看当前安全策略（模式 / 确认开关 / 黑名单） |
 | `safety:mode <blacklist\|whitelist>` | 切换模式                                     |
 | `safety:confirm <on\|off>`           | 开关危险命令确认                             |
+
+#### 故障排查
+
+**问题 1：合法操作被误拦截**
+
+- **症状**：`rm tests/temp.txt` 被拒绝，但 `tests/` 应该是询问级
+- **原因**：可能 `tests/` 没有在 `confirm_paths` 中，或被父路径（如 `{project_root}`）的保护级规则覆盖
+- **解决**：
+  1. 检查 `config/safety.json` 中的 `path_protection` 配置
+  2. 确认 `tests/` 在 `confirm_paths` 中
+  3. 确认 `protected_paths` 中没有更具体的规则覆盖（如 `{project_root}/tests` 也在保护级）
+
+**问题 2：路径保护不生效**
+
+- **症状**：删除保护级路径时没有被拒绝
+- **原因**：`path_protection.enabled` 可能为 `false`，或配置文件格式错误
+- **解决**：
+  1. 检查 `config/safety.json` 语法是否正确（JSON 格式）
+  2. 确认 `path_protection.enabled: true`
+  3. 运行 `safety` 命令查看当前策略是否正确加载
+
+**问题 3：如何临时允许危险操作**
+
+- **方法 1**：将目标路径从 `protected_paths` 移到 `confirm_paths`（需重启程序）
+- **方法 2**：使用 `safety:confirm off` 暂时关闭确认（不推荐，风险高）
+- **方法 3**：在确认提示时输入 `y` 或 `yes` 允许执行
 
 ### 工具调用机制
 
@@ -1771,18 +1849,46 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
   "mode": "blacklist",
   "confirm_dangerous": true,
   "blacklist": [],
-  "whitelist": ["echo", "dir", "ls", "python", "pip", "git", "cat", "type"]
+  "whitelist": ["echo", "dir", "ls", "python", "pip", "git", "cat", "type"],
+  "path_protection": {
+    "enabled": true,
+    "protected_paths": [
+      "{system_root}",
+      "{user_home}",
+      "{project_root}",
+      "{project_root}/agent",
+      "{project_root}/config",
+      "..."
+    ],
+    "confirm_paths": [
+      "{project_root}/tests",
+      "{project_root}/tools",
+      "{project_root}/docs",
+      "..."
+    ]
+  }
 }
 ```
 
-| 键 | 类型 | 默认值 | 说明 |
-| --- | --- | --- | --- |
-| `mode` | `"blacklist"` / `"whitelist"` | `"blacklist"` | `blacklist` 默认放行（仅拦截匹配项）；`whitelist` 仅放行白名单命令 |
-| `confirm_dangerous` | bool | true | 是否对危险模式操作弹确认（匹配内置危险规则如格式化磁盘、删除系统目录等） |
-| `blacklist` | string[] | `[]` | 自定义禁止命令列表（正则表达式） |
-| `whitelist` | string[] | — | 白名单模式下允许的首命令列表 |
+| 键                                      | 类型                              | 默认值          | 说明                                                                                                 |
+| --------------------------------------- | --------------------------------- | --------------- | ---------------------------------------------------------------------------------------------------- |
+| `mode`                                | `"blacklist"` / `"whitelist"` | `"blacklist"` | `blacklist` 默认放行（仅拦截匹配项）；`whitelist` 仅放行白名单命令                                |
+| `confirm_dangerous`                   | bool                              | `true`        | 是否对危险命令交互确认（如 `rm`、`sudo`、`chmod` 等）                                             |
+| `blacklist`                           | string[]                          | `[]`          | 自定义禁止命令列表（正则表达式，与内置 BLOCKLIST 合并）                                             |
+| `whitelist`                           | string[]                          | —               | 白名单模式下允许的首命令列表                                                                         |
+| `path_protection.enabled`             | bool                              | `true`        | 是否启用两级路径保护                                                                                 |
+| `path_protection.protected_paths`     | string[]                          | —               | 保护级路径（禁止任何 CONFIRM 命令修改），支持占位符 `{project_root}`、`{system_root}` 等          |
+| `path_protection.confirm_paths`       | string[]                          | —               | 询问级路径（允许 CONFIRM 命令但需确认），支持占位符                                                  |
 
-内置黑名单覆盖 `rm -rf /`、`format`、`dd` 等破坏性操作；内置危险模式覆盖 `chmod`、`regedit`、`sc delete` 等操作。运行时可通过 `safety` 交互命令查看/修改。
+**两级保护策略**：
+
+- **BLOCKLIST**：`format`、`mkfs`、`fork bomb`、`curl|sh` 等灾难性命令始终拒绝
+- **CONFIRM + 路径分类**：
+  - 保护级路径（如 `agent/`、`config/`、`main.py`）→ 拒绝危险操作
+  - 询问级路径（如 `tests/`、`docs/`、`README.md`）→ 需用户确认
+  - 普通路径 → 需用户确认
+
+详见 [工具系统 > 安全护栏](#4-安全护栏safety) 章节。运行时可通过 `safety` 交互命令查看/修改。
 
 ### 5. `remote_control.json` — 远程控制（飞书）
 
