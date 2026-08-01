@@ -59,6 +59,12 @@ config/*
 !config/*.json.example
 docs/
 *.json
+# 必需入库的 JSON 配置（放回白名单）
+!web/package.json
+!web/package-lock.json
+!web/tsconfig.json
+!web/tsconfig.node.json
+!src-tauri/capabilities/*.json
 /tests/*
 !tests/test_*
 
