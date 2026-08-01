@@ -611,6 +611,33 @@ def test_execute_command_info(client, mock_agent):
         assert "glm-4-flash" in data["output"]
 
 
+def test_execute_command_threads_uses_current_thread(client, mock_agent):
+    """测试 threads 命令不会因为 current 参数导致菜单模拟器崩溃"""
+    with patch("api.server.dispatch_command") as mock_dispatch:
+        def side_effect(context, command):
+            selected = context.select_menu(
+                "选择会话",
+                [("thread-1 (当前)", "thread-1"), ("thread-2", "thread-2")],
+                current="thread-1",
+                action_keys={b"\x04": "delete"},
+                hint="提示",
+            )
+            context.print_fn(f"selected={selected}")
+            return "success"
+
+        mock_dispatch.side_effect = side_effect
+
+        response = client.post(
+            "/api/command",
+            json={"command": "threads", "thread_id": "thread-1"}
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert "selected=thread-1" in data["output"]
+
+
 def test_execute_command_with_exception(client, mock_agent):
     """测试命令执行异常"""
     with patch("api.server.dispatch_command") as mock_dispatch:

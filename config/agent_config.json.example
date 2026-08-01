@@ -1,5 +1,5 @@
 {
-  "max_iterations": 15,
+  "max_iterations": 50,
   "skills_dir": ".agents/skills",
   "auto_match_skills": true,
   "enable_mcp": true,

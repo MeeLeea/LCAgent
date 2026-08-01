@@ -59,5 +59,26 @@ config/*
 !config/*.json.example
 docs/
 *.json
+# 必需入库的 JSON 配置（放回白名单）
+!web/package.json
+!web/package-lock.json
+!web/tsconfig.json
+!web/tsconfig.node.json
+!src-tauri/capabilities/*.json
 /tests/*
 !tests/test_*
+
+# Rust / Cargo
+src-tauri/target/
+**/*.rs.bk
+*.pdb
+
+# Tauri
+src-tauri/tauri.conf.json
+
+# Frontend build
+web/dist/
+web/node_modules/
+*.tsbuildinfo
+web/vite.config.js
+web/vite.config.d.ts

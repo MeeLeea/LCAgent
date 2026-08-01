@@ -511,11 +511,31 @@ async def execute_command(req: CommandRequest):
             output_lines.append(f"[交互提示] {prompt}")
             return ""
         
-        # 对于菜单选择，返回第一项
-        def fake_select_menu(title: str, choices: List[str]) -> str:
+        # 对于菜单选择，优先返回当前项，否则返回第一项
+        def fake_select_menu(
+            title: str,
+            choices: List[str],
+            current: str | None = None,
+            action_keys: dict | None = None,
+            hint: str | None = None,
+        ) -> str | tuple[str, str] | None:
+            if action_keys:
+                # 命令模式下不模拟二次动作，直接忽略快捷键分支
+                action_keys = None
+            if current is not None:
+                for choice in choices:
+                    if isinstance(choice, tuple) and len(choice) == 2:
+                        label, value = choice
+                        if value == current or str(label) == current:
+                            return value
+                    elif choice == current:
+                        return choice
             if choices:
-                return choices[0]
-            return ""
+                first = choices[0]
+                if isinstance(first, tuple) and len(first) == 2:
+                    return first[1]
+                return first
+            return None
         
         # 不支持的命令会 fallback 到聊天模式，提示用户用正常对话
         def unsupported_runner(agent_obj, text: str) -> str:
@@ -606,6 +626,8 @@ def main():
     provider = args.provider or pick_default_provider()
     logger.info("初始化提供商: %s", provider)
     agent, llm = build_agent(provider)
+    # 非交互环境：危险命令确认改为通过 LangGraph interrupt 抛给前端，而不是终端 input()
+    safety_module.set_confirm_backend(safety_module.interrupt_confirm)
     info = llm.get_info()
     logger.info("模型: %s / %s", info["provider_name"], info["model"])
     logger.info("工具: %s", ", ".join(agent.get_available_tools()))

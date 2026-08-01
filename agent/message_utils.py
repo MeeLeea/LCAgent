@@ -128,7 +128,7 @@ def stringify_content(content: Any) -> str:
 
 
 def build_interrupt_event(value: Any) -> Dict[str, Any]:
-    """把 ask_human 的 interrupt.value 转成前端可消费的事件。
+    """把 ask_human / 危险命令确认的 interrupt.value 转成前端可消费的事件。
 
     Args:
         value: interrupt 的 value 字段
@@ -136,7 +136,7 @@ def build_interrupt_event(value: Any) -> Dict[str, Any]:
     Returns:
         前端可消费的事件字典，包含 type、prompt、choices 三个字段
     """
-    if isinstance(value, dict) and value.get("kind") == "human_choice":
+    if isinstance(value, dict) and value.get("kind") in ("human_choice", "dangerous_command"):
         return {
             "type": "interrupt",
             "prompt": str(value.get("prompt") or "需要人工输入"),
