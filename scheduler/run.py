@@ -35,7 +35,7 @@ from scheduler import TaskStore, SchedulerEngine
 
 BASE_DIR = _PROJECT_ROOT
 LLM_CONFIG_FILE = os.path.join(BASE_DIR, "config", "llm_config.json")
-AGENT_CONFIG_FILE = os.path.join(BASE_DIR, "config", "agent_config.json")
+AGENT_CONFIG_FILE = os.path.join(BASE_DIR, "agent", "agent_config.json")
 SCHEDULER_CONFIG_FILE = os.path.join(BASE_DIR, "config", "scheduler_config.json")
 DEFAULT_DB_PATH = os.path.join(BASE_DIR, "memory", "scheduled_tasks.sqlite")
 MEMORY_FILE = os.path.join(BASE_DIR, "memory", "memory.json")
@@ -96,6 +96,7 @@ def make_agent_factory(provider: str):
     def factory() -> AgentCore:
         return AgentCore(
             llm_client=llm,
+            name=agent_config["name"],
             memory_size=agent_config["memory_size"],
             long_term_memory_file=MEMORY_FILE,
             checkpoint_file=CHECKPOINT_FILE,
@@ -107,7 +108,8 @@ def make_agent_factory(provider: str):
             auto_match_skills=agent_config["auto_match_skills"],
             max_context_messages=agent_config["max_context_messages"],
             context_trim_keep=agent_config["context_trim_keep"],
-            process_type="scheduler"
+            process_type="scheduler",
+            agent_core_prompt=agent_config["agent_core_prompt"]
         )
 
     return factory

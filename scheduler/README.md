@@ -312,14 +312,14 @@ schedule_task(
 
 ```python
 from scheduler import TaskStore, SchedulerEngine
-from llm_client import LLMClient
+from agent.llm_client import LLMClient
 from agent import AgentCore
 
 # 1. 准备 agent_factory
 llm = LLMClient(provider="zhipu", config_file="config/llm_config.json")
 
 def agent_factory():
-    return AgentCore(llm_client=llm, ...)
+    return AgentCore(llm_client=llm, name="LCAgent", ...)
 
 # 2. 创建引擎（非阻塞模式，嵌入主进程后台线程）
 store = TaskStore("memory/scheduled_tasks.sqlite")

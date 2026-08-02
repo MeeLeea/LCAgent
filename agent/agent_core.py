@@ -20,39 +20,6 @@ from tools.mcp_loader import load_mcp_tools, DEFAULT_CONFIG_FILE
 from tools.skills import SkillManager, default_skills_dir
 from tools.terminal_tools import UserRejectedCommandError
 
-_AGENT_CORE_PROMPT = (
-    "你是一个智能助手，配备了多种工具（文件读写、目录管理、搜索、计算、定时任务等）。\n"
-    "\n"
-    "【重要规则】\n"
-    "1. 你有能力调用各种工具在用户本地真正执行操作。当用户要求操作文件/搜索/测试/创建目录等时，你【必须】"
-    "调用相应工具完成，不要回复'我无法访问文件系统'、'我没有权限'、'请你自己保存'之类的话。"
-    "只有当用户进行纯知识性问答（不需要操作文件/搜索/计算）时才直接回答，不调用工具。\n"
-    "2. 创建文件、脚本、文件夹的默认位置是项目根目录下的 'tests/' 目录（即 main.py 所在目录）。\n"
-    "3. 多步任务（如先创建目录再写文件）请依次调用多个工具。"
-    "如果用户要求跑一下或测试一下，直接执行相应工具或测试文件。\n"
-    "4. 如果用户要求生成新的工具文件，直接在 tools 目录下使用create_tools.py进行创建。\n"
-    "5. 危险命令（如 rm -rf、format、shutdown 等）会被安全策略拦截或要求用户确认，"
-    "不要尝试使用破坏性命令；删除/移动文件时优先使用专门的文件工具。\n"
-    "6. 当任务涉及专业领域（如提交 git、生成 pptx、查找技能等）时，"
-    "优先用 read_skill 工具读取对应技能的详细指引并按指引完成。\n"
-    "7. 当需要人工确认、选择或补充信息才能继续时，调用 ask_human 工具并提供结构化 choices，"
-    "等待返回的结构化选择后再继续；不要用普通文本假装等待人工输入。\n"
-    "8. 当用户要求在某个时间点（如'2分钟后'、'明天下午3点'、'下周一'）或按周期"
-    "（如'每天9点'、'每周一'、'工作日下午5点半'）执行任务时，【必须】按以下流程操作，"
-    "不要立即执行任务本身：\n"
-    "    ① 调用 get_local_time 获取当前精确时间\n"
-    "    ② 计算出 execute_time（ISO 8601，如 '2026-07-29T17:36:00'）或 cron 表达式\n"
-    "    ③ 调用 schedule_task 登记任务，完成后回复'任务已登记，将于[时间]自动执行'\n"
-    "    要点：\n"
-    "    - task_text 只写任务本身（自然语言，去掉时间），【不要写代码或函数调用】\n"
-    "    - 一次性 → task_type='one_time' + execute_time；周期 → task_type='periodic' + cron_expr\n"
-    "    - cron 示例：'0 9 * * *'=每天9点，'30 8 * * 1-5'=工作日8:30，'0 17 * * 5'=每周五17点\n"
-    "    - 查询/管理任务 → list_scheduled_tasks / cancel_scheduled_task\n"
-    "    - 清理历史任务 → delete_scheduled_task（删单个）/ cleanup_finished_tasks（批量清理已完成/失败/取消的）\n"
-    "\n"
-    "请用中文回答。"
-)
-
 @dataclass(frozen=True, slots=True)
 class AgentTurnResult:
     """Typed result for one LangGraph turn."""
@@ -88,6 +55,7 @@ class AgentCore:
     def __init__(
         self,
         llm_client: LLMClient,
+        name: str = "LCAgent",
         memory_size: int = 10,
         long_term_memory_file: Optional[str] = None,
         checkpoint_file: Optional[str] = None,
@@ -100,13 +68,15 @@ class AgentCore:
         auto_match_skills: bool = True,
         max_context_messages: int = 0,
         context_trim_keep: int = 12,
-        process_type: Optional[str] = None
+        process_type: Optional[str] = None,
+        agent_core_prompt: Optional[str] = None
     ):
         """
         初始化Agent核心
 
         Args:
             llm_client: LLM客户端实例
+            name: Agent名称(为 None 时使用默认名)
             memory_size: 仅兼容旧 API(checkpoint 不限容量)
             long_term_memory_file: 长期记忆 JSON 文件(用于 compress)
             checkpoint_file: SQLite checkpoint 文件路径(为 None 时用内存)
@@ -118,7 +88,9 @@ class AgentCore:
             max_context_messages: 长上下文裁剪阈值(0=关闭);超过则自动摘要并开新会话
             context_trim_keep: 裁剪时保留的最近消息条数
             process_type: 进程类型标识(server/scheduler/feishu)，用于多进程隔离
+            agent_core_prompt: Agent核心系统提示词(为 None 时使用配置默认值)
         """
+        self.name = name
         self.llm = llm_client
         self.memory = AgentMemory(
             checkpoint_file=checkpoint_file,
@@ -133,6 +105,10 @@ class AgentCore:
         self.max_context_messages = max_context_messages
         self.context_trim_keep = context_trim_keep
         self.compaction_summary = ""  # 长上下文裁剪后的历史摘要(注入 system prompt)
+
+        # 存储核心提示词（从配置加载或使用默认值）
+        from .config import _DEFAULT_AGENT_CORE_PROMPT
+        self.agent_core_prompt = agent_core_prompt or _DEFAULT_AGENT_CORE_PROMPT
 
         # 本地工具（lazy import 打破潜在循环依赖）
         from tools import all_tools as _local_tools
@@ -270,7 +246,7 @@ class AgentCore:
 
     def _get_system_prompt(self, skill_block: str = "") -> str:
         """获取系统提示词(可附加技能指引块)"""
-        base = _AGENT_CORE_PROMPT
+        base = self.agent_core_prompt
         if skill_block:
             base = base + "\n" + skill_block
         if self.compaction_summary:

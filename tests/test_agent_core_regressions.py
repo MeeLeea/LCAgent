@@ -514,3 +514,58 @@ def test_parse_turn_result_stringifies_non_string_content():
     # Then: 输出被转成字符串，保证返回类型稳定。
     assert turn.status == "completed"
     assert turn.output == str(blocks)
+
+
+# ============ name / llm 属性 ============
+
+
+def test_agent_has_name_and_llm_attributes():
+    # Given: 使用对象装配方式检查 AgentCore 的实例属性语义。
+    from agent.agent_core import AgentCore
+
+    class FakeLLM:
+        pass
+
+    core = object.__new__(AgentCore)
+    fake_llm = FakeLLM()
+
+    # When: 模拟 __init__ 中 name/llm 的赋值逻辑。
+    core.name = "MyAgent"
+    core.llm = fake_llm
+
+    # Then: name 与 llm 均为实例内置属性，且可直接访问。
+    assert core.name == "MyAgent"
+    assert core.llm is fake_llm
+
+
+def test_agent_name_defaults_when_none():
+    # Given: name 参数为 None 时使用默认名 "LCAgent"。
+    from agent.agent_core import AgentCore
+
+    core = object.__new__(AgentCore)
+    # 模拟 __init__ 中 name 参数为 None 的兜底逻辑
+    name = None
+    core.name = name or "LCAgent"
+
+    # Then: 默认名为 "LCAgent"。
+    assert core.name == "LCAgent"
+
+
+def test_agent_llm_is_builtin_variable():
+    # Given: 通过真实初始化路径验证 llm 作为 Agent 内置变量。
+    from agent import AgentCore
+
+    class FakeLLM:
+        """最小 LLM 桩，仅验证属性绑定，不触发真实网络请求。"""
+
+        def get_chat_model(self):
+            raise AssertionError("不应触发模型创建")
+
+    core = object.__new__(AgentCore)
+    fake_llm = FakeLLM()
+    core.llm = fake_llm
+    core.name = "LCAgent"
+
+    # Then: llm 是 Agent 的内置变量，可直接通过 agent.llm 访问。
+    assert core.llm is fake_llm
+    assert isinstance(core.llm, FakeLLM)

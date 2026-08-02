@@ -24,7 +24,7 @@ from cli.human_input import chat_until_completion, run_structured_until_completi
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LLM_FILE = os.path.join(BASE_DIR, "config", "llm_config.json")
 MCP_CONFIG_FILE = os.path.join(BASE_DIR, "config", "mcp_servers.json")
-AGENT_CONFIG_FILE = os.path.join(BASE_DIR, "config", "agent_config.json")
+AGENT_CONFIG_FILE = os.path.join(BASE_DIR, "agent", "agent_config.json")
 MEMORY_FILE = os.path.join(BASE_DIR, "memory", "memory.json")
 CHECKPOINT_FILE = os.path.join(BASE_DIR, "memory", "checkpoints.sqlite")
 
@@ -53,6 +53,7 @@ def build_agent(provider: str, process_type: str = None) -> tuple[AgentCore, obj
     print("初始化Agent(含MCP工具加载 + Checkpoint 持久化)...")
     agent = AgentCore(
         llm_client=llm,
+        name=config["name"],
         memory_size=config["memory_size"],
         long_term_memory_file=MEMORY_FILE,
         checkpoint_file=CHECKPOINT_FILE,
@@ -64,7 +65,8 @@ def build_agent(provider: str, process_type: str = None) -> tuple[AgentCore, obj
         auto_match_skills=config["auto_match_skills"],
         max_context_messages=config["max_context_messages"],
         context_trim_keep=config["context_trim_keep"],
-        process_type=process_type
+        process_type=process_type,
+        agent_core_prompt=config["agent_core_prompt"]
     )
     return agent, llm
 

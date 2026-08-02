@@ -83,5 +83,5 @@ _HELP_LINES = [
     "  - 输入 'export' 或 'export:<thread_id> [路径]' 导出对话为 Markdown(默认存 exports/)",
     "  - 输入 'json:<任务>' 让 Agent 以 JSON 对象返回结果并解析展示",
     "  - 其他输入为普通对话模式",
-    "  - 运行时配置见 config/agent_config.json(迭代上限/技能目录/长上下文裁剪等)",
+    "  - 运行时配置见 agent/agent_config.json(迭代上限/技能目录/长上下文裁剪等)",
 ]

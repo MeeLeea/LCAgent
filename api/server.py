@@ -42,8 +42,8 @@ if BASE_DIR not in sys.path:
 from agent import AgentCore
 from agent.message_utils import stringify_content  # 消息内容序列化
 from agent.config import load_agent_config, resolve_path
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 from agent.llm_client import LLMClient, load_providers
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 from tools import safety as safety_module
 from cli.commands import CommandContext, dispatch_command
 from cli.cli_menu import select_menu
@@ -54,7 +54,7 @@ from cli.commands.provider import create_llm
 # --------------------------------------------------------------------------- #
 LLM_FILE = os.path.join(BASE_DIR, "config", "llm_config.json")
 MCP_CONFIG_FILE = os.path.join(BASE_DIR, "config", "mcp_servers.json")
-AGENT_CONFIG_FILE = os.path.join(BASE_DIR, "config", "agent_config.json")
+AGENT_CONFIG_FILE = os.path.join(BASE_DIR, "agent", "agent_config.json")
 SERVER_CONFIG_FILE = os.path.join(BASE_DIR, "config", "server_config.json")
 MEMORY_FILE = os.path.join(BASE_DIR, "memory", "memory.json")
 CHECKPOINT_FILE = os.path.join(BASE_DIR, "memory", "checkpoints.sqlite")
@@ -98,6 +98,7 @@ def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
     mcp_config_file = resolve_path(cfg["mcp_config_file"], BASE_DIR)
     new_agent = AgentCore(
         llm_client=new_llm,
+        name=cfg["name"],
         memory_size=cfg["memory_size"],
         long_term_memory_file=MEMORY_FILE,
         checkpoint_file=CHECKPOINT_FILE,
@@ -109,7 +110,8 @@ def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
         auto_match_skills=cfg["auto_match_skills"],
         max_context_messages=cfg["max_context_messages"],
         context_trim_keep=cfg["context_trim_keep"],
-        process_type="server"
+        process_type="server",
+        agent_core_prompt=cfg["agent_core_prompt"]
     )
     return new_agent, new_llm
 

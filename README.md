@@ -26,7 +26,7 @@
     - [5. 运行](#5-运行)
   - [项目结构](#项目结构)
     - [模块职责](#模块职责)
-    - [llm\_client.py 主要 API](#llm_clientpy-主要-api)
+    - [agent/llm\_client.py 主要 API](#agentllm_clientpy-主要-api)
   - [核心概念：三种模式](#核心概念三种模式)
   - [记忆系统（Memory）](#记忆系统memory)
     - [设计架构](#设计架构)
@@ -143,12 +143,13 @@ pip install -r requirements.txt
 项目克隆后 `config/` 目录下只有 `.example` 模板（不含真实密钥），需手动复制为运行时配置：
 
 ```bash
-cp config/agent_config.json.example   config/agent_config.json
 cp config/llm_config.json.example     config/llm_config.json
 cp config/mcp_servers.json.example    config/mcp_servers.json
 cp config/safety.json.example         config/safety.json
 cp config/scheduler_config.json.example config/scheduler_config.json
 ```
+
+> 注：`agent/agent_config.json` 已包含默认配置，无需从模板复制。
 
 ### 4. 配置 API 密钥
 
@@ -198,10 +199,8 @@ python main.py
 ```
 LangChainAgent/
 ├── main.py                  # 入口文件，交互式命令行
-├── llm_client.py            # 统一大模型封装（多提供商 + 多模型）
 ├── config/                  # 配置目录（需从 .example 复制；见快速开始）
 │   ├── llm_config.json      # API 密钥配置文件
-│   ├── agent_config.json    # Agent 运行时参数
 │   ├── mcp_servers.json     # MCP Server 配置
 │   ├── safety.json          # 安全护栏策略
 │   ├── remote_control.json  # 远程控制（飞书）配置
@@ -217,7 +216,10 @@ LangChainAgent/
 │   └── scheduled_tasks.sqlite# 定时任务数据库
 ├── agent/
 │   ├── __init__.py
-│   ├── config.py            # 运行时配置加载(config/agent_config.json)
+│   ├── agent_config.json    # Agent 运行时参数
+│   ├── AGENT.md             # Agent 核心系统提示词（行为规则）
+│   ├── llm_client.py        # 统一大模型封装（多提供商 + 多模型）
+│   ├── config.py            # 运行时配置加载(agent/agent_config.json)
 │   ├── memory.py            # AgentMemory：checkpoint + 长期记忆 + 会话管理
 │   └── agent_core.py        # Agent 核心调度：run/chat/cot 三种模式 + HITL
 ├── tools/
@@ -274,8 +276,8 @@ LangChainAgent/
 | 模块                                                        | 职责                                                                                                                        |
 | ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
 | [main.py](main.py)                                           | 交互式命令行入口：初始化运行时、读取输入并调用命令分发器                                                                    |
-| [llm_client.py](llm_client.py)                               | 从`config/llm_config.json` 读取提供商配置，支持运行时切换提供商/模型                                                      |
-| [agent/config.py](agent/config.py)                           | 加载`config/agent_config.json`，统一运行时配置                                                                            |
+| [agent/llm_client.py](agent/llm_client.py)                   | 从`config/llm_config.json` 读取提供商配置，支持运行时切换提供商/模型                                                      |
+| [agent/config.py](agent/config.py)                           | 加载`agent/agent_config.json`，统一运行时配置                                                                            |
 | [agent/memory.py](agent/memory.py)                           | 双层记忆：Checkpoint（自动）+ memory.json（手动）+ 对话导出                                                                 |
 | [agent/agent_core.py](agent/agent_core.py)                   | Agent 核心：`run()` / `chat()` / `cot()` 三种模式 + `AgentTurnResult` 结构化暂停/恢复 API + 技能注入 + 长上下文裁剪 |
 | [tools/skills.py](tools/skills.py)                           | `SkillManager`：扫描/匹配/渲染本地技能                                                                                    |
@@ -288,7 +290,7 @@ LangChainAgent/
 | [cli/commands/](cli/commands/)                           | 会话、记忆、模型、MCP、技能、安全及 Agent 执行命令                                                                          |
 | [scheduler/](scheduler/)                                     | 定时任务调度：TaskStore（SQLite CRUD）、SchedulerEngine（APScheduler 轮询）、独立进程入口                                   |
 
-### llm_client.py 主要 API
+### agent/llm_client.py 主要 API
 
 | 类/函数                           | 说明                                     |
 | --------------------------------- | ---------------------------------------- |
@@ -299,7 +301,7 @@ LangChainAgent/
 | `LLMClient.switch_provider()`   | 运行时切换提供商                         |
 | `LLMClient.switch_model(model)` | 运行时切换当前提供商的模型               |
 | `LLMClient.list_models()`       | 列出当前提供商的可用模型                 |
-| `create_client()`               | 创建客户端的便捷函数                     |
+| `LLMClient(...)`                | 创建客户端的构造方法                     |
 | `list_providers()`              | 列出所有支持的提供商                     |
 
 **支持的提供商：**
@@ -1667,13 +1669,14 @@ MCP Servers:
 ## 代码使用示例
 
 ```python
-from llm_client import create_client
 from agent import AgentCore
+from agent.llm_client import LLMClient
 
 # 创建客户端和Agent
-llm = create_client(provider="deepseek", config_file="config/llm_config.json")
+llm = LLMClient(provider="deepseek", config_file="config/llm_config.json")
 agent = AgentCore(
     llm_client=llm,
+    name="LCAgent",                                    # Agent 名称（默认 LCAgent）
     memory_size=10,
     long_term_memory_file="memory/memory.json",        # 长期记忆(用于 compress)
     checkpoint_file="memory/checkpoints.sqlite",       # Checkpoint 持久化
@@ -1685,6 +1688,10 @@ agent = AgentCore(
     max_context_messages=0,                           # 0=关闭长上下文裁剪
     context_trim_keep=12
 )
+
+# 内置变量：agent.name 与 agent.llm（LLM 是 Agent 的内置变量）
+print(agent.name)   # -> LCAgent
+print(agent.llm.get_info())  # 直接通过 agent.llm 访问当前 LLM 客户端
 
 # 普通对话（自动判断是否调用工具，自动写 checkpoint，不存长期记忆）
 response = agent.chat("帮我创建一个叫 test 的文件夹")
@@ -1711,8 +1718,8 @@ while turn.is_interrupted:
 print(turn.output)
 
 # 切换LLM提供商
-from llm_client import create_client
-new_llm = create_client(provider="qwen", config_file="config/llm_config.json")
+from agent.llm_client import LLMClient
+new_llm = LLMClient(provider="qwen", config_file="config/llm_config.json")
 agent.switch_llm(new_llm)
 
 # 切换模型(同一提供商内)
@@ -1757,6 +1764,7 @@ agent.set_auto_match(False)      # 关闭任务自动匹配
 
 | 键 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
+| `name` | str | `LCAgent` | Agent 名称（可通过 `agent.name` 访问） |
 | `max_iterations` | int | 15 | 单次 `invoke` 最大推理步数（即 `recursion_limit`） |
 | `skills_dir` | str | `.agents/skills` | 技能目录（相对项目根或绝对路径） |
 | `auto_match_skills` | bool | true | 任务自动匹配并注入相关技能 |
@@ -1766,8 +1774,20 @@ agent.set_auto_match(False)      # 关闭任务自动匹配
 | `mcp_config_file` | str | `config/mcp_servers.json` | MCP 配置文件（相对项目根或绝对路径） |
 | `max_context_messages` | int | 0 | 长上下文裁剪阈值（0 = 关闭） |
 | `context_trim_keep` | int | 12 | 裁剪时保留的最近消息条数 |
+| `agent_prompt_file` | str | `agent/AGENT.md` | Agent 核心提示词文件路径（相对项目根或绝对路径） |
 
 修改后重启 `main.py` 即可生效。
+
+#### Agent 核心提示词（`agent/AGENT.md`）
+
+Agent 的核心系统提示词（行为规则）已从 `agent_config.json` 中拆分到独立的 [agent/AGENT.md](agent/AGENT.md) 文件，便于单独维护和版本控制。
+
+加载优先级：
+
+1. **`agent/AGENT.md`**（优先，由 `agent_prompt_file` 指定路径）
+2. **内置默认提示词**（fallback，当文件不存在或为空时使用）
+
+自定义 Agent 行为规则时，直接编辑 `agent/AGENT.md` 即可，无需修改代码或 JSON 配置。
 
 #### 长上下文裁剪（Long-Context Trimming）
 
@@ -1777,11 +1797,11 @@ agent.set_auto_match(False)      # 关闭任务自动匹配
 2. 开启**新会话**，并把摘要注入后续 system prompt（保留上下文精华）；
 3. 仅保留最近 `context_trim_keep` 条消息，从而避免撞上 LLM 上下文窗口。
 
-> 触发时会在终端打印提示（含新旧 `thread_id`）。默认 `max_context_messages=0`（关闭），需要时在 `config/agent_config.json` 中设一个合理值（如 60）即可开启。
+> 触发时会在终端打印提示（含新旧 `thread_id`）。默认 `max_context_messages=0`（关闭），需要时在 `agent/agent_config.json` 中设一个合理值（如 60）即可开启。
 
 ### 2. `llm_config.json` — LLM 服务商配置
 
-定义多个 LLM 服务商的接入信息，由 [LLMClient](llm_client.py) 按名称引用加载。
+定义多个 LLM 服务商的接入信息，由 [LLMClient](agent/llm_client.py) 按名称引用加载。
 
 ```json
 {
@@ -1966,6 +1986,7 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 | `tests/test_api.py`                        | API Server：端点路由、流式聊天、命令执行                 |
 | `tests/test_message_utils.py`              | LLM 异常信息提取：429/5xx/鉴权/未知错误的中文提示        |
 | `tests/test_llm_client.py`                 | 瞬时错误自动重试：should_retry 判定与重试行为            |
+| `tests/test_agent_core_regressions.py`     | Agent 核心回归：name/llm 内置属性、裁剪、中断解析等        |
 
 ### 运行测试
 
