@@ -5,7 +5,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from agent.config import load_agent_config, resolve_path, DEFAULTS, _DEFAULT_AGENT_CORE_PROMPT
+from agent.config import (
+    _DEFAULT_AGENT_CORE_PROMPT,
+    DEFAULTS,
+    load_agent_config,
+    resolve_path,
+)
 
 
 def test_defaults_when_missing():

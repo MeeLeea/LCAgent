@@ -1538,7 +1538,7 @@ Terminator (汇总结果,返回最终答案)
 | **TerminatorAgent** | 汇总结果并返回 | 纯文本推理(无工具) | `team/terminator/` |
 
 **轻量设计**：团队 Agent 继承 `TeamAgent` 轻量基类,不继承 `AgentCore`。相比完整智能体:
-- **无会话记忆/checkpoint**:单轮任务执行,不需要持久化历史
+- **无会话记忆/checkpoint**:单轮任务执行,不需要持久化历史(但工作流会在外层注入当前会话记忆,见「记忆注入机制」)
 - **按需工具注入**:Manager/Terminator 纯 LLM 推理,Worker 注入工具列表后用 `create_agent` 构建轻量 ReAct 循环
 - **快速构建**:不加载 MCP Server、不扫描技能目录、不创建 SQLite checkpointer
 - **能力边界清晰**:规划/汇总角色不暴露危险工具(如 `run_shell`),Worker 才拥有工具执行能力
@@ -1548,6 +1548,27 @@ Terminator (汇总结果,返回最终答案)
 ### 状态隔离机制
 
 **设计原则**：工作流状态通过外层 `WorkflowState` 显式传递(`plan`/`worker_result`/`final_answer`),每次运行用独立 `thread_id`,不同运行互不干扰。
+
+### 记忆注入机制
+
+工作流把当前 CLI 会话的记忆注入任务上下文,并在结束后写回,形成记忆闭环:
+
+1. **记忆提取**:`run_workflow` 调用 `build_memory_context` 从 `context.agent.memory` 提取当前会话短期记忆与长期记忆,拼装为文本(超 `MAX_RAW_CONTEXT_CHARS` 自动截断)。
+2. **Manager 总结分发**:工作流首个节点 `summarize` 调用 `ManagerAgent.summarize_context` 把原始记忆提炼成上下文摘要,存入 `WorkflowState.context_summary`。下游仅 `manager_plan` 与 `terminator_final` 节点注入该摘要,`worker_exec` 不注入(靠 plan 承接记忆)。
+3. **写回闭环**:工作流结束后,`_record_workflow_result` 把 `workflow:<name> <task>`(HumanMessage)与 `final_answer`(AIMessage)写入当前会话 checkpoint。
+
+### 工作流提示词外置
+
+工作流各节点/记忆提炼的提示词不再硬编码在代码里,而是由各角色 `team/*/AGENT.md` 的 `## workflow:<名称>` 小节驱动(与角色系统提示词同文件)。改 prompt 只改 md,无需动代码:
+
+| 小节 | 所在文件 | 用途 |
+|------|---------|------|
+| `## workflow:manager_plan` | `team/manager/AGENT.md` | Manager 制定执行计划的用户消息模板(内含记忆摘要段) |
+| `## workflow:summarize_context` | `team/manager/AGENT.md` | `summarize_context` 的 system prompt |
+| `## workflow:worker_exec` | `team/worker/AGENT.md` | Worker 执行子任务的用户消息模板 |
+| `## workflow:terminator_final` | `team/terminator/AGENT.md` | Terminator 汇总结果的用户消息模板(内含记忆摘要段) |
+
+模板用 `{task}`/`{plan}`/`{worker_result}`/`{context_summary}` 占位,运行时以 `TeamAgent.render_template` 做字符串替换(即使模板含 JSON 花括号也不会报错)。各节点在需要时经 `TeamAgent.get_template(name)` 懒加载对应小节(首次读取后缓存),缺失回退各角色类的 `default_templates` 默认模板。加载/解析逻辑见 `team/base.py`;角色系统提示词在 `team/factory.py` 构建 TeamAgent 时经 `TeamAgent.parse_prompt_sections` 剥离工作流小节,避免模板混入 system prompt。
 
 ### 使用方式
 
@@ -1595,6 +1616,9 @@ from graph.simple import run_simple_workflow
 graph, agents = build_workflow("simple")
 result = run_simple_workflow(graph, "帮我分析项目结构")
 print(result["final_answer"])
+
+# 可选: 手动传入记忆上下文(经 Manager 总结后注入 plan/final 节点)
+result = run_simple_workflow(graph, "帮我分析项目结构", raw_context="用户: 之前聊过项目背景")
 
 # 方式2: 通过 CLI 层封装(带打印提示)
 from cli.commands.workflow import run_workflow
@@ -1931,6 +1955,8 @@ Agent 的核心系统提示词（行为规则）已从 `agent_config.json` 中�
 2. **内置默认提示词**（fallback，当文件不存在或为空时使用）
 
 自定义 Agent 行为规则时，直接编辑 `agent/AGENT.md` 即可，无需修改代码或 JSON 配置。
+
+> **注意**：`agent_prompt_file` 指定的 AGENT.md 同时也承载工作流提示词模板（`## workflow:*` 小节）。构建 TeamAgent 时（`team/factory.py`）会经 `TeamAgent.parse_prompt_sections` 剥离这些小节，避免模板内容混入 system prompt（详见「工作流提示词外置」）。
 
 #### 长上下文裁剪（Long-Context Trimming）
 

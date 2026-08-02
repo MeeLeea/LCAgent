@@ -17,9 +17,9 @@ Agent 核心提示词加载顺序：
     1. agent/AGENT.md（优先）
     2. 内置默认提示词（fallback）
 """
-import os
 import json
-from typing import Dict, Any
+import os
+from typing import Any
 
 _DEFAULT_AGENT_CORE_PROMPT = (
     "你是一个智能助手，配备了多种工具（文件读写、目录管理、搜索、计算、定时任务等）。\n"
@@ -54,7 +54,7 @@ _DEFAULT_AGENT_CORE_PROMPT = (
     "请用中文回答。"
 )
 
-DEFAULTS: Dict[str, Any] = {
+DEFAULTS: dict[str, Any] = {
     "name": "LCAgent",
     "max_iterations": 15,
     "skills_dir": ".agents/skills",
@@ -71,7 +71,7 @@ DEFAULTS: Dict[str, Any] = {
 }
 
 
-def load_agent_config(config_file: str, base_dir: str = None) -> Dict[str, Any]:
+def load_agent_config(config_file: str, base_dir: str = None) -> dict[str, Any]:
     """
     加载 agent 运行时配置,与默认值合并
 
@@ -91,7 +91,7 @@ def load_agent_config(config_file: str, base_dir: str = None) -> Dict[str, Any]:
             for key in DEFAULTS:
                 if key in data:
                     cfg[key] = data[key]
-        except (json.JSONDecodeError, IOError):
+        except (OSError, json.JSONDecodeError):
             pass
     
     # 加载 Agent 核心提示词（优先从 AGENT.md 读取）
@@ -106,14 +106,14 @@ def load_agent_config(config_file: str, base_dir: str = None) -> Dict[str, Any]:
 def _load_agent_prompt(prompt_file: str) -> str:
     """
     加载 Agent 核心提示词
-    
+
     加载顺序：
         1. agent_prompt_file 指定的文件（默认 agent/AGENT.md）
         2. 内置默认提示词（fallback）
-    
+
     Args:
         prompt_file: 提示词文件路径（相对或绝对）
-    
+
     Returns:
         Agent 核心提示词字符串
     """
@@ -123,7 +123,7 @@ def _load_agent_prompt(prompt_file: str) -> str:
                 content = f.read().strip()
                 if content:
                     return content
-        except (IOError, UnicodeDecodeError):
+        except (OSError, UnicodeDecodeError):
             pass
     
     # Fallback 到默认提示词
