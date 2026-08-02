@@ -6,7 +6,7 @@ from .types import CommandContext, CommandOutcome, HANDLED
 
 
 def show_ready(context: CommandContext, full_help: bool = False) -> None:
-    info = context.llm.get_info()
+    info = context.agent.llm.get_info()
     context.print("\n" + "=" * 50)
     context.print("Agent 已就绪！")
     context.print("=" * 50)
@@ -32,7 +32,7 @@ def show_help(context: CommandContext) -> CommandOutcome:
 
 
 def show_info(context: CommandContext) -> CommandOutcome:
-    info = context.llm.get_info()
+    info = context.agent.llm.get_info()
     context.print(f"\n当前提供商: {info['provider_name']}")
     context.print(f"当前模型:   {info['model']}")
     context.print(f"API地址:    {info['base_url']}")

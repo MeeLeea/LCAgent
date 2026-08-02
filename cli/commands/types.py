@@ -104,11 +104,10 @@ class CommandOutcome:
 
 
 @dataclass(slots=True)
-class CommandContext:  # noqa: MUTABLE_OK - interactive session state updates the active LLM.
+class CommandContext:
     """Dependencies and mutable session state used by command handlers."""
 
     agent: AgentLike
-    llm: LlmLike
     base_dir: str
     config_file: str
     mcp_config_file: str
@@ -129,9 +128,8 @@ class CommandContext:  # noqa: MUTABLE_OK - interactive session state updates th
         return self.input_fn(prompt)
 
     def replace_llm(self, llm: LlmLike) -> None:
-        # Agent 执行器和命令上下文必须指向同一客户端，避免切换后状态分叉。
+        # Agent 执行器持有唯一 LLM 客户端，切换后命令层直接经 agent.llm 访问。
         self.agent.switch_llm(llm)
-        self.llm = llm
 
 
 HANDLED = CommandOutcome(handled=True)

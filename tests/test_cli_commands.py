@@ -149,7 +149,6 @@ def harness(tmp_path: Path) -> Harness:
 
     context = CommandContext(
         agent=agent,
-        llm=llm,
         base_dir=str(tmp_path),
         config_file=str(tmp_path / "llm.json"),
         mcp_config_file=str(tmp_path / "mcp.json"),
@@ -163,13 +162,12 @@ def harness(tmp_path: Path) -> Harness:
         safety_backend=safety,
     )
     agent.llm = llm
-    return Harness(agent=context.agent, llm=context.llm, runners=runners, safety=safety, printed=printed, created=created)
+    return Harness(agent=context.agent, llm=agent.llm, runners=runners, safety=safety, printed=printed, created=created)
 
 
 def dispatch(harness: Harness, command: str) -> Any:
     context = CommandContext(
         agent=harness.agent,
-        llm=harness.llm,
         base_dir=".",
         config_file="config/llm_config.json",
         mcp_config_file="config/mcp_servers.json",

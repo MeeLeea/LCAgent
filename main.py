@@ -72,14 +72,13 @@ def build_agent(provider: str, process_type: str = None) -> tuple[AgentCore, obj
     return agent, llm
 
 
-def make_context(agent: AgentCore, llm: object) -> CommandContext:
+def make_context(agent: AgentCore) -> CommandContext:
     """组装命令分发器所需的运行时依赖。"""
     from agent.llm_client import load_providers as list_providers
     
     # 命令模块只依赖该上下文，便于在测试中替换输入、菜单、LLM 和安全后端。
     return CommandContext(
         agent=agent,
-        llm=llm,
         base_dir=BASE_DIR,
         config_file=LLM_FILE,
         mcp_config_file=MCP_CONFIG_FILE,
@@ -100,8 +99,8 @@ def main() -> None:
     print("  LangChain Agent (基于LangChain框架)")
     print("=" * 50)
     provider = select_provider(LLM_FILE, select_menu)
-    agent, llm = build_agent(provider)
-    context = make_context(agent, llm)
+    agent, _ = build_agent(provider)
+    context = make_context(agent)
     show_ready(context)
 
     while True:

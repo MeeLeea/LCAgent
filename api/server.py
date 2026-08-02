@@ -387,7 +387,6 @@ async def chat(req: ChatRequest):
                 try:
                     context = CommandContext(
                         agent=agent,
-                        llm=llm,
                         print_fn=capture_output,
                         input_fn=lambda prompt="": "",  # 不支持交互输入
                         select_menu=lambda title, choices: choices[0] if choices else "",
@@ -547,7 +546,6 @@ async def execute_command(req: CommandRequest):
         try:
             context = CommandContext(
                 agent=agent,
-                llm=llm,
                 print_fn=capture_output,
                 input_fn=fake_input,
                 select_menu=fake_select_menu,
