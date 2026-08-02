@@ -3,7 +3,61 @@ Workflow 命令处理 - 多 Agent 工作流执行
 """
 from __future__ import annotations
 
+from langchain_core.messages import AIMessage, HumanMessage
+
 from .types import HANDLED, CommandContext, CommandOutcome
+
+# 注入工作流的原始记忆文本上限,防止超长上下文撑爆 summarize 的 LLM 调用
+MAX_RAW_CONTEXT_CHARS = 6000
+
+
+def build_memory_context(memory) -> str:
+    """
+    从 AgentMemory 提取当前会话短期记忆与长期记忆,拼装为文本并截断
+    
+    Args:
+        memory: AgentMemory 实例
+        
+    Returns:
+        记忆文本;无记忆时返回空串
+    """
+    blocks = []
+
+    short_term = memory.get_short_term() or []
+    if short_term:
+        lines = [f"{item.get('role', 'user')}: {item.get('content', '')}" for item in short_term]
+        blocks.append("【当前会话】\n" + "\n".join(lines))
+
+    long_term = memory.get_long_term() or []
+    if long_term:
+        lines = [f"{item.get('role', 'user')}: {item.get('content', '')}" for item in long_term]
+        blocks.append("【长期记忆】\n" + "\n".join(lines))
+
+    text = "\n\n".join(blocks).strip()
+    if len(text) > MAX_RAW_CONTEXT_CHARS:
+        text = text[:MAX_RAW_CONTEXT_CHARS] + "\n...(记忆文本过长,已截断)"
+    return text
+
+
+def _record_workflow_result(context: CommandContext, name: str, task: str, result: dict) -> None:
+    """把工作流任务与最终答案写回当前会话记忆,形成记忆闭环"""
+    final_answer = result.get("final_answer", "")
+    if not final_answer:
+        return
+    executor = getattr(context.agent, "agent_executor", None)
+    if executor is None:
+        return
+    try:
+        executor.update_state(
+            context.agent.memory.get_config(),
+            {"messages": [
+                HumanMessage(content=f"workflow:{name} {task}"),
+                AIMessage(content=final_answer),
+            ]},
+        )
+    except Exception:
+        # 写回失败不影响工作流主流程,静默跳过
+        pass
 
 
 def run_workflow(context: CommandContext, name: str, task: str) -> dict:
@@ -33,7 +87,8 @@ def run_workflow(context: CommandContext, name: str, task: str) -> dict:
     context.print(f"\n执行任务: {task}")
     context.print("-" * 50)
     
-    result = run_simple_workflow(graph, task)
+    result = run_simple_workflow(graph, task, raw_context=build_memory_context(context.agent.memory))
+    _record_workflow_result(context, name, task, result)
     return result
 
 

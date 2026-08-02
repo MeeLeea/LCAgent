@@ -12,9 +12,22 @@ from graph.simple import (
     build_simple_workflow,
     manager_plan_node,
     run_simple_workflow,
+    summarize_context,
     terminator_final_node,
     worker_exec_node,
 )
+from team.base import TeamAgent
+
+# 默认模板(与各角色类的 default_templates 一致,供 FakeAgent 兜底)
+DEFAULT_TEMPLATES: dict[str, str] = {
+    "manager_plan": "请为以下任务制定详细的执行计划:\n\n{task}\n\n记忆上下文摘要:\n{context_summary}",
+    "summarize_context": "你是一个工作流上下文提炼助手。",
+    "worker_exec": "请执行以下计划:\n\n{plan}",
+    "terminator_final": (
+        "原始任务: {task}\n\n执行计划: {plan}\n\n执行结果: {worker_result}\n\n"
+        "记忆上下文摘要:\n{context_summary}\n\n请汇总以上信息,为用户提供清晰的最终答案。"
+    ),
+}
 
 
 @dataclass
@@ -22,6 +35,9 @@ class FakeAgent:
     """模拟 TeamAgent,不联网"""
     name: str = "test-agent"
     response: str = "fake response"
+    summary_response: str = "记忆摘要: 用户偏好中文"
+    prompt_file: str | None = None
+    default_templates: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_TEMPLATES))
     calls: list[tuple[str, str]] = field(default_factory=list)
     
     def invoke(self, task: str) -> str:
@@ -29,8 +45,36 @@ class FakeAgent:
         self.calls.append(("invoke", task))
         return self.response
 
+    def summarize_context(self, memory_text: str) -> str:
+        """记录记忆提炼调用并返回模拟摘要"""
+        self.calls.append(("summarize", memory_text))
+        return self.summary_response
+
+    def get_template(self, name: str) -> str:
+        """懒加载模板:优先读 AGENT.md 小节,缺失回退默认模板"""
+        return TeamAgent.load_workflow_template(
+            self.prompt_file, name, self.default_templates.get(name, "")
+        )
+
+    def render_template(self, template: str, **kwargs) -> str:
+        """占位符替换"""
+        return TeamAgent.render_template(template, **kwargs)
+
 
 # ==================== 测试工作流节点 ====================
+
+def test_summarize_context_node():
+    """测试 summarize 节点:Manager 提炼记忆上下文摘要"""
+    manager = FakeAgent(name="manager", summary_response="记忆摘要: 项目背景A")
+    state = {"raw_context": "用户: 之前聊过项目A"}
+
+    result = summarize_context(state, manager)
+
+    assert result["context_summary"] == "记忆摘要: 项目背景A"
+    assert len(manager.calls) == 1
+    assert manager.calls[0][0] == "summarize"
+    assert manager.calls[0][1] == "用户: 之前聊过项目A"
+
 
 def test_manager_plan_node():
     """测试 Manager 节点:拆解任务"""
@@ -78,6 +122,110 @@ def test_terminator_final_node():
     assert "执行结果" in prompt
 
 
+def test_manager_plan_node_with_summary():
+    """测试 Manager 节点:有记忆摘要时注入摘要块"""
+    manager = FakeAgent(name="manager", response="计划")
+    state = {"task": "任务", "context_summary": "用户偏好中文"}
+
+    result = manager_plan_node(state, manager)
+
+    assert result["plan"] == "计划"
+    prompt = manager.calls[0][1]
+    assert "记忆上下文摘要:" in prompt
+    assert "用户偏好中文" in prompt
+
+
+def test_terminator_final_node_with_summary():
+    """测试 Terminator 节点:有记忆摘要时注入摘要块"""
+    terminator = FakeAgent(name="terminator", response="最终答案")
+    state = {
+        "task": "任务",
+        "plan": "计划",
+        "worker_result": "结果",
+        "context_summary": "用户偏好中文",
+    }
+
+    result = terminator_final_node(state, terminator)
+
+    assert result["final_answer"] == "最终答案"
+    prompt = terminator.calls[0][1]
+    assert "记忆上下文摘要:" in prompt
+    assert "用户偏好中文" in prompt
+
+
+def test_terminator_final_node_no_summary():
+    """测试 Terminator 节点:无记忆摘要时摘要段头仍在但内容为空"""
+    terminator = FakeAgent(name="terminator", response="最终答案")
+    state = {
+        "task": "任务",
+        "plan": "计划",
+        "worker_result": "结果",
+    }
+
+    terminator_final_node(state, terminator)
+
+    prompt = terminator.calls[0][1]
+    assert "记忆上下文摘要:" in prompt
+    assert "用户偏好" not in prompt
+
+
+# ==================== 测试 AGENT.md 提示词模板 ====================
+
+def test_parse_prompt_sections():
+    """测试按 ## workflow: 小节拆分系统提示词与工作流模板"""
+    content = (
+        "# Agent 核心提示词\n\n"
+        "你是经理。\n\n"
+        "## 重要规则\n"
+        "1. 规则A\n\n"
+        "## workflow:manager_plan\n"
+        "请制定计划:\n"
+        "{task}\n\n"
+        "## workflow:summarize_context\n"
+        "你是一个提炼助手。"
+    )
+    system, templates = TeamAgent.parse_prompt_sections(content)
+    assert "你是经理" in system
+    assert "## 重要规则" in system
+    assert "请制定计划" not in system
+    assert templates["manager_plan"] == "请制定计划:\n{task}"
+    assert templates["summarize_context"] == "你是一个提炼助手。"
+
+
+def test_load_workflow_template(tmp_path):
+    """测试从 AGENT.md 加载工作流模板,小节缺失/文件缺失回退默认"""
+    prompt_file = tmp_path / "AGENT.md"
+    prompt_file.write_text("## workflow:worker_exec\n\n请执行计划:\n{plan}", encoding="utf-8")
+
+    assert TeamAgent.load_workflow_template(str(prompt_file), "worker_exec", "默认") == "请执行计划:\n{plan}"
+    assert TeamAgent.load_workflow_template(str(prompt_file), "manager_plan", "默认计划") == "默认计划"
+    assert TeamAgent.load_workflow_template(None, "worker_exec", "默认") == "默认"
+
+
+def test_render_template():
+    """测试占位符安全替换,JSON 花括号字面量不报错"""
+    template = '任务: {task}\n数据: {"key": 1}\n{plan}'
+    rendered = TeamAgent.render_template(template, task="分析项目", plan="执行A")
+    assert "任务: 分析项目" in rendered
+    assert '数据: {"key": 1}' in rendered
+    assert "执行A" in rendered
+
+
+def test_role_agent_md_strips_workflow_sections():
+    """测试角色 AGENT.md 的 ## workflow:* 小节从系统提示词剥离且模板可读"""
+    import os
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    manager_md = os.path.join(base_dir, "team", "manager", "AGENT.md")
+
+    with open(manager_md, encoding="utf-8") as f:
+        content = f.read()
+    system, templates = TeamAgent.parse_prompt_sections(content)
+
+    assert "workflow:" not in system
+    assert "manager_plan" in templates
+    assert "summarize_context" in templates
+
+
 # ==================== 测试工作流图构建 ====================
 
 def test_build_simple_workflow():
@@ -94,6 +242,7 @@ def test_build_simple_workflow():
     # 验证节点存在
     nodes = graph.get_graph().nodes
     node_names = [n.id for n in nodes.values()]
+    assert "summarize" in node_names
     assert "manager_plan" in node_names
     assert "worker_exec" in node_names
     assert "terminator_final" in node_names
@@ -108,13 +257,50 @@ def test_workflow_edges():
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
     graph_obj = graph.get_graph()
     
-    # 验证边: START → manager_plan → worker_exec → terminator_final → END
+    # 验证边: START → summarize → manager_plan → worker_exec → terminator_final → END
     edges = [(e.source, e.target) for e in graph_obj.edges]
     
-    assert ("__start__", "manager_plan") in edges
+    assert ("__start__", "summarize") in edges
+    assert ("summarize", "manager_plan") in edges
     assert ("manager_plan", "worker_exec") in edges
     assert ("worker_exec", "terminator_final") in edges
     assert ("terminator_final", "__end__") in edges
+
+
+def test_build_simple_workflow_with_prompt_file(tmp_path):
+    """测试从各角色 AGENT.md 加载工作流节点模板并注入记忆摘要"""
+    manager_md = tmp_path / "manager.md"
+    manager_md.write_text(
+        "## workflow:manager_plan\n请按文件计划: {task}\n\n记忆块: {context_summary}",
+        encoding="utf-8",
+    )
+    worker_md = tmp_path / "worker.md"
+    worker_md.write_text("## workflow:worker_exec\n按文件执行: {plan}", encoding="utf-8")
+    terminator_md = tmp_path / "terminator.md"
+    terminator_md.write_text(
+        "## workflow:terminator_final\n文件汇总: {task} / {worker_result}\n记忆块: {context_summary}",
+        encoding="utf-8",
+    )
+
+    manager = FakeAgent(name="manager", response="计划X", summary_response="摘要S", prompt_file=str(manager_md))
+    worker = FakeAgent(name="worker", response="结果X", prompt_file=str(worker_md))
+    terminator = FakeAgent(name="terminator", response="答案X", prompt_file=str(terminator_md))
+
+    graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
+    graph.invoke({
+        "task": "任务T",
+        "raw_context": "",
+        "context_summary": "摘要S",
+        "plan": "",
+        "worker_result": "",
+        "final_answer": "",
+    })
+
+    assert "按文件计划: 任务T" in manager.calls[1][1]
+    assert "记忆块: 摘要S" in manager.calls[1][1]
+    assert "按文件执行: 计划X" in worker.calls[0][1]
+    assert "文件汇总: 任务T / 结果X" in terminator.calls[0][1]
+    assert "记忆块: 摘要S" in terminator.calls[0][1]
 
 
 def test_run_simple_workflow():
@@ -132,8 +318,8 @@ def test_run_simple_workflow():
     assert result["worker_result"] == "执行结果: 完成A、B、C"
     assert result["final_answer"] == "最终答案: 全部完成"
     
-    # 验证三个 Agent 都被调用
-    assert len(manager.calls) == 1
+    # 验证三个 Agent 都被调用(manager 承担 summarize + plan 两次调用)
+    assert len(manager.calls) == 2
     assert len(worker.calls) == 1
     assert len(terminator.calls) == 1
 
@@ -324,7 +510,182 @@ def test_workflow_thread_isolation():
     assert result2["task"] == "任务2"
     assert result2["final_answer"] == "答案2"
     
-    # 验证两次都调用了 agent
-    assert len(manager.calls) == 1
+    # 验证两次都调用了 agent(manager 为 summarize + plan 两次调用)
+    assert len(manager.calls) == 2
     assert len(worker.calls) == 1
     assert len(terminator.calls) == 1
+
+
+# ==================== 测试记忆注入与写回 ====================
+
+def test_run_simple_workflow_with_memory():
+    """测试带记忆运行时:摘要注入 plan/final 节点,worker 不注入"""
+    manager = FakeAgent(name="manager", response="计划: A、B、C", summary_response="记忆摘要: 用户偏好中文")
+    worker = FakeAgent(name="worker", response="执行结果: 完成")
+    terminator = FakeAgent(name="terminator", response="最终答案: 完成")
+    graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
+
+    result = run_simple_workflow(graph, "测试任务", raw_context="用户: 之前聊过偏好中文")
+
+    # manager 两次调用:summarize + plan
+    assert manager.calls[0] == ("summarize", "用户: 之前聊过偏好中文")
+    assert manager.calls[1][0] == "invoke"
+    assert "记忆摘要: 用户偏好中文" in manager.calls[1][1]
+    # worker 只拿 plan,不注入摘要
+    assert worker.calls[0][0] == "invoke"
+    assert "请执行以下计划" in worker.calls[0][1]
+    assert "记忆摘要" not in worker.calls[0][1]
+    # terminator 注入摘要
+    assert "记忆摘要: 用户偏好中文" in terminator.calls[0][1]
+    # 状态透传
+    assert result["context_summary"] == "记忆摘要: 用户偏好中文"
+    assert result["final_answer"] == "最终答案: 完成"
+
+
+class FakeMemory:
+    """模拟 AgentMemory 的记忆读取接口"""
+    def __init__(self, short_term=None, long_term=None):
+        self._short = short_term or []
+        self._long = long_term or []
+
+    def get_short_term(self, limit=None):
+        return self._short
+
+    def get_long_term(self, limit=5):
+        return self._long
+
+
+def test_build_memory_context():
+    """测试记忆文本提取:短期+长期拼装"""
+    from cli.commands.workflow import build_memory_context
+    memory = FakeMemory(
+        short_term=[
+            {"role": "user", "content": "你好"},
+            {"role": "assistant", "content": "你好!"},
+        ],
+        long_term=[{"role": "system", "content": "用户偏好中文"}],
+    )
+    text = build_memory_context(memory)
+    assert "【当前会话】" in text
+    assert "user: 你好" in text
+    assert "assistant: 你好!" in text
+    assert "【长期记忆】" in text
+    assert "system: 用户偏好中文" in text
+
+
+def test_build_memory_context_empty():
+    """测试无记忆时返回空串"""
+    from cli.commands.workflow import build_memory_context
+    assert build_memory_context(FakeMemory()) == ""
+
+
+def test_build_memory_context_truncation(monkeypatch):
+    """测试记忆文本超长截断"""
+    import cli.commands.workflow as wf_module
+    from cli.commands.workflow import build_memory_context
+    monkeypatch.setattr(wf_module, "MAX_RAW_CONTEXT_CHARS", 20)
+    memory = FakeMemory(short_term=[{"role": "user", "content": "这是一段很长很长的内容" * 10}])
+    text = build_memory_context(memory)
+    assert "已截断" in text
+
+
+class FakeExecutor:
+    """记录 update_state 调用的假 executor"""
+    def __init__(self):
+        self.updated = []
+
+    def update_state(self, config, values):
+        self.updated.append((config, values))
+
+
+class FakeAgentCore:
+    """模拟 AgentCore 的 executor + memory"""
+    def __init__(self):
+        self.agent_executor = FakeExecutor()
+        self.memory = FakeMemory()
+
+
+class WriteBackContext:
+    """携带 agent 的假上下文(供写回测试)"""
+    def __init__(self, agent=None):
+        self.agent = agent or FakeAgentCore()
+        self.output: list[str] = []
+
+    def print(self, text: str) -> None:
+        self.output.append(text)
+
+
+def test_record_workflow_result():
+    """测试写回:任务与最终答案写入当前会话 checkpoint"""
+    from cli.commands.workflow import _record_workflow_result
+    core = FakeAgentCore()
+    core.memory.get_config = lambda: {"configurable": {"thread_id": "t1"}}
+    ctx = WriteBackContext(core)
+
+    _record_workflow_result(ctx, "simple", "测试任务", {"final_answer": "最终答案"})
+
+    assert len(core.agent_executor.updated) == 1
+    config, values = core.agent_executor.updated[0]
+    assert config == {"configurable": {"thread_id": "t1"}}
+    msgs = values["messages"]
+    assert msgs[0].content == "workflow:simple 测试任务"
+    assert msgs[1].content == "最终答案"
+
+
+def test_record_workflow_result_empty_answer():
+    """测试无最终答案时不写回"""
+    from cli.commands.workflow import _record_workflow_result
+    core = FakeAgentCore()
+    ctx = WriteBackContext(core)
+
+    _record_workflow_result(ctx, "simple", "测试任务", {"final_answer": ""})
+
+    assert core.agent_executor.updated == []
+
+
+def test_record_workflow_result_no_executor():
+    """测试没有 executor 时不写回也不报错"""
+    from cli.commands.workflow import _record_workflow_result
+    core = FakeAgentCore()
+    core.agent_executor = None
+    ctx = WriteBackContext(core)
+
+    _record_workflow_result(ctx, "simple", "测试任务", {"final_answer": "答案"})
+    # 不应抛异常
+
+
+def test_run_workflow_injects_memory(monkeypatch):
+    """测试 run_workflow:提取记忆传入图并写回会话"""
+    import cli.commands.workflow as wf_module
+
+    class Mem:
+        def get_short_term(self, limit=None):
+            return [{"role": "user", "content": "之前聊过X"}]
+
+        def get_long_term(self, limit=5):
+            return []
+
+        def get_config(self):
+            return {"configurable": {"thread_id": "t1"}}
+
+    core = FakeAgentCore()
+    core.memory = Mem()
+    ctx = WriteBackContext(core)
+
+    captured = {}
+
+    def fake_build(name):
+        return ("graph", {})
+
+    def fake_run(graph, task, raw_context=""):
+        captured["raw_context"] = raw_context
+        return {"final_answer": "答案"}
+
+    monkeypatch.setattr("graph.registry.build_workflow", fake_build)
+    monkeypatch.setattr("graph.simple.run_simple_workflow", fake_run)
+
+    result = wf_module.run_workflow(ctx, "simple", "测试任务")
+
+    assert result["final_answer"] == "答案"
+    assert "user: 之前聊过X" in captured["raw_context"]
+    assert len(core.agent_executor.updated) == 1

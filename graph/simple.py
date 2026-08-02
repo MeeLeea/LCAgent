@@ -12,17 +12,27 @@ from langgraph.graph import END, START, StateGraph
 # 1. 定义工作流状态
 class WorkflowState(TypedDict):
     """监督者工作流状态"""
-    task: str           # 用户原始任务
-    plan: str           # Manager 拆解的执行计划
-    worker_result: str  # Worker 执行结果
-    final_answer: str   # Terminator 最终答案
+    task: str             # 用户原始任务
+    raw_context: str      # 原始记忆文本(当前会话+长期记忆,仅 summarize 节点消费)
+    context_summary: str  # Manager 提炼后的上下文摘要(注入 plan/final 节点)
+    plan: str             # Manager 拆解的执行计划
+    worker_result: str    # Worker 执行结果
+    final_answer: str     # Terminator 最终答案
 
 
-# 2. 节点函数
+# 2. 节点函数(提示词模板由各角色 TeamAgent 懒加载,节点需要时调用 get_template)
+def summarize_context(state: WorkflowState, manager) -> WorkflowState:
+    """Manager 提炼记忆上下文,生成分发给下游节点的上下文摘要"""
+    result = manager.summarize_context(state.get("raw_context", ""))
+    return {"context_summary": result}
+
+
 def manager_plan_node(state: WorkflowState, manager) -> WorkflowState:
-    """Manager 拆解任务,生成执行计划"""
+    """Manager 拆解任务,生成执行计划(结合记忆上下文摘要)"""
     task = state["task"]
-    prompt = f"请为以下任务制定详细的执行计划:\n{task}"
+    summary = state.get("context_summary", "")
+    template = manager.get_template("manager_plan")
+    prompt = manager.render_template(template, task=task, context_summary=summary)
     result = manager.invoke(prompt)
     return {"plan": result}
 
@@ -30,22 +40,26 @@ def manager_plan_node(state: WorkflowState, manager) -> WorkflowState:
 def worker_exec_node(state: WorkflowState, worker) -> WorkflowState:
     """Worker 执行计划中的子任务"""
     plan = state["plan"]
-    prompt = f"请执行以下计划:\n{plan}"
+    template = worker.get_template("worker_exec")
+    prompt = worker.render_template(template, plan=plan)
     result = worker.invoke(prompt)
     return {"worker_result": result}
 
 
 def terminator_final_node(state: WorkflowState, terminator) -> WorkflowState:
-    """Terminator 汇总结果并返回最终答案"""
+    """Terminator 汇总结果并返回最终答案(结合记忆上下文摘要)"""
     task = state["task"]
     plan = state["plan"]
     worker_result = state["worker_result"]
-    
-    prompt = (
-        f"原始任务: {task}\n\n"
-        f"执行计划: {plan}\n\n"
-        f"执行结果: {worker_result}\n\n"
-        f"请汇总以上信息,为用户提供清晰的最终答案。"
+    summary = state.get("context_summary", "")
+    template = terminator.get_template("terminator_final")
+
+    prompt = terminator.render_template(
+        template,
+        task=task,
+        plan=plan,
+        worker_result=worker_result,
+        context_summary=summary,
     )
     result = terminator.invoke(prompt)
     return {"final_answer": result}
@@ -69,13 +83,15 @@ def build_simple_workflow(agents: dict) -> StateGraph:
     
     builder = StateGraph(WorkflowState)
     
-    # 添加节点(使用 lambda 绑定 agent 实例)
+    # 添加节点(使用 lambda 绑定 agent 实例;提示词模板由节点内懒加载)
+    builder.add_node("summarize", lambda state: summarize_context(state, manager))
     builder.add_node("manager_plan", lambda state: manager_plan_node(state, manager))
     builder.add_node("worker_exec", lambda state: worker_exec_node(state, worker))
     builder.add_node("terminator_final", lambda state: terminator_final_node(state, terminator))
     
-    # 添加边: START → manager_plan → worker_exec → terminator_final → END
-    builder.add_edge(START, "manager_plan")
+    # 添加边: START → summarize → manager_plan → worker_exec → terminator_final → END
+    builder.add_edge(START, "summarize")
+    builder.add_edge("summarize", "manager_plan")
     builder.add_edge("manager_plan", "worker_exec")
     builder.add_edge("worker_exec", "terminator_final")
     builder.add_edge("terminator_final", END)
@@ -84,13 +100,14 @@ def build_simple_workflow(agents: dict) -> StateGraph:
 
 
 # 4. 运行工作流
-def run_simple_workflow(graph: StateGraph, task: str) -> dict:
+def run_simple_workflow(graph: StateGraph, task: str, raw_context: str = "") -> dict:
     """
     运行监督者工作流
     
     Args:
         graph: 编译好的工作流图
         task: 用户任务
+        raw_context: 原始记忆文本(当前会话+长期记忆),为空则不注入记忆
         
     Returns:
         包含 final_answer 的结果字典
@@ -100,6 +117,8 @@ def run_simple_workflow(graph: StateGraph, task: str) -> dict:
     
     initial_state = {
         "task": task,
+        "raw_context": raw_context,
+        "context_summary": "",
         "plan": "",
         "worker_result": "",
         "final_answer": ""
@@ -125,4 +144,3 @@ def graph_display(graph: StateGraph, output_file: str = "workflow.png") -> None:
         print(f"工作流图已导出到: {output_file}")
     except Exception as e:
         print(f"导出工作流图失败: {e}")
-
