@@ -1,5 +1,5 @@
 """
-LangChain Agent 项目入口 - 支持多提供商(智谱/千问/DeepSeek/Kimi) + MCP工具
+LangChain Agent 项目入口 - 支持多提供商(智谱/千问/DeepSeek/Kimi) + MCP工具 + 多Agent工作流
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ except ImportError:
 
 from agent import AgentCore
 from agent.config import load_agent_config, resolve_path
-from agent.llm_client import load_providers as list_providers
 from tools import safety as safety_module
 from cli.cli_menu import select_menu
 from cli.commands import CommandContext, dispatch_command
@@ -43,10 +42,12 @@ def build_agent(provider: str, process_type: str = None) -> tuple[AgentCore, obj
         process_type: 进程类型标识(feishu/None)，用于多进程隔离。
                       CLI 模式传 None(单进程不需要隔离)
     """
+    from agent.llm_client import load_providers as list_providers
+    
     print(f"\n初始化 {list_providers(LLM_FILE)[provider]['name']} 客户端...")
     llm = create_llm(provider, LLM_FILE)
     print("加载运行时配置...")
-    config = load_agent_config(AGENT_CONFIG_FILE)
+    config = load_agent_config(AGENT_CONFIG_FILE, base_dir=BASE_DIR)
     # 配置中的相对路径统一锚定项目根，避免调用方工作目录影响资源加载。
     skills_dir = resolve_path(config["skills_dir"], BASE_DIR)
     mcp_config_file = resolve_path(config["mcp_config_file"], BASE_DIR)
@@ -73,6 +74,8 @@ def build_agent(provider: str, process_type: str = None) -> tuple[AgentCore, obj
 
 def make_context(agent: AgentCore, llm: object) -> CommandContext:
     """组装命令分发器所需的运行时依赖。"""
+    from agent.llm_client import load_providers as list_providers
+    
     # 命令模块只依赖该上下文，便于在测试中替换输入、菜单、LLM 和安全后端。
     return CommandContext(
         agent=agent,

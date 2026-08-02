@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from . import core, execution, mcp, memory, provider, safety, skills, threads
+from . import core, execution, mcp, memory, provider, safety, skills, threads, workflow
 from .types import BREAK, HANDLED, UNHANDLED, CommandContext, CommandOutcome
 
 
@@ -55,6 +55,8 @@ def dispatch_command(context: CommandContext, user_input: str) -> CommandOutcome
         return safety.show_safety(context)
     if low.startswith("safety:"):
         return safety.safety_command(context, user_input)
+    if low == "workflow" or low.startswith("workflow:"):
+        return workflow.workflow_command(context, user_input)
     if low.startswith("json:"):
         return execution.json_mode(context, user_input)
     if low.startswith("react:"):

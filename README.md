@@ -198,7 +198,7 @@ python main.py
 
 ```
 LangChainAgent/
-├── main.py                  # 入口文件，交互式命令行
+├── main.py                  # 入口文件，交互式命令行 + 工作流构建
 ├── config/                  # 配置目录（需从 .example 复制；见快速开始）
 │   ├── llm_config.json      # API 密钥配置文件
 │   ├── mcp_servers.json     # MCP Server 配置
@@ -222,6 +222,23 @@ LangChainAgent/
 │   ├── config.py            # 运行时配置加载(agent/agent_config.json)
 │   ├── memory.py            # AgentMemory：checkpoint + 长期记忆 + 会话管理
 │   └── agent_core.py        # Agent 核心调度：run/chat/cot 三种模式 + HITL
+├── team/                    # 多 Agent 团队协作模块
+│   ├── __init__.py          # 导出 ManagerAgent/WorkerAgent/TerminatorAgent
+│   ├── factory.py           # 团队 Agent 工厂函数
+│   ├── manager/             # Manager Agent（任务拆解）
+│   │   ├── manager.py
+│   │   ├── agent_config.json
+│   │   └── AGENT.md
+│   ├── worker/              # Worker Agent（任务执行）
+│   │   ├── manager.py
+│   │   ├── agent_config.json
+│   │   └── AGENT.md
+│   └── terminator/          # Terminator Agent（结果汇总）
+│       ├── terminator.py
+│       ├── agent_config.json
+│       └── AGENT.md
+├── graph/                   # LangGraph 工作流编排
+│   └── simple.py            # 监督者模式工作流（Manager→Worker→Terminator）
 ├── tools/
 │   ├── __init__.py          # 本地工具注册
 │   ├── search.py            # 联网搜索工具(Tavily API)
@@ -251,6 +268,7 @@ LangChainAgent/
 │       ├── mcp.py           # MCP 管理命令
 │       ├── skills.py        # Skill 管理命令
 │       ├── safety.py        # 安全策略命令
+│       ├── workflow.py      # 工作流命令（workflow / workflow:<name> <task>）
 │       └── execution.py     # json / react / cot / 普通对话
 ├── tests/                   # 离线单元测试(pytest)
 │   ├── conftest.py
@@ -263,6 +281,7 @@ LangChainAgent/
 │   ├── test_cli_commands.py
 │   ├── test_human_input.py
 │   ├── test_scheduler.py
+│   ├── test_workflow.py
 │   ├── test_agent_core_regressions.py
 │   ├── test_config_templates.py
 │   ├── test_calculator.py
@@ -275,11 +294,13 @@ LangChainAgent/
 
 | 模块                                                        | 职责                                                                                                                        |
 | ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| [main.py](main.py)                                           | 交互式命令行入口：初始化运行时、读取输入并调用命令分发器                                                                    |
+| [main.py](main.py)                                           | 交互式命令行入口 + Agent 构建接口                                                          |
 | [agent/llm_client.py](agent/llm_client.py)                   | 从`config/llm_config.json` 读取提供商配置，支持运行时切换提供商/模型                                                      |
 | [agent/config.py](agent/config.py)                           | 加载`agent/agent_config.json`，统一运行时配置                                                                            |
 | [agent/memory.py](agent/memory.py)                           | 双层记忆：Checkpoint（自动）+ memory.json（手动）+ 对话导出                                                                 |
 | [agent/agent_core.py](agent/agent_core.py)                   | Agent 核心：`run()` / `chat()` / `cot()` 三种模式 + `AgentTurnResult` 结构化暂停/恢复 API + 技能注入 + 长上下文裁剪 |
+| [team/](team/)                                               | 多 Agent 团队协作：ManagerAgent（拆解）/ WorkerAgent（执行）/ TerminatorAgent（汇总）+ 工厂函数                           |
+| [graph/simple.py](graph/simple.py)                           | LangGraph 监督者模式工作流编排（Manager→Worker→Terminator）                                                              |
 | [tools/skills.py](tools/skills.py)                           | `SkillManager`：扫描/匹配/渲染本地技能                                                                                    |
 | [tools/skill_tool.py](tools/skill_tool.py)                   | `read_skill` 工具：LLM 在任务中自助读取技能指引                                                                           |
 | [tools/](tools/)                                             | 本地工具 + MCP 工具加载 + 技能管理                                                                                          |
@@ -1483,10 +1504,130 @@ output = chat_until_completion(agent, "需要人工选择时请先问我")
 | `safety`                                  | 查看当前安全策略                                                           |
 | `safety:mode <blacklist\|whitelist>`       | 切换安全模式                                                               |
 | `safety:confirm <on\|off>`                 | 开关危险命令确认                                                           |
+| `workflow`                                | 列出可用的多 Agent 工作流                                                  |
+| `workflow:<name> <任务>`                  | 运行指定工作流（如 `workflow:simple 帮我分析项目结构`）                   |
 | `export` 或 `export:<thread_id> [路径]` | 导出对话为 Markdown(默认存`exports/`)                                    |
 | `json:<任务>`                             | 让 Agent 以 JSON 对象返回结果并解析展示                                    |
 | `quit` / `exit`                         | 退出                                                                       |
 | 其他输入                                    | 普通对话模式（也支持工具调用，但不打印步骤）                               |
+
+---
+
+## 多 Agent 工作流
+
+项目支持基于 LangGraph 的多 Agent 团队协作，采用**监督者模式**（Supervisor Pattern）编排。
+
+### 架构
+
+```
+用户任务
+    ↓
+Manager (拆解任务,生成计划)
+    ↓
+Worker (执行子任务)
+    ↓
+Terminator (汇总结果,返回最终答案)
+```
+
+### 团队角色
+
+| Agent | 职责 | 工具能力 | 配置 |
+|-------|------|---------|------|
+| **ManagerAgent** | 任务拆解与规划 | 纯文本推理(无工具) | `team/manager/` |
+| **WorkerAgent** | 执行具体子任务 | 工具模式(注入全部本地工具) | `team/worker/` |
+| **TerminatorAgent** | 汇总结果并返回 | 纯文本推理(无工具) | `team/terminator/` |
+
+**轻量设计**：团队 Agent 继承 `TeamAgent` 轻量基类,不继承 `AgentCore`。相比完整智能体:
+- **无会话记忆/checkpoint**:单轮任务执行,不需要持久化历史
+- **按需工具注入**:Manager/Terminator 纯 LLM 推理,Worker 注入工具列表后用 `create_agent` 构建轻量 ReAct 循环
+- **快速构建**:不加载 MCP Server、不扫描技能目录、不创建 SQLite checkpointer
+- **能力边界清晰**:规划/汇总角色不暴露危险工具(如 `run_shell`),Worker 才拥有工具执行能力
+- **自带 LLM 配置**:每个 agent 的 `agent_config.json` 里配置 `provider` + `model`,TeamAgent 内部创建 LLMClient
+- **可定制 LLM 采样参数**:子类可通过类属性或 `__init__` 参数覆盖 `temperature`/`max_tokens`(如 WorkerAgent 用 `temperature=0.3` 提升执行确定性、`max_tokens=4096` 放宽输出上限)
+
+### 状态隔离机制
+
+**设计原则**：工作流状态通过外层 `WorkflowState` 显式传递(`plan`/`worker_result`/`final_answer`),每次运行用独立 `thread_id`,不同运行互不干扰。
+
+### 使用方式
+
+#### 1. CLI 命令
+
+```bash
+# 列出可用工作流
+你: workflow
+
+# 运行 simple 工作流
+你: workflow:simple 帮我分析 LCAgent 项目的目录结构
+```
+
+输出示例：
+```
+构建工作流: simple
+初始化团队 Agent(Manager/Worker/Terminator)...
+工作流 simple 构建完成
+
+执行任务: 帮我分析 LCAgent 项目的目录结构
+--------------------------------------------------
+[Manager 拆解任务...]
+[Worker 执行...]
+[Terminator 汇总...]
+
+==================================================
+工作流执行完成
+==================================================
+
+项目包含以下主要模块：
+- agent/: Agent 核心与配置
+- team/: 多 Agent 团队
+- graph/: 工作流编排
+- tools/: 本地工具 + MCP
+...
+```
+
+#### 2. 编程接口
+
+```python
+from graph.registry import build_workflow
+from graph.simple import run_simple_workflow
+
+# 方式1: 构建并运行
+graph, agents = build_workflow("simple")
+result = run_simple_workflow(graph, "帮我分析项目结构")
+print(result["final_answer"])
+
+# 方式2: 通过 CLI 层封装(带打印提示)
+from cli.commands.workflow import run_workflow
+from cli.commands.types import CommandContext
+
+# 需要构造 CommandContext(简化示例,实际使用中从 main.py 获取)
+result = run_workflow(context, "simple", "帮我分析项目结构")
+```
+
+### 扩展工作流
+
+在 `graph/` 下新建工作流文件，实现 `build_xxx_workflow(agents)` 函数（统一接收角色字典，内部按角色名取值），然后在 `graph/registry.py` 的 `WORKFLOWS` 注册表中注册：
+
+```python
+# graph/registry.py
+from graph.advanced import build_advanced_workflow
+
+WORKFLOWS = {
+    "simple": build_simple_workflow,
+    "advanced": build_advanced_workflow,  # 新增
+}
+```
+
+```python
+# graph/advanced.py - 工作流构建器统一接收 agents 字典
+def build_advanced_workflow(agents: dict) -> StateGraph:
+    manager = agents["manager"]
+    worker = agents["worker"]
+    terminator = agents["terminator"]
+    ...
+```
+
+CLI 会自动识别新工作流：`workflow:advanced <任务>`。构建时 `build_workflow` 会遍历 `AGENT_REGISTRY` 构建所有已注册角色，无需在注册表里手动指定角色。
 
 ---
 
