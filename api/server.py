@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import sys
+from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("api.server")
@@ -156,7 +157,7 @@ def serialize_messages(messages: List[Any]) -> List[Dict[str, Any]]:
 
 
 def thread_summary(thread_id: str) -> Dict[str, Any]:
-    """单个会话的摘要信息（消息数 + 预览）。"""
+    """单个会话的摘要信息（消息数 + 预览 + 会话类型）。"""
     msgs = agent.memory.get_messages(thread_id=thread_id) if agent else []
     preview = ""
     for m in msgs:
@@ -165,7 +166,17 @@ def thread_summary(thread_id: str) -> Dict[str, Any]:
             break
     if not preview and msgs:
         preview = stringify_content(msgs[-1].content).strip().replace("\n", " ")[:50]
-    return {"thread_id": thread_id, "message_count": len(msgs), "preview": preview}
+    summary: Dict[str, Any] = {
+        "thread_id": thread_id,
+        "message_count": len(msgs),
+        "preview": preview,
+        "type": "chat",
+    }
+    # 专属工作流会话：标注类型并带上绑定的工作流名，前端据此区分展示
+    if agent and agent.memory.is_workflow_thread(thread_id):
+        summary["type"] = "workflow"
+        summary["workflow_name"] = agent.memory.workflow_name_of(thread_id)
+    return summary
 
 
 # --------------------------------------------------------------------------- #
@@ -174,6 +185,11 @@ def thread_summary(thread_id: str) -> Dict[str, Any]:
 class ChatRequest(BaseModel):
     message: str
     thread_id: Optional[str] = None
+
+
+class CreateThreadRequest(BaseModel):
+    type: Optional[str] = "chat"
+    workflow_name: Optional[str] = None
 
 
 class ResumeRequest(BaseModel):
@@ -277,6 +293,71 @@ async def get_tools():
     return {"tools": agent.get_available_tools() if agent else []}
 
 
+# LangGraph 内部哨兵节点与前端友好标签的映射
+_SENTINEL_LABELS = {"__start__": "START", "__end__": "END"}
+
+
+@lru_cache(maxsize=8)
+def _workflow_snapshot(name: str) -> dict:
+    """
+    构建工作流并提取结构快照（带进程级缓存）。
+
+    缓存的是最终 JSON 快照而非 graph 实例，避免 LLM Client 等资源长期占用。
+    哨兵节点(__start__/__end__)从 nodes 中过滤,并在 edges 中映射为 START/END 标签。
+
+    Args:
+        name: 工作流名称
+
+    Returns:
+        包含 name/nodes/edges 的结构字典
+
+    Raises:
+        KeyError: 工作流名称不存在
+    """
+    from graph.registry import build_workflow
+
+    graph, _ = build_workflow(name)
+
+    graph_obj = graph.get_graph()
+    nodes = [
+        {"id": n.id, "label": n.id, "status": "pending"}
+        for n in graph_obj.nodes.values()
+        # 过滤掉内部哨兵节点(__start__/__end__),仅展示真实业务节点
+        if not n.id.startswith("__")
+    ]
+    edges = [
+        {
+            "source": _SENTINEL_LABELS.get(e.source, e.source),
+            "target": _SENTINEL_LABELS.get(e.target, e.target),
+        }
+        for e in graph_obj.edges
+    ]
+    return {"name": name, "nodes": nodes, "edges": edges}
+
+
+@app.get("/api/workflow")
+async def get_workflow(name: str = "simple"):
+    """获取工作流结构图与节点状态（节点状态为静态 pending，暂无运行进度跟踪）。"""
+    try:
+        snapshot = _workflow_snapshot(name)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error("构建工作流失败 [%s]: %s", name, e)
+        raise HTTPException(status_code=500, detail=f"工作流构建失败: {e}")
+
+    snapshot["workflow_status"] = "idle"
+    return snapshot
+
+
+@app.get("/api/workflows")
+async def list_workflows():
+    """列出全部可用工作流名称（供前端切换选择）。"""
+    from graph.registry import WORKFLOWS
+
+    return {"workflows": list(WORKFLOWS.keys())}
+
+
 @app.get("/api/threads")
 async def list_threads():
     """列出所有会话（按消息数倒序，便于最近活跃的靠前）。"""
@@ -287,10 +368,14 @@ async def list_threads():
 
 
 @app.post("/api/threads")
-async def create_thread():
-    """新建会话，返回 thread_id。"""
+async def create_thread(req: Optional[CreateThreadRequest] = None):
+    """新建会话，返回 thread_id。type=workflow 时创建专属工作流会话。"""
     async with chat_lock:
-        tid = agent.memory.new_thread()
+        if req and req.type == "workflow":
+            workflow_name = req.workflow_name or "simple"
+            tid = agent.memory.new_workflow_thread(workflow_name)
+        else:
+            tid = agent.memory.new_thread()
     logger.info("创建会话: %s", tid)
     return {"thread_id": tid}
 
@@ -374,6 +459,12 @@ async def chat(req: ChatRequest):
             
             # 检测是否为命令（以 / 开头）
             message = req.message.strip()
+            # 专属工作流会话：未显式以 / 开头时，自动包装为 /workflow:<name> 命令执行
+            if agent.memory.is_workflow_thread(tid):
+                workflow_name = agent.memory.workflow_name_of(tid)
+                if workflow_name and not message.startswith('/'):
+                    message = f"/workflow:{workflow_name} {message}"
+                    logger.info("工作流会话 [%s] 自动包装命令: %s", tid, message)
             if message.startswith('/'):
                 # 命令模式：通过 dispatch_command 处理
                 command = message.lstrip('/')
