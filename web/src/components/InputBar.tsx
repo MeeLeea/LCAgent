@@ -10,7 +10,11 @@ export function InputBar() {
   const sendMessage = useStore((s) => s.sendMessage)
   const stopStreaming = useStore((s) => s.stopStreaming)
   const tools = useStore((s) => s.tools)
+  const threads = useStore((s) => s.threads)
   const currentThreadId = useStore((s) => s.currentThreadId)
+
+  const currentThread = threads.find((t) => t.thread_id === currentThreadId)
+  const isWorkflowThread = currentThread?.type === 'workflow' || currentThreadId?.includes('workflow')
 
   // 自适应高度
   useEffect(() => {
@@ -42,7 +46,13 @@ export function InputBar() {
           id="chat-message"
           name="message"
           className="input-textarea"
-          placeholder={currentThreadId ? '输入消息，Enter 发送，Shift+Enter 换行…' : '输入消息开始对话…'}
+          placeholder={
+            isWorkflowThread
+              ? '输入任务，自动以工作流方式执行…'
+              : currentThreadId
+                ? '输入消息，Enter 发送，Shift+Enter 换行…'
+                : '输入消息开始对话…'
+          }
           value={text}
           rows={1}
           onChange={(e) => setText(e.target.value)}

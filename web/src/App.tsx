@@ -5,6 +5,7 @@ import { useStore } from './store'
 import { Sidebar } from './components/Sidebar'
 import { TopBar } from './components/TopBar'
 import { ChatView } from './components/ChatView'
+import { WorkflowView } from './components/WorkflowView'
 import { InputBar } from './components/InputBar'
 
 const DEFAULT_SIDEBAR_WIDTH = 264
@@ -23,6 +24,7 @@ function loadSidebarWidth(): number {
 
 export default function App() {
   const init = useStore((s) => s.init)
+  const viewMode = useStore((s) => s.viewMode)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth)
   const [isResizing, setIsResizing] = useState(false)
@@ -71,7 +73,7 @@ export default function App() {
       </aside>
       <div className="main">
         <TopBar onExpand={() => setSidebarCollapsed(false)} />
-        <ChatView />
+        {viewMode === 'workflow' ? <WorkflowView /> : <ChatView />}
         <InputBar />
       </div>
     </div>

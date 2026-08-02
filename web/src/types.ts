@@ -19,6 +19,28 @@ export interface ThreadSummary {
   thread_id: string
   message_count: number
   preview: string
+  /** 会话类型：chat=普通对话，workflow=专属工作流会话 */
+  type?: 'chat' | 'workflow'
+  /** 工作流会话绑定的工作流名称（仅 type=workflow 时存在） */
+  workflow_name?: string
+}
+
+export interface WorkflowNode {
+  id: string
+  label: string
+  status: 'pending' | 'running' | 'done'
+}
+
+export interface WorkflowEdge {
+  source: string
+  target: string
+}
+
+export interface WorkflowInfo {
+  name: string
+  workflow_status: 'idle' | 'running' | 'done'
+  nodes: WorkflowNode[]
+  edges: WorkflowEdge[]
 }
 
 export interface ToolCall {

@@ -7,6 +7,7 @@ import type {
   Provider,
   RawMessage,
   ThreadSummary,
+  WorkflowInfo,
 } from './types'
 
 export type ThemeId = 'dark' | 'deepblue' | 'midnight' | 'forest' | 'light' | 'sepia'
@@ -38,6 +39,10 @@ interface AppState {
   theme: ThemeId
   setTheme: (id: ThemeId) => void
 
+  // 视图模式（对话 / 工作流）
+  viewMode: 'chat' | 'workflow'
+  setViewMode: (mode: 'chat' | 'workflow') => void
+
   // 数据
   threads: ThreadSummary[]
   currentThreadId: string | null
@@ -46,6 +51,14 @@ interface AppState {
   currentProvider: string | null
   currentModel: string | null
   tools: string[]
+
+  // 工作流
+  workflows: string[]
+  workflow: WorkflowInfo | null
+  workflowLoading: boolean
+  workflowError: string | null
+  fetchWorkflows: () => Promise<void>
+  fetchWorkflow: (name?: string, force?: boolean) => Promise<void>
 
   // 流式状态
   isStreaming: boolean
@@ -59,6 +72,7 @@ interface AppState {
   // 会话操作
   selectThread: (id: string) => Promise<void>
   newThread: () => Promise<void>
+  newWorkflowThread: (workflowName: string) => Promise<void>
   deleteThread: (id: string) => Promise<void>
 
   // 聊天
@@ -174,12 +188,43 @@ export const useStore = create<AppState>((set, get) => ({
   currentProvider: null,
   currentModel: null,
   tools: [],
+  viewMode: 'chat',
+  workflows: [],
+  workflow: null,
+  workflowLoading: false,
+  workflowError: null,
   isStreaming: false,
   pendingInterrupt: null,
 
+  setViewMode: (mode) => set({ viewMode: mode }),
+
+  fetchWorkflows: async () => {
+    try {
+      const r = await api.getWorkflows()
+      set({ workflows: r.workflows })
+    } catch {
+      /* ignore */
+    }
+  },
+
+  fetchWorkflow: async (name = 'simple', force = false) => {
+    // 已加载同名称工作流且非强制刷新时复用缓存，避免重复请求
+    if (!force && get().workflow?.name === name) return
+    set({ workflowLoading: true, workflowError: null })
+    try {
+      const info = await api.getWorkflow(name)
+      set({ workflow: info, workflowLoading: false })
+    } catch (e) {
+      set({
+        workflowLoading: false,
+        workflowError: `获取工作流失败: ${(e as Error).message}`,
+      })
+    }
+  },
+
   init: async () => {
     applyTheme(get().theme)
-    await Promise.all([get().refreshProviders(), get().fetchThreads()])
+    await Promise.all([get().refreshProviders(), get().fetchThreads(), get().fetchWorkflows()])
     api.getTools().then((r) => set({ tools: r.tools })).catch(() => {})
   },
 
@@ -225,7 +270,20 @@ export const useStore = create<AppState>((set, get) => ({
   newThread: async () => {
     if (get().isStreaming) return
     try {
-      const r = await api.createThread()
+      // 工作流模式下创建专属工作流会话，其余为普通对话
+      const type = get().viewMode
+      const r = type === 'workflow' ? await api.createThread('workflow', 'simple') : await api.createThread('chat')
+      set({ currentThreadId: r.thread_id, messages: [], pendingInterrupt: null })
+      await get().fetchThreads()
+    } catch (e) {
+      console.error(e)
+    }
+  },
+
+  newWorkflowThread: async (workflowName) => {
+    if (get().isStreaming) return
+    try {
+      const r = await api.createThread('workflow', workflowName)
       set({ currentThreadId: r.thread_id, messages: [], pendingInterrupt: null })
       await get().fetchThreads()
     } catch (e) {

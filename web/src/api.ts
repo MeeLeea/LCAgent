@@ -1,5 +1,5 @@
 // API 客户端：REST 请求 + SSE 流式解析
-import type { ProvidersInfo, ThreadSummary, RawMessage, StreamEvent } from './types'
+import type { ProvidersInfo, ThreadSummary, RawMessage, StreamEvent, WorkflowInfo } from './types'
 
 // Vite 构建期从 config/server_config.json 注入的后端地址（Tauri 模式使用）
 declare const __SERVER_HOST__: string
@@ -148,9 +148,18 @@ export const api = {
 
   getTools: () => jsonFetch<{ tools: string[] }>(`${BASE}/tools`),
 
+  getWorkflows: () => jsonFetch<{ workflows: string[] }>(`${BASE}/workflows`),
+
+  getWorkflow: (name = 'simple') =>
+    jsonFetch<WorkflowInfo>(`${BASE}/workflow?name=${encodeURIComponent(name)}`),
+
   listThreads: () => jsonFetch<{ threads: ThreadSummary[]; current: string | null }>(`${BASE}/threads`),
-  createThread: () =>
-    jsonFetch<{ thread_id: string }>(`${BASE}/threads`, { method: 'POST' }),
+  createThread: (type: 'chat' | 'workflow' = 'chat', workflowName?: string) =>
+    jsonFetch<{ thread_id: string }>(`${BASE}/threads`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type, workflow_name: workflowName }),
+    }),
   deleteThread: (thread_id: string) =>
     jsonFetch(`${BASE}/threads/${encodeURIComponent(thread_id)}`, { method: 'DELETE' }),
   getMessages: (thread_id: string) =>

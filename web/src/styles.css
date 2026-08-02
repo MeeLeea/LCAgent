@@ -246,6 +246,43 @@ button {
   color: var(--text-muted);
 }
 
+/* 对话/工作流切换开关 */
+.mode-switch {
+  display: flex;
+  gap: 4px;
+  margin: 10px 12px 4px;
+  padding: 3px;
+  background: var(--bg-hover);
+  border-radius: 10px;
+}
+
+.mode-switch-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 7px 0;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.mode-switch-btn:hover {
+  color: var(--text);
+}
+
+.mode-switch-btn.active {
+  background: var(--bg-input);
+  color: var(--accent);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+}
+
 .new-thread-btn {
   margin: 12px;
   padding: 10px 14px;
@@ -316,6 +353,21 @@ button {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 工作流会话类型标签 */
+.thread-badge {
+  flex-shrink: 0;
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 4px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
 }
 
 .thread-count {
@@ -1190,4 +1242,208 @@ tool-group,
 
 .theme-option.active .theme-check {
   display: flex;
+}
+
+/* ============================================================
+   工作流视图
+   ============================================================ */
+.workflow-view {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px;
+}
+
+.workflow-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 20px;
+  padding: 14px 16px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+}
+
+.workflow-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  font-size: 15px;
+}
+
+.workflow-select {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 5px 10px;
+  outline: none;
+  cursor: pointer;
+  font-family: inherit;
+  transition: border-color 0.12s;
+}
+
+.workflow-select:hover,
+.workflow-select:focus {
+  border-color: var(--accent);
+}
+
+.workflow-select option {
+  background: var(--bg-elevated);
+  color: var(--text);
+}
+
+.workflow-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.workflow-section {
+  margin-bottom: 24px;
+}
+
+.workflow-section-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.wf-node-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 10px;
+}
+
+.wf-node {
+  padding: 14px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+}
+
+.wf-node-label {
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 8px;
+  word-break: break-all;
+}
+
+.wf-node-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.wf-node-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+
+.wf-node-dot.pending {
+  background: var(--text-faint);
+}
+
+.wf-node-dot.running {
+  background: var(--accent);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.wf-node-dot.done {
+  background: var(--accent);
+}
+
+.wf-node-dot.idle {
+  background: var(--text-faint);
+}
+
+/* mermaid 工作流图容器 */
+.wf-graph-wrap {
+  padding: 16px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+}
+
+.wf-graph {
+  display: flex;
+  justify-content: center;
+  min-width: 320px;
+}
+
+/* mermaid 的 svg 自带 width=100% + max-width=<图宽> 内联样式，已自适应容器，无需覆盖尺寸 */
+
+/* htmlLabels 模式下节点是 HTML div，字号需单独放大 */
+.wf-graph .nodeLabel {
+  font-size: 20px !important;
+  font-weight: 600;
+  fill: var(--text, #ececec);
+  color: var(--text, #ececec);
+  line-height: 1.3;
+}
+
+.wf-graph .edgeLabel {
+  font-size: 15px;
+}
+
+.wf-graph .edgePath .path {
+  stroke-width: 2px;
+}
+
+.wf-graph-fallback {
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.8;
+  word-break: break-all;
+}
+
+.workflow-loading,
+.workflow-empty,
+.workflow-error {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  height: 100%;
+  min-height: 200px;
+  color: var(--text-muted);
+  font-size: 14px;
+}
+
+.workflow-error {
+  flex-direction: column;
+  color: var(--danger);
+}
+
+.spin {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
 }

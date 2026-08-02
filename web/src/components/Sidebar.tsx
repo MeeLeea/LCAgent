@@ -1,5 +1,5 @@
 // 侧边栏：会话列表管理（内容渲染到外层 aside 容器中）
-import { MessageSquarePlus, MessagesSquare, Trash2, PanelLeftClose } from 'lucide-react'
+import { MessageSquarePlus, MessagesSquare, Trash2, PanelLeftClose, GitBranch } from 'lucide-react'
 import { useStore, THEMES } from '../store'
 import { ThemePicker } from './ThemePicker'
 
@@ -8,11 +8,37 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
   const currentThreadId = useStore((s) => s.currentThreadId)
   const isStreaming = useStore((s) => s.isStreaming)
   const theme = useStore((s) => s.theme)
+  const viewMode = useStore((s) => s.viewMode)
+  const setViewMode = useStore((s) => s.setViewMode)
+  const fetchWorkflow = useStore((s) => s.fetchWorkflow)
+  const fetchThreads = useStore((s) => s.fetchThreads)
+  const workflow = useStore((s) => s.workflow)
   const newThread = useStore((s) => s.newThread)
+  const newWorkflowThread = useStore((s) => s.newWorkflowThread)
   const selectThread = useStore((s) => s.selectThread)
   const deleteThread = useStore((s) => s.deleteThread)
 
   const currentTheme = THEMES.find((t) => t.id === theme)
+
+  /** 判断会话是否属于工作流类型（兼容后端 type 缺失时按 thread_id 前缀兜底） */
+  const isWorkflowThread = (t: { thread_id: string; type?: 'chat' | 'workflow' }) =>
+    t.type === 'workflow' || t.thread_id.includes('workflow')
+
+  const visibleThreads = threads.filter((t) =>
+    viewMode === 'workflow' ? isWorkflowThread(t) : !isWorkflowThread(t),
+  )
+
+  const switchMode = (mode: 'chat' | 'workflow') => {
+    setViewMode(mode)
+    fetchThreads()
+    if (mode === 'workflow') fetchWorkflow()
+  }
+
+  // 工作流模式下「新建会话」创建绑定当前工作流的专属工作流会话
+  const handleNew = () => {
+    if (viewMode === 'workflow') newWorkflowThread(workflow?.name ?? 'simple')
+    else newThread()
+  }
 
   return (
     <>
@@ -26,26 +52,54 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
         </div>
       </div>
 
-      <button className="new-thread-btn" onClick={() => newThread()} disabled={isStreaming}>
-        <MessageSquarePlus size={16} />
-        新建会话
+      <div className="mode-switch">
+        <button
+          className={`mode-switch-btn${viewMode === 'chat' ? ' active' : ''}`}
+          onClick={() => switchMode('chat')}
+        >
+          <MessageSquarePlus size={14} />
+          对话
+        </button>
+        <button
+          className={`mode-switch-btn${viewMode === 'workflow' ? ' active' : ''}`}
+          onClick={() => switchMode('workflow')}
+        >
+          <GitBranch size={14} />
+          工作流
+        </button>
+      </div>
+
+      <button className="new-thread-btn" onClick={handleNew} disabled={isStreaming}>
+        <GitBranch size={16} />
+        {viewMode === 'workflow' ? '新建工作流会话' : '新建会话'}
       </button>
 
       <div className="thread-list">
-        {threads.length === 0 && (
+        {visibleThreads.length === 0 && (
           <div style={{ padding: '20px 12px', color: 'var(--text-faint)', fontSize: 12 }}>
-            暂无会话，点击上方按钮开始
+            {viewMode === 'workflow' ? '暂无工作流会话，请先运行工作流' : '暂无会话，点击上方按钮开始'}
           </div>
         )}
-        {threads.map((t) => (
+        {visibleThreads.map((t) => (
           <div
             key={t.thread_id}
             className={`thread-item ${t.thread_id === currentThreadId ? 'active' : ''}`}
             onClick={() => selectThread(t.thread_id)}
           >
-            <MessagesSquare size={14} className="thread-icon" />
+            {isWorkflowThread(t) ? (
+              <GitBranch size={14} className="thread-icon" />
+            ) : (
+              <MessagesSquare size={14} className="thread-icon" />
+            )}
             <div className="thread-meta">
-              <div className="thread-preview">{t.preview || '新会话'}</div>
+              <div className="thread-preview">
+                {t.preview || '新会话'}
+                {isWorkflowThread(t) && (
+                  <span className="thread-badge" title={`工作流: ${t.workflow_name ?? ''}`}>
+                    工作流
+                  </span>
+                )}
+              </div>
               <div className="thread-count">{t.message_count} 条消息</div>
             </div>
             <button
