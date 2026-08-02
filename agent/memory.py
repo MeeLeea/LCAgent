@@ -114,6 +114,63 @@ class AgentMemory:
             return f"{self.process_type}-thread-{suffix}"
         return f"thread-{suffix}"
 
+    def _generate_workflow_thread_id(self, workflow_name: str) -> str:
+        """生成专属工作流会话的 thread_id（编码工作流名，便于恢复时自动包装命令）。
+
+        Args:
+            workflow_name: 工作流名称（注册表 WORKFLOWS 的键）
+
+        Returns:
+            形如 `{process_type}-workflow-{name}-{suffix}`（无 process_type 时去掉前缀）。
+            名称中的 `-`/空格被替换为 `_`，保证从 thread_id 反解名称时不会歧义。
+        """
+        suffix = uuid.uuid4().hex[:8]
+        safe = workflow_name.replace("-", "_").replace(" ", "_")
+        if self.process_type:
+            return f"{self.process_type}-workflow-{safe}-{suffix}"
+        return f"workflow-{safe}-{suffix}"
+
+    def new_workflow_thread(self, workflow_name: str) -> str:
+        """开启新的专属工作流会话（绑定指定工作流名称，原会话保留在数据库）。
+
+        Args:
+            workflow_name: 工作流名称
+
+        Returns:
+            新生成的 thread_id
+        """
+        self.thread_id = self._generate_workflow_thread_id(workflow_name)
+        return self.thread_id
+
+    def is_workflow_thread(self, thread_id: str) -> bool:
+        """判断 thread_id 是否为专属工作流会话。
+
+        Args:
+            thread_id: 会话 ID
+
+        Returns:
+            True=工作流会话，False=普通会话
+        """
+        return thread_id.startswith("workflow-") or "-workflow-" in thread_id
+
+    def workflow_name_of(self, thread_id: str) -> Optional[str]:
+        """从工作流会话的 thread_id 反解绑定的工作流名称。
+
+        Args:
+            thread_id: 工作流会话的 thread_id
+
+        Returns:
+            工作流名称；非工作流会话返回 None
+        """
+        if thread_id.startswith("workflow-"):
+            body = thread_id[len("workflow-"):]
+        elif "-workflow-" in thread_id:
+            body = thread_id.split("-workflow-", 1)[1]
+        else:
+            return None
+        name, _, _ = body.rpartition("-")
+        return name if name else body
+
     def _matches_process_type(self, thread_id: str) -> bool:
         """判断 thread_id 是否属于当前 process_type
         
