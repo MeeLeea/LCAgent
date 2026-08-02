@@ -1628,6 +1628,53 @@ from cli.commands.types import CommandContext
 result = run_workflow(context, "simple", "帮我分析项目结构")
 ```
 
+#### 3. Web 前端工作流视图
+
+侧边栏左上角提供「对话 | 工作流」切换开关：
+
+- 切到「工作流」时，主内容区从聊天视图切换为工作流视图。
+- 工作流视图头部提供工作流名称下拉框（`simple` / `pipline` 等，来源 `GET /api/workflows`），可随时切换并刷新展示对应工作流的节点与链路。
+- 工作流模式的侧边栏与对话视图保持一致：工作流模式下显示专属工作流会话列表，「新建会话」按钮创建绑定当前工作流的专属工作流会话。
+- 工作流会话在侧边栏以工作流图标 + 徽标区分；专属工作流会话的会话 ID 为 `{process_type}-workflow-{name}-{uuid}`。
+- 工作流视图下方同样显示聊天输入框；在专属工作流会话中输入消息，后端会自动包装为 `/workflow:{name} <任务>` 命令执行，无需手动输入命令前缀。
+- 前端调用后端 `GET /api/workflow?name=simple`，获取工作流节点/边结构与节点状态，渲染为节点卡片 + mermaid 流程图。
+- 工作流结构带进程级缓存（`_workflow_snapshot` 的 `lru_cache`），同一工作流只构建一次；前端切换视图时复用缓存，仅点击刷新按钮强制重新拉取。
+- 哨兵节点（`__start__`/`__end__`）在返回结果中映射为 `START`/`END` 标签，避免前端展示裸哨兵名。
+- 当前节点状态为静态 `pending`（待执行），暂无运行进度跟踪；如需实时进度上报可后续扩展 `run_simple_workflow` 的 stream 模式。
+
+##### 专属工作流会话 API
+
+- `GET /api/workflows`：列出可用工作流名称（`{"workflows": ["simple", "pipline"]}`）。
+- `POST /api/threads`：`{"type": "workflow", "workflow_name": "simple"}` 创建专属工作流会话；缺省时创建普通会话。
+- `GET /api/threads`：每个会话摘要带 `type`（`chat`/`workflow`），工作流会话额外带 `workflow_name`。
+- `POST /api/chat`：在 `type=workflow` 的会话中发送不以 `/` 开头的消息时，自动包装为 `/workflow:{workflow_name} <消息>` 执行。
+
+```bash
+curl "http://127.0.0.1:8000/api/workflow?name=simple"
+```
+
+返回示例：
+
+```json
+{
+  "name": "simple",
+  "workflow_status": "idle",
+  "nodes": [
+    {"id": "summarize", "label": "summarize", "status": "pending"},
+    {"id": "manager_plan", "label": "manager_plan", "status": "pending"},
+    {"id": "worker_exec", "label": "worker_exec", "status": "pending"},
+    {"id": "terminator_final", "label": "terminator_final", "status": "pending"}
+  ],
+  "edges": [
+    {"source": "START", "target": "summarize"},
+    {"source": "summarize", "target": "manager_plan"},
+    {"source": "manager_plan", "target": "worker_exec"},
+    {"source": "worker_exec", "target": "terminator_final"},
+    {"source": "terminator_final", "target": "END"}
+  ]
+}
+```
+
 ### 扩展工作流
 
 在 `graph/` 下新建工作流文件，实现 `build_xxx_workflow(agents)` 函数（统一接收角色字典，内部按角色名取值），然后在 `graph/registry.py` 的 `WORKFLOWS` 注册表中注册：
