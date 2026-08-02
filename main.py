@@ -13,7 +13,7 @@ except ImportError:
 
 from agent import AgentCore
 from agent.config import load_agent_config, resolve_path
-from llm_client import load_providers as list_providers
+from agent.llm_client import load_providers as list_providers
 from tools import safety as safety_module
 from cli.cli_menu import select_menu
 from cli.commands import CommandContext, dispatch_command

@@ -10,7 +10,7 @@ from .types import CommandContext, CommandOutcome, HANDLED, LlmLike
 
 
 def select_provider(config_file: str, select_menu) -> str:
-    from llm_client import load_providers
+    from agent.llm_client import load_providers
 
     providers = load_providers(config_file)
     # 环境变量和本地配置文件任一提供密钥，都应在菜单中标记为已配置。
@@ -27,7 +27,7 @@ def select_provider(config_file: str, select_menu) -> str:
 
 
 def create_llm(provider: str, config_file: str) -> LlmLike:
-    from llm_client import LLMClient
+    from agent.llm_client import LLMClient
 
     try:
         return LLMClient(provider=provider, config_file=config_file)

@@ -13,7 +13,7 @@ from langchain_core.messages import (
 )
 from langchain_core.tools import BaseTool
 from langgraph.types import Command, Interrupt
-from llm_client import LLMClient
+from .llm_client import LLMClient
 from .memory import AgentMemory
 from .message_utils import StreamHandler
 from tools.mcp_loader import load_mcp_tools, DEFAULT_CONFIG_FILE

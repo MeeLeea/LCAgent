@@ -1,4 +1,5 @@
 """Agent模块"""
+from .llm_client import LLMClient, load_providers
 from .memory import AgentMemory
 from .agent_core import AgentCore
 from .message_utils import (
@@ -9,6 +10,8 @@ from .message_utils import (
 )
 
 __all__ = [
+    'LLMClient',
+    'load_providers',
     'AgentMemory',
     'AgentCore',
     'extract_llm_error',

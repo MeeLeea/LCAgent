@@ -43,7 +43,7 @@ from agent import AgentCore
 from agent.message_utils import stringify_content  # 消息内容序列化
 from agent.config import load_agent_config, resolve_path
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
-from llm_client import LLMClient, load_providers
+from agent.llm_client import LLMClient, load_providers
 from tools import safety as safety_module
 from cli.commands import CommandContext, dispatch_command
 from cli.cli_menu import select_menu

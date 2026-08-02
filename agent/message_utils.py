@@ -19,7 +19,7 @@ from langchain_core.messages import (
 )
 from langgraph.types import Command
 
-from llm_client import RETRY_ATTEMPTS, RETRY_MAX_DELAY, should_retry
+from .llm_client import RETRY_ATTEMPTS, RETRY_MAX_DELAY, should_retry
 from tools.terminal_tools import UserRejectedCommandError
 
 # ============ LLM 异常提取 ============

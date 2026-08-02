@@ -26,7 +26,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from agent.config import load_agent_config, resolve_path
-from llm_client import LLMClient, load_providers
+from agent.llm_client import LLMClient, load_providers
 from agent import AgentCore
 from scheduler import TaskStore, SchedulerEngine
 

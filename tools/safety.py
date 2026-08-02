@@ -74,8 +74,7 @@ DEFAULT_CONFIG = {
             "{project_root}/agent", "{project_root}/api", "{project_root}/cli",
             "{project_root}/config", "{project_root}/memory", "{project_root}/scheduler",
             "{project_root}/web", "{project_root}/remote", "{project_root}/.agents",
-            "{project_root}/main.py", "{project_root}/llm_client.py",
-            "{project_root}/requirements.txt", "{project_root}/pyproject.toml",
+            "{project_root}/main.py", "{project_root}/requirements.txt", "{project_root}/pyproject.toml",
             "{project_root}/uv.lock", "{project_root}/skills-lock.json",
         ],
         "confirm_paths": [
