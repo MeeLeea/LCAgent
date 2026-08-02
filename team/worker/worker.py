@@ -17,3 +17,11 @@ class WorkerAgent(TeamAgent):
     # 定制 LLM 采样参数:执行型任务用较低温度提升确定性,放宽 token 上限
     temperature = 0.3
     max_tokens = 4096
+
+    # 工作流节点提示词的默认模板(仅 AGENT.md 缺失或未定义小节时兜底)
+    default_templates: dict[str, str] = {
+        "worker_exec": (
+            "请执行以下计划:\n\n"
+            "{plan}"
+        ),
+    }

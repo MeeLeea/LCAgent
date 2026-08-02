@@ -7,7 +7,7 @@ import os
 
 from langchain_core.tools import BaseTool
 
-from agent.config import load_agent_config
+from agent.config import load_agent_config, resolve_path
 from team.base import TeamAgent
 
 
@@ -37,15 +37,22 @@ def build_team_agent(
     # 应用覆盖参数
     config.update(overrides)
     
+    # 解析角色 AGENT.md 绝对路径,供工作流节点提示词模板加载
+    prompt_file = resolve_path(config.get("agent_prompt_file", "agent/AGENT.md"), base_dir)
+    
+    # 剥离 AGENT.md 中的 ## workflow:* 小节,避免模板混入系统提示词
+    system_prompt, _ = TeamAgent.parse_prompt_sections(config["agent_core_prompt"])
+    
     # 构建轻量 TeamAgent
     agent = agent_class(
         name=config["name"],
-        system_prompt=config["agent_core_prompt"],
+        system_prompt=system_prompt,
         tools=tools,
         max_iterations=config["max_iterations"],
         verbose=config.get("verbose", False),
         provider=config.get("provider", "zhipu"),
         model=config.get("model"),
+        prompt_file=prompt_file,
     )
     
     return agent
