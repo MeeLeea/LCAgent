@@ -66,7 +66,7 @@ def terminator_final_node(state: WorkflowState, terminator) -> WorkflowState:
 
 
 # 3. 构建工作流图
-def build_simple_workflow(agents: dict) -> StateGraph:
+def build_pipline_workflow(agents: dict) -> StateGraph:
     """
     构建监督者模式工作流
     

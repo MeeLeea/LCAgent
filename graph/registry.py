@@ -7,6 +7,7 @@ import os
 
 from langchain_core.tools import BaseTool
 
+from graph.pipline import build_pipline_workflow
 from graph.simple import build_simple_workflow
 
 # 项目根目录(基于本文件位置计算)
@@ -15,6 +16,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 工作流注册表
 WORKFLOWS = {
     "simple": build_simple_workflow,
+    "pipline": build_pipline_workflow,
 }
 
 # Agent 注册表: name -> {agent_class, config_file, tools}
