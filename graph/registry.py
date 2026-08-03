@@ -202,19 +202,29 @@ def build_workflow(name: str) -> tuple[object, dict[str, object]]:
 # 内置工作流加载
 # ──────────────────────────────────────────────
 def _load_builtin_workflows() -> None:
-    """加载内置工作流模块,触发其模块自注册(延迟导入避免循环依赖)。
+    """加载内置工作流模块，触发其模块自注册（延迟导入避免循环依赖）。
 
-    各工作流模块在文件末尾调用 register_workflow 自注册,
-    import 即触发注册。systemc_cmodel 依赖 team 包中的 Agent,
-    在 build_workflow 时才延迟导入 team,此处的 import 仅触发工作流注册。
+    自动扫描 graph/ 目录下所有 .py 文件（排除 __init__.py 和基础设施文件），
+    import 即触发各模块内 register_workflow 调用完成注册。
+
+    systemc_cmodel 等依赖 team 包中 Agent 的模块，
+    在 build_workflow 时才延迟导入 team，此处的 import 仅触发工作流注册。
+
+    新增工作流只需在 graph/ 下新建 .py 文件，底部调用 register_workflow() 即可，
+    无需修改本文件。
     """
-    import graph.pipline  # noqa: F401
-    import graph.simple  # noqa: F401
+    import importlib
+    import pkgutil
 
-    try:
-        import graph.systemc_cmodel  # noqa: F401
-    except ImportError:
-        pass  # systemc_cmodel 模块暂未就绪，跳过注册
+    # 基础设施文件列表（非工作流模块，跳过）
+    _NON_WORKFLOW_MODULES = frozenset({"common", "registry", "__init__"})
+
+    import graph as _graph_pkg
+
+    for _finder, _name, _is_pkg in pkgutil.iter_modules(_graph_pkg.__path__):
+        if _is_pkg or _name in _NON_WORKFLOW_MODULES:
+            continue
+        importlib.import_module(f"graph.{_name}")  # noqa: F401
 
 
 _load_builtin_workflows()

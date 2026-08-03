@@ -138,7 +138,6 @@ def run_pipline_workflow(
     )
 
 
-# 5. 注册工作流(方式二: 直接调用 registry.register_workflow)
 # 注: import 置于模块顶部、调用置于文件末尾——register_workflow 与 WORKFLOWS
 # 在 graph.registry 文件前部定义,先于本模块被 import 时执行,循环导入安全。
 register_workflow(
