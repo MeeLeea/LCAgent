@@ -204,11 +204,57 @@ def build_workflow(name: str) -> tuple[object, dict[str, object]]:
 def _load_builtin_workflows() -> None:
     """加载内置工作流模块,触发其模块自注册(延迟导入避免循环依赖)。
 
-    simple/pipline 均在各自模块被 import 时通过 register_workflow 自注册
-    (见 graph/simple.py 与 graph/pipline.py 末尾)。
+    各工作流模块在文件末尾调用 register_workflow 自注册,
+    import 即触发注册。systemc_cmodel 依赖 team 包中的 Agent,
+    在 build_workflow 时才延迟导入 team,此处的 import 仅触发工作流注册。
     """
-    import graph.pipline
-    import graph.simple  # noqa: F401  触发 simple 自注册
+    import graph.pipline  # noqa: F401
+    import graph.simple  # noqa: F401
+    import graph.systemc_cmodel  # noqa: F401
 
 
 _load_builtin_workflows()
+
+
+# ──────────────────────────────────────────────
+# 独立执行入口(供 scheduler 等非 CLI 场景使用)
+# ──────────────────────────────────────────────
+def run_workflow_by_name(
+    workflow_name: str,
+    task: str,
+    on_node_start: Callable | None = None,
+    on_node_end: Callable | None = None,
+) -> dict:
+    """
+    按名称构建并运行工作流(不依赖 CLI 上下文)
+
+    供 scheduler/executor 等非 CLI 场景调用:只需工作流名称和任务文本,
+    内部完成构建 → 运行 → 返回结果字典。
+
+    Args:
+        workflow_name: 工作流名称(如 "simple"/"systemc_cmodel")
+        task: 用户任务文本
+        on_node_start: 节点开始回调(可选,接收节点名)
+        on_node_end: 节点结束回调(可选,接收节点名)
+
+    Returns:
+        工作流结果字典(含 "final_answer" 键)
+
+    Raises:
+        KeyError: 工作流不存在或角色未注册
+        Exception: 工作流执行中的异常
+    """
+    graph, _agents = build_workflow(workflow_name)
+
+    # 获取工作流专用运行器,缺失时回退到 run_simple_workflow
+    runner = get_workflow_runner(workflow_name)
+    if runner is None:
+        from graph.simple import run_simple_workflow as runner
+
+    return runner(
+        graph,
+        task,
+        raw_context="",  # scheduler 场景无会话记忆
+        on_node_start=on_node_start,
+        on_node_end=on_node_end,
+    )
