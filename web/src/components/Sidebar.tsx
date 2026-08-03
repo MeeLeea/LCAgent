@@ -1,6 +1,7 @@
 // 侧边栏：会话列表管理（内容渲染到外层 aside 容器中）
-import { MessageSquarePlus, MessagesSquare, Trash2, PanelLeftClose, GitBranch } from 'lucide-react'
-import { useStore, THEMES } from '../store'
+import { useState } from 'react'
+import { MessageSquarePlus, MessagesSquare, Trash2, PanelLeftClose, GitBranch, Search } from 'lucide-react'
+import { useStore, THEMES, isWorkflowThread } from '../store'
 import { ThemePicker } from './ThemePicker'
 
 export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
@@ -9,29 +10,31 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
   const isStreaming = useStore((s) => s.isStreaming)
   const theme = useStore((s) => s.theme)
   const viewMode = useStore((s) => s.viewMode)
-  const setViewMode = useStore((s) => s.setViewMode)
-  const fetchWorkflow = useStore((s) => s.fetchWorkflow)
-  const fetchThreads = useStore((s) => s.fetchThreads)
+  const switchViewMode = useStore((s) => s.switchViewMode)
   const workflow = useStore((s) => s.workflow)
   const newThread = useStore((s) => s.newThread)
   const newWorkflowThread = useStore((s) => s.newWorkflowThread)
   const selectThread = useStore((s) => s.selectThread)
   const deleteThread = useStore((s) => s.deleteThread)
+  const [search, setSearch] = useState('')
 
   const currentTheme = THEMES.find((t) => t.id === theme)
-
-  /** 判断会话是否属于工作流类型（兼容后端 type 缺失时按 thread_id 前缀兜底） */
-  const isWorkflowThread = (t: { thread_id: string; type?: 'chat' | 'workflow' }) =>
-    t.type === 'workflow' || t.thread_id.includes('workflow')
 
   const visibleThreads = threads.filter((t) =>
     viewMode === 'workflow' ? isWorkflowThread(t) : !isWorkflowThread(t),
   )
+  // 搜索过滤：匹配 preview 或 thread_id
+  const searchLower = search.trim().toLowerCase()
+  const filteredThreads = searchLower
+    ? visibleThreads.filter(
+        (t) =>
+          (t.preview || '').toLowerCase().includes(searchLower) ||
+          t.thread_id.toLowerCase().includes(searchLower),
+      )
+    : visibleThreads
 
   const switchMode = (mode: 'chat' | 'workflow') => {
-    setViewMode(mode)
-    fetchThreads()
-    if (mode === 'workflow') fetchWorkflow()
+    void switchViewMode(mode)
   }
 
   // 工作流模式下「新建会话」创建绑定当前工作流的专属工作流会话
@@ -74,13 +77,28 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
         {viewMode === 'workflow' ? '新建工作流会话' : '新建会话'}
       </button>
 
+      <div className="thread-search">
+        <Search size={13} />
+        <input
+          type="text"
+          className="thread-search-input"
+          placeholder="搜索会话…"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+        />
+      </div>
+
       <div className="thread-list">
-        {visibleThreads.length === 0 && (
+        {filteredThreads.length === 0 && (
           <div style={{ padding: '20px 12px', color: 'var(--text-faint)', fontSize: 12 }}>
-            {viewMode === 'workflow' ? '暂无工作流会话，请先运行工作流' : '暂无会话，点击上方按钮开始'}
+            {searchLower
+              ? '没有匹配的会话'
+              : viewMode === 'workflow'
+                ? '暂无工作流会话，请先运行工作流'
+                : '暂无会话，点击上方按钮开始'}
           </div>
         )}
-        {visibleThreads.map((t) => (
+        {filteredThreads.map((t) => (
           <div
             key={t.thread_id}
             className={`thread-item ${t.thread_id === currentThreadId ? 'active' : ''}`}

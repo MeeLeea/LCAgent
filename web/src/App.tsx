@@ -73,7 +73,10 @@ export default function App() {
       </aside>
       <div className="main">
         <TopBar onExpand={() => setSidebarCollapsed(false)} />
-        {viewMode === 'workflow' ? <WorkflowView /> : <ChatView />}
+        <div className="main-content">
+          {viewMode === 'workflow' && <WorkflowView />}
+          <ChatView />
+        </div>
         <InputBar />
       </div>
     </div>

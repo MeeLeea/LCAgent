@@ -34,6 +34,11 @@ export const THEMES: ThemeMeta[] = [
   { id: 'light', name: '皓月白', swatch: '#ffffff', swatchAlt: '#f7f7f8', accent: '#00b85a', isDark: false },
 ]
 
+/** 判断会话是否属于工作流类型（兼容后端 type 缺失时按 thread_id 前缀兜底） */
+export function isWorkflowThread(t: { thread_id: string; type?: 'chat' | 'workflow' }): boolean {
+  return t.type === 'workflow' || t.thread_id.includes('workflow')
+}
+
 interface AppState {
   // 主题
   theme: ThemeId
@@ -42,6 +47,8 @@ interface AppState {
   // 视图模式（对话 / 工作流）
   viewMode: 'chat' | 'workflow'
   setViewMode: (mode: 'chat' | 'workflow') => void
+  /** 切换视图模式并同步选中对应模式的会话 */
+  switchViewMode: (mode: 'chat' | 'workflow') => Promise<void>
 
   // 数据
   threads: ThreadSummary[]
@@ -64,6 +71,10 @@ interface AppState {
   isStreaming: boolean
   pendingInterrupt: InterruptInfo | null
 
+  // 连接状态
+  connectionStatus: 'connected' | 'disconnected' | 'checking'
+  checkConnection: () => Promise<void>
+
   // 初始化与元数据
   init: () => Promise<void>
   fetchThreads: () => Promise<void>
@@ -77,8 +88,14 @@ interface AppState {
 
   // 聊天
   sendMessage: (text: string) => void
+  /** 重新生成最后一条 assistant 回复：截断到上一条 user 消息后重发 */
+  regenerate: () => void
+  /** 编辑某条 user 消息后重发：截断到该消息（含）并重新发送 */
+  editAndResend: (index: number, newText: string) => void
   resume: (payload: Record<string, unknown>) => void
   stopStreaming: () => void
+  /** 清空当前会话的前端消息显示（不删后端历史） */
+  clearMessages: () => void
 
   // 提供商/模型
   switchProvider: (key: string) => Promise<void>
@@ -195,8 +212,36 @@ export const useStore = create<AppState>((set, get) => ({
   workflowError: null,
   isStreaming: false,
   pendingInterrupt: null,
+  connectionStatus: 'checking',
+
+  checkConnection: async () => {
+    set({ connectionStatus: 'checking' })
+    try {
+      await api.health()
+      set({ connectionStatus: 'connected' })
+    } catch {
+      set({ connectionStatus: 'disconnected' })
+    }
+  },
 
   setViewMode: (mode) => set({ viewMode: mode }),
+
+  switchViewMode: async (mode) => {
+    if (get().isStreaming) return
+    set({ viewMode: mode })
+    if (mode === 'workflow') void get().fetchWorkflow()
+    await get().fetchThreads()
+    // 切换到目标模式的第一个会话；若无则清空，避免主区域显示跨模式会话
+    const wantWorkflow = mode === 'workflow'
+    const first = get().threads.find((t) => isWorkflowThread(t) === wantWorkflow)
+    if (first) {
+      if (get().currentThreadId !== first.thread_id) {
+        await get().selectThread(first.thread_id)
+      }
+    } else {
+      set({ currentThreadId: null, messages: [], pendingInterrupt: null })
+    }
+  },
 
   fetchWorkflows: async () => {
     try {
@@ -224,6 +269,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   init: async () => {
     applyTheme(get().theme)
+    void get().checkConnection()
     await Promise.all([get().refreshProviders(), get().fetchThreads(), get().fetchWorkflows()])
     api.getTools().then((r) => set({ tools: r.tools })).catch(() => {})
   },
@@ -245,9 +291,12 @@ export const useStore = create<AppState>((set, get) => ({
     try {
       const r = await api.listThreads()
       set({ threads: r.threads })
-      // 没有选中会话时，自动选第一个
+      // 没有选中会话时，自动选当前模式的第一个会话（无匹配则退回首个）
       if (!get().currentThreadId && r.threads.length) {
-        await get().selectThread(r.threads[0].thread_id)
+        const wantWorkflow = get().viewMode === 'workflow'
+        const first =
+          r.threads.find((t) => isWorkflowThread(t) === wantWorkflow) ?? r.threads[0]
+        await get().selectThread(first.thread_id)
       }
     } catch {
       /* ignore */
@@ -311,7 +360,8 @@ export const useStore = create<AppState>((set, get) => ({
     // 所有消息（包括 / 命令）统一走流式通道
     console.log('[前端] 发送消息:', trimmed.slice(0, 50) + (trimmed.length > 50 ? '...' : ''))
 
-    const userMsg: ChatMessage = { id: nextId(), role: 'user', content: trimmed }
+    const now = Date.now()
+    const userMsg: ChatMessage = { id: nextId(), role: 'user', content: trimmed, timestamp: now }
     const assistantMsg: ChatMessage = {
       id: nextId(),
       role: 'assistant',
@@ -319,6 +369,7 @@ export const useStore = create<AppState>((set, get) => ({
       toolCalls: [],
       toolResults: [],
       streaming: true,
+      timestamp: now,
     }
     set((s) => ({
       messages: [...s.messages, userMsg, assistantMsg],
@@ -402,6 +453,23 @@ export const useStore = create<AppState>((set, get) => ({
           }
           finish()
           break
+        case 'workflow_node': {
+          const wf = get().workflow
+          if (wf) {
+            set({
+              workflow: {
+                ...wf,
+                nodes: wf.nodes.map((n) => (n.id === ev.node ? { ...n, status: ev.status } : n)),
+              },
+            })
+          }
+          break
+        }
+        case 'workflow_status': {
+          const wf = get().workflow
+          if (wf) set({ workflow: { ...wf, workflow_status: ev.status } })
+          break
+        }
         case 'done':
           msgs[lastIndex] = { ...last, streaming: false }
           set({ messages: msgs })
@@ -410,6 +478,35 @@ export const useStore = create<AppState>((set, get) => ({
           break
       }
     })
+  },
+
+  regenerate: () => {
+    if (get().isStreaming) return
+    const msgs = [...get().messages]
+    if (msgs.length === 0) return
+    // 找到最后一条 user 消息
+    let lastUserIdx = -1
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].role === 'user') {
+        lastUserIdx = i
+        break
+      }
+    }
+    if (lastUserIdx === -1) return
+    const lastUserText = msgs[lastUserIdx].content
+    // 截断到最后一条 user 消息（不含），然后重新发送
+    set({ messages: msgs.slice(0, lastUserIdx) })
+    void get().sendMessage(lastUserText)
+  },
+
+  editAndResend: (index, newText) => {
+    if (get().isStreaming) return
+    const msgs = [...get().messages]
+    if (index < 0 || index >= msgs.length) return
+    if (msgs[index].role !== 'user') return
+    // 截断到该 user 消息（不含），重新发送新文本
+    set({ messages: msgs.slice(0, index) })
+    void get().sendMessage(newText)
   },
 
   resume: (payload) => {
@@ -423,6 +520,7 @@ export const useStore = create<AppState>((set, get) => ({
       toolCalls: [],
       toolResults: [],
       streaming: true,
+      timestamp: Date.now(),
     }
     set((s) => ({ messages: [...s.messages, assistantMsg], isStreaming: true, pendingInterrupt: null }))
 
@@ -492,6 +590,23 @@ export const useStore = create<AppState>((set, get) => ({
           }
           finish()
           break
+        case 'workflow_node': {
+          const wf = get().workflow
+          if (wf) {
+            set({
+              workflow: {
+                ...wf,
+                nodes: wf.nodes.map((n) => (n.id === ev.node ? { ...n, status: ev.status } : n)),
+              },
+            })
+          }
+          break
+        }
+        case 'workflow_status': {
+          const wf = get().workflow
+          if (wf) set({ workflow: { ...wf, workflow_status: ev.status } })
+          break
+        }
         case 'done':
           msgs[lastIndex] = { ...last, streaming: false }
           set({ messages: msgs })
@@ -519,6 +634,11 @@ export const useStore = create<AppState>((set, get) => ({
       }
       return { messages: msgs, isStreaming: false }
     })
+  },
+
+  clearMessages: () => {
+    if (get().isStreaming) return
+    set({ messages: [], pendingInterrupt: null })
   },
 
   switchProvider: async (key) => {

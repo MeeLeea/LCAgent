@@ -74,6 +74,8 @@ export interface ChatMessage {
   streaming?: boolean
   error?: boolean
   interrupted?: boolean
+  /** 消息创建时间戳（ms） */
+  timestamp?: number
 }
 
 export interface InterruptInfo {
@@ -90,4 +92,6 @@ export type StreamEvent =
   | { type: 'interrupt'; prompt: string; choices: { id: string; label: string }[] }
   | { type: 'cancelled'; content: string }
   | { type: 'error'; content: string }
+  | { type: 'workflow_node'; node: string; status: 'running' | 'done' }
+  | { type: 'workflow_status'; status: 'idle' | 'running' | 'done' }
   | { type: 'done' }

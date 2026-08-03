@@ -102,14 +102,14 @@ export function WorkflowGraph({ workflow }: { workflow: WorkflowInfo }) {
             primaryTextColor: colors.text,
             primaryBorderColor: colors.border,
             lineColor: colors.line,
-            fontSize: '20px',
+            fontSize: '14px',
             fontFamily: 'inherit',
           },
           flowchart: {
             htmlLabels: true,
-            padding: 16,
-            nodeSpacing: 60,
-            rankSpacing: 50,
+            padding: 8,
+            nodeSpacing: 32,
+            rankSpacing: 28,
             useMaxWidth: true,
           },
         })
