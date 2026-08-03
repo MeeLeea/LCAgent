@@ -674,6 +674,80 @@ def test_chat_management_command(client, mock_agent):
         assert "命令" in content or "help" in content
 
 
+def test_chat_management_command_realtime_stream(client, mock_agent):
+    """测试管理型命令输出实时推送:多段 print 输出是独立 token 事件而非合并一次"""
+    with patch("api.server.dispatch_command") as mock_dispatch:
+        def side_effect(context, command):
+            context.print_fn("第一段输出")
+            context.print_fn("第二段输出")
+            return "success"
+
+        mock_dispatch.side_effect = side_effect
+
+        response = client.post(
+            "/api/chat",
+            json={"message": "/info", "thread_id": "test-thread-123"}
+        )
+
+        assert response.status_code == 200
+
+        events = []
+        for line in response.iter_lines():
+            if line.startswith("data: "):
+                events.append(json.loads(line[6:]))
+
+        # 两段输出是独立 token 事件(实时推送),且按顺序到达,最后以 done 收尾
+        token_events = [e for e in events if e["type"] == "token"]
+        assert len(token_events) == 2
+        assert token_events[0]["content"] == "第一段输出"
+        assert token_events[1]["content"] == "第二段输出"
+        assert events[-1]["type"] == "done"
+
+
+def test_chat_workflow_events_forwarded(client, mock_agent):
+    """测试工作流运行事件经 SSE 实时转发(workflow_node / workflow_status)"""
+    with patch("api.server.dispatch_command") as mock_dispatch:
+        def side_effect(context, command):
+            context.print_fn("构建工作流: simple")
+            # 模拟 run_workflow 内部经 workflow_event_cb 转发的事件
+            if context.workflow_event_cb:
+                context.workflow_event_cb({"type": "workflow_status", "status": "running"})
+                context.workflow_event_cb({"type": "workflow_node", "node": "manager_plan", "status": "running"})
+                context.workflow_event_cb({"type": "workflow_node", "node": "manager_plan", "status": "done"})
+                context.workflow_event_cb({"type": "workflow_status", "status": "done"})
+            context.print_fn("工作流执行完成")
+            return "success"
+
+        mock_dispatch.side_effect = side_effect
+
+        response = client.post(
+            "/api/chat",
+            json={"message": "/workflow:simple 测试任务", "thread_id": "test-thread-123"}
+        )
+
+        assert response.status_code == 200
+
+        events = []
+        for line in response.iter_lines():
+            if line.startswith("data: "):
+                events.append(json.loads(line[6:]))
+
+        types = [e["type"] for e in events]
+        # 顺序:token → workflow_status → workflow_node → workflow_node → workflow_status → token → done
+        assert types[0] == "token"
+        assert types[1] == "workflow_status"
+        assert events[1]["status"] == "running"
+        assert types[2] == "workflow_node"
+        assert events[2]["node"] == "manager_plan"
+        assert events[2]["status"] == "running"
+        assert types[3] == "workflow_node"
+        assert events[3]["status"] == "done"
+        assert types[4] == "workflow_status"
+        assert events[4]["status"] == "done"
+        assert types[-2] == "token"
+        assert types[-1] == "done"
+
+
 def test_chat_workflow_thread_auto_command(client, mock_agent):
     """测试专属工作流会话自动包装为 /workflow:<name> 命令"""
     mock_agent.memory.is_workflow_thread.return_value = True

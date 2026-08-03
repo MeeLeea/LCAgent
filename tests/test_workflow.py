@@ -329,9 +329,13 @@ def test_run_simple_workflow():
 def test_workflow_registry():
     """测试 WORKFLOWS 注册表"""
     from graph.registry import WORKFLOWS
-    
+
     assert "simple" in WORKFLOWS
-    assert callable(WORKFLOWS["simple"])
+    spec = WORKFLOWS["simple"]
+    # register_workflow 注册的是规格字典,不是裸函数
+    assert isinstance(spec, dict)
+    assert callable(spec["builder"])
+    assert spec["runner"] is not None
 
 
 def test_build_workflow_unknown_name():
@@ -342,7 +346,8 @@ def test_build_workflow_unknown_name():
         build_workflow("unknown_workflow")
     
     assert "未知工作流: unknown_workflow" in str(exc_info.value)
-    assert "可用工作流: simple" in str(exc_info.value)
+    assert "可用工作流:" in str(exc_info.value)
+    assert "simple" in str(exc_info.value)
 
 
 # ==================== 测试 Agent 注册装饰器 ====================
@@ -446,7 +451,8 @@ def test_workflow_execute_command_unknown_workflow():
     assert outcome.handled
     output_text = "\n".join(context.output)
     assert "错误: 未知工作流 'unknown'" in output_text
-    assert "可用工作流: simple" in output_text
+    assert "可用工作流:" in output_text
+    assert "simple" in output_text
 
 
 def test_workflow_command_parse():
@@ -610,6 +616,8 @@ class WriteBackContext:
     def __init__(self, agent=None):
         self.agent = agent or FakeAgentCore()
         self.output: list[str] = []
+        # 与 CommandContext 对齐:工作流事件回调默认为空
+        self.workflow_event_cb = None
 
     def print(self, text: str) -> None:
         self.output.append(text)
@@ -677,15 +685,122 @@ def test_run_workflow_injects_memory(monkeypatch):
     def fake_build(name):
         return ("graph", {})
 
-    def fake_run(graph, task, raw_context=""):
+    def fake_run(graph, task, raw_context="", on_node_start=None, on_node_end=None):
         captured["raw_context"] = raw_context
         return {"final_answer": "答案"}
 
     monkeypatch.setattr("graph.registry.build_workflow", fake_build)
-    monkeypatch.setattr("graph.simple.run_simple_workflow", fake_run)
+    # 注册表捕获的是原始函数对象,monkeypatch 模块属性无法穿透,需直接 patch 注册表 runner
+    from graph.registry import WORKFLOWS
+
+    monkeypatch.setitem(WORKFLOWS["simple"], "runner", fake_run)
 
     result = wf_module.run_workflow(ctx, "simple", "测试任务")
 
     assert result["final_answer"] == "答案"
     assert "user: 之前聊过X" in captured["raw_context"]
     assert len(core.agent_executor.updated) == 1
+
+
+# ==================== 测试运行进度跟踪 ====================
+
+def test_run_simple_workflow_node_callbacks():
+    """测试节点进度回调:4 个业务节点按链路顺序各触发 start/end 且 start 先于 end"""
+    manager = FakeAgent(name="manager", response="计划: A")
+    worker = FakeAgent(name="worker", response="结果: 完成")
+    terminator = FakeAgent(name="terminator", response="答案: 完成")
+    graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
+
+    events: list[tuple[str, str]] = []
+    run_simple_workflow(
+        graph,
+        "测试任务",
+        on_node_start=lambda n: events.append(("start", n)),
+        on_node_end=lambda n: events.append(("end", n)),
+    )
+
+    expected = ["summarize", "manager_plan", "worker_exec", "terminator_final"]
+    # start/end 各 4 次,且顺序与执行链路一致
+    assert [e for e in events if e[0] == "start"] == [("start", n) for n in expected]
+    assert [e for e in events if e[0] == "end"] == [("end", n) for n in expected]
+    # 每个节点 start 严格先于其 end
+    for node in expected:
+        assert events.index(("start", node)) < events.index(("end", node))
+
+
+def test_run_simple_workflow_no_callbacks_still_works():
+    """测试不传回调时工作流正常运行(向后兼容)"""
+    manager = FakeAgent(name="manager", response="计划")
+    worker = FakeAgent(name="worker", response="结果")
+    terminator = FakeAgent(name="terminator", response="答案")
+    graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
+
+    result = run_simple_workflow(graph, "测试任务")
+    assert result["final_answer"] == "答案"
+
+
+def test_run_workflow_emits_workflow_events(monkeypatch):
+    """测试 run_workflow:节点/整体状态通过 workflow_event_cb 转发结构化事件"""
+    import cli.commands.workflow as wf_module
+    from cli.commands.types import CommandContext
+
+    events: list[dict[str, str]] = []
+
+    def fake_build(name):
+        return ("graph", {"manager": object(), "worker": object(), "terminator": object()})
+
+    def fake_run(graph, task, raw_context="", on_node_start=None, on_node_end=None):
+        # 模拟 4 个业务节点依次执行:每个节点 start → end
+        for node in ("summarize", "manager_plan", "worker_exec", "terminator_final"):
+            if on_node_start:
+                on_node_start(node)
+            if on_node_end:
+                on_node_end(node)
+        return {"final_answer": "答案"}
+
+    monkeypatch.setattr("graph.registry.build_workflow", fake_build)
+    # 注册表捕获的是原始函数对象,monkeypatch 模块属性无法穿透,需直接 patch 注册表 runner
+    from graph.registry import WORKFLOWS
+
+    monkeypatch.setitem(WORKFLOWS["simple"], "runner", fake_run)
+
+    class Mem:
+        def get_short_term(self, limit=None):
+            return []
+
+        def get_long_term(self, limit=5):
+            return []
+
+        def get_config(self):
+            return {"configurable": {"thread_id": "t1"}}
+
+    core = FakeAgentCore()
+    core.memory = Mem()
+    ctx = CommandContext(
+        agent=core,
+        base_dir=".",
+        config_file="",
+        mcp_config_file="",
+        print_fn=lambda t: None,
+        input_fn=lambda p="": "",
+        select_menu=lambda *a, **k: "",
+        create_llm=lambda p: None,
+        list_providers=dict,
+        run_structured_until_completion=lambda a, t: "",
+        chat_until_completion=lambda a, t: "",
+        safety_backend=object(),
+        workflow_event_cb=events.append,
+    )
+
+    wf_module.run_workflow(ctx, "simple", "测试任务")
+
+    # 整体状态:先 running 后 done
+    statuses = [e["status"] for e in events if e["type"] == "workflow_status"]
+    assert statuses == ["running", "done"]
+    # 4 个节点各产生 running + done,且每个节点 running 先于 done
+    node_events = [e for e in events if e["type"] == "workflow_node"]
+    assert len(node_events) == 8
+    for node in ("summarize", "manager_plan", "worker_exec", "terminator_final"):
+        running_idx = node_events.index({"type": "workflow_node", "node": node, "status": "running"})
+        done_idx = node_events.index({"type": "workflow_node", "node": node, "status": "done"})
+        assert running_idx < done_idx
