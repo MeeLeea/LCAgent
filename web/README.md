@@ -133,7 +133,8 @@ npm run preview
 - 工作流模式下侧边栏显示专属工作流会话列表，「新建会话」创建绑定当前工作流的专属会话（会话 ID 为 `{process_type}-workflow-{name}-{uuid}`，以工作流图标 + 徽标区分）。
 - 在专属工作流会话中直接输入消息即可，后端自动包装为 `/workflow:{name} <任务>` 命令执行。
 - 节点/边结构与状态通过 `GET /api/workflow?name=<name>` 获取，渲染为节点卡片 + mermaid 流程图；工作流结构带进程级缓存，仅点击刷新按钮强制重新拉取。
-- 哨兵节点（`__start__`/`__end__`）映射为 `START`/`END` 标签；节点状态目前为静态 `pending`，暂无实时进度跟踪。
+- 哨兵节点（`__start__`/`__end__`）映射为 `START`/`END` 标签；节点初始状态为 `pending`。
+- **运行进度实时跟踪**：工作流执行期间，`POST /api/chat` 的 SSE 流会推送 `workflow_node`（节点 `running`/`done`）与 `workflow_status`（整体 `running`/`done`）事件，前端据此实时高亮节点卡片与流程图中的当前节点。
 
 #### 相关 API
 

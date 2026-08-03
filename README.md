@@ -1550,6 +1550,14 @@ Terminator (汇总结果,返回最终答案)
 
 **设计原则**：工作流状态通过外层 `WorkflowState` 显式传递(`plan`/`worker_result`/`final_answer`),每次运行用独立 `thread_id`,不同运行互不干扰。
 
+### 运行进度跟踪
+
+工作流运行期间可实时感知节点执行进度（CLI 打印 + Web 前端节点高亮）：
+
+- **节点级回调**：`run_simple_workflow` 接受可选 `on_node_start` / `on_node_end` 回调（接收节点名）。内部通过 LangGraph 的 `config["callbacks"]` 注入 `NodeTrackingHandler`（位于 `graph/common.py`），利用节点执行时 `metadata["langgraph_node"]` 字段识别业务节点（哨兵节点与内部 agent 子图会被过滤），在节点开始/结束/异常时触发回调。不传回调时零额外开销。
+- **CLI 场景**：`run_workflow` 把节点状态打印到终端（`▸ 节点开始: manager_plan` / `✓ 节点完成: manager_plan`）。
+- **Web 场景**：`CommandContext.workflow_event_cb` 把结构化事件（`workflow_node` / `workflow_status`）经 `/api/chat` 的 SSE 流实时推送；服务端将管理型命令的 `dispatch_command` 放到后台线程执行、输出经 `asyncio.Queue` 实时转发，前端 `WorkflowView` 据此高亮节点卡片与流程图。
+
 ### 记忆注入机制
 
 工作流把当前 CLI 会话的记忆注入任务上下文,并在结束后写回,形成记忆闭环:
@@ -1592,9 +1600,14 @@ Terminator (汇总结果,返回最终答案)
 
 执行任务: 帮我分析 LCAgent 项目的目录结构
 --------------------------------------------------
-[Manager 拆解任务...]
-[Worker 执行...]
-[Terminator 汇总...]
+▸ 节点开始: summarize
+✓ 节点完成: summarize
+▸ 节点开始: manager_plan
+✓ 节点完成: manager_plan
+▸ 节点开始: worker_exec
+✓ 节点完成: worker_exec
+▸ 节点开始: terminator_final
+✓ 节点完成: terminator_final
 
 ==================================================
 工作流执行完成
@@ -1622,6 +1635,14 @@ print(result["final_answer"])
 # 可选: 手动传入记忆上下文(经 Manager 总结后注入 plan/final 节点)
 result = run_simple_workflow(graph, "帮我分析项目结构", raw_context="用户: 之前聊过项目背景")
 
+# 可选: 节点进度回调(节点开始/结束时触发,接收节点名,用于进度跟踪)
+result = run_simple_workflow(
+    graph,
+    "帮我分析项目结构",
+    on_node_start=lambda node: print(f"节点开始: {node}"),
+    on_node_end=lambda node: print(f"节点完成: {node}"),
+)
+
 # 方式2: 通过 CLI 层封装(带打印提示)
 from cli.commands.workflow import run_workflow
 from cli.commands.types import CommandContext
@@ -1632,28 +1653,87 @@ result = run_workflow(context, "simple", "帮我分析项目结构")
 
 ### 扩展工作流
 
-在 `graph/` 下新建工作流文件，实现 `build_xxx_workflow(agents)` 函数（统一接收角色字典，内部按角色名取值），然后在 `graph/registry.py` 的 `WORKFLOWS` 注册表中注册：
+#### 1. 添加新 Agent（team 添加 agent）
+
+在 `team/<role>/` 下创建 `__init__.py` 无需,只需 3 个文件:
 
 ```python
-# graph/registry.py
-from graph.advanced import build_advanced_workflow
+# team/my_agent/my_agent.py
+from graph.registry import register_agent
+from team.base import TeamAgent
+from tools import all_tools
 
-WORKFLOWS = {
-    "simple": build_simple_workflow,
-    "advanced": build_advanced_workflow,  # 新增
-}
+@register_agent("my_agent", "team/my_agent/agent_config.json", tools=all_tools)
+class MyAgent(TeamAgent):
+    temperature = 0.3
+    max_tokens = 4096
+    default_templates = {"my_node": "模板..."}
 ```
+
+```
+# team/my_agent/AGENT.md        — 角色系统提示词 + ## workflow:小节
+# team/my_agent/agent_config.json — LLM 配置(provider/model/prompt_file 等)
+```
+
+然后在 `team/__init__.py` 中添加导入即可,`@register_agent` 装饰器会在模块加载时自动注册。
+
+#### 2. 添加新工作流（register_workflow 注册）
+
+所有工作流统一通过 `graph.registry.register_workflow` 注册（唯一入口）,仅调用时机不同:
+
+**方式 A — 模块自注册（推荐,内置工作流采用）:**
+
+在 `graph/` 下新建工作流文件,实现 `build_xxx_workflow(agents)` 构建函数与 `run_xxx_workflow` 运行器,文件末尾调用 `register_workflow` 完成自注册（参照 `graph/simple.py` 与 `graph/pipline.py`）:
 
 ```python
-# graph/advanced.py - 工作流构建器统一接收 agents 字典
-def build_advanced_workflow(agents: dict) -> StateGraph:
-    manager = agents["manager"]
-    worker = agents["worker"]
-    terminator = agents["terminator"]
-    ...
+# graph/my_workflow.py
+from graph.registry import register_workflow
+
+def build_my_workflow(agents: dict) -> StateGraph:
+    my_agent = agents["my_agent"]
+    builder = StateGraph(MyWorkflowState)
+    builder.add_node("step1", lambda state: step1_node(state, my_agent))
+    builder.add_edge(START, "step1")
+    builder.add_edge("step1", END)
+    return builder.compile()
+
+# 文件末尾自注册:模块被 import 时写入全局注册表
+register_workflow(
+    name="my_flow",
+    builder=build_my_workflow,
+    runner=run_my_workflow,          # 可选,缺失时回退到 run_simple_workflow
+    roles=["my_agent"],              # 可选,声明依赖角色(仅构建这些角色)
+    description="我的自定义工作流",  # 可选,CLI 列表展示用
+)
 ```
 
-CLI 会自动识别新工作流：`workflow:advanced <任务>`。构建时 `build_workflow` 会遍历 `AGENT_REGISTRY` 构建所有已注册角色，无需在注册表里手动指定角色。
+`graph/registry.py` 底部 `_load_builtin_workflows()` 在 registry 首次 import 时加载 `graph.simple` / `graph.pipline`,触发其自注册;新增内置工作流时在该函数中补充 import 即可。
+
+**方式 B — 动态注册（运行时添加,无需改源码,适合插件式/条件式工作流）:**
+
+```python
+from graph.registry import register_workflow
+
+register_workflow(
+    name="my_flow",
+    builder=build_my_workflow,
+    runner=run_my_workflow,          # 可选,缺失时回退到 run_simple_workflow
+    roles=["my_agent"],              # 可选,声明依赖角色(仅构建这些角色)
+    description="我的自定义工作流",  # 可选,CLI 列表展示用
+)
+```
+
+#### register_workflow 参数说明
+
+| 参数 | 必填 | 说明 |
+| ---- | ---- | ---- |
+| `name` | 是 | 工作流名称(CLI 以 `workflow:<name> <任务>` 调用) |
+| `builder` | 是 | 构建函数 `build_xxx(agents: dict) -> StateGraph` |
+| `runner` | 否 | 运行函数 `run_xxx(graph, task, ...) -> dict`,缺失时回退 `run_simple_workflow` |
+| `roles` | 否 | 声明依赖角色列表,仅构建这些角色;缺失时构建全部已注册角色 |
+| `description` | 否 | 工作流描述,CLI `workflow` 列表展示用 |
+
+CLI 会自动识别新工作流：`workflow:my_flow <任务>`。
 
 ---
 
