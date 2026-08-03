@@ -391,7 +391,7 @@ def _do_switch(chat_id: str, agent, pk: str, mn: str) -> None:
     old = f"{agent.llm.provider}: {agent.llm.model}"
     try:
         if agent.llm.provider != pk:
-            from utils.commands.provider import create_llm
+            from cli.commands.provider import create_llm
             agent.llm = create_llm(pk, LLM_FILE)
             if agent.llm.model != mn: agent.llm.switch_model(mn)
         else:
