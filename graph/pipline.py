@@ -1,12 +1,17 @@
 """
 监督者模式工作流 - Manager 拆解 → Worker 执行 → Terminator 汇总
+
+与 graph/simple.py 结构相同(独立保留状态/节点/图定义),通过
+register_workflow 在模块被 import 时自注册(方式二)。
 """
 from __future__ import annotations
 
-import uuid
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
+
+from graph.common import NodeCallback, run_compiled_workflow
+from graph.registry import register_workflow
 
 
 # 1. 定义工作流状态
@@ -69,60 +74,77 @@ def terminator_final_node(state: WorkflowState, terminator) -> WorkflowState:
 def build_pipline_workflow(agents: dict) -> StateGraph:
     """
     构建监督者模式工作流
-    
+
     Args:
         agents: 角色字典,需包含 manager/worker/terminator 三个键,
             分别对应管理者/执行者/终结者 Agent 实例
-        
+
     Returns:
         编译好的 LangGraph StateGraph
     """
     manager = agents["manager"]
     worker = agents["worker"]
     terminator = agents["terminator"]
-    
+
     builder = StateGraph(WorkflowState)
-    
+
     # 添加节点(使用 lambda 绑定 agent 实例;提示词模板由节点内懒加载)
     builder.add_node("summarize", lambda state: summarize_context(state, manager))
     builder.add_node("manager_plan", lambda state: manager_plan_node(state, manager))
     builder.add_node("worker_exec", lambda state: worker_exec_node(state, worker))
     builder.add_node("terminator_final", lambda state: terminator_final_node(state, terminator))
-    
+
     # 添加边: START → summarize → manager_plan → worker_exec → terminator_final → END
     builder.add_edge(START, "summarize")
     builder.add_edge("summarize", "manager_plan")
     builder.add_edge("manager_plan", "worker_exec")
     builder.add_edge("worker_exec", "terminator_final")
     builder.add_edge("terminator_final", END)
-    
+
     return builder.compile()
 
 
 # 4. 运行工作流
-def run_simple_workflow(graph: StateGraph, task: str, raw_context: str = "") -> dict:
+def run_pipline_workflow(
+    graph: StateGraph,
+    task: str,
+    raw_context: str = "",
+    on_node_start: NodeCallback | None = None,
+    on_node_end: NodeCallback | None = None,
+    on_node_error: NodeCallback | None = None,
+) -> dict:
     """
     运行监督者工作流
-    
+
     Args:
         graph: 编译好的工作流图
         task: 用户任务
         raw_context: 原始记忆文本(当前会话+长期记忆),为空则不注入记忆
-        
+        on_node_start: 节点开始回调,接收节点名(用于运行进度跟踪)
+        on_node_end: 节点结束回调,接收节点名
+        on_node_error: 节点异常回调,接收节点名
+
     Returns:
         包含 final_answer 的结果字典
     """
-    # 生成独立 thread_id 确保不同运行间状态隔离
-    thread_id = f"workflow-{uuid.uuid4().hex[:8]}"
-    
-    initial_state = {
-        "task": task,
-        "raw_context": raw_context,
-        "context_summary": "",
-        "plan": "",
-        "worker_result": "",
-        "final_answer": ""
-    }
-    
-    result = graph.invoke(initial_state, config={"configurable": {"thread_id": thread_id}})
-    return result
+    return run_compiled_workflow(
+        graph,
+        task,
+        state_fields={"plan": "", "worker_result": "", "final_answer": ""},
+        raw_context=raw_context,
+        on_node_start=on_node_start,
+        on_node_end=on_node_end,
+        on_node_error=on_node_error,
+    )
+
+
+# 5. 注册工作流(方式二: 直接调用 registry.register_workflow)
+# 注: import 置于模块顶部、调用置于文件末尾——register_workflow 与 WORKFLOWS
+# 在 graph.registry 文件前部定义,先于本模块被 import 时执行,循环导入安全。
+register_workflow(
+    "pipline",
+    builder=build_pipline_workflow,
+    runner=run_pipline_workflow,
+    roles=["manager", "worker", "terminator"],
+    description="监督者模式工作流(Manager 拆解→Worker 执行→Terminator 汇总)",
+)
