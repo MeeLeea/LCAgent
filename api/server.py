@@ -304,6 +304,8 @@ def _workflow_snapshot(name: str) -> dict:
 
     缓存的是最终 JSON 快照而非 graph 实例，避免 LLM Client 等资源长期占用。
     哨兵节点(__start__/__end__)从 nodes 中过滤,并在 edges 中映射为 START/END 标签。
+    节点状态为初始 pending；运行时的实时进度由 /api/chat 的 SSE 事件
+    (workflow_node / workflow_status)推送，前端据此更新本快照的节点状态。
 
     Args:
         name: 工作流名称
@@ -337,7 +339,7 @@ def _workflow_snapshot(name: str) -> dict:
 
 @app.get("/api/workflow")
 async def get_workflow(name: str = "simple"):
-    """获取工作流结构图与节点状态（节点状态为静态 pending，暂无运行进度跟踪）。"""
+    """获取工作流结构图与节点状态（节点初始为 pending；运行进度通过 /api/chat 的 SSE 事件实时推送）。"""
     try:
         snapshot = _workflow_snapshot(name)
     except KeyError as e:
@@ -472,9 +474,21 @@ async def chat(req: ChatRequest):
                 
                 # 文本输出包装器：管理型命令的输出包成 token 事件
                 output_buffer = []
+                # 管理型命令实时输出队列：print 输出与工作流结构化事件入队，主循环边收边推，
+                # 避免 dispatch_command 长耗时（如工作流）运行期间前端收不到任何进度
+                output_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+                # help 命令需要全量输出做表格转换，禁用实时推送，最后统一推送表格
+                is_help = command.lower() == "help"
+
                 def capture_output(text: str):
                     output_buffer.append(text)
-                
+                    if not is_help:
+                        output_queue.put_nowait(("print", text))
+
+                def emit_workflow_event(event: dict[str, str]):
+                    """工作流节点/整体状态事件：实时转发给前端 SSE"""
+                    output_queue.put_nowait(("event", event))
+
                 try:
                     context = CommandContext(
                         agent=agent,
@@ -489,6 +503,7 @@ async def chat(req: ChatRequest):
                         base_dir=BASE_DIR,
                         config_file=AGENT_CONFIG_FILE,
                         mcp_config_file=MCP_CONFIG_FILE,
+                        workflow_event_cb=emit_workflow_event,
                     )
                     
                     # 检测执行型命令（json:/react:/cot:/skill:<task>）
@@ -516,17 +531,44 @@ async def chat(req: ChatRequest):
                         logger.info("完成 [%s]", tid)
                         return
                     else:
-                        # 管理型命令：调用 dispatch_command，输出包成 token
+                        # 管理型命令：dispatch_command 放后台线程执行，print 输出/工作流事件
+                        # 经队列实时推送，保证长耗时命令（如 workflow）运行期间前端持续收到进度
                         logger.info("管理型命令 [%s]", tid)
-                        outcome = dispatch_command(context, command)
-                        output = "\n".join(output_buffer)
-                        
-                        if command.lower() == "help":
-                            output = _format_help_as_table(output)
-                        
-                        # 输出包成 token 事件推送
-                        if output:
-                            yield _sse({"type": "token", "content": output})
+
+                        def _run_dispatch() -> None:
+                            """后台线程执行 dispatch_command，结果/异常经队列送回主循环"""
+                            try:
+                                outcome = dispatch_command(context, command)
+                                output_queue.put_nowait(("outcome", outcome))
+                            except Exception as e:
+                                logger.error("命令执行异常 [%s]: %s", tid, e)
+                                output_queue.put_nowait(("error", e))
+
+                        dispatch_task = asyncio.create_task(asyncio.to_thread(_run_dispatch))
+
+                        # 实时消费队列：print → token 事件；workflow 事件 → 结构化 SSE 事件
+                        outcome = None
+                        while True:
+                            kind, payload = await output_queue.get()
+                            if kind == "print":
+                                yield _sse({"type": "token", "content": payload})
+                            elif kind == "event":
+                                yield _sse(payload)
+                            elif kind == "outcome":
+                                outcome = payload
+                                break
+                            else:  # error
+                                yield _sse({"type": "error", "content": f"命令执行失败: {payload}"})
+                                return
+
+                        await dispatch_task  # 确保后台线程完全退出
+
+                        # help 命令：全量输出统一转表格后推送（实时通道已跳过）
+                        if is_help:
+                            output = _format_help_as_table("\n".join(output_buffer))
+                            if output:
+                                yield _sse({"type": "token", "content": output})
+
                         yield _sse({"type": "done"})
                         logger.info("命令完成 [%s]: %s", tid, outcome)
                         return
