@@ -162,6 +162,17 @@ def main():
     print(f"\n[Scheduler] 使用 LLM 提供商: {provider}")
     agent_factory = make_agent_factory(provider)
 
+    # 2.5 预加载 team 模块,触发 @register_agent 装饰器注册工作流角色
+    #     使 executor 中的 workflow: 任务能正确构建所需 Agent
+    try:
+        import team  # noqa: F401  触发各 agent 模块的 @register_agent
+        from graph.registry import list_workflows, AGENT_REGISTRY
+        wf_list = list_workflows()
+        print(f"[Scheduler] 已注册 Agent: {', '.join(sorted(AGENT_REGISTRY.keys()))}")
+        print(f"[Scheduler] 可用工作流: {', '.join(name for name, _ in wf_list)}")
+    except Exception as exc:
+        print(f"[Scheduler] 警告: 工作流模块加载失败({exc}),workflow: 任务将不可用")
+
     # 3. 初始化 TaskStore
     task_store = TaskStore(db_path)
     print(f"[Scheduler] 数据库: {db_path}")
