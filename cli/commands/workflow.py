@@ -63,31 +63,57 @@ def _record_workflow_result(context: CommandContext, name: str, task: str, resul
 def run_workflow(context: CommandContext, name: str, task: str) -> dict:
     """
     运行指定工作流
-    
+
     Args:
         context: 命令上下文
         name: 工作流名称
         task: 用户任务
-        
+
     Returns:
         工作流执行结果字典(包含 final_answer)
     """
     # 函数内延迟导入,避免循环依赖
-    from graph.registry import build_workflow
+    from graph.registry import build_workflow, get_workflow_runner
     from graph.simple import run_simple_workflow
-    
+
     context.print(f"\n构建工作流: {name}")
-    
+
     graph, agents = build_workflow(name)
-    
+
     # 从构建结果动态获取角色名,避免写死
     role_names = "、".join(agents.keys())
     context.print(f"初始化团队 Agent({role_names})...")
     context.print(f"工作流 {name} 构建完成")
     context.print(f"\n执行任务: {task}")
     context.print("-" * 50)
-    
-    result = run_simple_workflow(graph, task, raw_context=build_memory_context(context.agent.memory))
+
+    # 节点进度跟踪:打印节点状态 + 转发结构化事件(供 SSE 等实时通道更新前端节点高亮)
+    def _emit(event: dict[str, str]) -> None:
+        if context.workflow_event_cb:
+            context.workflow_event_cb(event)
+
+    def _on_node_start(node: str) -> None:
+        context.print(f"▸ 节点开始: {node}")
+        _emit({"type": "workflow_node", "node": node, "status": "running"})
+
+    def _on_node_end(node: str) -> None:
+        context.print(f"✓ 节点完成: {node}")
+        _emit({"type": "workflow_node", "node": node, "status": "done"})
+
+    _emit({"type": "workflow_status", "status": "running"})
+    try:
+        # 获取工作流专用运行器,缺失则回退到通用运行器
+        runner = get_workflow_runner(name) or run_simple_workflow
+        result = runner(
+            graph,
+            task,
+            raw_context=build_memory_context(context.agent.memory),
+            on_node_start=_on_node_start,
+            on_node_end=_on_node_end,
+        )
+    finally:
+        # 无论成功失败都复位整体状态,避免前端 UI 停留在"运行中"
+        _emit({"type": "workflow_status", "status": "done"})
     _record_workflow_result(context, name, task, result)
     return result
 
@@ -101,13 +127,16 @@ def workflow_command(context: CommandContext, user_input: str) -> CommandOutcome
         workflow:<name> <task> - 运行指定工作流
     """
     # 导入放在函数内避免循环依赖
-    from graph.registry import WORKFLOWS
+    from graph.registry import list_workflows
     
     if user_input.strip() == "workflow":
-        # 列出可用工作流
+        # 列出可用工作流(含描述)
         context.print("\n可用工作流:")
-        for name in WORKFLOWS.keys():
-            context.print(f"  - {name}")
+        for wf_name, desc in list_workflows():
+            if desc:
+                context.print(f"  - {wf_name}: {desc}")
+            else:
+                context.print(f"  - {wf_name}")
         context.print("\n用法: workflow:<name> <task>")
         context.print("示例: workflow:simple 帮我分析一下项目结构")
         return HANDLED
@@ -134,7 +163,7 @@ def workflow_command(context: CommandContext, user_input: str) -> CommandOutcome
         # 检查工作流是否存在
         from graph.registry import WORKFLOWS
         if workflow_name not in WORKFLOWS:
-            available = ", ".join(WORKFLOWS.keys())
+            available = ", ".join(name for name, _ in list_workflows())
             context.print(f"\n错误: 未知工作流 '{workflow_name}'")
             context.print(f"可用工作流: {available}")
             return HANDLED

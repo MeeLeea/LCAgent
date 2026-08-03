@@ -93,6 +93,8 @@ SelectMenuFn: TypeAlias = Callable[..., str | tuple[str, str] | None]
 CreateLlmFn: TypeAlias = Callable[[str], LlmLike]
 ListProvidersFn: TypeAlias = Callable[[], dict[str, dict[str, JsonValue]]]
 RunnerFn: TypeAlias = Callable[[AgentLike, str], str]
+# 工作流运行跟踪事件回调:接收结构化事件字典(如 {"type": "workflow_node", "node": ..., "status": ...})
+WorkflowEventFn: TypeAlias = Callable[[dict[str, str]], None]
 
 
 @dataclass(slots=True)
@@ -120,6 +122,8 @@ class CommandContext:
     chat_until_completion: RunnerFn
     safety_backend: SafetyBackend
     mcp_backend: McpBackend | None = None
+    # 工作流运行跟踪回调:推送节点/整体状态事件(SSE 等实时通道);None 时仅靠 print 输出
+    workflow_event_cb: WorkflowEventFn | None = None
 
     def print(self, value: str = "") -> None:
         self.print_fn(value)
