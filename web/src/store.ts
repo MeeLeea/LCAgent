@@ -39,6 +39,15 @@ export function isWorkflowThread(t: { thread_id: string; type?: 'chat' | 'workfl
   return t.type === 'workflow' || t.thread_id.includes('workflow')
 }
 
+/**
+ * 剥离后端写回记忆的 "workflow:" 命令前缀（仅显示层使用，不动原始消息数据，
+ * 以保证重新生成/编辑重发时仍携带完整命令）。
+ * 例：`workflow:pipline 帮我分析` -> `pipline 帮我分析`
+ */
+export function stripWorkflowPrefix(text: string): string {
+  return text.replace(/^workflow:/, '')
+}
+
 interface AppState {
   // 主题
   theme: ThemeId

@@ -1,7 +1,7 @@
 // 侧边栏：会话列表管理（内容渲染到外层 aside 容器中）
 import { useState } from 'react'
 import { MessageSquarePlus, MessagesSquare, Trash2, PanelLeftClose, GitBranch, Search } from 'lucide-react'
-import { useStore, THEMES, isWorkflowThread } from '../store'
+import { useStore, THEMES, isWorkflowThread, stripWorkflowPrefix } from '../store'
 import { ThemePicker } from './ThemePicker'
 
 export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
@@ -111,7 +111,7 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
             )}
             <div className="thread-meta">
               <div className="thread-preview">
-                {t.preview || '新会话'}
+                {t.preview ? stripWorkflowPrefix(t.preview) : '新会话'}
                 {isWorkflowThread(t) && (
                   <span className="thread-badge" title={`工作流: ${t.workflow_name ?? ''}`}>
                     工作流

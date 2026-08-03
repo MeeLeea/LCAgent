@@ -12,7 +12,7 @@ import {
   MessageSquare,
   Wrench,
 } from 'lucide-react'
-import { useStore } from '../store'
+import { useStore, stripWorkflowPrefix } from '../store'
 import { Message } from './Message'
 import type { ChatMessage } from '../types'
 
@@ -70,7 +70,7 @@ function exportMarkdown(messages: ChatMessage[], preview: string) {
     if (m.role === 'user') {
       lines.push(`## 🧑 用户`)
       lines.push('')
-      lines.push(m.content)
+      lines.push(stripWorkflowPrefix(m.content))
       lines.push('')
     } else {
       if (m.toolCalls && m.toolCalls.length) {

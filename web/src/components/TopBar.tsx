@@ -1,7 +1,7 @@
 // 顶栏：会话标题 + 连接状态 + 提供商/模型选择器
 import { useEffect } from 'react'
 import { PanelLeft, Cpu } from 'lucide-react'
-import { useStore } from '../store'
+import { useStore, stripWorkflowPrefix } from '../store'
 
 const STATUS_META = {
   connected: { color: 'var(--accent)', label: '已连接' },
@@ -36,7 +36,9 @@ export function TopBar({ onExpand }: { onExpand: () => void }) {
       <button className="icon-btn" onClick={onExpand} title="展开侧栏">
         <PanelLeft size={16} />
       </button>
-      <div className="topbar-title">{currentThread?.preview || '新会话'}</div>
+      <div className="topbar-title">
+        {currentThread?.preview ? stripWorkflowPrefix(currentThread.preview) : '新会话'}
+      </div>
 
       {/* 连接状态圆点 */}
       <div

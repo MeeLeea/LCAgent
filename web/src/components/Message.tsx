@@ -3,6 +3,7 @@ import { memo, useState, useRef, useEffect } from 'react'
 import { Bot, User, Copy, Check, RotateCcw, Pencil, Send } from 'lucide-react'
 import { Markdown } from './Markdown'
 import { ToolCallCard } from './ToolCallCard'
+import { stripWorkflowPrefix } from '../store'
 import type { ChatMessage } from '../types'
 
 interface Props {
@@ -90,7 +91,9 @@ export const Message = memo(function Message({ message, onRegenerate, onEdit }: 
         {(message.content || message.streaming) && !editing && (
           <div className={`bubble ${message.error ? 'error' : ''}`}>
             {message.content ? (
-              <Markdown content={message.content} />
+              <Markdown
+                content={isUser ? stripWorkflowPrefix(message.content) : message.content}
+              />
             ) : message.streaming ? (
               <span className="streaming-cursor" />
             ) : null}
