@@ -32,13 +32,10 @@ function mermaidOptions(theme: string): { theme: 'dark' | 'default'; colors: typ
   }
 }
 
-// 每个子图容纳的业务节点数，节点多时折行，避免单行拉得过长
-const GROUP_SIZE = 2
-
 function toMermaidCode(workflow: WorkflowInfo): string {
   const lines: string[] = ['flowchart TB']
 
-  const nodeDefs = (id: string, indent = 4): string => {
+  const nodeDefs = (id: string, indent = 2): string => {
     const n = workflow.nodes.find((x) => x.id === id)
     const label = n?.label ?? id
     // 括号类字符需转义，避免破坏 mermaid 语法
@@ -46,26 +43,23 @@ function toMermaidCode(workflow: WorkflowInfo): string {
     return `${' '.repeat(indent)}${id}["${safe}"]`
   }
 
-  // 按业务节点顺序分组成子图，形成折行布局
-  const bizIds = workflow.nodes.map((n) => n.id)
-  for (let i = 0; i < bizIds.length; i += GROUP_SIZE) {
-    const group = bizIds.slice(i, i + GROUP_SIZE)
-    const groupName = `group_${i / GROUP_SIZE}`
-    lines.push(`  subgraph ${groupName}`)
-    for (const id of group) {
-      lines.push(nodeDefs(id))
-    }
-    lines.push('  end')
+  // 收集所有节点 ID（业务节点 + 哨兵节点）
+  const bizIds = new Set(workflow.nodes.map((n) => n.id))
+  const allNodeIds = new Set<string>()
+
+  // 先定义所有业务节点
+  for (const n of workflow.nodes) {
+    lines.push(nodeDefs(n.id))
+    allNodeIds.add(n.id)
   }
 
-  // 哨兵节点 START/END 定义在子图外
-  const sentinelNodes = new Set<string>()
+  // 哨兵节点 START/END 等
   for (const e of workflow.edges) {
     for (const id of [e.source, e.target]) {
       if (id.startsWith('__')) continue
-      if (!bizIds.includes(id) && !sentinelNodes.has(id)) {
-        sentinelNodes.add(id)
-        lines.push(nodeDefs(id, 2))
+      if (!bizIds.has(id) && !allNodeIds.has(id)) {
+        allNodeIds.add(id)
+        lines.push(nodeDefs(id))
       }
     }
   }
@@ -96,20 +90,20 @@ export function WorkflowGraph({ workflow }: { workflow: WorkflowInfo }) {
           startOnLoad: false,
           theme: mTheme,
           securityLevel: 'loose',
-          fontFamily: 'inherit',
           themeVariables: {
             primaryColor: colors.primary,
             primaryTextColor: colors.text,
             primaryBorderColor: colors.border,
             lineColor: colors.line,
             fontSize: '14px',
-            fontFamily: 'inherit',
+            // 指定具体字体族，避免 'inherit' 导致测量时字体不确定
+            fontFamily: "'Segoe UI', 'PingFang SC', 'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif",
           },
           flowchart: {
-            htmlLabels: true,
-            padding: 8,
-            nodeSpacing: 32,
-            rankSpacing: 28,
+            htmlLabels: false,
+            padding: 16,
+            nodeSpacing: 40,
+            rankSpacing: 36,
             useMaxWidth: true,
           },
         })

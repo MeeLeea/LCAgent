@@ -1619,17 +1619,26 @@ tool-group,
 
 /* mermaid 的 svg 自带 width=100% + max-width=<图宽> 内联样式，已自适应容器，无需覆盖尺寸 */
 
-/* htmlLabels 模式下节点是 HTML div，字号需单独放大 */
-.wf-graph .nodeLabel {
-  font-size: 20px !important;
+/* 节点标签：htmlLabels 关闭后为 SVG <text>，由 mermaid 正确测量宽度 */
+.wf-graph .node text {
   font-weight: 600;
-  fill: var(--text, #ececec);
-  color: var(--text, #ececec);
-  line-height: 1.3;
+  fill: var(--text, #ececec) !important;
+}
+
+/* 确保节点内的 foreignObject 不裁切文本 */
+.wf-graph .node foreignObject {
+  overflow: visible;
+}
+
+/* mermaid 节点容器：圆角 */
+.wf-graph .node rect,
+.wf-graph .node polygon {
+  rx: 6;
+  ry: 6;
 }
 
 .wf-graph .edgeLabel {
-  font-size: 15px;
+  font-size: 12px;
 }
 
 .wf-graph .edgePath .path {
