@@ -210,7 +210,11 @@ def _load_builtin_workflows() -> None:
     """
     import graph.pipline  # noqa: F401
     import graph.simple  # noqa: F401
-    import graph.systemc_cmodel  # noqa: F401
+
+    try:
+        import graph.systemc_cmodel  # noqa: F401
+    except ImportError:
+        pass  # systemc_cmodel 模块暂未就绪，跳过注册
 
 
 _load_builtin_workflows()
