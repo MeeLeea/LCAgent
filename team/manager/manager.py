@@ -5,8 +5,9 @@ from typing import ClassVar
 
 from graph.registry import register_agent
 from team.base import TeamAgent
+from tools import search, read_file, read_skill
 
-
+USE_TOOL = [search, read_file, read_skill]
 @register_agent("manager", "team/manager/agent_config.json", tools=None)
 class ManagerAgent(TeamAgent):
     """
