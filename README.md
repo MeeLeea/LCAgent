@@ -270,7 +270,7 @@ LangChainAgent/
 │       ├── safety.py        # 安全策略命令
 │       ├── workflow.py      # 工作流命令（workflow / workflow:<name> <task>）
 │       └── execution.py     # json / react / cot / 普通对话
-├── tests/                   # 离线单元测试(pytest)
+├── tests/                   # 单元测试(pytest；含 1 个在线连通性测试)
 │   ├── conftest.py
 │   ├── test_config.py
 │   ├── test_safety.py
@@ -285,7 +285,15 @@ LangChainAgent/
 │   ├── test_agent_core_regressions.py
 │   ├── test_config_templates.py
 │   ├── test_calculator.py
-│   ├── test_provider_models.py
+│   ├── test_api.py
+│   ├── test_llm_client.py
+│   ├── test_message_utils.py
+│   ├── test_compaction.py
+│   ├── test_create_tool.py
+│   ├── test_graph_rebuild.py
+│   ├── test_mcp_pool.py
+│   ├── test_threads_preview.py
+│   ├── test_provider_models.py        # 在线连通性测试(需 API Key)
 │   └── test_workspace_tool_path_protection.py
 └── exports/                 # 对话导出目录(运行 export 命令时生成)
 ```
@@ -2216,34 +2224,52 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 
 ## 测试
 
-项目提供一套**离线**单元测试（无需 API Key、不联网），覆盖核心逻辑：
+项目提供一套**离线**单元测试（无需 API Key、不联网），覆盖核心逻辑；另含 1 个**在线连通性测试**（真实调用各提供商 API，需配置密钥）。
 
-| 测试文件                                      | 覆盖内容                                                 |
-| --------------------------------------------- | -------------------------------------------------------- |
-| `tests/test_config.py`                      | 运行时配置：默认值合并、路径解析                         |
-| `tests/test_config_templates.py`            | 配置模板验证：.example 文件完整性检查                    |
-| `tests/test_safety.py`                      | 安全护栏：黑名单拒绝、白名单放行、危险命令确认、路径保护 |
-| `tests/test_skills.py`                      | `SkillManager`：列出/读取/匹配(中→英别名)/渲染技能    |
-| `tests/test_search.py`                      | `search` 工具：无 Key 降级、Tavily 返回结构(mock)      |
-| `tests/test_cli_commands.py`                | CLI 命令分发：路由优先级、状态变更和各领域处理器         |
-| `tests/test_human_input.py`                 | LangGraph HITL：interrupt、恢复、并行选择和线程隔离      |
-| `tests/test_terminal.py`                    | 终端工具：输出截断、护栏拒绝、安全执行(mock subprocess)  |
-| `tests/test_calculator.py`                  | 计算器工具：表达式求值、错误处理                         |
-| `tests/test_memory.py`                      | `AgentMemory`：长期记忆、会话管理(SQLite)              |
-| `tests/test_agent_core_regressions.py`      | Agent 核心回归测试：HITL 恢复、会话隔离、技能匹配        |
-| `tests/test_scheduler.py`                   | 定时任务调度：TaskStore CRUD、原子抢占、重试逻辑         |
-| `tests/test_provider_models.py`             | 提供商模型切换：配置加载、模型列表                       |
-| `tests/test_workspace_tool_path_protection` | 工作目录工具：路径保护、越界检测                         |
-| `tests/test_api.py`                         | API Server：端点路由、流式聊天、命令执行                 |
-| `tests/test_message_utils.py`               | LLM 异常信息提取：429/5xx/鉴权/未知错误的中文提示        |
-| `tests/test_llm_client.py`                  | 瞬时错误自动重试：should_retry 判定与重试行为            |
-| `tests/test_agent_core_regressions.py`      | Agent 核心回归：name/llm 内置属性、裁剪、中断解析等      |
+### 离线单元测试
+
+| 测试文件                                      | 覆盖内容                                                         |
+| --------------------------------------------- | ---------------------------------------------------------------- |
+| `tests/test_config.py`                      | 运行时配置：默认值合并、路径解析                                 |
+| `tests/test_config_templates.py`            | 配置模板验证：.example 文件完整性检查                            |
+| `tests/test_safety.py`                      | 安全护栏：黑名单拒绝、白名单放行、危险命令确认、路径保护         |
+| `tests/test_skills.py`                      | `SkillManager`：列出/读取/匹配(中→英别名)/渲染技能            |
+| `tests/test_search.py`                      | `search` 工具：无 Key 降级、Tavily 返回结构(mock)              |
+| `tests/test_cli_commands.py`                | CLI 命令分发：路由优先级、状态变更和各领域处理器                 |
+| `tests/test_human_input.py`                 | LangGraph HITL：interrupt、恢复、并行选择和线程隔离              |
+| `tests/test_terminal.py`                    | 终端工具：输出截断、护栏拒绝、安全执行(mock subprocess)          |
+| `tests/test_calculator.py`                  | 计算器工具：表达式求值、错误处理                                 |
+| `tests/test_memory.py`                      | `AgentMemory`：长期记忆、会话管理(SQLite)                      |
+| `tests/test_agent_core_regressions.py`      | Agent 核心回归：HITL 恢复、会话隔离、技能匹配、长上下文裁剪等    |
+| `tests/test_scheduler.py`                   | 定时任务调度：TaskStore CRUD、原子抢占、重试逻辑                 |
+| `tests/test_workspace_tool_path_protection.py` | 工作目录工具：路径保护、越界检测                             |
+| `tests/test_api.py`                         | API Server：端点路由、流式聊天、命令执行（FastAPI TestClient）   |
+| `tests/test_message_utils.py`               | LLM 异常信息提取：429/5xx/鉴权/未知错误的中文提示                |
+| `tests/test_llm_client.py`                  | 瞬时错误自动重试：should_retry 判定与重试行为                    |
+| `tests/test_compaction.py`                  | 长上下文压缩中间件：增量摘要、工具输出 Prune、安全切割           |
+| `tests/test_create_tool.py`                 | `create_tool` 动态生成工具代码并自动注册到 `tools/__init__.py` |
+| `tests/test_graph_rebuild.py`               | Graph 重建：MCP 工具变化触发重建、技能变化不重建                 |
+| `tests/test_mcp_pool.py`                    | `MCPPool` 连接池：连接管理、健康探测、重连（mock 注入）        |
+| `tests/test_threads_preview.py`             | 会话菜单预览：首条用户消息提取与截断                             |
+| `tests/test_workflow.py`                    | 监督者模式工作流编排：Manager→Worker→Terminator 模板            |
+
+### 在线连通性测试
+
+| 测试文件 | 覆盖内容 |
+| -------- | -------- |
+| `tests/test_provider_models.py` | 真实调用各提供商 `chat/completions`，校验配置的模型当前是否可用（需 API Key） |
+
+> 该文件不在默认离线测试集内，通常**单独运行**（见下文 `--provider` 用法）。失败一般表示某个模型在服务商端不可用或密钥无效，并非代码问题。
 
 ### 运行测试
 
 **运行全部测试：**
 
 ```bash
+# uv 方式（推荐，自动使用 .venv）
+uv run pytest tests/ -v
+
+# 直接方式
 # Linux / macOS
 .venv/bin/pytest
 
@@ -2291,7 +2317,15 @@ pytest -k safety
 pytest -k "memory or thread"
 ```
 
-测试配置见 `pytest.ini`（`pythonpath = .` 保证 `import tools`/`import agent` 可用），`conftest.py` 提供安全配置缓存隔离的 autouse fixture。
+**只检测指定提供商（在线连通性测试）：**
+
+```bash
+uv run pytest tests/test_provider_models.py --provider kimi -v
+```
+
+> 不传 `--provider` 时检测 `config/llm_config.json` 中配置的**全部**提供商；传入未知提供商会直接报 UsageError。
+
+测试配置见 `pytest.ini`（`pythonpath = .` 保证 `import tools`/`import agent` 可用；`testpaths = tests` 指定默认收集目录；`addopts = -q` 默认静默模式），`conftest.py` 提供安全配置缓存隔离的 autouse fixture。
 
 ---
 
