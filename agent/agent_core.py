@@ -457,10 +457,10 @@ class AgentCore:
                 )
                 answered_ids.add(call_id)
         if repairs:
-            await self.agent_executor.aupdate_state(
+            await asyncio.to_thread(
+                self.agent_executor.update_state,
                 config,
                 {"messages": [*existing_results, *repairs]},
-                as_node="tools",
             )
 
     async def _ahandle_rejected_command(self, config: Dict[str, Any]) -> AgentTurnResult:
@@ -481,8 +481,7 @@ class AgentCore:
     async def arun_structured(self, task: str) -> AgentTurnResult:
         """异步执行任务（结构化入口）
 
-        使用 ainvoke / aupdate_state 替代同步 invoke / update_state，
-        支持 AsyncSqliteSaver 和事件循环内调用。
+        使用 asyncio.to_thread 将同步 invoke 跑在线程池中，避免阻塞事件循环。
         """
         await self._acompact_if_needed()
         config = self._invoke_config()
@@ -491,9 +490,10 @@ class AgentCore:
         await self._arebuild_agent_executor(task)
 
         try:
-            result = await self.agent_executor.ainvoke(
+            result = await asyncio.to_thread(
+                self.agent_executor.invoke,
                 {"messages": [input_msg]},
-                config=config
+                config=config,
             )
         except UserRejectedCommandError:
             return await self._ahandle_rejected_command(config)
@@ -534,9 +534,10 @@ class AgentCore:
         with self._temp_verbose(False):
             await self._arebuild_agent_executor(message)
             try:
-                result = await self.agent_executor.ainvoke(
+                result = await asyncio.to_thread(
+                    self.agent_executor.invoke,
                     {"messages": [HumanMessage(content=message)]},
-                    config=config
+                    config=config,
                 )
             except UserRejectedCommandError:
                 return await self._ahandle_rejected_command(config)
@@ -576,9 +577,10 @@ class AgentCore:
             raise ValueError("Cannot resume interrupt on a different thread")
 
         try:
-            result = await self.agent_executor.ainvoke(
+            result = await asyncio.to_thread(
+                self.agent_executor.invoke,
                 Command(resume=payload),
-                config=config
+                config=config,
             )
         except UserRejectedCommandError:
             return await self._ahandle_rejected_command(config)
@@ -987,7 +989,8 @@ class AgentCore:
         await self._arebuild_agent_executor("")
 
         if retained:
-            await self.agent_executor.aupdate_state(
+            await asyncio.to_thread(
+                self.agent_executor.update_state,
                 self.memory.get_config(),
                 {"messages": retained},
             )
