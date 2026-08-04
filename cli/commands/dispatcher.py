@@ -41,8 +41,8 @@ def dispatch_command(context: CommandContext, user_input: str) -> CommandOutcome
         return provider.switch_model(context, user_input)
     if low == "mcp":
         return mcp.show_mcp(context)
-    if low == "mcp:reload":
-        return mcp.reload_mcp(context)
+    if low.startswith("mcp:reload"):
+        return mcp.reload_mcp(context, user_input)
     if low.startswith("mcp:add"):
         return mcp.add_mcp(context, user_input)
     if low.startswith("mcp:remove"):

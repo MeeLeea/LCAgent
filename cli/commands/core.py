@@ -69,7 +69,7 @@ _HELP_LINES = [
     "  - 输入 'thread:new' 开启新会话(原会话保留)",
     "  - 输入 'thread:delete <thread_id>' 删除指定会话",
     "  - 输入 'mcp' 查看 MCP Server 状态",
-    "  - 输入 'mcp:reload' 重新加载 MCP 工具",
+    "  - 输入 'mcp:reload [name]' 重新加载 MCP 工具(指定 name 只重连该 server)",
     "  - 输入 'mcp:add <name> <command> <arg1> [arg2...]' 添加 stdio MCP Server",
     "  - 输入 'mcp:add <name> <url>' 添加 sse/http MCP Server (前缀 sse: 或 http:)",
     "  - 输入 'mcp:remove <name>' 删除 MCP Server",
