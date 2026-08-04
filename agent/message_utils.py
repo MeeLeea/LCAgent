@@ -226,7 +226,7 @@ class StreamHandler:
                 for ev in self._stream_events(input_or_command, config):
                     asyncio.run_coroutine_threadsafe(queue.put(ev), loop)
             except UserRejectedCommandError:
-                self.agent._repair_rejected_tool_calls(config)
+                await self.agent._arepair_rejected_tool_calls(config)
                 self.agent._clear_pending_interrupt()
                 asyncio.run_coroutine_threadsafe(
                     queue.put({"type": "cancelled", "content": "用户已拒绝执行危险命令，当前任务已取消。"}),
@@ -273,7 +273,7 @@ class StreamHandler:
 
         说明：checkpoint 会自动持久化整轮对话，故无需手动 memory.add。
         """
-        self.agent._compact_if_needed()
+        await self.agent._acompact_if_needed()
         config = self.agent._invoke_config()
         self.agent.agent_executor = self.agent._create_agent_executor(
             self.agent._compute_skill_block(message)

@@ -266,7 +266,7 @@ async def switch_provider(req: SwitchProviderRequest):
         except Exception as e:
             logger.error("切换失败: %s", e)
             raise HTTPException(status_code=400, detail=str(e))
-        agent.switch_llm(new_llm)
+        await agent.aswitch_llm(new_llm)
         llm = new_llm
     info = llm.get_info()
     logger.info("已切换 → %s / %s", info["provider_name"], info["model"])
@@ -279,7 +279,7 @@ async def switch_model(req: SwitchModelRequest):
     async with chat_lock:
         try:
             llm.switch_model(req.model)
-            agent.switch_llm(llm)
+            await agent.aswitch_llm(llm)
         except Exception as e:
             logger.error("切换失败: %s", e)
             raise HTTPException(status_code=400, detail=str(e))
