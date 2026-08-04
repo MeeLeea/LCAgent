@@ -689,54 +689,93 @@ class AgentCore:
 
     # ============ 长上下文裁剪 ============
 
-    def _compact_if_needed(self):
-        """调用 memory.maybe_compact 执行上下文裁剪(阈值 <= 0 时自动跳过)。"""
-        def _summarize_messages(msgs: List[BaseMessage]) -> str:
-            lines = []
-            for m in msgs:
-                if isinstance(m, HumanMessage):
-                    role = "user"
-                elif isinstance(m, AIMessage):
-                    role = "assistant"
-                elif isinstance(m, SystemMessage):
-                    role = "system"
-                else:
-                    role = "tool"
-                content = getattr(m, "content", "")
-                if isinstance(content, list):
-                    content = " ".join(str(x) for x in content)
-                text = str(content).strip()
-                if text:
-                    lines.append(f"{role}: {text}")
-            if not lines:
-                return ""
-            prompt = (
-                "请将以下对话历史压缩成一份简洁的中文摘要,保留关键决策、用户意图与事实,"
-                "按主题分条列出,不要添加推测内容:"
-            )
-            try:
-                summary = self.llm.chat([
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": "\n".join(lines)},
-                ]).strip()
-            except Exception:
-                summary = ""
-            if not summary and self.verbose:
-                print("[上下文摘要生成失败,跳过裁剪]")
-            return summary
+    async def _asummarize_messages(self, msgs: List[BaseMessage]) -> str:
+        """异步生成对话历史摘要（供 _acompact_if_needed 使用）
 
-        def _recreate(summary: str):
-            self.compaction_summary = summary
-            self._rebuild_agent_executor("")
-            return self.agent_executor
+        将 BaseMessage 列表格式化为文本，调用 LLM 异步接口生成中文摘要。
 
-        self.memory.maybe_compact(
-            max_context_messages=self.max_context_messages,
-            context_trim_keep=self.context_trim_keep,
-            summarize_callback=_summarize_messages,
-            recreate_agent_callback=_recreate,
-            verbose=self.verbose,
+        Args:
+            msgs: 待压缩的消息列表
+
+        Returns:
+            压缩后的中文摘要文本，失败时返回空字符串
+        """
+        lines = []
+        for m in msgs:
+            if isinstance(m, HumanMessage):
+                role = "user"
+            elif isinstance(m, AIMessage):
+                role = "assistant"
+            elif isinstance(m, SystemMessage):
+                role = "system"
+            else:
+                role = "tool"
+            content = getattr(m, "content", "")
+            if isinstance(content, list):
+                content = " ".join(str(x) for x in content)
+            text = str(content).strip()
+            if text:
+                lines.append(f"{role}: {text}")
+        if not lines:
+            return ""
+        prompt = (
+            "请将以下对话历史压缩成一份简洁的中文摘要,保留关键决策、用户意图与事实,"
+            "按主题分条列出,不要添加推测内容:"
         )
+        try:
+            summary = (await self.llm.achat([
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": "\n".join(lines)},
+            ])).strip()
+        except Exception:
+            summary = ""
+        if not summary and self.verbose:
+            print("[上下文摘要生成失败,跳过裁剪]")
+        return summary
+
+    async def _acompact_if_needed(self):
+        """异步执行上下文裁剪（阈值 <= 0 时自动跳过）
+
+        替代 _compact_if_needed() 的异步版本，避免在事件循环中调用
+        self.llm.chat() 同步阻塞。
+        """
+        if self.max_context_messages <= 0:
+            return
+        msgs = self.memory.get_messages()
+        if len(msgs) <= self.max_context_messages:
+            return
+
+        keep = min(self.context_trim_keep, max(len(msgs) - 1, 0))
+        old = msgs[:-keep] if keep > 0 else msgs
+        retained = msgs[-keep:] if keep > 0 else []
+
+        summary = await self._asummarize_messages(old)
+        if not summary:
+            return
+
+        self.compaction_summary = summary
+        old_tid = self.memory.thread_id
+        self.memory.new_thread()
+        await self._arebuild_agent_executor("")
+
+        if retained:
+            await self.agent_executor.aupdate_state(
+                self.memory.get_config(),
+                {"messages": retained},
+            )
+
+    def _compact_if_needed(self):
+        """调用 memory.maybe_compact 执行上下文裁剪(阈值 <= 0 时自动跳过)。
+
+        已废弃：请使用 _acompact_if_needed() 异步方法。
+        """
+        import warnings
+        warnings.warn(
+            "_compact_if_needed() 已废弃，请使用 _acompact_if_needed()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        asyncio.run(self._acompact_if_needed())
 
     def get_available_tools(self) -> List[str]:
         """获取可用工具名称列表"""
