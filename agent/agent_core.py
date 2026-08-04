@@ -122,6 +122,10 @@ class AgentCore:
         self.mcp_config_file = mcp_config_file or DEFAULT_CONFIG_FILE
         self.enable_mcp = enable_mcp
 
+        # 异步互斥锁：保护 tools / mcp_tools / agent_executor / active_skills 等共享状态
+        # 必须在任何异步方法调用之前初始化，因为 areload_mcp_tools / _arebuild_agent_executor 等都会访问它
+        self._state_lock = asyncio.Lock()
+
         # 技能阅读(本地 .agents/skills)
         if skills_dir is None:
             skills_dir = default_skills_dir()
@@ -142,9 +146,6 @@ class AgentCore:
 
         # 流式事件处理器（组合模式）
         self.stream = StreamHandler(self)
-
-        # 异步互斥锁：保护 tools / mcp_tools / agent_executor / active_skills 等共享状态
-        self._state_lock = asyncio.Lock()
 
     async def areload_mcp_tools(self) -> int:
         """
