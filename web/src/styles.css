@@ -172,9 +172,97 @@ button {
 /* ---------- 主布局 ---------- */
 .app {
   display: flex;
+  flex-direction: column;
   height: 100vh;
   width: 100vw;
   overflow: hidden;
+}
+
+.app-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ---------- 自定义窗口标题栏 ---------- */
+.titlebar {
+  height: 36px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 0 0 12px;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.titlebar-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 100%;
+}
+
+.titlebar-logo {
+  width: 20px;
+  height: 20px;
+  border-radius: 5px;
+  background: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.titlebar-logo-text {
+  font-size: 10px;
+  font-weight: 800;
+  color: #0d0d0d;
+  letter-spacing: -0.5px;
+}
+
+.titlebar-title {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.titlebar-controls {
+  display: flex;
+  align-items: center;
+  height: 100%;
+}
+
+.titlebar-btn {
+  width: 46px;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  transition: background 0.15s, color 0.15s;
+}
+
+.titlebar-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.titlebar-btn:active {
+  background: var(--border-soft);
+}
+
+.titlebar-close:hover {
+  background: #e02424;
+  color: #fff;
+}
+
+.titlebar-close:active {
+  background: #c01a1a;
 }
 
 /* ---------- 侧边栏 ---------- */
