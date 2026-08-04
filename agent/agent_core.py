@@ -143,24 +143,47 @@ class AgentCore:
         # 流式事件处理器（组合模式）
         self.stream = StreamHandler(self)
 
+        # 异步互斥锁：保护 tools / mcp_tools / agent_executor / active_skills 等共享状态
+        self._state_lock = asyncio.Lock()
+
     def reload_mcp_tools(self) -> int:
         """
-        重新加载 MCP 工具(同步入口)
+        重新加载 MCP 工具(同步兼容壳，已废弃)
+
+        业务代码请使用 areload_mcp_tools() 异步方法。
 
         Returns:
             加载到的 MCP 工具数量
         """
-        try:
-            count = asyncio.run(self._async_load_mcp_tools())
-            # 合并工具列表
-            self.tools = list(self.local_tools) + list(self.mcp_tools)
-            # 重建Agent(保留已加载的技能)
-            if hasattr(self, "agent_executor"):
-                self._rebuild_agent_executor("")
-            return count
-        except Exception as e:
-            print(f"[MCP] 重新加载失败: {e}")
-            return 0
+        import warnings
+        warnings.warn(
+            "reload_mcp_tools() 已废弃，请使用 areload_mcp_tools()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return asyncio.run(self.areload_mcp_tools())
+
+    async def areload_mcp_tools(self) -> int:
+        """
+        异步重新加载 MCP 工具
+
+        使用 _state_lock 保护 tools 和 agent_executor 的并发修改。
+
+        Returns:
+            加载到的 MCP 工具数量
+        """
+        async with self._state_lock:
+            try:
+                count = await self._async_load_mcp_tools()
+                # 合并工具列表
+                self.tools = list(self.local_tools) + list(self.mcp_tools)
+                # 重建Agent(保留已加载的技能)
+                if hasattr(self, "agent_executor"):
+                    await self._arebuild_agent_executor("")
+                return count
+            except Exception as e:
+                print(f"[MCP] 重新加载失败: {e}")
+                return 0
 
     async def _async_load_mcp_tools(self) -> int:
         """异步加载 MCP 工具"""
@@ -188,7 +211,7 @@ class AgentCore:
         return agent
 
     def _rebuild_agent_executor(self, task: str = "") -> None:
-        """统一的 Agent 重建入口
+        """统一的 Agent 重建入口（同步，已废弃，请使用 _arebuild_agent_executor）
 
         根据当前技能状态和任务内容重新创建 agent_executor。
 
@@ -197,6 +220,19 @@ class AgentCore:
         """
         skill_block = self._compute_skill_block(task)
         self.agent_executor = self._create_agent_executor(skill_block)
+
+    async def _arebuild_agent_executor(self, task: str = "") -> None:
+        """统一的 Agent 异步重建入口
+
+        根据当前技能状态和任务内容重新创建 agent_executor。
+        使用 _state_lock 保护共享状态。
+
+        Args:
+            task: 任务描述，用于自动匹配技能（为空时不自动匹配）
+        """
+        async with self._state_lock:
+            skill_block = self._compute_skill_block(task)
+            self.agent_executor = self._create_agent_executor(skill_block)
 
     def _handle_rejected_command(self, config: Dict[str, Any]) -> AgentTurnResult:
         """处理用户拒绝执行危险命令的情况
