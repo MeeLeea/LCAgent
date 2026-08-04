@@ -226,7 +226,9 @@ class StreamHandler:
                 for ev in self._stream_events(input_or_command, config):
                     asyncio.run_coroutine_threadsafe(queue.put(ev), loop)
             except UserRejectedCommandError:
-                await self.agent._arepair_rejected_tool_calls(config)
+                asyncio.run_coroutine_threadsafe(
+                    self.agent._arepair_rejected_tool_calls(config), loop,
+                )
                 self.agent._clear_pending_interrupt()
                 asyncio.run_coroutine_threadsafe(
                     queue.put({"type": "cancelled", "content": "用户已拒绝执行危险命令，当前任务已取消。"}),

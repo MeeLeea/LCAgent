@@ -478,7 +478,7 @@ class AgentCore:
         self._clear_pending_interrupt()
         return AgentTurnResult.cancelled("用户已拒绝执行危险命令，当前任务已取消。")
 
-async def arun_structured(self, task: str) -> AgentTurnResult:
+    async def arun_structured(self, task: str) -> AgentTurnResult:
         """异步执行任务（结构化入口）
 
         使用 ainvoke / aupdate_state 替代同步 invoke / update_state，
