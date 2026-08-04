@@ -4,9 +4,10 @@ Agent核心调度模块 - 基于LangChain 1.x + LangGraph
 支持动态加载本地工具 + MCP Server工具
 """
 import asyncio
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Dict, Any, List, Optional, Literal
+from typing import Dict, Any, Deque, List, Optional, Literal
 from langchain.agents import create_agent
 from langchain_core.messages import (
     HumanMessage, AIMessage, SystemMessage, ToolMessage, BaseMessage,
@@ -16,7 +17,13 @@ from langgraph.types import Command, Interrupt
 from .llm_client import LLMClient
 from .memory import AgentMemory
 from .message_utils import StreamHandler
-from tools.mcp_loader import load_mcp_tools, DEFAULT_CONFIG_FILE
+from .compaction import (
+    CompactionConfig,
+    LCAgentCompactionMiddleware,
+    LCAgentState,
+)
+from tools.mcp_loader import DEFAULT_CONFIG_FILE
+from tools.mcp_pool import MCPPool, ServerStatus
 from tools.skills import SkillManager, default_skills_dir
 from tools.terminal_tools import UserRejectedCommandError
 
@@ -69,7 +76,8 @@ class AgentCore:
         max_context_messages: int = 0,
         context_trim_keep: int = 12,
         process_type: Optional[str] = None,
-        agent_core_prompt: Optional[str] = None
+        agent_core_prompt: Optional[str] = None,
+        max_execution_history: int = 100,
     ):
         """
         初始化Agent核心
@@ -89,6 +97,7 @@ class AgentCore:
             context_trim_keep: 裁剪时保留的最近消息条数
             process_type: 进程类型标识(server/scheduler/feishu)，用于多进程隔离
             agent_core_prompt: Agent核心系统提示词(为 None 时使用配置默认值)
+            max_execution_history: 执行历史最大条数(防止内存泄漏)
         """
         self.name = name
         self.llm = llm_client
@@ -104,7 +113,13 @@ class AgentCore:
         self.verbose = verbose
         self.max_context_messages = max_context_messages
         self.context_trim_keep = context_trim_keep
-        self.compaction_summary = ""  # 长上下文裁剪后的历史摘要(注入 system prompt)
+
+        # 压缩配置：before_model 中间件自动触发 + manually_compact 手动触发
+        # summary 存入 LangGraph state（随 checkpoint 持久化），天然 per-thread 隔离
+        self.compaction_config = CompactionConfig.from_kwargs(
+            max_context_messages=max_context_messages,
+            context_trim_keep=context_trim_keep,
+        )
 
         # 存储核心提示词（从配置加载或使用默认值）
         from .config import _DEFAULT_AGENT_CORE_PROMPT
@@ -122,6 +137,9 @@ class AgentCore:
         self.mcp_config_file = mcp_config_file or DEFAULT_CONFIG_FILE
         self.enable_mcp = enable_mcp
 
+        # MCP 连接池（per-server 连接管理 + 健康探测 + 自动重连）
+        self._mcp_pool = MCPPool(self.mcp_config_file)
+
         # 异步互斥锁：保护 tools / mcp_tools / agent_executor / active_skills 等共享状态
         # 必须在任何异步方法调用之前初始化，因为 areload_mcp_tools / _arebuild_agent_executor 等都会访问它
         self._state_lock = asyncio.Lock()
@@ -133,15 +151,21 @@ class AgentCore:
         self.active_skills: set = set()      # 由 CLI (skill:<name>) 手动加载
         self.auto_match_skills = auto_match_skills  # 任务开始时自动匹配注入
 
-        # 启动时加载 MCP 工具
+        # 启动时加载 MCP 工具（通过连接池）
         if enable_mcp:
             asyncio.run(self.areload_mcp_tools())
 
-        # 创建Agent
+        # 可变 SystemMessage：content 在每次 invoke 前动态更新（技能匹配），
+        # 避免 create_agent 重新编译 Graph。model_node 闭包捕获此对象引用，
+        # 修改 .content 即可让下次 LLM 调用看到最新提示词。
+        self._system_message = SystemMessage(content=self._get_system_prompt(""))
+
+        # 创建Agent（编译一次，后续不再因技能变化而重建）
         self.agent_executor = self._create_agent_executor()
 
-        # 执行历史
-        self.execution_history: List[Dict[str, Any]] = []
+        # 执行历史（deque 有界队列，防止内存泄漏）
+        self.execution_history: Deque[Dict[str, Any]] = deque(maxlen=max_execution_history)
+        self._max_execution_history = max_execution_history
         self._recorded_tool_call_ids: set[str] = set()
 
         # 流式事件处理器（组合模式）
@@ -149,63 +173,155 @@ class AgentCore:
 
     async def areload_mcp_tools(self) -> int:
         """
-        异步重新加载 MCP 工具
+        异步重新加载 MCP 工具（通过 MCPPool 全量重连）
 
         使用 _state_lock 保护 tools 和 agent_executor 的并发修改。
+        仅当工具签名（工具名集合）变化时才重建 Graph，否则只更新系统提示词。
+
+        对于单个 server 的重连，推荐使用 areload_mcp_server(name)。
 
         Returns:
             加载到的 MCP 工具数量
         """
         async with self._state_lock:
             try:
+                old_signature = getattr(self, "_tools_signature", frozenset())
                 count = await self._async_load_mcp_tools()
                 # 合并工具列表
                 self.tools = list(self.local_tools) + list(self.mcp_tools)
-                # 重建Agent(保留已加载的技能)
+                new_signature = frozenset(t.name for t in self.tools)
+
                 if hasattr(self, "agent_executor"):
-                    await self._arebuild_agent_executor("")
+                    if new_signature != old_signature:
+                        # 工具列表变化，必须重建 Graph
+                        await self._arebuild_agent_executor("")
+                    else:
+                        # 工具列表不变，只更新系统提示词
+                        self._update_system_prompt("")
                 return count
             except Exception as e:
                 print(f"[MCP] 重新加载失败: {e}")
                 return 0
 
+    async def areload_mcp_server(self, name: str) -> bool:
+        """重连单个 MCP server（不影响其他 server）
+
+        Args:
+            name: server 名称
+
+        Returns:
+            True=重连成功
+        """
+        async with self._state_lock:
+            try:
+                old_signature = getattr(self, "_tools_signature", frozenset())
+                success = await self._mcp_pool.reload_server(name)
+                if not success:
+                    if self.verbose:
+                        print(f"[MCP] {name}: 重连失败或已移除")
+                # 从池中获取最新工具列表
+                self.mcp_tools = self._mcp_pool.get_all_tools()
+                self.tools = list(self.local_tools) + list(self.mcp_tools)
+                new_signature = frozenset(t.name for t in self.tools)
+
+                if hasattr(self, "agent_executor"):
+                    if new_signature != old_signature:
+                        await self._arebuild_agent_executor("")
+                    else:
+                        self._update_system_prompt("")
+                return success
+            except Exception as e:
+                print(f"[MCP] {name}: 重连失败 - {e}")
+                return False
+
     async def _async_load_mcp_tools(self) -> int:
-        """异步加载 MCP 工具"""
-        tools = await load_mcp_tools(self.mcp_config_file)
-        self.mcp_tools = tools
-        if tools and self.verbose:
-            print(f"[MCP] 已加载 {len(tools)} 个工具: {', '.join(t.name for t in tools)}")
+        """通过 MCPPool 初始化所有 MCP 连接"""
+        tool_count = await self._mcp_pool.initialize()
+        self.mcp_tools = self._mcp_pool.get_all_tools()
+        if self.mcp_tools and self.verbose:
+            # 按 server 分组展示
+            for info in self._mcp_pool.get_server_infos():
+                if info.status == ServerStatus.CONNECTED:
+                    print(f"[MCP] {info.name}: {info.tool_count} 个工具 ({', '.join(info.tool_names)})")
+                elif info.status == ServerStatus.ERROR:
+                    print(f"[MCP] {info.name}: 连接失败 - {info.last_error}")
         elif self.verbose:
             print("[MCP] 未加载到任何工具(可能配置为空或服务器未启用)")
-        return len(tools)
+        return tool_count
 
     def _create_agent_executor(self, skill_block: str = ""):
-        """创建LangGraph ReAct Agent"""
+        """创建LangGraph ReAct Agent（仅在工具列表或 LLM 变化时调用）
+
+        集成压缩中间件（before_model 自动触发增量摘要 + 工具输出 Prune）。
+        summary 存入 LCAgentState.summary，随 checkpoint per-thread 持久化。
+
+        关键优化：system_prompt 传入可变 SystemMessage 对象（self._system_message），
+        而非字符串。model_node 闭包捕获此对象引用，后续修改 .content 即可动态
+        更新提示词，无需重新编译 Graph。
+        """
         chat_model = self.llm.get_chat_model()
 
+        # 更新 _system_message 内容（重建时同步当前技能状态）
+        self._system_message.content = self._get_system_prompt(skill_block)
+
+        # 压缩中间件：消息超阈值时自动增量摘要 + Prune 工具输出
+        compaction_middleware = LCAgentCompactionMiddleware(
+            model=chat_model,
+            config=self.compaction_config,
+        )
+
         # create_agent 直接返回可调用的agent
-        # system_prompt 参数作为系统提示词
-        # checkpointer 让 Agent 自动持久化状态到 SQLite
+        # system_prompt 传入可变 SystemMessage 对象，后续可通过 _update_system_prompt 动态更新
         agent = create_agent(
             model=chat_model,
             tools=self.tools,
-            system_prompt=self._get_system_prompt(skill_block),
+            system_prompt=self._system_message,
             checkpointer=self.memory.get_checkpointer(),
+            state_schema=LCAgentState,
+            middleware=[compaction_middleware],
         )
+        # 保存中间件引用，供手动压缩使用
+        self._compaction_middleware = compaction_middleware
+        # 记录工具签名，用于检测工具列表是否变化
+        self._tools_signature = frozenset(t.name for t in self.tools)
         return agent
 
-    async def _arebuild_agent_executor(self, task: str = "") -> None:
-        """统一的 Agent 异步重建入口
+    def _update_system_prompt(self, task: str = "") -> None:
+        """动态更新系统提示词（不重建 Graph）
 
-        根据当前技能状态和任务内容重新创建 agent_executor。
-        使用 _state_lock 保护共享状态。
+        通过修改 _system_message.content 实现：
+        - model_node 闭包捕获的是 SystemMessage 对象引用
+        - 修改 .content 后，下次 LLM 调用自动使用新提示词
+        - 无需重新编译 LangGraph，性能提升约 100x
 
         Args:
             task: 任务描述，用于自动匹配技能（为空时不自动匹配）
         """
-        async with self._state_lock:
-            skill_block = self._compute_skill_block(task)
-            self.agent_executor = self._create_agent_executor(skill_block)
+        skill_block = self._compute_skill_block(task)
+        new_content = self._get_system_prompt(skill_block)
+        # _system_message 可能不存在（测试中用 object.__new__ 创建）
+        sys_msg = getattr(self, "_system_message", None)
+        if sys_msg is None:
+            self._system_message = SystemMessage(content=new_content)
+        else:
+            sys_msg.content = new_content
+
+    async def _arebuild_agent_executor(self, task: str = "") -> None:
+        """重建 Agent（仅在工具列表或 LLM 变化时使用）
+
+        技能变化不需要重建——使用 _update_system_prompt 即可。
+        此方法仅在以下场景调用：
+        - MCP 工具列表变化（areload_mcp_tools 检测到工具签名不同）
+        - LLM 切换（aswitch_llm，model 对象变化）
+
+        注意：调用方必须已持有 _state_lock（此方法不再自行加锁，
+        避免在 areload_mcp_tools 内部调用时死锁）。
+
+        Args:
+            task: 任务描述，用于自动匹配技能（为空时不自动匹配）
+        """
+        skill_block = self._compute_skill_block(task)
+        self.agent_executor = self._create_agent_executor(skill_block)
 
     def _handle_turn_completion(
         self,
@@ -239,15 +355,15 @@ class AgentCore:
                 self.memory.add("assistant", turn.output, metadata)
 
     def _get_system_prompt(self, skill_block: str = "") -> str:
-        """获取系统提示词(可附加技能指引块)"""
+        """获取系统提示词(可附加技能指引块)
+
+        注意：历史对话摘要不再拼接到这里。
+        压缩中间件会将摘要作为 SystemMessage 放入 messages 列表头部，
+        与 system_prompt 分离，避免实例级共享状态污染。
+        """
         base = self.agent_core_prompt
         if skill_block:
             base = base + "\n" + skill_block
-        if self.compaction_summary:
-            base = base + (
-                "\n\n【历史对话摘要(上文因过长已被自动裁剪压缩)】\n"
-                + self.compaction_summary
-            )
         return base
 
     def _invoke_config(self) -> Dict[str, Any]:
@@ -357,41 +473,11 @@ class AgentCore:
                 return AgentTurnResult.completed(str(msg.content))
         return AgentTurnResult.completed("")
 
-    def _repair_rejected_tool_calls(self, config: Dict[str, Any]) -> None:
-        """为 checkpoint 中未完成的工具调用补齐取消结果。"""
-        state = self.agent_executor.get_state(config)
-        messages = list(state.values.get("messages", []))
-        existing_results = [message for message in messages if isinstance(message, ToolMessage)]
-        answered_ids = {message.tool_call_id for message in existing_results}
-        repairs = []
-        for message in messages:
-            if not isinstance(message, AIMessage):
-                continue
-            for tool_call in message.tool_calls:
-                call_id = tool_call.get("id")
-                if not isinstance(call_id, str) or call_id in answered_ids:
-                    continue
-                repairs.append(
-                    ToolMessage(
-                        content="用户拒绝执行危险命令，工具调用已取消。",
-                        name=tool_call.get("name"),
-                        tool_call_id=call_id,
-                        status="error",
-                    )
-                )
-                answered_ids.add(call_id)
-        if repairs:
-            # 保留并行调用已经产生的结果，再补齐缺失项，确保消息历史满足工具协议。
-            self.agent_executor.update_state(
-                config,
-                {"messages": [*existing_results, *repairs]},
-                as_node="tools",
-            )
-
     async def _arepair_rejected_tool_calls(self, config: Dict[str, Any]) -> None:
         """异步修复 checkpoint 中未完成的工具调用（补齐取消结果）。
 
-        使用 aupdate_state 替代 update_state，支持 AsyncSqliteSaver。
+        使用 aupdate_state 替代 asyncio.to_thread(update_state)，
+        真正异步执行，不阻塞事件循环。
         """
         state = self.agent_executor.get_state(config)
         messages = list(state.values.get("messages", []))
@@ -415,8 +501,7 @@ class AgentCore:
                 )
                 answered_ids.add(call_id)
         if repairs:
-            await asyncio.to_thread(
-                self.agent_executor.update_state,
+            await self.agent_executor.aupdate_state(
                 config,
                 {"messages": [*existing_results, *repairs]},
             )
@@ -440,12 +525,14 @@ class AgentCore:
         """异步执行任务（结构化入口）
 
         使用 asyncio.to_thread 将同步 invoke 跑在线程池中，避免阻塞事件循环。
+        压缩由 before_model 中间件自动触发，无需手动调用。
+        系统提示词通过 _update_system_prompt 动态更新，不重建 Graph。
         """
-        await self._acompact_if_needed()
         config = self._invoke_config()
         input_msg = HumanMessage(content=task)
 
-        await self._arebuild_agent_executor(task)
+        # 动态更新系统提示词（技能匹配），不重建 Graph
+        self._update_system_prompt(task)
 
         try:
             result = await asyncio.to_thread(
@@ -463,12 +550,15 @@ class AgentCore:
         return turn
 
     async def achat_structured(self, message: str) -> AgentTurnResult:
-        """异步对话（结构化入口）"""
-        await self._acompact_if_needed()
+        """异步对话（结构化入口）
+
+        压缩由 before_model 中间件自动触发，无需手动调用。
+        系统提示词通过 _update_system_prompt 动态更新，不重建 Graph。
+        """
         config = self._invoke_config()
 
         with self._temp_verbose(False):
-            await self._arebuild_agent_executor(message)
+            self._update_system_prompt(message)
             try:
                 result = await asyncio.to_thread(
                     self.agent_executor.invoke,
@@ -670,7 +760,8 @@ class AgentCore:
         """
         异步加载技能到当前会话
 
-        使用 _state_lock 保护 active_skills 和 agent_executor 的并发修改。
+        使用 _state_lock 保护 active_skills 的并发修改。
+        技能变化只需更新系统提示词，不重建 Graph。
 
         Args:
             name: 技能名(目录名或 frontmatter name)
@@ -682,14 +773,14 @@ class AgentCore:
             return False
         async with self._state_lock:
             self.active_skills.add(name)
-            await self._arebuild_agent_executor("")
+            self._update_system_prompt("")
         return True
 
     async def aclear_skills(self):
-        """异步清空手动加载的技能"""
+        """异步清空手动加载的技能（不重建 Graph）"""
         async with self._state_lock:
             self.active_skills.clear()
-            await self._arebuild_agent_executor("")
+            self._update_system_prompt("")
 
     def set_auto_match(self, enabled: bool):
         """开关任务自动匹配技能"""
@@ -711,83 +802,50 @@ class AgentCore:
 
     # ============ 长上下文裁剪 ============
 
-    async def _asummarize_messages(self, msgs: List[BaseMessage]) -> str:
-        """异步生成对话历史摘要（供 _acompact_if_needed 使用）
+    async def manually_compact(self) -> dict[str, Any] | None:
+        """手动触发一次上下文压缩（CLI 命令 compact 调用）
 
-        将 BaseMessage 列表格式化为文本，调用 LLM 异步接口生成中文摘要。
-
-        Args:
-            msgs: 待压缩的消息列表
+        与 before_model 中间件使用相同的压缩逻辑（增量摘要 + 工具输出 Prune），
+        但通过 aupdate_state 直接写入 checkpoint，不依赖 LangGraph 中间件上下文。
 
         Returns:
-            压缩后的中文摘要文本，失败时返回空字符串
+            {"summary": str, "messages_before": int, "messages_after": int} 或 None
         """
-        lines = []
-        for m in msgs:
-            if isinstance(m, HumanMessage):
-                role = "user"
-            elif isinstance(m, AIMessage):
-                role = "assistant"
-            elif isinstance(m, SystemMessage):
-                role = "system"
-            else:
-                role = "tool"
-            content = getattr(m, "content", "")
-            if isinstance(content, list):
-                content = " ".join(str(x) for x in content)
-            text = str(content).strip()
-            if text:
-                lines.append(f"{role}: {text}")
-        if not lines:
-            return ""
-        prompt = (
-            "请将以下对话历史压缩成一份简洁的中文摘要,保留关键决策、用户意图与事实,"
-            "按主题分条列出,不要添加推测内容:"
-        )
-        try:
-            summary = (await self.llm.achat([
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": "\n".join(lines)},
-            ])).strip()
-        except Exception:
-            summary = ""
-        if not summary and self.verbose:
-            print("[上下文摘要生成失败,跳过裁剪]")
-        return summary
-
-    async def _acompact_if_needed(self):
-        """异步执行上下文裁剪（阈值 <= 0 时自动跳过）
-
-        替代 _compact_if_needed() 的异步版本，避免在事件循环中调用
-        self.llm.chat() 同步阻塞。
-        """
-        max_ctx = getattr(self, "max_context_messages", 0)
-        if max_ctx <= 0:
-            return
         msgs = self.memory.get_messages()
-        if len(msgs) <= max_ctx:
-            return
+        if not msgs:
+            return None
 
-        trim_keep = getattr(self, "context_trim_keep", 12)
-        keep = min(trim_keep, max(len(msgs) - 1, 0))
-        old = msgs[:-keep] if keep > 0 else msgs
-        retained = msgs[-keep:] if keep > 0 else []
+        # 读取当前 state 中的已有摘要
+        config = self._invoke_config()
+        state = self.agent_executor.get_state(config)
+        existing_summary = ""
+        if state and state.values:
+            existing_summary = state.values.get("summary", "") or ""
 
-        summary = await self._asummarize_messages(old)
-        if not summary:
-            return
+        # 调用中间件的手动压缩接口
+        mw = getattr(self, "_compaction_middleware", None)
+        if mw is None:
+            return None
 
-        self.compaction_summary = summary
-        old_tid = self.memory.thread_id
-        self.memory.new_thread()
-        await self._arebuild_agent_executor("")
+        update = await mw.arun_compaction(msgs, existing_summary=existing_summary)
+        if update is None:
+            if self.verbose:
+                print("[压缩] 消息数未超阈值，无需压缩")
+            return None
 
-        if retained:
-            await asyncio.to_thread(
-                self.agent_executor.update_state,
-                self.memory.get_config(),
-                {"messages": retained},
-            )
+        messages_before = len(msgs)
+        # 通过 aupdate_state 写入压缩后的消息和摘要
+        await self.agent_executor.aupdate_state(config, update)
+        messages_after = len(update["messages"]) - 1  # 减去 RemoveMessage 标记
+
+        if self.verbose:
+            print(f"[压缩] {messages_before} → {messages_after} 条消息，摘要已更新")
+
+        return {
+            "summary": update["summary"],
+            "messages_before": messages_before,
+            "messages_after": messages_after,
+        }
 
     def get_available_tools(self) -> List[str]:
         """获取可用工具名称列表"""
@@ -795,7 +853,7 @@ class AgentCore:
 
     def get_execution_history(self) -> List[Dict[str, Any]]:
         """获取执行历史"""
-        return self.execution_history
+        return list(self.execution_history)
 
     def clear_history(self):
         """清空执行历史"""

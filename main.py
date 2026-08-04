@@ -67,7 +67,8 @@ def build_agent(provider: str, process_type: str = None) -> tuple[AgentCore, obj
         max_context_messages=config["max_context_messages"],
         context_trim_keep=config["context_trim_keep"],
         process_type=process_type,
-        agent_core_prompt=config["agent_core_prompt"]
+        agent_core_prompt=config["agent_core_prompt"],
+        max_execution_history=config.get("max_execution_history", 100),
     )
     return agent, llm
 
@@ -96,7 +97,7 @@ def make_context(agent: AgentCore) -> CommandContext:
 def main() -> None:
     """运行交互式命令行主循环。"""
     print("=" * 50)
-    print("  LangChain Agent (基于LangChain框架)")
+    print("  LC Agent (基于LangChain框架)")
     print("=" * 50)
     provider = select_provider(LLM_FILE, select_menu)
     agent, _ = build_agent(provider)

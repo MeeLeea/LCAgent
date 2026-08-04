@@ -65,6 +65,7 @@ DEFAULTS: dict[str, Any] = {
     "mcp_config_file": "config/mcp_servers.json",
     "max_context_messages": 0,
     "context_trim_keep": 12,
+    "max_execution_history": 100,
     "agent_prompt_file": "agent/AGENT.md",
     "provider": "zhipu",
     "model": None

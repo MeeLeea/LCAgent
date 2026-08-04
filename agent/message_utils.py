@@ -151,7 +151,7 @@ class StreamHandler:
     """流式事件处理器，通过组合方式注入 AgentCore。
 
     构造时接收 agent 引用，通过 agent 访问其 agent_executor、verbose
-    以及 _invoke_config、_create_agent_executor 等业务方法。
+    以及 _invoke_config、_update_system_prompt 等业务方法。
     提供 astream_chat / astream_resume 两个流式接口。
     """
 
@@ -264,6 +264,8 @@ class StreamHandler:
         """
         流式对话：异步生成事件字典，供 SSE 推送。
 
+        压缩由 before_model 中间件自动触发，无需手动调用。
+
         事件类型:
           {"type": "token", "content": str}                 # LLM 文本增量
           {"type": "tool_call", "id", "name", "args"}       # 工具调用开始
@@ -275,11 +277,9 @@ class StreamHandler:
 
         说明：checkpoint 会自动持久化整轮对话，故无需手动 memory.add。
         """
-        await self.agent._acompact_if_needed()
         config = self.agent._invoke_config()
-        self.agent.agent_executor = self.agent._create_agent_executor(
-            self.agent._compute_skill_block(message)
-        )
+        # 动态更新系统提示词（技能匹配），不重建 Graph
+        self.agent._update_system_prompt(message)
         input_msg = HumanMessage(content=message)
         original_verbose = self.agent.verbose
         self.agent.verbose = False

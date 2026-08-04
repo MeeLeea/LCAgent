@@ -9,73 +9,68 @@ from tools.terminal_tools import UserRejectedCommandError
 
 def test_compaction_retains_recent_messages_in_new_thread_state():
     # Given: the current thread has more messages than the compaction threshold.
+    # Updated: tests manually_compact (replaces old _acompact_if_needed)
     from agent.agent_core import AgentCore
-    from agent.memory import AgentMemory
+    from agent.compaction import CompactionConfig, LCAgentCompactionMiddleware
 
-    messages = [HumanMessage(content=f"message-{idx}") for idx in range(5)]
-    summarized_batches = []
+    messages = [HumanMessage(content=f"message-{idx}") for idx in range(8)]
     state_updates = []
 
     class FakeMemory:
         def __init__(self):
-            self.thread_id = "thread-before"
+            self.thread_id = "thread-test"
 
         def get_messages(self):
             return messages
-
-        def new_thread(self):
-            self.thread_id = "thread-after"
-            return self.thread_id
 
         def get_config(self):
             return {"configurable": {"thread_id": self.thread_id}}
 
-        maybe_compact = AgentMemory.maybe_compact
+    class FakeState:
+        values = {"summary": ""}
 
     class FakeExecutor:
-        def update_state(self, config, values):
+        def get_state(self, config):
+            return FakeState()
+
+        async def aupdate_state(self, config, values):
             state_updates.append((config, values))
 
     core = object.__new__(AgentCore)
     core.memory = FakeMemory()
-    core.max_context_messages = 3
+    core.max_context_messages = 5
     core.context_trim_keep = 2
-    core.compaction_summary = ""
     core.verbose = False
     core.agent_executor = FakeExecutor()
     core._state_lock = asyncio.Lock()
-    core._compute_skill_block = lambda task: ""
-    core._create_agent_executor = lambda skill_block="": core.agent_executor
+    core._invoke_config = lambda: {"configurable": {"thread_id": "thread-test"}}
 
-    async def _achat(messages):
-        summarized_batches.append(messages)
-        return "summary"
+    # Set up compaction middleware
+    class FakeModel:
+        async def ainvoke(self, prompt):
+            return SimpleNamespace(text="summary")
 
-    core.llm = SimpleNamespace(achat=_achat)
+    core._compaction_middleware = LCAgentCompactionMiddleware(
+        FakeModel(), CompactionConfig(max_messages=5, keep_recent=2)
+    )
 
-    # When: compaction runs.
-    asyncio.run(core._acompact_if_needed())
+    # When: manually_compact runs.
+    result = asyncio.run(core.manually_compact())
 
-    # Then: only older messages are summarized and retained messages seed the new thread.
-    assert len(summarized_batches) == 1
-    assert core.memory.thread_id == "thread-after"
-    assert core.compaction_summary == "summary"
-    assert state_updates == [
-        (
-            {"configurable": {"thread_id": "thread-after"}},
-            {"messages": messages[-2:]},
-        )
-    ]
+    # Then: compression succeeds with summary and message count
+    assert result is not None
+    assert result["summary"] == "summary"
+    assert result["messages_before"] == 8
+    assert len(state_updates) == 1
 
 
 def test_compaction_does_not_change_thread_when_summary_fails():
     # Given: compaction is needed but summarization returns no summary.
+    # Updated: tests manually_compact with LLM failure
     from agent.agent_core import AgentCore
-    from agent.memory import AgentMemory
+    from agent.compaction import CompactionConfig, LCAgentCompactionMiddleware
 
-    messages = [HumanMessage(content=f"message-{idx}") for idx in range(4)]
-    new_thread_calls = []
-    state_updates = []
+    messages = [HumanMessage(content=f"message-{idx}") for idx in range(8)]
 
     class FakeMemory:
         def __init__(self):
@@ -84,41 +79,41 @@ def test_compaction_does_not_change_thread_when_summary_fails():
         def get_messages(self):
             return messages
 
-        def new_thread(self):
-            new_thread_calls.append(True)
-            self.thread_id = "thread-after"
-            return self.thread_id
+        def get_config(self):
+            return {"configurable": {"thread_id": self.thread_id}}
 
-        maybe_compact = AgentMemory.maybe_compact
+    class FakeState:
+        values = {"summary": "existing"}
 
     class FakeExecutor:
-        def update_state(self, config, values):
-            state_updates.append((config, values))
+        def get_state(self, config):
+            return FakeState()
+
+        async def aupdate_state(self, config, values):
+            raise AssertionError("失败时不应更新状态")
 
     core = object.__new__(AgentCore)
     core.memory = FakeMemory()
-    core.max_context_messages = 3
+    core.max_context_messages = 5
     core.context_trim_keep = 2
-    core.compaction_summary = "existing"
     core.verbose = False
     core.agent_executor = FakeExecutor()
     core._state_lock = asyncio.Lock()
-    core._compute_skill_block = lambda task: ""
-    core._create_agent_executor = lambda skill_block="": core.agent_executor
+    core._invoke_config = lambda: {"configurable": {"thread_id": "thread-before"}}
 
-    async def _achat(messages):
-        return ""
+    class FailingModel:
+        async def ainvoke(self, prompt):
+            raise RuntimeError("LLM 不可用")
 
-    core.llm = SimpleNamespace(achat=_achat)
+    core._compaction_middleware = LCAgentCompactionMiddleware(
+        FailingModel(), CompactionConfig(max_messages=5, keep_recent=2)
+    )
 
-    # When: compaction runs.
-    asyncio.run(core._acompact_if_needed())
+    # When: manually_compact runs with failing LLM.
+    result = asyncio.run(core.manually_compact())
 
-    # Then: failed summary leaves the active thread and state untouched.
-    assert core.memory.thread_id == "thread-before"
-    assert core.compaction_summary == "existing"
-    assert new_thread_calls == []
-    assert state_updates == []
+    # Then: failed summary returns None, state untouched.
+    assert result is None
 
 
 def test_record_tool_steps_deduplicates_full_history_and_maps_observations():
@@ -223,12 +218,9 @@ def test_arun_stops_after_user_rejects_command(monkeypatch):
     core.verbose = False
     core.execution_history = []
     core._state_lock = asyncio.Lock()
-    async def _skip_compaction():
-        return None
-
-    core._acompact_if_needed = _skip_compaction
+    core.agent_core_prompt = "test prompt"
     core._compute_skill_block = lambda task: ""
-    core._create_agent_executor = lambda skill_block="": executor
+    core.agent_executor = executor
 
     # When: 当前任务尝试执行被拒绝的命令。
     turn = asyncio.run(core.arun_structured("commit changes"))
@@ -307,7 +299,7 @@ def test_arun_repairs_checkpoint_after_user_rejects_command():
         def get_state(self, config):
             return state
 
-        def update_state(self, config, values, as_node=None):
+        async def aupdate_state(self, config, values, as_node=None):
             updates.append((config, values, as_node))
 
     executor = RejectingExecutor()
@@ -317,12 +309,9 @@ def test_arun_repairs_checkpoint_after_user_rejects_command():
     core.verbose = False
     core.execution_history = []
     core._state_lock = asyncio.Lock()
-    async def _skip_compaction():
-        return None
-
-    core._acompact_if_needed = _skip_compaction
+    core.agent_core_prompt = "test prompt"
     core._compute_skill_block = lambda task: ""
-    core._create_agent_executor = lambda skill_block="": executor
+    core.agent_executor = executor
 
     # When: 拒绝信号终止当前 turn。
     turn = asyncio.run(core.arun_structured("commit changes"))

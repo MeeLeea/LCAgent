@@ -508,18 +508,14 @@ def test_resume_after_switching_thread_is_rejected():
                 return {"__interrupt__": [Interrupt(value={"kind": "human_choice"}, id="i-1")]}
             return {"messages": [AIMessage(content="should not resume")]} 
 
-    async def no_compact() -> None:
-        return None
-
     core = object.__new__(AgentCore)
     core.memory = FakeMemory()
     core.agent_executor = FakeExecutor()
     core.max_iterations = 25
     core.verbose = False
     core.execution_history = []
-    core._acompact_if_needed = no_compact
+    core.agent_core_prompt = "test prompt"
     core._compute_skill_block = lambda task: ""
-    core._create_agent_executor = lambda skill_block="": core.agent_executor
     core._state_lock = asyncio.Lock()
 
     # When: the run interrupts and the current thread is switched before resume.
@@ -555,18 +551,14 @@ def test_interrupted_run_records_final_important_assistant_memory_after_resume()
                 return {"__interrupt__": [Interrupt(value={"kind": "human_choice"}, id="i-1")]}
             return {"messages": [AIMessage(content="approved result")]} 
 
-    async def no_compact() -> None:
-        return None
-
     core = object.__new__(AgentCore)
     core.memory = FakeMemory()
     core.agent_executor = FakeExecutor()
     core.max_iterations = 25
     core.verbose = False
     core.execution_history = []
-    core._acompact_if_needed = no_compact
+    core.agent_core_prompt = "test prompt"
     core._compute_skill_block = lambda task: ""
-    core._create_agent_executor = lambda skill_block="": core.agent_executor
     core._state_lock = asyncio.Lock()
 
     # When: run interrupts and then completes after resume.
