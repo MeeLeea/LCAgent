@@ -50,6 +50,7 @@ def mock_agent():
     agent.memory.workflow_name_of = MagicMock(return_value=None)
     agent.get_available_tools = MagicMock(return_value=["calculator", "web_search", "ask_human"])
     agent.switch_llm = MagicMock()
+    agent.aswitch_llm = AsyncMock(side_effect=agent.switch_llm)
     
     # Mock astream_chat：普通对话返回 token + done 事件
     async def mock_astream_chat(message: str) -> AsyncIterator[Dict[str, Any]]:
