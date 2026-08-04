@@ -39,6 +39,9 @@ class FakeAgent:
         self.calls.append(("switch_llm", llm))
         self.llm = llm
 
+    async def aswitch_llm(self, llm: Any) -> None:
+        self.switch_llm(llm)
+
     def get_memory_summary(self) -> dict[str, Any]:
         self.calls.append(("get_memory_summary", None))
         return {
@@ -54,6 +57,9 @@ class FakeAgent:
         self.calls.append(("reload_mcp_tools", None))
         return 4
 
+    async def areload_mcp_tools(self) -> int:
+        return self.reload_mcp_tools()
+
     def list_skills(self) -> list[dict[str, str]]:
         self.calls.append(("list_skills", None))
         return [{"name": "git-commit", "description": "commit helper"}]
@@ -61,6 +67,15 @@ class FakeAgent:
     def load_skill(self, name: str) -> bool:
         self.calls.append(("load_skill", name))
         return True
+
+    async def aclear_skills(self) -> None:
+        self.calls.append(("clear_skills", None))
+
+    def clear_skills(self) -> None:
+        self.calls.append(("clear_skills", None))
+
+    async def aload_skill(self, name: str) -> bool:
+        return self.load_skill(name)
 
     def cot(self, task: str) -> str:
         self.calls.append(("cot", task))

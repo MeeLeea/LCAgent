@@ -1,5 +1,6 @@
 import importlib
 import os
+import asyncio  # noqa: ANYIO_OK
 import sys
 from types import SimpleNamespace
 from typing import TypedDict
@@ -134,13 +135,18 @@ def test_resume_structured_invokes_command_resume_with_same_thread_config():
             calls.append((command, config))
             return {"messages": [AIMessage(content="resumed")]} 
 
+    async def no_compact() -> None:
+        return None
+
     core = object.__new__(AgentCore)
     core.agent_executor = FakeExecutor()
     core.memory = SimpleNamespace(get_config=lambda: {"configurable": {"thread_id": "thread-123"}})
     core.max_iterations = 25
+    core._state_lock = asyncio.Lock()
+    core._acompact_if_needed = no_compact
 
     # When: a structured resume payload is sent.
-    turn = core.resume_structured({"choice_id": "approve"})
+    turn = asyncio.run(core.aresume_structured({"choice_id": "approve"}))
 
     # Then: Command(resume=...) uses the same thread config plus recursion limit.
     assert turn.status == "completed"
@@ -167,11 +173,11 @@ def test_cli_helper_renders_and_resumes_until_completion():
         def __init__(self):
             self.resume_count = 0
 
-        def chat_structured(self, message):
+        async def achat_structured(self, message):
             assert message == "start"
             return SimpleNamespace(status="interrupted", output=None, interrupts=[interrupts[0]])
 
-        def resume_structured(self, payload):
+        async def aresume_structured(self, payload):
             resume_requests.append(payload)
             self.resume_count += 1
             if self.resume_count == 1:
@@ -445,11 +451,11 @@ def test_cli_helper_collects_simultaneous_interrupts_before_one_resume():
     resume_payloads = []
 
     class FakeAgent:
-        def chat_structured(self, message):
+        async def achat_structured(self, message):
             assert message == "start"
             return SimpleNamespace(status="interrupted", output=None, interrupts=interrupts)
 
-        def resume_structured(self, payload):
+        async def aresume_structured(self, payload):
             resume_payloads.append(payload)
             return SimpleNamespace(status="completed", output="done", interrupts=[])
 
@@ -502,24 +508,28 @@ def test_resume_after_switching_thread_is_rejected():
                 return {"__interrupt__": [Interrupt(value={"kind": "human_choice"}, id="i-1")]}
             return {"messages": [AIMessage(content="should not resume")]} 
 
+    async def no_compact() -> None:
+        return None
+
     core = object.__new__(AgentCore)
     core.memory = FakeMemory()
     core.agent_executor = FakeExecutor()
     core.max_iterations = 25
     core.verbose = False
     core.execution_history = []
-    core._compact_if_needed = lambda: None
+    core._acompact_if_needed = no_compact
     core._compute_skill_block = lambda task: ""
     core._create_agent_executor = lambda skill_block="": core.agent_executor
+    core._state_lock = asyncio.Lock()
 
     # When: the run interrupts and the current thread is switched before resume.
-    turn = core.run_structured("needs approval")
+    turn = asyncio.run(core.arun_structured("needs approval"))
     core.memory.thread_id = "thread-after"
 
     # Then: resume is rejected instead of resuming against the wrong thread.
     assert turn.status == "interrupted"
     with pytest.raises(ValueError, match="thread"):
-        core.resume_structured({"choice_id": "approve"})
+        asyncio.run(core.aresume_structured({"choice_id": "approve"}))
 
 
 def test_interrupted_run_records_final_important_assistant_memory_after_resume():
@@ -543,7 +553,10 @@ def test_interrupted_run_records_final_important_assistant_memory_after_resume()
             self.calls += 1
             if self.calls == 1:
                 return {"__interrupt__": [Interrupt(value={"kind": "human_choice"}, id="i-1")]}
-            return {"messages": [AIMessage(content="approved result")]}
+            return {"messages": [AIMessage(content="approved result")]} 
+
+    async def no_compact() -> None:
+        return None
 
     core = object.__new__(AgentCore)
     core.memory = FakeMemory()
@@ -551,13 +564,14 @@ def test_interrupted_run_records_final_important_assistant_memory_after_resume()
     core.max_iterations = 25
     core.verbose = False
     core.execution_history = []
-    core._compact_if_needed = lambda: None
+    core._acompact_if_needed = no_compact
     core._compute_skill_block = lambda task: ""
     core._create_agent_executor = lambda skill_block="": core.agent_executor
+    core._state_lock = asyncio.Lock()
 
     # When: run interrupts and then completes after resume.
-    interrupted = core.run_structured("needs approval")
-    completed = core.resume_structured({"choice_id": "approve"})
+    interrupted = asyncio.run(core.arun_structured("needs approval"))
+    completed = asyncio.run(core.aresume_structured({"choice_id": "approve"}))
 
     # Then: the final assistant output is saved as important memory after completion.
     assert interrupted.status == "interrupted"
@@ -571,11 +585,17 @@ def test_legacy_run_and_chat_raise_on_interrupt_instead_of_empty_string():
 
     interrupted = SimpleNamespace(status="interrupted", output=None, interrupts=[Interrupt(value={}, id="i-1")])
     core = object.__new__(AgentCore)
-    core.run_structured = lambda task: interrupted
-    core.chat_structured = lambda message: interrupted
+    async def arun_structured(task):
+        return interrupted
+
+    async def achat_structured(message):
+        return interrupted
+
+    core.arun_structured = arun_structured
+    core.achat_structured = achat_structured
 
     # When / Then: callers get an explicit error instead of an empty string.
     with pytest.raises(RuntimeError, match="interrupt"):
-        core.run("needs approval")
+        asyncio.run(core.arun("needs approval"))
     with pytest.raises(RuntimeError, match="interrupt"):
-        core.chat("needs approval")
+        asyncio.run(core.achat("needs approval"))

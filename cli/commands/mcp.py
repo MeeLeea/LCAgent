@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from .types import CommandContext, CommandOutcome, HANDLED
 
 
@@ -27,7 +29,7 @@ def show_mcp(context: CommandContext) -> CommandOutcome:
 
 def reload_mcp(context: CommandContext) -> CommandOutcome:
     context.print("\n重新加载 MCP 工具...")
-    count = context.agent.reload_mcp_tools()
+    count = asyncio.run(context.agent.areload_mcp_tools())
     context.print(f"完成: 已加载 {count} 个 MCP 工具")
     return HANDLED
 
@@ -70,7 +72,7 @@ def add_mcp(context: CommandContext, user_input: str) -> CommandOutcome:
                 config_file=context.mcp_config_file,
             )
             context.print(f"\n已添加 stdio MCP Server: {name}")
-        count = context.agent.reload_mcp_tools()
+        count = asyncio.run(context.agent.areload_mcp_tools())
         context.print(f"已加载 {count} 个 MCP 工具")
     except (OSError, RuntimeError, ValueError) as error:
         context.print(f"\n添加失败: {error}")
@@ -88,7 +90,7 @@ def remove_mcp(context: CommandContext, user_input: str) -> CommandOutcome:
     name = parts[1].strip()
     if backend.remove_server(name, context.mcp_config_file):
         context.print(f"\n已删除 MCP Server: {name}")
-        count = context.agent.reload_mcp_tools()
+        count = asyncio.run(context.agent.areload_mcp_tools())
         context.print(f"已加载 {count} 个 MCP 工具")
     else:
         context.print(f"\n未找到: {name}")
@@ -108,7 +110,7 @@ def toggle_mcp(context: CommandContext, user_input: str) -> CommandOutcome:
     if backend.toggle_server(name, enabled, context.mcp_config_file):
         state = "启用" if enabled else "禁用"
         context.print(f"\n已{state} MCP Server: {name}")
-        count = context.agent.reload_mcp_tools()
+        count = asyncio.run(context.agent.areload_mcp_tools())
         context.print(f"已加载 {count} 个 MCP 工具")
     else:
         context.print(f"\n未找到: {name}")
