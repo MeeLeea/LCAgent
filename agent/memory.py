@@ -18,6 +18,8 @@ import logging
 import sqlite3
 import tempfile
 import uuid
+import asyncio
+import aiosqlite
 from contextlib import closing
 from typing import Callable, List, Dict, Any, Optional, Tuple
 from datetime import datetime
@@ -30,7 +32,7 @@ from langchain_core.messages import (
     BaseMessage,
 )
 from langgraph.checkpoint.base import BaseCheckpointSaver
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.checkpoint.memory import MemorySaver
 
 logger = logging.getLogger(__name__)
@@ -184,16 +186,19 @@ class AgentMemory:
     # ============ Checkpointer 管理 ============
 
     def _init_checkpointer(self) -> BaseCheckpointSaver:
-        """初始化 checkpointer"""
+        """初始化 checkpointer（使用 AsyncSqliteSaver 支持异步调用）"""
         if self.use_sqlite:
             parent = os.path.dirname(os.path.abspath(self.checkpoint_file))
             if parent:
                 os.makedirs(parent, exist_ok=True)
-            conn = sqlite3.connect(self.checkpoint_file, check_same_thread=False, timeout=10)
-            # 启用 WAL 模式 + 忙等待：多进程(server/scheduler/remote)并发读写更友好
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=10000")
-            return SqliteSaver(conn)
+
+            async def _create_async_saver() -> AsyncSqliteSaver:
+                conn = await aiosqlite.connect(self.checkpoint_file)
+                await conn.execute("PRAGMA journal_mode=WAL")
+                await conn.execute("PRAGMA busy_timeout=10000")
+                return AsyncSqliteSaver(conn)
+
+            return asyncio.run(_create_async_saver())
         else:
             return MemorySaver()
 
@@ -212,7 +217,7 @@ class AgentMemory:
         return conn
 
     def close(self) -> None:
-        """关闭 checkpointer 持有的 SQLite 连接。
+        """关闭 checkpointer 持有的 SQLite 连接（同步入口，内部用 asyncio.run）。
 
         sqlite3 的 connection 上下文管理器只提交事务、不关闭连接,
         因此长驻连接必须显式关闭,否则 WAL 无法回收、Windows 上文件也删不掉。
@@ -221,8 +226,8 @@ class AgentMemory:
         if conn is None:
             return
         try:
-            conn.close()
-        except sqlite3.Error as error:
+            asyncio.run(conn.close())
+        except Exception as error:
             logger.warning("关闭 checkpoint 连接失败: %s", error)
 
     def __enter__(self) -> "AgentMemory":
