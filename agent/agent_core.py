@@ -131,7 +131,7 @@ class AgentCore:
 
         # 启动时加载 MCP 工具
         if enable_mcp:
-            self.reload_mcp_tools()
+            asyncio.run(self.areload_mcp_tools())
 
         # 创建Agent
         self.agent_executor = self._create_agent_executor()
@@ -145,23 +145,6 @@ class AgentCore:
 
         # 异步互斥锁：保护 tools / mcp_tools / agent_executor / active_skills 等共享状态
         self._state_lock = asyncio.Lock()
-
-    def reload_mcp_tools(self) -> int:
-        """
-        重新加载 MCP 工具(同步兼容壳，已废弃)
-
-        业务代码请使用 areload_mcp_tools() 异步方法。
-
-        Returns:
-            加载到的 MCP 工具数量
-        """
-        import warnings
-        warnings.warn(
-            "reload_mcp_tools() 已废弃，请使用 areload_mcp_tools()",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return asyncio.run(self.areload_mcp_tools())
 
     async def areload_mcp_tools(self) -> int:
         """
@@ -210,17 +193,6 @@ class AgentCore:
         )
         return agent
 
-    def _rebuild_agent_executor(self, task: str = "") -> None:
-        """统一的 Agent 重建入口（同步，已废弃，请使用 _arebuild_agent_executor）
-
-        根据当前技能状态和任务内容重新创建 agent_executor。
-
-        Args:
-            task: 任务描述，用于自动匹配技能（为空时不自动匹配）
-        """
-        skill_block = self._compute_skill_block(task)
-        self.agent_executor = self._create_agent_executor(skill_block)
-
     async def _arebuild_agent_executor(self, task: str = "") -> None:
         """统一的 Agent 异步重建入口
 
@@ -233,21 +205,6 @@ class AgentCore:
         async with self._state_lock:
             skill_block = self._compute_skill_block(task)
             self.agent_executor = self._create_agent_executor(skill_block)
-
-    def _handle_rejected_command(self, config: Dict[str, Any]) -> AgentTurnResult:
-        """处理用户拒绝执行危险命令的情况
-
-        当工具调用被用户拒绝时，修复 checkpoint 状态并返回取消结果。
-
-        Args:
-            config: LangGraph 配置对象
-
-        Returns:
-            状态为 'cancelled' 的 AgentTurnResult
-        """
-        self._repair_rejected_tool_calls(config)
-        self._clear_pending_interrupt()
-        return AgentTurnResult.cancelled("用户已拒绝执行危险命令，当前任务已取消。")
 
     def _handle_turn_completion(
         self,
@@ -504,28 +461,6 @@ class AgentCore:
 
         return turn
 
-    def run_structured(self, task: str) -> AgentTurnResult:
-        """同步执行任务（保留原实现，新代码请使用 arun_structured）"""
-        self._compact_if_needed()
-        config = self._invoke_config()
-        input_msg = HumanMessage(content=task)
-
-        self._rebuild_agent_executor(task)
-
-        try:
-            result = self.agent_executor.invoke(
-                {"messages": [input_msg]},
-                config=config
-            )
-        except UserRejectedCommandError:
-            return self._handle_rejected_command(config)
-
-        self._record_tool_steps(result.get("messages", []), input_msg)
-        turn = self._parse_turn_result(result)
-        self._handle_turn_completion(turn, config, "run", task, important=True)
-
-        return turn
-
     async def achat_structured(self, message: str) -> AgentTurnResult:
         """异步对话（结构化入口）"""
         await self._acompact_if_needed()
@@ -541,26 +476,6 @@ class AgentCore:
                 )
             except UserRejectedCommandError:
                 return await self._ahandle_rejected_command(config)
-
-        turn = self._parse_turn_result(result)
-        self._handle_turn_completion(turn, config, "chat", message)
-
-        return turn
-
-    def chat_structured(self, message: str) -> AgentTurnResult:
-        """同步对话（保留原实现，新代码请使用 achat_structured）"""
-        self._compact_if_needed()
-        config = self._invoke_config()
-
-        with self._temp_verbose(False):
-            self._rebuild_agent_executor(message)
-            try:
-                result = self.agent_executor.invoke(
-                    {"messages": [HumanMessage(content=message)]},
-                    config=config
-                )
-            except UserRejectedCommandError:
-                return self._handle_rejected_command(config)
 
         turn = self._parse_turn_result(result)
         self._handle_turn_completion(turn, config, "chat", message)
@@ -600,39 +515,7 @@ class AgentCore:
 
         return turn
 
-    def resume_structured(self, payload: Dict[str, Any]) -> AgentTurnResult:
-        """同步恢复中断会话（保留原实现，新代码请使用 aresume_structured）"""
-        config = self._invoke_config()
-        pending_thread_id = getattr(self, "_pending_interrupt_thread_id", None)
-        current_thread_id = self._thread_id_from_config(config)
-
-        if pending_thread_id is not None and current_thread_id != pending_thread_id:
-            raise ValueError("Cannot resume interrupt on a different thread")
-
-        try:
-            result = self.agent_executor.invoke(
-                Command(resume=payload),
-                config=config
-            )
-        except UserRejectedCommandError:
-            return self._handle_rejected_command(config)
-
-        turn = self._parse_turn_result(result)
-
-        if turn.is_interrupted:
-            self._capture_pending_interrupt(
-                config,
-                getattr(self, "_pending_interrupt_mode", "chat")
-            )
-        elif turn.is_completed:
-            mode = getattr(self, "_pending_interrupt_mode", None)
-            self._clear_pending_interrupt()
-            if mode == "run" and turn.output:
-                self.memory.add("assistant", turn.output, {"important": True})
-
-        return turn
-
-    # ============ 流式接口（委托给 StreamHandler） ============
+# ============ 流式接口（委托给 StreamHandler） ============
 
     async def astream_chat(self, message: str):
         """流式对话，委托给 self.stream。事件格式见 StreamHandler.astream_chat。"""
@@ -677,38 +560,6 @@ class AgentCore:
             print(f"\n错误: {error_msg}")
             return error_msg
 
-    def run(self, task: str) -> str:
-        """
-        使用Agent执行任务（自动决定是否调用工具）
-
-        Args:
-            task: 任务描述
-
-        Returns:
-            执行结果
-        """
-        print(f"\n{'='*50}")
-        print(f"开始执行任务: {task}")
-        print(f"{'='*50}\n")
-
-        try:
-            turn = self.run_structured(task)
-            self._check_and_raise_if_interrupted(turn)
-            output = turn.output or ""
-            print(f"\n最终答案: {output}")
-            return output
-
-        except RuntimeError as e:
-            if "interrupt" in str(e):
-                raise
-            error_msg = f"任务执行失败: {str(e)}"
-            print(f"\n错误: {error_msg}")
-            return error_msg
-        except Exception as e:
-            error_msg = f"任务执行失败: {str(e)}"
-            print(f"\n错误: {error_msg}")
-            return error_msg
-
     async def achat(self, message: str) -> str:
         """
         异步对话模式（推荐使用）
@@ -727,33 +578,6 @@ class AgentCore:
             if "interrupt" in str(e):
                 raise
             return self._fallback_chat(message)
-        except Exception as e:
-            if e.__class__.__name__ in {"GraphInterrupt", "NodeInterrupt"}:
-                raise
-            return self._fallback_chat(message)
-
-    def chat(self, message: str) -> str:
-        """
-        普通对话模式（也通过Agent执行，自动判断是否调用工具）
-
-        与 run() 的区别：不打印步骤详情，不强制存入长期记忆。
-
-        Args:
-            message: 用户消息
-
-        Returns:
-            助手回复
-        """
-        try:
-            turn = self.chat_structured(message)
-            self._check_and_raise_if_interrupted(turn)
-            return turn.output or ""
-
-        except RuntimeError as e:
-            if "interrupt" in str(e):
-                raise
-            return self._fallback_chat(message)
-
         except Exception as e:
             if e.__class__.__name__ in {"GraphInterrupt", "NodeInterrupt"}:
                 raise
@@ -822,16 +646,6 @@ class AgentCore:
 
         return response
 
-    def switch_llm(self, llm_client: LLMClient):
-        """
-        切换LLM提供商
-
-        Args:
-            llm_client: 新的LLM客户端实例
-        """
-        self.llm = llm_client
-        self._rebuild_agent_executor("")
-
     async def aswitch_llm(self, llm_client: LLMClient):
         """
         异步切换LLM提供商
@@ -851,22 +665,6 @@ class AgentCore:
         """列出所有本地可用技能"""
         return self.skill_manager.list_skills()
 
-    def load_skill(self, name: str) -> bool:
-        """
-        手动将某技能加载进当前会话(注入后续 system prompt)
-
-        Args:
-            name: 技能名(目录名或 frontmatter name)
-
-        Returns:
-            True=成功加载, False=技能不存在
-        """
-        if self.skill_manager.get_skill(name) is None:
-            return False
-        self.active_skills.add(name)
-        self._rebuild_agent_executor("")
-        return True
-
     async def aload_skill(self, name: str) -> bool:
         """
         异步加载技能到当前会话
@@ -885,11 +683,6 @@ class AgentCore:
             self.active_skills.add(name)
             await self._arebuild_agent_executor("")
         return True
-
-    def clear_skills(self):
-        """清空手动加载的技能"""
-        self.active_skills.clear()
-        self._rebuild_agent_executor("")
 
     async def aclear_skills(self):
         """异步清空手动加载的技能"""
@@ -994,55 +787,6 @@ class AgentCore:
                 self.memory.get_config(),
                 {"messages": retained},
             )
-
-    def _compact_if_needed(self):
-        """调用 memory.maybe_compact 执行上下文裁剪(阈值 <= 0 时自动跳过)。"""
-        def _summarize_messages(msgs: List[BaseMessage]) -> str:
-            lines = []
-            for m in msgs:
-                if isinstance(m, HumanMessage):
-                    role = "user"
-                elif isinstance(m, AIMessage):
-                    role = "assistant"
-                elif isinstance(m, SystemMessage):
-                    role = "system"
-                else:
-                    role = "tool"
-                content = getattr(m, "content", "")
-                if isinstance(content, list):
-                    content = " ".join(str(x) for x in content)
-                text = str(content).strip()
-                if text:
-                    lines.append(f"{role}: {text}")
-            if not lines:
-                return ""
-            prompt = (
-                "请将以下对话历史压缩成一份简洁的中文摘要,保留关键决策、用户意图与事实,"
-                "按主题分条列出,不要添加推测内容:"
-            )
-            try:
-                summary = self.llm.chat([
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": "\n".join(lines)},
-                ]).strip()
-            except Exception:
-                summary = ""
-            if not summary and self.verbose:
-                print("[上下文摘要生成失败,跳过裁剪]")
-            return summary
-
-        def _recreate(summary: str):
-            self.compaction_summary = summary
-            self._rebuild_agent_executor("")
-            return self.agent_executor
-
-        self.memory.maybe_compact(
-            max_context_messages=self.max_context_messages,
-            context_trim_keep=self.context_trim_keep,
-            summarize_callback=_summarize_messages,
-            recreate_agent_callback=_recreate,
-            verbose=self.verbose,
-        )
 
     def get_available_tools(self) -> List[str]:
         """获取可用工具名称列表"""

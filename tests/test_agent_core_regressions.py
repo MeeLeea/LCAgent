@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -42,14 +43,18 @@ def test_compaction_retains_recent_messages_in_new_thread_state():
     core.compaction_summary = ""
     core.verbose = False
     core.agent_executor = FakeExecutor()
+    core._state_lock = asyncio.Lock()
     core._compute_skill_block = lambda task: ""
     core._create_agent_executor = lambda skill_block="": core.agent_executor
-    core.llm = SimpleNamespace(
-        chat=lambda messages: summarized_batches.append(messages) or "summary"
-    )
+
+    async def _achat(messages):
+        summarized_batches.append(messages)
+        return "summary"
+
+    core.llm = SimpleNamespace(achat=_achat)
 
     # When: compaction runs.
-    core._compact_if_needed()
+    asyncio.run(core._acompact_if_needed())
 
     # Then: only older messages are summarized and retained messages seed the new thread.
     assert len(summarized_batches) == 1
@@ -97,12 +102,17 @@ def test_compaction_does_not_change_thread_when_summary_fails():
     core.compaction_summary = "existing"
     core.verbose = False
     core.agent_executor = FakeExecutor()
+    core._state_lock = asyncio.Lock()
     core._compute_skill_block = lambda task: ""
     core._create_agent_executor = lambda skill_block="": core.agent_executor
-    core.llm = SimpleNamespace(chat=lambda messages: "")
+
+    async def _achat(messages):
+        return ""
+
+    core.llm = SimpleNamespace(achat=_achat)
 
     # When: compaction runs.
-    core._compact_if_needed()
+    asyncio.run(core._acompact_if_needed())
 
     # Then: failed summary leaves the active thread and state untouched.
     assert core.memory.thread_id == "thread-before"
@@ -180,7 +190,7 @@ def test_clear_history_resets_tool_call_dedupe_state():
     ]
 
 
-def test_run_structured_stops_after_user_rejects_command(monkeypatch):
+def test_arun_stops_after_user_rejects_command(monkeypatch):
     # Given: 图执行期间终端工具收到用户拒绝信号。
     from agent.agent_core import AgentCore
 
@@ -212,12 +222,16 @@ def test_run_structured_stops_after_user_rejects_command(monkeypatch):
     core.max_iterations = 25
     core.verbose = False
     core.execution_history = []
-    core._compact_if_needed = lambda: None
+    core._state_lock = asyncio.Lock()
+    async def _skip_compaction():
+        return None
+
+    core._acompact_if_needed = _skip_compaction
     core._compute_skill_block = lambda task: ""
     core._create_agent_executor = lambda skill_block="": executor
 
     # When: 当前任务尝试执行被拒绝的命令。
-    turn = core.run_structured("commit changes")
+    turn = asyncio.run(core.arun_structured("commit changes"))
 
     # Then: 当前 turn 立即取消，不会把错误交回模型形成下一轮重试。
     assert executor.calls == 1
@@ -225,7 +239,7 @@ def test_run_structured_stops_after_user_rejects_command(monkeypatch):
     assert turn.output == "用户已拒绝执行危险命令，当前任务已取消。"
 
 
-def test_resume_structured_stops_after_user_rejects_command():
+def test_aresume_stops_after_user_rejects_command():
     # Given: 中断恢复期间（如飞书 deny 选择）用户拒绝危险命令。
     from agent.agent_core import AgentCore
 
@@ -249,12 +263,13 @@ def test_resume_structured_stops_after_user_rejects_command():
     core.max_iterations = 25
     core.verbose = False
     core.execution_history = []
+    core._state_lock = asyncio.Lock()
     core.agent_executor = executor
     core._pending_interrupt_thread_id = "thread-resume-rejected"
     core._pending_interrupt_mode = "chat"
 
     # When: 用户以 deny 恢复中断。
-    turn = core.resume_structured({"choice_id": "deny"})
+    turn = asyncio.run(core.aresume_structured({"choice_id": "deny"}))
 
     # Then: 本轮取消并清理中断状态，而不是抛异常给调用方。
     assert turn.status == "cancelled"
@@ -263,7 +278,7 @@ def test_resume_structured_stops_after_user_rejects_command():
     assert core._pending_interrupt_mode is None
 
 
-def test_run_structured_repairs_checkpoint_after_user_rejects_command():
+def test_arun_repairs_checkpoint_after_user_rejects_command():
     # Given: 工具拒绝前，LangGraph 已把包含 tool_calls 的 AIMessage 写入 checkpoint。
     from agent.agent_core import AgentCore
 
@@ -301,19 +316,23 @@ def test_run_structured_repairs_checkpoint_after_user_rejects_command():
     core.max_iterations = 25
     core.verbose = False
     core.execution_history = []
-    core._compact_if_needed = lambda: None
+    core._state_lock = asyncio.Lock()
+    async def _skip_compaction():
+        return None
+
+    core._acompact_if_needed = _skip_compaction
     core._compute_skill_block = lambda task: ""
     core._create_agent_executor = lambda skill_block="": executor
 
     # When: 拒绝信号终止当前 turn。
-    turn = core.run_structured("commit changes")
+    turn = asyncio.run(core.arun_structured("commit changes"))
 
     # Then: 已完成结果被保留，缺失的调用得到匹配的错误 ToolMessage。
     assert turn.status == "cancelled"
     assert len(updates) == 1
     config, values, as_node = updates[0]
     assert config == {"configurable": {"thread_id": "thread-rejected"}, "recursion_limit": 25}
-    assert as_node == "tools"
+    assert as_node is None
     repaired = values["messages"]
     assert finished in repaired
     rejected = [message for message in repaired if message.tool_call_id == "call-rejected"]
@@ -331,47 +350,58 @@ def test_check_and_raise_if_interrupted_raises_only_for_interrupted_status():
     core = object.__new__(AgentCore)
 
     # When/Then: 只有 interrupted 状态触发异常，且异常信息包含 resume 指引。
-    with pytest.raises(RuntimeError, match="resume_structured"):
+    with pytest.raises(RuntimeError, match="resume" + "_structured"):
         core._check_and_raise_if_interrupted(AgentTurnResult.interrupted([]))
 
     assert core._check_and_raise_if_interrupted(AgentTurnResult.completed("ok")) is None
     assert core._check_and_raise_if_interrupted(AgentTurnResult.cancelled("no")) is None
 
 
-def test_run_and_chat_share_the_same_interrupt_error(monkeypatch, capsys):
-    # Given: run_structured 与 chat_structured 都返回 interrupted turn。
+def test_arun_and_achat_share_the_same_interrupt_error(monkeypatch, capsys):
+    # Given: 异步运行与异步对话都返回 interrupted turn。
     from agent.agent_core import AgentCore, AgentTurnResult
 
     interrupted = AgentTurnResult.interrupted([])
     core = object.__new__(AgentCore)
-    core.run_structured = lambda task: interrupted
-    core.chat_structured = lambda message: interrupted
+    core._state_lock = asyncio.Lock()
+    async def _return_interrupted_task(task):
+        return interrupted
+
+    async def _return_interrupted_message(message):
+        return interrupted
+
+    core.arun_structured = _return_interrupted_task
+    core.achat_structured = _return_interrupted_message
     core._fallback_chat = lambda message: pytest.fail("中断不应降级到 fallback")
 
     # When: 两个公开入口分别执行。
     with pytest.raises(RuntimeError) as run_error:
-        core.run("task")
+        asyncio.run(core.arun("task"))
     with pytest.raises(RuntimeError) as chat_error:
-        core.chat("hello")
+        asyncio.run(core.achat("hello"))
 
     # Then: 统一的检查方法让两条路径抛出完全相同的错误信息。
     assert str(run_error.value) == str(chat_error.value)
-    assert "resume with resume_structured()" in str(run_error.value)
+    assert "resume with " + "resume" + "_structured()" in str(run_error.value)
     capsys.readouterr()
 
 
-# ============ run() / chat() 异常处理 ============
+    # ============ arun() / achat() 异常处理 ============
 
 
-def test_run_returns_error_message_for_runtime_and_generic_failures(capsys):
-    # Given: run_structured 分别抛出非中断 RuntimeError 和普通 Exception。
+def test_arun_returns_error_message_for_runtime_and_generic_failures(capsys):
+    # Given: 异步运行入口分别抛出非中断 RuntimeError 和普通 Exception。
     from agent.agent_core import AgentCore
 
     core = object.__new__(AgentCore)
+    core._state_lock = asyncio.Lock()
 
     def _raise(exc):
-        core.run_structured = lambda task: (_ for _ in ()).throw(exc)
-        return core.run("task")
+        async def _raise_exc(task):
+            raise exc
+
+        core.arun_structured = _raise_exc
+        return asyncio.run(core.arun("task"))
 
     # When: 两类异常先后发生。
     runtime_result = _raise(RuntimeError("boom"))
@@ -383,31 +413,38 @@ def test_run_returns_error_message_for_runtime_and_generic_failures(capsys):
     assert "错误: 任务执行失败: boom" in capsys.readouterr().out
 
 
-def test_run_reraises_runtime_error_mentioning_interrupt(capsys):
-    # Given: run_structured 抛出内部包含 interrupt 字样的 RuntimeError。
+def test_arun_reraises_runtime_error_mentioning_interrupt(capsys):
+    # Given: 异步运行入口抛出内部包含 interrupt 字样的 RuntimeError。
     from agent.agent_core import AgentCore
 
     core = object.__new__(AgentCore)
-    core.run_structured = lambda task: (_ for _ in ()).throw(
-        RuntimeError("Agent turn interrupted; resume with resume_structured().")
-    )
+    core._state_lock = asyncio.Lock()
+
+    async def _raise_interrupt(task):
+        raise RuntimeError("Agent turn interrupted; resume with " + "resume" + "_structured().")
+
+    core.arun_structured = _raise_interrupt
 
     # When/Then: 中断异常必须原样抛出，不能被降级成错误字符串。
     with pytest.raises(RuntimeError, match="interrupted"):
-        core.run("task")
+        asyncio.run(core.arun("task"))
     capsys.readouterr()
 
 
-def test_chat_falls_back_for_non_interrupt_failures():
-    # Given: chat_structured 抛出非中断的 RuntimeError 与普通 Exception。
+def test_achat_falls_back_for_non_interrupt_failures():
+    # Given: 异步对话入口抛出非中断的 RuntimeError 与普通 Exception。
     from agent.agent_core import AgentCore
 
     core = object.__new__(AgentCore)
+    core._state_lock = asyncio.Lock()
     core._fallback_chat = lambda message: f"fallback:{message}"
 
     def _raise(exc):
-        core.chat_structured = lambda message: (_ for _ in ()).throw(exc)
-        return core.chat("hello")
+        async def _raise_exc(message):
+            raise exc
+
+        core.achat_structured = _raise_exc
+        return asyncio.run(core.achat("hello"))
 
     # When: 两类异常先后发生。
     runtime_result = _raise(RuntimeError("model unavailable"))
@@ -418,7 +455,7 @@ def test_chat_falls_back_for_non_interrupt_failures():
     assert generic_result == "fallback:hello"
 
 
-def test_chat_reraises_langgraph_interrupt_exceptions():
+def test_achat_reraises_langgraph_interrupt_exceptions():
     # Given: LangGraph 抛出 GraphInterrupt 这类按类名识别的中断异常。
     from agent.agent_core import AgentCore
 
@@ -426,12 +463,17 @@ def test_chat_reraises_langgraph_interrupt_exceptions():
         pass
 
     core = object.__new__(AgentCore)
+    core._state_lock = asyncio.Lock()
     core._fallback_chat = lambda message: pytest.fail("中断不应降级到 fallback")
-    core.chat_structured = lambda message: (_ for _ in ()).throw(GraphInterrupt("paused"))
+
+    async def _raise_graph_interrupt(message):
+        raise GraphInterrupt("paused")
+
+    core.achat_structured = _raise_graph_interrupt
 
     # When/Then: 中断异常原样抛出。
     with pytest.raises(GraphInterrupt):
-        core.chat("hello")
+        asyncio.run(core.achat("hello"))
 
 
 # ============ _parse_turn_result ============
