@@ -71,11 +71,11 @@ export default function App() {
           className={`sidebar${sidebarCollapsed ? ' collapsed' : ''}${isResizing ? ' resizing' : ''}`}
           style={{ width: sidebarCollapsed ? 0 : sidebarWidth }}
         >
-          <Sidebar onCollapse={() => setSidebarCollapsed(true)} />
+          <Sidebar />
           <div className="sidebar-resizer" onPointerDown={onResizeStart} />
         </aside>
         <div className="main">
-          <TopBar onExpand={() => setSidebarCollapsed(false)} />
+          <TopBar collapsed={sidebarCollapsed} onToggle={() => setSidebarCollapsed((v) => !v)} />
           <div className="main-content">
             {viewMode === 'workflow' && <WorkflowView />}
             <ChatView />
