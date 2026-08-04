@@ -13,6 +13,7 @@
     - 支持 workflow: 前缀: task_text 以 "workflow:" 开头时路由到多 Agent 工作流
 """
 from typing import Any, Callable, Dict, Tuple
+import asyncio
 
 AgentFactory = Callable[[], Any]  # 返回具备 .run(task_text) -> str 接口的对象
 
@@ -138,7 +139,7 @@ def execute_task(task: Dict[str, Any], agent_factory: AgentFactory) -> Tuple[boo
 
     try:
         # AgentCore.run() 返回执行结果字符串
-        result = agent.run(task_text)
+        result = asyncio.run(agent.arun(task_text))
         output = str(result) if result else "(Agent 未返回内容)"
         print(f"[Scheduler] 任务 #{task_id} 执行完成")
         return True, output
