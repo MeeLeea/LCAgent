@@ -478,79 +478,113 @@ class AgentCore:
         self._clear_pending_interrupt()
         return AgentTurnResult.cancelled("用户已拒绝执行危险命令，当前任务已取消。")
 
-    def run_structured(self, task: str) -> AgentTurnResult:
-        self._compact_if_needed()
+async def arun_structured(self, task: str) -> AgentTurnResult:
+        """异步执行任务（结构化入口）
+
+        使用 ainvoke / aupdate_state 替代同步 invoke / update_state，
+        支持 AsyncSqliteSaver 和事件循环内调用。
+        """
+        await self._acompact_if_needed()
         config = self._invoke_config()
         input_msg = HumanMessage(content=task)
-        
-        self._rebuild_agent_executor(task)
-        
+
+        await self._arebuild_agent_executor(task)
+
         try:
-            result = self.agent_executor.invoke(
+            result = await self.agent_executor.ainvoke(
                 {"messages": [input_msg]},
                 config=config
             )
         except UserRejectedCommandError:
-            return self._handle_rejected_command(config)
-        
+            return await self._ahandle_rejected_command(config)
+
         self._record_tool_steps(result.get("messages", []), input_msg)
         turn = self._parse_turn_result(result)
         self._handle_turn_completion(turn, config, "run", task, important=True)
-        
+
         return turn
 
-    def chat_structured(self, message: str) -> AgentTurnResult:
-        self._compact_if_needed()
+    def run_structured(self, task: str) -> AgentTurnResult:
+        """同步执行任务（已废弃，请使用 arun_structured）"""
+        import warnings
+        warnings.warn(
+            "run_structured() 已废弃，请使用 arun_structured()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return asyncio.run(self.arun_structured(task))
+
+    async def achat_structured(self, message: str) -> AgentTurnResult:
+        """异步对话（结构化入口）"""
+        await self._acompact_if_needed()
         config = self._invoke_config()
-        
+
         with self._temp_verbose(False):
-            self._rebuild_agent_executor(message)
+            await self._arebuild_agent_executor(message)
             try:
-                result = self.agent_executor.invoke(
+                result = await self.agent_executor.ainvoke(
                     {"messages": [HumanMessage(content=message)]},
                     config=config
                 )
             except UserRejectedCommandError:
-                return self._handle_rejected_command(config)
-        
+                return await self._ahandle_rejected_command(config)
+
         turn = self._parse_turn_result(result)
         self._handle_turn_completion(turn, config, "chat", message)
-        
+
         return turn
 
-    def resume_structured(self, payload: Dict[str, Any]) -> AgentTurnResult:
+    def chat_structured(self, message: str) -> AgentTurnResult:
+        """同步对话（已废弃，请使用 achat_structured）"""
+        import warnings
+        warnings.warn(
+            "chat_structured() 已废弃，请使用 achat_structured()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return asyncio.run(self.achat_structured(message))
+
+    async def aresume_structured(self, payload: Dict[str, Any]) -> AgentTurnResult:
+        """异步恢复中断会话（结构化入口）"""
         config = self._invoke_config()
         pending_thread_id = getattr(self, "_pending_interrupt_thread_id", None)
         current_thread_id = self._thread_id_from_config(config)
-        
+
         if pending_thread_id is not None and current_thread_id != pending_thread_id:
             raise ValueError("Cannot resume interrupt on a different thread")
-        
+
         try:
-            result = self.agent_executor.invoke(
+            result = await self.agent_executor.ainvoke(
                 Command(resume=payload),
                 config=config
             )
         except UserRejectedCommandError:
-            # 用户拒绝危险命令确认（如飞书/CLI 的 deny 选择），终止本轮并修复 checkpoint。
-            return self._handle_rejected_command(config)
-        
+            return await self._ahandle_rejected_command(config)
+
         turn = self._parse_turn_result(result)
-        
-        # resume 的特殊处理：不添加用户消息，只在 run 模式时保存 assistant 消息
+
         if turn.is_interrupted:
             self._capture_pending_interrupt(
                 config,
                 getattr(self, "_pending_interrupt_mode", "chat")
             )
         elif turn.is_completed:
-            # 先取出 mode，再清理状态：_clear_pending_interrupt 会把 mode 置为 None
             mode = getattr(self, "_pending_interrupt_mode", None)
             self._clear_pending_interrupt()
             if mode == "run" and turn.output:
                 self.memory.add("assistant", turn.output, {"important": True})
-        
+
         return turn
+
+    def resume_structured(self, payload: Dict[str, Any]) -> AgentTurnResult:
+        """同步恢复中断会话（已废弃，请使用 aresume_structured）"""
+        import warnings
+        warnings.warn(
+            "resume_structured() 已废弃，请使用 aresume_structured()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return asyncio.run(self.aresume_structured(payload))
 
     # ============ 流式接口（委托给 StreamHandler） ============
 
@@ -564,9 +598,11 @@ class AgentCore:
         async for ev in self.stream.astream_resume(payload):
             yield ev
 
-    def run(self, task: str) -> str:
+    async def arun(self, task: str) -> str:
         """
-        使用Agent执行任务（自动决定是否调用工具）
+        异步执行任务（推荐使用）
+
+        使用 arun_structured 异步执行，支持事件循环内调用。
 
         Args:
             task: 任务描述
@@ -579,17 +615,14 @@ class AgentCore:
         print(f"{'='*50}\n")
 
         try:
-            turn = self.run_structured(task)
+            turn = await self.arun_structured(task)
             self._check_and_raise_if_interrupted(turn)
             output = turn.output or ""
             print(f"\n最终答案: {output}")
             return output
-
         except RuntimeError as e:
-            # interrupt 相关异常需要重新抛出
             if "interrupt" in str(e):
                 raise
-            # 其他异常返回错误信息
             error_msg = f"任务执行失败: {str(e)}"
             print(f"\n错误: {error_msg}")
             return error_msg
@@ -598,11 +631,23 @@ class AgentCore:
             print(f"\n错误: {error_msg}")
             return error_msg
 
-    def chat(self, message: str) -> str:
+    def run(self, task: str) -> str:
         """
-        普通对话模式（也通过Agent执行，自动判断是否调用工具）
+        使用Agent执行任务（同步兼容壳，已废弃）
 
-        与 run() 的区别：不打印步骤详情，不强制存入长期记忆。
+        业务代码请使用 arun() 异步方法。
+        """
+        import warnings
+        warnings.warn(
+            "run() 已废弃，请使用 arun()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return asyncio.run(self.arun(task))
+
+    async def achat(self, message: str) -> str:
+        """
+        异步对话模式（推荐使用）
 
         Args:
             message: 用户消息
@@ -611,23 +656,45 @@ class AgentCore:
             助手回复
         """
         try:
-            turn = self.chat_structured(message)
+            turn = await self.achat_structured(message)
             self._check_and_raise_if_interrupted(turn)
             return turn.output or ""
-        
         except RuntimeError as e:
-            # interrupt 相关异常需要重新抛出
             if "interrupt" in str(e):
                 raise
-            # 其他 RuntimeError 降级到 fallback
             return self._fallback_chat(message)
-        
         except Exception as e:
-            # LangGraph 特定的 interrupt 异常也需要重新抛出
             if e.__class__.__name__ in {"GraphInterrupt", "NodeInterrupt"}:
                 raise
-            # 其他异常降级到 fallback
             return self._fallback_chat(message)
+
+    def chat(self, message: str) -> str:
+        """
+        普通对话模式（同步兼容壳，已废弃）
+
+        业务代码请使用 achat() 异步方法。
+        """
+        import warnings
+        warnings.warn(
+            "chat() 已废弃，请使用 achat()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return asyncio.run(self.achat(message))
+
+    async def aresume(self, payload: Dict[str, Any]) -> str:
+        """
+        异步恢复中断会话（推荐使用）
+
+        Args:
+            payload: 恢复数据
+
+        Returns:
+            助手回复
+        """
+        turn = await self.aresume_structured(payload)
+        self._check_and_raise_if_interrupted(turn)
+        return turn.output or ""
 
     def _fallback_chat(self, message: str) -> str:
         """Agent 执行失败时降级为纯 LLM 对话"""
@@ -680,14 +747,30 @@ class AgentCore:
 
     def switch_llm(self, llm_client: LLMClient):
         """
-        切换LLM提供商
+        切换LLM提供商（同步兼容壳，已废弃）
+
+        业务代码请使用 aswitch_llm() 异步方法。
+        """
+        import warnings
+        warnings.warn(
+            "switch_llm() 已废弃，请使用 aswitch_llm()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        asyncio.run(self.aswitch_llm(llm_client))
+
+    async def aswitch_llm(self, llm_client: LLMClient):
+        """
+        异步切换LLM提供商
+
+        使用 _state_lock 保护共享状态。
 
         Args:
             llm_client: 新的LLM客户端实例
         """
-        self.llm = llm_client
-        # 重新创建Agent(保留已加载的技能)
-        self._rebuild_agent_executor("")
+        async with self._state_lock:
+            self.llm = llm_client
+            await self._arebuild_agent_executor("")
 
     # ============ 技能阅读(Skills) ============
 
@@ -697,7 +780,23 @@ class AgentCore:
 
     def load_skill(self, name: str) -> bool:
         """
-        手动将某技能加载进当前会话(注入后续 system prompt)
+        手动加载技能（同步兼容壳，已废弃）
+
+        业务代码请使用 aload_skill() 异步方法。
+        """
+        import warnings
+        warnings.warn(
+            "load_skill() 已废弃，请使用 aload_skill()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return asyncio.run(self.aload_skill(name))
+
+    async def aload_skill(self, name: str) -> bool:
+        """
+        异步加载技能到当前会话
+
+        使用 _state_lock 保护 active_skills 和 agent_executor 的并发修改。
 
         Args:
             name: 技能名(目录名或 frontmatter name)
@@ -707,15 +806,30 @@ class AgentCore:
         """
         if self.skill_manager.get_skill(name) is None:
             return False
-        self.active_skills.add(name)
-        # 立即重建 Agent,使后续对话带上该技能指引
-        self._rebuild_agent_executor("")
+        async with self._state_lock:
+            self.active_skills.add(name)
+            await self._arebuild_agent_executor("")
         return True
 
     def clear_skills(self):
-        """清空手动加载的技能"""
-        self.active_skills.clear()
-        self._rebuild_agent_executor("")
+        """
+        清空手动加载的技能（同步兼容壳，已废弃）
+
+        业务代码请使用 aclear_skills() 异步方法。
+        """
+        import warnings
+        warnings.warn(
+            "clear_skills() 已废弃，请使用 aclear_skills()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        asyncio.run(self.aclear_skills())
+
+    async def aclear_skills(self):
+        """异步清空手动加载的技能"""
+        async with self._state_lock:
+            self.active_skills.clear()
+            await self._arebuild_agent_executor("")
 
     def set_auto_match(self, enabled: bool):
         """开关任务自动匹配技能"""
