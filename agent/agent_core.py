@@ -430,6 +430,54 @@ class AgentCore:
                 as_node="tools",
             )
 
+    async def _arepair_rejected_tool_calls(self, config: Dict[str, Any]) -> None:
+        """异步修复 checkpoint 中未完成的工具调用（补齐取消结果）。
+
+        使用 aupdate_state 替代 update_state，支持 AsyncSqliteSaver。
+        """
+        state = self.agent_executor.get_state(config)
+        messages = list(state.values.get("messages", []))
+        existing_results = [message for message in messages if isinstance(message, ToolMessage)]
+        answered_ids = {message.tool_call_id for message in existing_results}
+        repairs = []
+        for message in messages:
+            if not isinstance(message, AIMessage):
+                continue
+            for tool_call in message.tool_calls:
+                call_id = tool_call.get("id")
+                if not isinstance(call_id, str) or call_id in answered_ids:
+                    continue
+                repairs.append(
+                    ToolMessage(
+                        content="用户拒绝执行危险命令，工具调用已取消。",
+                        name=tool_call.get("name"),
+                        tool_call_id=call_id,
+                        status="error",
+                    )
+                )
+                answered_ids.add(call_id)
+        if repairs:
+            await self.agent_executor.aupdate_state(
+                config,
+                {"messages": [*existing_results, *repairs]},
+                as_node="tools",
+            )
+
+    async def _ahandle_rejected_command(self, config: Dict[str, Any]) -> AgentTurnResult:
+        """异步处理用户拒绝执行危险命令的情况
+
+        当工具调用被用户拒绝时，异步修复 checkpoint 状态并返回取消结果。
+
+        Args:
+            config: LangGraph 配置对象
+
+        Returns:
+            状态为 'cancelled' 的 AgentTurnResult
+        """
+        await self._arepair_rejected_tool_calls(config)
+        self._clear_pending_interrupt()
+        return AgentTurnResult.cancelled("用户已拒绝执行危险命令，当前任务已取消。")
+
     def run_structured(self, task: str) -> AgentTurnResult:
         self._compact_if_needed()
         config = self._invoke_config()
