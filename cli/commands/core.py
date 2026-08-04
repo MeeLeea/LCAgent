@@ -64,6 +64,7 @@ _HELP_LINES = [
     "  - 输入 'tools' 查看可用工具",
     "  - 输入 'clear [long|short|all]' 清理记忆(默认 long)",
     "  - 输入 'compress' 压缩长期记忆(LLM摘要后替换原内容)",
+    "  - 输入 'compact' 手动压缩当前会话上下文(增量摘要+工具输出裁剪)",
     "  - 输入 'thread' 查看所有会话(方向键选择切换,Ctrl+D 删除高亮会话)",
     "  - 输入 'thread:new' 开启新会话(原会话保留)",
     "  - 输入 'thread:delete <thread_id>' 删除指定会话",

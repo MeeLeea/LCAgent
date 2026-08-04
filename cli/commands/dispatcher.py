@@ -31,6 +31,8 @@ def dispatch_command(context: CommandContext, user_input: str) -> CommandOutcome
         return memory.clear_memory(context, user_input)
     if low in ("compress", "压缩"):
         return memory.compress_memory(context)
+    if low in ("compact", "压缩上下文"):
+        return memory.compact_context(context)
     if low.startswith("switch"):
         return provider.switch_provider(context, user_input)
     if low == "model" or low == "models":

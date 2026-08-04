@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from .types import CommandContext, CommandOutcome, HANDLED
 
 
@@ -42,4 +44,21 @@ def compress_memory(context: CommandContext) -> CommandOutcome:
         context.print("--- 已保存到 memory.json ---")
     else:
         context.print(f"\n压缩失败: {result.get('error', '未知错误')}")
+    return HANDLED
+
+
+def compact_context(context: CommandContext) -> CommandOutcome:
+    """手动触发上下文压缩（增量摘要 + 工具输出 Prune）
+
+    与 before_model 中间件使用相同的压缩逻辑，但通过 CLI 手动触发。
+    适用于：对话过长但尚未达到自动触发阈值，或想主动释放 token。
+    """
+    context.print("\n开始压缩当前会话上下文...")
+    result = asyncio.run(context.agent.manually_compact())
+    if result is None:
+        context.print("消息数未超阈值或无消息可压缩")
+        return HANDLED
+    context.print(f"压缩完成！{result['messages_before']} → {result['messages_after']} 条消息")
+    context.print("\n--- 摘要内容 ---")
+    context.print(result["summary"])
     return HANDLED
