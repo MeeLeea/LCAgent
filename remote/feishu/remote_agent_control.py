@@ -178,7 +178,9 @@ def start_agent() -> str:
                     _save_remote_thread_id(agent.memory.thread_id)
                 # 主动修复可能残留的孤儿 tool_calls（上次中断可能遗留）
                 try:
-                    agent._repair_rejected_tool_calls(agent._invoke_config())
+loop.run_until_complete(
+                    agent._arepair_rejected_tool_calls(agent._invoke_config())
+                )
                     agent._clear_pending_interrupt()
                 except Exception:
                     pass
@@ -244,7 +246,7 @@ def _auto_send_files(chat_id: str, text: str) -> int:
 def _clear_pending_interrupt(agent: Any) -> None:
     """清理未完成的中断，确保 checkpoint 干净。"""
     try:
-        agent._repair_rejected_tool_calls(agent._invoke_config())
+        asyncio.run(agent._arepair_rejected_tool_calls(agent._invoke_config()))
         agent._clear_pending_interrupt()
     except Exception as e:
         print(f"[中断] 清理失败: {e}")
@@ -296,7 +298,7 @@ def _resume_interrupt(chat_id: str, content: str) -> None:
     else:
         payload = {"text": content}
     try:
-        _handle_turn_result(chat_id, agent, agent.resume_structured(payload),
+        _handle_turn_result(chat_id, agent, asyncio.run(agent.aresume_structured(payload)),
                             getattr(agent, "_pending_interrupt_mode", "chat"))
     except Exception as e:
         _send_text(chat_id, f"❌ 恢复失败: {e}")
@@ -418,7 +420,7 @@ def _agent_task(chat_id: str, method: str, payload: str) -> None:
             agent = get_agent()
             if not agent: return _send_text(chat_id, "⚠️ 请先启动agent")
             _clear_pending_interrupt(agent)
-            turn = agent.run_structured(payload) if method == "run" else agent.chat_structured(payload)
+            turn = asyncio.run(agent.arun_structured(payload)) if method == "run" else asyncio.run(agent.achat_structured(payload))
             _handle_turn_result(chat_id, agent, turn, method)
         except Exception as e:
             _send_text(chat_id, f"❌ {e}")
