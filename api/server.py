@@ -210,6 +210,11 @@ class CommandRequest(BaseModel):
     thread_id: Optional[str] = None
 
 
+class SwitchRoleRequest(BaseModel):
+    role: str
+    task: Optional[str] = None
+
+
 class SafetyUpdateRequest(BaseModel):
     mode: Optional[str] = None
     confirm_dangerous: Optional[bool] = None
@@ -296,6 +301,46 @@ async def switch_model(req: SwitchModelRequest):
 @app.get("/api/tools")
 async def get_tools():
     return {"tools": agent.get_available_tools() if agent else []}
+
+
+@app.get("/api/roles")
+async def get_roles():
+    """列出 team/ 下的可用团队角色与当前角色名（对应 CLI 的 role 命令）。"""
+    from agent.role_sw import get_available_team_roles
+
+    return {
+        "roles": get_available_team_roles(),
+        "current": agent.name if agent else None,
+    }
+
+
+@app.post("/api/roles/switch")
+async def switch_role(req: SwitchRoleRequest):
+    """切换主对话 Agent 的团队角色。
+
+    就地把 AgentCore 重建为 team/<role>/ 定义的角色（提示词/LLM）。
+    可选 task：切换后由角色自动匹配注入相应技能。
+
+    错误映射：未知角色 → 404；角色提示词文件为空 → 400；其他异常 → 500。
+    """
+    logger.info("切换团队角色: %s", req.role)
+    async with chat_lock:
+        try:
+            await agent.arebuild_from_team_dir(req.role, task=req.task or "")
+        except KeyError as e:
+            from agent.role_sw import get_available_team_roles
+
+            available = ", ".join(get_available_team_roles()) or "(无)"
+            logger.warning("角色不存在 [%s]，可用: %s", req.role, available)
+            raise HTTPException(status_code=404, detail=f"{e}")
+        except FileNotFoundError as e:
+            logger.error("角色提示词读取失败 [%s]: %s", req.role, e)
+            raise HTTPException(status_code=400, detail=f"{e}")
+        except (RuntimeError, ValueError) as e:
+            logger.error("切换角色失败 [%s]: %s", req.role, e)
+            raise HTTPException(status_code=500, detail=f"{e}")
+    logger.info("已切换到团队角色: %s", req.role)
+    return {"role": req.role, "current": agent.name if agent else None}
 
 
 # LangGraph 内部哨兵节点与前端友好标签的映射
