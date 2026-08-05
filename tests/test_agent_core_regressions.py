@@ -34,7 +34,7 @@ def test_compaction_retains_recent_messages_in_new_thread_state():
         def get_state(self, config):
             return FakeState()
 
-        async def aupdate_state(self, config, values):
+        def update_state(self, config, values):
             state_updates.append((config, values))
 
     core = object.__new__(AgentCore)
@@ -90,7 +90,7 @@ def test_compaction_does_not_change_thread_when_summary_fails():
         def get_state(self, config):
             return FakeState()
 
-        async def aupdate_state(self, config, values):
+        def update_state(self, config, values):
             raise AssertionError("失败时不应更新状态")
 
     core = object.__new__(AgentCore)
@@ -300,7 +300,7 @@ def test_arun_repairs_checkpoint_after_user_rejects_command():
         def get_state(self, config):
             return state
 
-        async def aupdate_state(self, config, values, as_node=None):
+        def update_state(self, config, values, as_node=None):
             updates.append((config, values, as_node))
 
     executor = RejectingExecutor()

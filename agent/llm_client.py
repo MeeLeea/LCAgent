@@ -246,40 +246,6 @@ class LLMClient:
         except Exception as e:
             raise RuntimeError(f"[{self.provider_config['name']}] 调用失败: {str(e)}")
 
-    async def achat(
-        self,
-        messages: List[Dict[str, str]],
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None
-    ) -> str:
-        """
-        异步发送对话请求（供 AgentCore 异步链路使用）
-
-        Args:
-            messages: 消息列表，格式为 [{"role": "user/assistant/system", "content": "..."}]
-            temperature: 温度参数（覆盖默认值）
-            max_tokens: 最大生成token数（覆盖默认值）
-
-        Returns:
-            模型生成的回复文本
-        """
-        langchain_messages = self._to_langchain_messages(messages)
-
-        client = self.client
-        if temperature is not None or max_tokens is not None:
-            overrides: Dict[str, Any] = {}
-            if temperature is not None:
-                overrides["temperature"] = temperature
-            if max_tokens is not None:
-                overrides["max_tokens"] = max_tokens
-            client = client.bind(**overrides)
-
-        try:
-            response = await client.ainvoke(langchain_messages)
-            return response.content
-        except Exception as e:
-            raise RuntimeError(f"[{self.provider_config['name']}] 异步调用失败: {str(e)}")
-
     def chat_with_history(
         self,
         user_input: str,

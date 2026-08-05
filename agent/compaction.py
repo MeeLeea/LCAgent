@@ -134,6 +134,7 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
         self,
         messages: list[AnyMessage],
         existing_summary: str = "",
+        force: bool = False,
     ) -> dict[str, Any] | None:
         """手动执行一次压缩，返回状态更新字典（或 None 表示无需压缩）。
 
@@ -142,11 +143,14 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
         Args:
             messages: 当前 thread 的完整消息列表
             existing_summary: 当前已有的摘要文本
+            force: 为 True 时跳过 max_messages 阈值检查，允许在消息数
+                   未超阈值时强制压缩。仍受 _find_safe_cutoff 约束
+                   （消息数 <= keep_recent 时无法安全切割，返回 None）。
 
         Returns:
             {"messages": [...], "summary": str} 或 None（消息不足或摘要失败时）
         """
-        if len(messages) <= self.config.max_messages:
+        if not force and len(messages) <= self.config.max_messages:
             return None
 
         cutoff = self._find_safe_cutoff(messages)

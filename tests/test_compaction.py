@@ -266,11 +266,44 @@ def test_manual_compaction_returns_update_dict():
 
 
 def test_manual_compaction_returns_none_when_below_threshold():
-    """消息不足时手动压缩返回 None"""
+    """消息不足时手动压缩返回 None（force=False 默认行为）"""
     mw = LCAgentCompactionMiddleware(FakeModel(), CompactionConfig(max_messages=50, keep_recent=10))
 
     async def run():
         return await mw.arun_compaction(_build_messages(5), existing_summary="")
+
+    result = asyncio.run(run())
+    assert result is None
+
+
+def test_manual_compaction_force_bypasses_threshold():
+    """force=True 时跳过阈值检查，消息数未超阈值也能压缩
+
+    场景：max_messages=50（阈值高），消息只有 25 条，
+    但 keep_recent=10，force=True 允许压缩前 15 条。
+    """
+    model = FakeModel(response="强制摘要")
+    mw = LCAgentCompactionMiddleware(model, CompactionConfig(max_messages=50, keep_recent=10))
+    msgs = _build_messages(25)
+
+    async def run():
+        return await mw.arun_compaction(msgs, existing_summary="", force=True)
+
+    result = asyncio.run(run())
+
+    assert result is not None
+    assert result["summary"] == "强制摘要"
+    # RemoveMessage(1) + summary SystemMessage(1) + 保留消息
+    # cutoff 因 ToolMessage 安全对齐可能 > keep_recent，故用范围断言
+    assert 11 <= len(result["messages"]) <= 13
+
+
+def test_manual_compaction_force_returns_none_when_too_few():
+    """force=True 时消息数 <= keep_recent 仍返回 None（无法安全切割）"""
+    mw = LCAgentCompactionMiddleware(FakeModel(), CompactionConfig(max_messages=50, keep_recent=20))
+
+    async def run():
+        return await mw.arun_compaction(_build_messages(5), existing_summary="", force=True)
 
     result = asyncio.run(run())
     assert result is None

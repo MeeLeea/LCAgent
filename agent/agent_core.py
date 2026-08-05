@@ -528,8 +528,10 @@ class AgentCore:
     async def _arepair_rejected_tool_calls(self, config: Dict[str, Any]) -> None:
         """异步修复 checkpoint 中未完成的工具调用（补齐取消结果）。
 
-        get_state 走 SqliteSaver 同步路径，用 asyncio.to_thread 包裹避免阻塞事件循环。
-        aupdate_state 本身是异步接口，直接 await。
+        checkpointer 为同步 SqliteSaver，不支持 aupdate_state（会触发
+        "SqliteSaver does not support async methods"）。
+        get_state / update_state 均用 asyncio.to_thread 跑到线程池，
+        与 invoke 路径保持一致，不阻塞事件循环。
         """
         state = await asyncio.to_thread(self.agent_executor.get_state, config)
         messages = list(state.values.get("messages", []))
@@ -553,7 +555,8 @@ class AgentCore:
                 )
                 answered_ids.add(call_id)
         if repairs:
-            await self.agent_executor.aupdate_state(
+            await asyncio.to_thread(
+                self.agent_executor.update_state,
                 config,
                 {"messages": [*existing_results, *repairs]},
             )
@@ -866,11 +869,16 @@ class AgentCore:
 
     # ============ 长上下文裁剪 ============
 
-    async def manually_compact(self) -> dict[str, Any] | None:
+    async def manually_compact(self, force: bool = False) -> dict[str, Any] | None:
         """手动触发一次上下文压缩（CLI 命令 compact 调用）
 
         与 before_model 中间件使用相同的压缩逻辑（增量摘要 + 工具输出 Prune），
-        但通过 aupdate_state 直接写入 checkpoint，不依赖 LangGraph 中间件上下文。
+        但通过 update_state（asyncio.to_thread 包裹）直接写入 checkpoint，
+        不依赖 LangGraph 中间件上下文。
+
+        Args:
+            force: 为 True 时跳过 max_messages 阈值检查，允许在消息数
+                   未超阈值时强制压缩（仍需消息数 > keep_recent 才能安全切割）。
 
         Returns:
             {"summary": str, "messages_before": int, "messages_after": int} 或 None
@@ -881,7 +889,7 @@ class AgentCore:
 
         # 读取当前 state 中的已有摘要
         config = self._invoke_config()
-        state = self.agent_executor.get_state(config)
+        state = await asyncio.to_thread(self.agent_executor.get_state, config)
         existing_summary = ""
         if state and state.values:
             existing_summary = state.values.get("summary", "") or ""
@@ -891,18 +899,18 @@ class AgentCore:
         if mw is None:
             return None
 
-        update = await mw.arun_compaction(msgs, existing_summary=existing_summary)
+        update = await mw.arun_compaction(msgs, existing_summary=existing_summary, force=force)
         if update is None:
             if self.verbose:
-                logger.debug("压缩: 消息数未超阈值，无需压缩")
+                logger.debug("压缩: 消息不足或无法安全切割，无需压缩")
             return None
 
         import time as _time
         _compact_start = _time.time()
 
         messages_before = len(msgs)
-        # 通过 aupdate_state 写入压缩后的消息和摘要
-        await self.agent_executor.aupdate_state(config, update)
+        # 同步 SqliteSaver 不支持 aupdate_state，用 to_thread 跑同步 update_state
+        await asyncio.to_thread(self.agent_executor.update_state, config, update)
         messages_after = len(update["messages"]) - 1  # 减去 RemoveMessage 标记
         summary_length = len(update.get("summary", ""))
 
