@@ -352,9 +352,9 @@ class MetricsCollector:
 
 
 def estimate_tokens(text: str) -> int:
-    """粗略估算文本的 token 数（中文约 1 字 = 1 token，英文约 4 字符 = 1 token）
+    """粗略估算文本的 token 数（字符数 / 4）
 
-    取字符数 / 3.5 作为折中估算。
+    中英文混合场景下约 4 字符 ≈ 1 token，取整除作为下界估算。
     """
     if not text:
         return 0

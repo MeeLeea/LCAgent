@@ -217,7 +217,7 @@ class StreamHandler:
         SqliteSaver 仅支持同步接口，无法直接用 astream；这里用线程 + 队列桥接，
         同时保持 SSE 端点的异步非阻塞特性。
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[Any]" = asyncio.Queue()
         sentinel = object()
 
@@ -226,9 +226,15 @@ class StreamHandler:
                 for ev in self._stream_events(input_or_command, config):
                     asyncio.run_coroutine_threadsafe(queue.put(ev), loop)
             except UserRejectedCommandError:
-                asyncio.run_coroutine_threadsafe(
+                # 修复 checkpoint 中悬挂的 tool_call，必须等待完成后再清状态，
+                # 否则后续 invoke 会读到未修复的 checkpoint 而报错
+                repair_future = asyncio.run_coroutine_threadsafe(
                     self.agent._arepair_rejected_tool_calls(config), loop,
                 )
+                try:
+                    repair_future.result(timeout=10)
+                except Exception:
+                    pass
                 self.agent._clear_pending_interrupt()
                 asyncio.run_coroutine_threadsafe(
                     queue.put({"type": "cancelled", "content": "用户已拒绝执行危险命令，当前任务已取消。"}),

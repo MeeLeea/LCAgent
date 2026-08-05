@@ -528,10 +528,10 @@ class AgentCore:
     async def _arepair_rejected_tool_calls(self, config: Dict[str, Any]) -> None:
         """异步修复 checkpoint 中未完成的工具调用（补齐取消结果）。
 
-        使用 aupdate_state 替代 asyncio.to_thread(update_state)，
-        真正异步执行，不阻塞事件循环。
+        get_state 走 SqliteSaver 同步路径，用 asyncio.to_thread 包裹避免阻塞事件循环。
+        aupdate_state 本身是异步接口，直接 await。
         """
-        state = self.agent_executor.get_state(config)
+        state = await asyncio.to_thread(self.agent_executor.get_state, config)
         messages = list(state.values.get("messages", []))
         existing_results = [message for message in messages if isinstance(message, ToolMessage)]
         answered_ids = {message.tool_call_id for message in existing_results}
@@ -732,10 +732,12 @@ class AgentCore:
         except RuntimeError as e:
             if "interrupt" in str(e):
                 raise
+            logger.warning("achat 降级到 fallback: %s", e, exc_info=True)
             return self._fallback_chat(message)
         except Exception as e:
             if e.__class__.__name__ in {"GraphInterrupt", "NodeInterrupt"}:
                 raise
+            logger.warning("achat 降级到 fallback: %s", e, exc_info=True)
             return self._fallback_chat(message)
 
     async def aresume(self, payload: Dict[str, Any]) -> str:
