@@ -210,6 +210,11 @@ class CommandRequest(BaseModel):
     thread_id: Optional[str] = None
 
 
+class SafetyUpdateRequest(BaseModel):
+    mode: Optional[str] = None
+    confirm_dangerous: Optional[bool] = None
+
+
 # --------------------------------------------------------------------------- #
 # FastAPI 应用
 # --------------------------------------------------------------------------- #
@@ -711,6 +716,159 @@ async def execute_command(req: CommandRequest):
             error_trace = traceback.format_exc()
             logger.error("命令执行异常 [%s]: %s\n%s", tid, e, error_trace)
             raise HTTPException(status_code=500, detail=f"{e}\n\n{error_trace}")
+
+
+# --------------------------------------------------------------------------- #
+# 运行时指标
+# --------------------------------------------------------------------------- #
+@app.get("/api/metrics")
+async def get_metrics():
+    """获取运行时指标（LLM 调用、工具执行、压缩统计的结构化 JSON）"""
+    metrics = getattr(agent, "metrics", None) if agent else None
+    if metrics is None:
+        raise HTTPException(status_code=503, detail="指标收集不可用")
+    return metrics.get_summary()
+
+
+@app.post("/api/metrics/reset")
+async def reset_metrics():
+    """重置所有运行时指标"""
+    metrics = getattr(agent, "metrics", None) if agent else None
+    if metrics is None:
+        raise HTTPException(status_code=503, detail="指标收集不可用")
+    metrics.reset()
+    logger.info("指标已重置")
+    return {"reset": True}
+
+
+# --------------------------------------------------------------------------- #
+# 上下文压缩
+# --------------------------------------------------------------------------- #
+@app.post("/api/compact")
+async def compact_context(thread_id: Optional[str] = None):
+    """手动触发当前会话的上下文压缩（增量摘要 + 工具输出 Prune）
+
+    与 before_model 中间件使用相同的压缩逻辑，适用于对话过长时主动释放 token。
+    """
+    async with chat_lock:
+        if thread_id:
+            agent.memory.thread_id = thread_id
+        tid = agent.memory.thread_id
+        logger.info("手动压缩上下文 [%s]", tid)
+        try:
+            result = await agent.manually_compact()
+        except Exception as e:
+            logger.error("压缩失败 [%s]: %s", tid, e)
+            raise HTTPException(status_code=500, detail=f"压缩失败: {e}")
+        if result is None:
+            return {"compacted": False, "message": "消息数未超阈值或无消息可压缩", "thread_id": tid}
+        logger.info("压缩完成 [%s]: %d → %d 条消息", tid, result["messages_before"], result["messages_after"])
+        return {"compacted": True, "thread_id": tid, **result}
+
+
+# --------------------------------------------------------------------------- #
+# 记忆管理
+# --------------------------------------------------------------------------- #
+@app.get("/api/memory")
+async def get_memory_summary():
+    """获取记忆摘要统计（当前会话消息数、长期记忆条数、checkpoint 信息）"""
+    if not agent:
+        raise HTTPException(status_code=503, detail="Agent 未初始化")
+    return agent.get_memory_summary()
+
+
+@app.post("/api/compress")
+async def compress_long_term_memory():
+    """压缩长期记忆（用 LLM 生成摘要并替换原始记忆条目）
+
+    compress_memory 内部调用同步 LLM，用 to_thread 避免阻塞事件循环。
+    """
+    async with chat_lock:
+        logger.info("压缩长期记忆")
+        try:
+            result = await asyncio.to_thread(agent.compress_memory)
+        except Exception as e:
+            logger.error("长期记忆压缩失败: %s", e)
+            raise HTTPException(status_code=500, detail=f"压缩失败: {e}")
+        if result.get("success"):
+            logger.info("长期记忆压缩完成: %d 条 → %d 字符", result.get("original_count", 0), result.get("compressed_chars", 0))
+        return result
+
+
+@app.delete("/api/memory")
+async def clear_memory(scope: str = "long"):
+    """清空记忆
+
+    Args:
+        scope: long=仅长期记忆, short=仅短期记忆(当前会话), all=全部
+    """
+    async with chat_lock:
+        if scope in ("long", "长期"):
+            agent.memory.clear_long_term()
+            logger.info("已清空长期记忆")
+        elif scope in ("short", "短期"):
+            agent.memory.clear_short_term()
+            logger.info("已清空短期记忆")
+        elif scope in ("all", "全部"):
+            agent.memory.clear_long_term()
+            agent.memory.clear_short_term()
+            logger.info("已清空全部记忆")
+        else:
+            raise HTTPException(status_code=400, detail="scope 必须为 long|short|all")
+        return {"cleared": True, "scope": scope}
+
+
+# --------------------------------------------------------------------------- #
+# 安全策略
+# --------------------------------------------------------------------------- #
+@app.get("/api/safety")
+async def get_safety():
+    """获取安全策略配置"""
+    return safety_module.load_config()
+
+
+@app.put("/api/safety")
+async def update_safety(req: SafetyUpdateRequest):
+    """更新安全策略配置（mode 和/或 confirm_dangerous）"""
+    config = safety_module.load_config()
+    if req.mode is not None:
+        if req.mode not in ("blacklist", "whitelist"):
+            raise HTTPException(status_code=400, detail="mode 必须为 blacklist|whitelist")
+        config["mode"] = req.mode
+    if req.confirm_dangerous is not None:
+        config["confirm_dangerous"] = req.confirm_dangerous
+    if safety_module.save_config(config):
+        logger.info("安全策略已更新: mode=%s, confirm=%s", config.get("mode"), config.get("confirm_dangerous"))
+        return config
+    raise HTTPException(status_code=500, detail="保存失败")
+
+
+# --------------------------------------------------------------------------- #
+# 技能列表
+# --------------------------------------------------------------------------- #
+@app.get("/api/skills")
+async def get_skills():
+    """列出所有本地可用技能"""
+    return {"skills": agent.list_skills() if agent else []}
+
+
+# --------------------------------------------------------------------------- #
+# 会话导出
+# --------------------------------------------------------------------------- #
+@app.get("/api/threads/{thread_id}/export")
+async def export_thread(thread_id: str, fmt: str = "text"):
+    """导出指定会话的对话为可读文本
+
+    Args:
+        thread_id: 会话 ID
+        fmt: 导出格式，支持 text（默认）与 markdown
+    """
+    if not agent:
+        raise HTTPException(status_code=503, detail="Agent 未初始化")
+    if fmt not in ("text", "markdown"):
+        raise HTTPException(status_code=400, detail="fmt 必须为 text|markdown")
+    content = agent.memory.export_thread(thread_id=thread_id, fmt=fmt)
+    return {"thread_id": thread_id, "format": fmt, "content": content}
 
 
 # 生产环境：如果前端已构建（web/dist），则由本服务直接托管静态文件
