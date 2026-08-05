@@ -69,6 +69,7 @@ class AgentCore:
     def __init__(
         self,
         llm_client: LLMClient,
+        name: str = "LCAgent",
         memory_size: int = 10,
         long_term_memory_file: Optional[str] = None,
         checkpoint_file: Optional[str] = None,
@@ -82,7 +83,7 @@ class AgentCore:
         max_context_messages: int = 0,
         context_trim_keep: int = 12,
         process_type: Optional[str] = None,
-        agent_core_prompt: Optional[str] = None,
+        agent_prompt_file: Optional[str] = None,
         max_execution_history: int = 100,
         tool_timeout: float = 60.0,
     ):
@@ -102,7 +103,7 @@ class AgentCore:
             max_context_messages: 长上下文裁剪阈值(0=关闭);超过则自动摘要并开新会话
             context_trim_keep: 裁剪时保留的最近消息条数
             process_type: 进程类型标识(server/scheduler/feishu)，用于多进程隔离
-            agent_core_prompt: Agent核心系统提示词(为 None 时使用配置默认值)
+            agent_prompt_file: Agent核心提示词文件路径(为 None 时使用配置默认值)
             max_execution_history: 执行历史最大条数(防止内存泄漏)
             tool_timeout: 工具执行默认超时秒数(0=禁用超时)
         """
@@ -131,8 +132,8 @@ class AgentCore:
         )
 
         # 存储核心提示词（从配置加载或使用默认值）
-        from .config import _DEFAULT_AGENT_CORE_PROMPT
-        self.agent_core_prompt = agent_core_prompt or _DEFAULT_AGENT_CORE_PROMPT
+        from .config import _load_agent_prompt
+        self.agent_core_prompt = _load_agent_prompt(agent_prompt_file)
 
         # 本地工具（lazy import 打破潜在循环依赖）
         from tools import all_tools as _local_tools
@@ -150,7 +151,6 @@ class AgentCore:
         self._mcp_pool = MCPPool(self.mcp_config_file)
 
         # 异步互斥锁：保护 tools / mcp_tools / agent_executor / active_skills 等共享状态
-        # 必须在任何异步方法调用之前初始化，因为 areload_mcp_tools / _arebuild_agent_executor 等都会访问它
         self._state_lock = asyncio.Lock()
 
         # 技能阅读(本地 .agents/skills)
@@ -165,13 +165,9 @@ class AgentCore:
             asyncio.run(self.areload_mcp_tools())
 
         # 可变 SystemMessage：content 在每次 invoke 前动态更新（技能匹配），
-        # 避免 create_agent 重新编译 Graph。model_node 闭包捕获此对象引用，
-        # 修改 .content 即可让下次 LLM 调用看到最新提示词。
         self._system_message = SystemMessage(content=self._get_system_prompt(""))
 
         # 运行时指标收集器（LLM tokens / 工具耗时 / 压缩统计）
-        # 必须在 _create_agent_executor 之前初始化，因为后者将 record_compaction
-        # 回调传给压缩中间件
         self._metrics = MetricsCollector()
 
         # 创建Agent（编译一次，后续不再因技能变化而重建）

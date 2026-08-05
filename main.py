@@ -48,7 +48,8 @@ def build_agent(provider: str, process_type: str = None) -> tuple[AgentCore, obj
     print(f"\n初始化 {list_providers(LLM_FILE)[provider]['name']} 客户端...")
     llm = create_llm(provider, LLM_FILE)
     print("加载运行时配置...")
-    config = load_agent_config(AGENT_CONFIG_FILE, base_dir=BASE_DIR)
+    config = load_agent_config(AGENT_CONFIG_FILE)
+    agent_prompt_file = config.get("agent_prompt_file")
     # 配置中的相对路径统一锚定项目根，避免调用方工作目录影响资源加载。
     skills_dir = resolve_path(config["skills_dir"], BASE_DIR)
     mcp_config_file = resolve_path(config["mcp_config_file"], BASE_DIR)
@@ -68,7 +69,7 @@ def build_agent(provider: str, process_type: str = None) -> tuple[AgentCore, obj
         max_context_messages=config["max_context_messages"],
         context_trim_keep=config["context_trim_keep"],
         process_type=process_type,
-        agent_core_prompt=config["agent_core_prompt"],
+        agent_prompt_file=agent_prompt_file,
         max_execution_history=config.get("max_execution_history", 100),
         tool_timeout=config.get("tool_timeout", 120),
     )

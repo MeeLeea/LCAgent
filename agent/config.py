@@ -71,13 +71,12 @@ DEFAULTS: dict[str, Any] = {
 }
 
 
-def load_agent_config(config_file: str, base_dir: str = None) -> dict[str, Any]:
+def load_agent_config(config_file: str) -> dict[str, Any]:
     """
     加载 agent 运行时配置,与默认值合并
 
     Args:
         config_file: agent/agent_config.json 路径(相对或绝对)
-        base_dir: 项目根目录,用于锚定相对路径(为 None 时使用当前工作目录)
 
     Returns:
         合并后的配置字典
@@ -93,12 +92,6 @@ def load_agent_config(config_file: str, base_dir: str = None) -> dict[str, Any]:
                     cfg[key] = data[key]
         except (OSError, json.JSONDecodeError):
             pass
-    
-    # 加载 Agent 核心提示词（优先从 AGENT.md 读取）
-    prompt_file = cfg.get("agent_prompt_file", "agent/AGENT.md")
-    if base_dir:
-        prompt_file = resolve_path(prompt_file, base_dir)
-    cfg["agent_core_prompt"] = _load_agent_prompt(prompt_file)
     
     return cfg
 
