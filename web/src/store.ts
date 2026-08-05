@@ -424,12 +424,12 @@ export const useStore = create<AppState>((set, get) => ({
           set({ messages: msgs })
           break
         case 'tool_result':
-          // 接收 tool_result 标记完成状态，但不保存内容
+          // 保存执行结果内容，供卡片展开时查看（默认收起）
           msgs[lastIndex] = {
             ...last,
             toolResults: [
               ...(last.toolResults ?? []),
-              { id: ev.id, name: ev.name, content: '' }, // 内容置空
+              { id: ev.id, name: ev.name, content: ev.content },
             ],
           }
           set({ messages: msgs })
@@ -563,12 +563,12 @@ export const useStore = create<AppState>((set, get) => ({
           set({ messages: msgs })
           break
         case 'tool_result':
-          // 接收 tool_result 标记完成状态，但不保存内容
+          // 保存执行结果内容，供卡片展开时查看（默认收起）
           msgs[lastIndex] = {
             ...last,
             toolResults: [
               ...(last.toolResults ?? []),
-              { id: ev.id, name: ev.name, content: '' }, // 内容置空
+              { id: ev.id, name: ev.name, content: ev.content },
             ],
           }
           set({ messages: msgs })

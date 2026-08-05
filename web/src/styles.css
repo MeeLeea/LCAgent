@@ -866,6 +866,16 @@ tool-group,
   font-size: 11.5px;
 }
 
+.tool-card-result-label {
+  margin-top: 8px;
+}
+
+/* 滑动窗口：固定最大高度 + 垂直滚动，避免长输出撑爆卡片 */
+.tool-card-result {
+  max-height: 240px;
+  overflow-y: auto;
+}
+
 .tool-args-key {
   color: var(--accent);
 }
