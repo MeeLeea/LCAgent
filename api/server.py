@@ -407,6 +407,24 @@ def _sse(data: Dict[str, Any]) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _get_total_tokens() -> int:
+    """获取当前 LLM 累计 total_tokens（供前端输入栏实时展示）"""
+    metrics = getattr(agent, "metrics", None) if agent else None
+    if metrics is None:
+        return 0
+    try:
+        return metrics.get_summary()["llm"]["total_tokens"]
+    except (KeyError, TypeError):
+        return 0
+
+
+def _enrich_done(ev: Dict[str, Any]) -> Dict[str, Any]:
+    """为 done 事件附加 total_tokens，前端据此更新输入栏 token 计数"""
+    if ev.get("type") == "done":
+        ev["total_tokens"] = _get_total_tokens()
+    return ev
+
+
 def _format_help_as_table(help_text: str) -> str:
     """将帮助文本转换成 Markdown 表格格式。"""
     lines = help_text.strip().split('\n')
@@ -532,7 +550,7 @@ async def chat(req: ChatRequest):
                         logger.info("执行型命令 [%s]，走流式通道", tid)
                         # 把命令原文传给 astream_chat（它会自动匹配技能）
                         async for ev in agent.astream_chat(command):
-                            yield _sse(ev)
+                            yield _sse(_enrich_done(ev))
                         logger.info("完成 [%s]", tid)
                         return
                     else:
@@ -574,7 +592,7 @@ async def chat(req: ChatRequest):
                             if output:
                                 yield _sse({"type": "token", "content": output})
 
-                        yield _sse({"type": "done"})
+                        yield _sse({"type": "done", "total_tokens": _get_total_tokens()})
                         logger.info("命令完成 [%s]: %s", tid, outcome)
                         return
                         
@@ -586,7 +604,7 @@ async def chat(req: ChatRequest):
             # 普通对话模式
             try:
                 async for event in agent.astream_chat(req.message):
-                    yield _sse(event)
+                    yield _sse(_enrich_done(event))
                 logger.info("完成 [%s]", tid)
             except Exception as e:
                 logger.error("异常 [%s]: %s", tid, e)
