@@ -189,4 +189,4 @@ export type StreamEvent =
   | { type: 'error'; content: string }
   | { type: 'workflow_node'; node: string; status: 'running' | 'done' }
   | { type: 'workflow_status'; status: 'idle' | 'running' | 'done' }
-  | { type: 'done' }
+  | { type: 'done'; total_tokens?: number }

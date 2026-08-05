@@ -1,5 +1,5 @@
-// 输入栏：自适应文本框 + 发送/停止按钮 + 工具列表 + 字符计数 + 快捷键
-import { useRef, useState, useEffect } from 'react'
+// 输入栏：自适应文本框 + 发送/停止按钮 + 工具列表 + 字符计数 + 上下文 Token 估算 + 快捷键
+import { useRef, useState, useEffect, useMemo } from 'react'
 import { ArrowUp, Square, Wrench, Keyboard } from 'lucide-react'
 import { useStore, isWorkflowThread } from '../store'
 
@@ -14,6 +14,7 @@ export function InputBar() {
   const sendMessage = useStore((s) => s.sendMessage)
   const stopStreaming = useStore((s) => s.stopStreaming)
   const tools = useStore((s) => s.tools)
+  const messages = useStore((s) => s.messages)
   const threads = useStore((s) => s.threads)
   const currentThreadId = useStore((s) => s.currentThreadId)
 
@@ -73,6 +74,30 @@ export function InputBar() {
 
   const charCount = text.length
   const hasText = text.trim().length > 0
+
+  // 估算当前会话上下文 token：所有已有消息内容 + 工具调用/结果 + 当前输入框文本
+  const contextTokens = useMemo(() => {
+    let totalChars = 0
+    for (const m of messages) {
+      totalChars += (m.content || '').length
+      if (m.toolCalls) {
+        for (const tc of m.toolCalls) {
+          totalChars += JSON.stringify(tc.args ?? '').length
+        }
+      }
+      if (m.toolResults) {
+        for (const tr of m.toolResults) {
+          totalChars += (tr.content || '').length
+        }
+      }
+    }
+    // 加上当前输入框文本
+    totalChars += text.length
+    return Math.max(1, Math.ceil(totalChars / 4))
+  }, [messages, text])
+
+  // 按 k 单位显示：0 → 0k, 500 → 0.5k, 12300 → 12.3k
+  const formatTokens = (n: number) => (n / 1000).toFixed(1) + 'k'
 
   return (
     <div className="input-wrap">
@@ -167,20 +192,26 @@ export function InputBar() {
               </span>
             )}
           </div>
-          {isStreaming ? (
-            <button className="send-btn stop" onClick={stopStreaming} title="停止生成">
-              <Square size={14} fill="currentColor" />
-            </button>
-          ) : (
-            <button
-              className="send-btn"
-              onClick={handleSend}
-              disabled={!hasText}
-              title="发送"
-            >
-              <ArrowUp size={16} />
-            </button>
-          )}
+          <div className="input-right">
+            {/* 当前会话上下文估算 token */}
+            <span className="token-count" title={`当前会话上下文估算 Token: ${contextTokens.toLocaleString()}`}>
+              {formatTokens(contextTokens)}
+            </span>
+            {isStreaming ? (
+              <button className="send-btn stop" onClick={stopStreaming} title="停止生成">
+                <Square size={14} fill="currentColor" />
+              </button>
+            ) : (
+              <button
+                className="send-btn"
+                onClick={handleSend}
+                disabled={!hasText}
+                title="发送"
+              >
+                <ArrowUp size={16} />
+              </button>
+            )}
+          </div>
         </div>
       </div>
     </div>

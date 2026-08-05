@@ -1089,6 +1089,20 @@ tool-group,
   gap: 4px;
 }
 
+.input-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.token-count {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+  white-space: nowrap;
+}
+
 .input-tool-btn {
   padding: 5px 8px;
   border-radius: 7px;

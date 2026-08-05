@@ -68,6 +68,9 @@ interface AppState {
   currentModel: string | null
   tools: string[]
 
+  // LLM 累计 token 用量（输入栏右下角展示）
+  totalTokens: number
+
   // 工作流
   workflows: string[]
   workflow: WorkflowInfo | null
@@ -214,6 +217,7 @@ export const useStore = create<AppState>((set, get) => ({
   currentProvider: null,
   currentModel: null,
   tools: [],
+  totalTokens: 0,
   viewMode: 'chat',
   workflows: [],
   workflow: null,
@@ -281,6 +285,8 @@ export const useStore = create<AppState>((set, get) => ({
     void get().checkConnection()
     await Promise.all([get().refreshProviders(), get().fetchThreads(), get().fetchWorkflows()])
     api.getTools().then((r) => set({ tools: r.tools })).catch(() => {})
+    // 拉取初始 token 用量
+    api.getMetrics().then((m) => set({ totalTokens: m.llm.total_tokens })).catch(() => {})
   },
 
   refreshProviders: async () => {
@@ -481,7 +487,7 @@ export const useStore = create<AppState>((set, get) => ({
         }
         case 'done':
           msgs[lastIndex] = { ...last, streaming: false }
-          set({ messages: msgs })
+          set({ messages: msgs, totalTokens: ev.total_tokens ?? get().totalTokens })
           finish()
           get().fetchThreads()
           break
@@ -618,7 +624,7 @@ export const useStore = create<AppState>((set, get) => ({
         }
         case 'done':
           msgs[lastIndex] = { ...last, streaming: false }
-          set({ messages: msgs })
+          set({ messages: msgs, totalTokens: ev.total_tokens ?? get().totalTokens })
           finish()
           get().fetchThreads()
           break
