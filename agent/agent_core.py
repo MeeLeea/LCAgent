@@ -26,6 +26,8 @@ from tools.mcp_loader import DEFAULT_CONFIG_FILE
 from tools.mcp_pool import MCPPool, ServerStatus
 from tools.skills import SkillManager, default_skills_dir
 from tools.terminal_tools import UserRejectedCommandError
+from tools.tool_wrapper import wrap_tools_with_timeout
+from .exceptions import AgentStateError
 
 @dataclass(frozen=True, slots=True)
 class AgentTurnResult:
@@ -78,6 +80,7 @@ class AgentCore:
         process_type: Optional[str] = None,
         agent_core_prompt: Optional[str] = None,
         max_execution_history: int = 100,
+        tool_timeout: float = 60.0,
     ):
         """
         初始化Agent核心
@@ -98,6 +101,7 @@ class AgentCore:
             process_type: 进程类型标识(server/scheduler/feishu)，用于多进程隔离
             agent_core_prompt: Agent核心系统提示词(为 None 时使用配置默认值)
             max_execution_history: 执行历史最大条数(防止内存泄漏)
+            tool_timeout: 工具执行默认超时秒数(0=禁用超时)
         """
         self.name = name
         self.llm = llm_client
@@ -113,6 +117,8 @@ class AgentCore:
         self.verbose = verbose
         self.max_context_messages = max_context_messages
         self.context_trim_keep = context_trim_keep
+        self.tool_timeout = tool_timeout if tool_timeout > 0 else None
+        self._closed = False
 
         # 压缩配置：before_model 中间件自动触发 + manually_compact 手动触发
         # summary 存入 LangGraph state（随 checkpoint 持久化），天然 per-thread 隔离
@@ -183,6 +189,7 @@ class AgentCore:
         Returns:
             加载到的 MCP 工具数量
         """
+        self._ensure_not_closed()
         async with self._state_lock:
             try:
                 old_signature = getattr(self, "_tools_signature", frozenset())
@@ -212,6 +219,7 @@ class AgentCore:
         Returns:
             True=重连成功
         """
+        self._ensure_not_closed()
         async with self._state_lock:
             try:
                 old_signature = getattr(self, "_tools_signature", frozenset())
@@ -272,9 +280,11 @@ class AgentCore:
 
         # create_agent 直接返回可调用的agent
         # system_prompt 传入可变 SystemMessage 对象，后续可通过 _update_system_prompt 动态更新
+        # 工具列表传入超时包装后的副本（原地包装，不影响 self.tools 的原始引用）
+        wrapped_tools = wrap_tools_with_timeout(self.tools, self.tool_timeout)
         agent = create_agent(
             model=chat_model,
-            tools=self.tools,
+            tools=wrapped_tools,
             system_prompt=self._system_message,
             checkpointer=self.memory.get_checkpointer(),
             state_schema=LCAgentState,
@@ -528,11 +538,14 @@ class AgentCore:
         压缩由 before_model 中间件自动触发，无需手动调用。
         系统提示词通过 _update_system_prompt 动态更新，不重建 Graph。
         """
+        self._ensure_not_closed()
         config = self._invoke_config()
         input_msg = HumanMessage(content=task)
 
         # 动态更新系统提示词（技能匹配），不重建 Graph
-        self._update_system_prompt(task)
+        # 加锁防止与 areload_mcp_tools / aload_skill 并发修改共享状态
+        async with self._state_lock:
+            self._update_system_prompt(task)
 
         try:
             result = await asyncio.to_thread(
@@ -555,10 +568,13 @@ class AgentCore:
         压缩由 before_model 中间件自动触发，无需手动调用。
         系统提示词通过 _update_system_prompt 动态更新，不重建 Graph。
         """
+        self._ensure_not_closed()
         config = self._invoke_config()
 
         with self._temp_verbose(False):
-            self._update_system_prompt(message)
+            # 加锁防止与 areload_mcp_tools / aload_skill 并发修改共享状态
+            async with self._state_lock:
+                self._update_system_prompt(message)
             try:
                 result = await asyncio.to_thread(
                     self.agent_executor.invoke,
@@ -876,3 +892,46 @@ class AgentCore:
                 return ""
 
         return self.memory.compress_memory(_summarize_text)
+
+    # ============ 生命周期管理 ============
+
+    async def aclose(self) -> None:
+        """优雅关闭：释放 MCP 连接池、Checkpoint DB 等资源
+
+        关闭后 AgentCore 不再可用，调用任何方法会抛 AgentStateError。
+        可安全重复调用（幂等）。
+        """
+        if self._closed:
+            return
+        self._closed = True
+
+        # 1. 关闭 MCP 连接池
+        try:
+            await self._mcp_pool.close()
+        except Exception as e:
+            if self.verbose:
+                print(f"[close] MCP 连接池关闭异常: {e}")
+
+        # 2. 关闭 Checkpoint DB 连接
+        try:
+            self.memory.close()
+        except Exception as e:
+            if self.verbose:
+                print(f"[close] Checkpoint DB 关闭异常: {e}")
+
+        # 3. 清理执行历史
+        self.execution_history.clear()
+
+        if self.verbose:
+            print("[close] AgentCore 资源已释放")
+
+    def _ensure_not_closed(self) -> None:
+        """检查 Agent 是否已关闭，已关闭则抛异常"""
+        if getattr(self, "_closed", False):
+            raise AgentStateError("AgentCore 已关闭，不再可用")
+
+    async def __aenter__(self) -> "AgentCore":
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback) -> None:
+        await self.aclose()

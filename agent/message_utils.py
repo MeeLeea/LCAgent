@@ -279,7 +279,9 @@ class StreamHandler:
         """
         config = self.agent._invoke_config()
         # 动态更新系统提示词（技能匹配），不重建 Graph
-        self.agent._update_system_prompt(message)
+        # 加锁防止与 areload_mcp_tools / aload_skill 并发修改共享状态
+        async with self.agent._state_lock:
+            self.agent._update_system_prompt(message)
         input_msg = HumanMessage(content=message)
         original_verbose = self.agent.verbose
         self.agent.verbose = False
