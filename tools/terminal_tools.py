@@ -6,6 +6,7 @@ from langchain_core.tools import tool
 from langgraph.errors import GraphInterrupt
 from typing import Dict, Any, Optional
 import os
+import shutil
 import subprocess
 import sys
 import platform
@@ -121,9 +122,10 @@ def run_shell(command: str, cwd: Optional[str] = None, timeout: int = DEFAULT_TI
 
         is_windows = platform.system() == "Windows"
         if is_windows:
-            # Windows 用 PowerShell
+            # Windows 用 PowerShell；PATH 中找不到时回退到已知安装路径
+            pwsh = shutil.which("powershell") or r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
             shell_args = [
-                "powershell",
+                pwsh,
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command", command

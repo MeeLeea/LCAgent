@@ -321,9 +321,13 @@ def test_real_state_graph_dangerous_command_confirm_interrupts_and_resumes():
         safety.set_confirm_backend(None)
 
 
-def test_run_shell_dangerous_command_interrupts_via_real_tool_and_resumes_approve():
+def test_run_shell_dangerous_command_interrupts_via_real_tool_and_resumes_approve(monkeypatch):
     # 回归测试：interrupt_confirm 抛出的 GraphInterrupt 必须穿透 run_shell 的
     # except Exception，由 ToolNode/运行时记录为图中断（而不是变成工具错误字符串）。
+    # 确保 python 在 PATH 中（Windows 上 .venv\Scripts 可能不在系统 PATH）
+    _venv_scripts = os.path.dirname(sys.executable)
+    monkeypatch.setenv("PATH", _venv_scripts + os.pathsep + os.environ.get("PATH", ""))
+
     from langgraph.prebuilt import ToolNode
 
     from tools import safety
@@ -377,7 +381,11 @@ def test_run_shell_dangerous_command_interrupts_via_real_tool_and_resumes_approv
         safety.set_confirm_backend(None)
 
 
-def test_run_shell_dangerous_command_deny_raises_rejection_via_real_tool():
+def test_run_shell_dangerous_command_deny_raises_rejection_via_real_tool(monkeypatch):
+    # 确保 python 在 PATH 中（Windows 上 .venv\Scripts 可能不在系统 PATH）
+    _venv_scripts = os.path.dirname(sys.executable)
+    monkeypatch.setenv("PATH", _venv_scripts + os.pathsep + os.environ.get("PATH", ""))
+
     from langgraph.prebuilt import ToolNode
 
     from tools import safety
