@@ -142,7 +142,7 @@ class LLMClient:
 
     def __init__(
         self,
-        provider: Optional[str] = "openai",
+        provider: Optional[str] = "zhipu",
         api_key: Optional[str] = None,
         model: Optional[str] = None,
         config_file: Optional[str] = None,

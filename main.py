@@ -13,6 +13,7 @@ except ImportError:
 
 from agent import AgentCore
 from agent.config import load_agent_config, resolve_path
+from agent.logging_config import setup_logging
 from tools import safety as safety_module
 from cli.cli_menu import select_menu
 from cli.commands import CommandContext, dispatch_command
@@ -96,6 +97,8 @@ def make_context(agent: AgentCore) -> CommandContext:
 
 def main() -> None:
     """运行交互式命令行主循环。"""
+    setup_logging()
+    # 启动 banner（保持 print，面向用户）
     print("=" * 50)
     print("  LC Agent (基于LangChain框架)")
     print("=" * 50)

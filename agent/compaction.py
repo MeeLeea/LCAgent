@@ -15,8 +15,9 @@ self.compaction_summary 的跨会话污染问题。
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Callable, Literal, Optional
 
 from langchain.agents.middleware import AgentMiddleware, AgentState
 from langchain_core.messages import (
@@ -89,9 +90,23 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
 
     SUMMARY_HEADER = "【历史对话摘要（上文因过长已被自动压缩）】\n"
 
-    def __init__(self, model: Any, config: CompactionConfig | None = None):
+    def __init__(
+        self,
+        model: Any,
+        config: CompactionConfig | None = None,
+        on_compaction: Optional[Callable[[str, int, int, int, float], None]] = None,
+    ):
+        """初始化压缩中间件
+
+        Args:
+            model: LLM 模型，用于生成摘要
+            config: 压缩配置
+            on_compaction: 压缩完成回调，签名 (trigger, messages_before, messages_after, summary_length, duration_ms)
+                           用于将自动触发的压缩记录到 MetricsCollector
+        """
         self.model = model
         self.config = config or CompactionConfig()
+        self._on_compaction = on_compaction
 
     # ============ 自动触发（中间件接口） ============
 
@@ -162,6 +177,7 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
 
     def _do_compact_sync(self, state: dict[str, Any]) -> dict[str, Any] | None:
         """同步执行压缩"""
+        _start = time.time()
         messages = list(state.get("messages", []))
         cutoff = self._find_safe_cutoff(messages)
         if cutoff <= 0:
@@ -177,7 +193,7 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
 
         pruned_keep = self._prune_tool_outputs(to_keep)
 
-        return {
+        result = {
             "messages": [
                 _make_remove_all(),
                 SystemMessage(content=self.SUMMARY_HEADER + new_summary),
@@ -186,8 +202,20 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
             "summary": new_summary,
         }
 
+        # 自动触发的压缩指标回调
+        if self._on_compaction is not None:
+            messages_after = len(pruned_keep) + 1  # +1 for summary SystemMessage
+            duration_ms = (time.time() - _start) * 1000
+            try:
+                self._on_compaction("auto", len(messages), messages_after, len(new_summary), duration_ms)
+            except Exception:
+                pass
+
+        return result
+
     async def _do_compact_async(self, state: dict[str, Any]) -> dict[str, Any] | None:
         """异步执行压缩"""
+        _start = time.time()
         messages = list(state.get("messages", []))
         cutoff = self._find_safe_cutoff(messages)
         if cutoff <= 0:
@@ -203,7 +231,7 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
 
         pruned_keep = self._prune_tool_outputs(to_keep)
 
-        return {
+        result = {
             "messages": [
                 _make_remove_all(),
                 SystemMessage(content=self.SUMMARY_HEADER + new_summary),
@@ -211,6 +239,17 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
             ],
             "summary": new_summary,
         }
+
+        # 自动触发的压缩指标回调
+        if self._on_compaction is not None:
+            messages_after = len(pruned_keep) + 1  # +1 for summary SystemMessage
+            duration_ms = (time.time() - _start) * 1000
+            try:
+                self._on_compaction("auto", len(messages), messages_after, len(new_summary), duration_ms)
+            except Exception:
+                pass
+
+        return result
 
     # ============ 增量摘要 ============
 

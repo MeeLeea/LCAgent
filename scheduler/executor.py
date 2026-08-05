@@ -14,6 +14,9 @@
 """
 from typing import Any, Callable, Dict, Tuple
 import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
 
 AgentFactory = Callable[[], Any]  # 返回具备 .run(task_text) -> str 接口的对象
 
@@ -62,8 +65,8 @@ def _execute_workflow_task(task_id: Any, task_text: str) -> Tuple[bool, str]:
     if not task:
         return False, f"工作流任务格式错误：缺少任务描述（格式: workflow:{workflow_name} <task>）"
 
-    print(f"[Scheduler] 任务 #{task_id} → 工作流: {workflow_name}")
-    print(f"[Scheduler]   任务内容: {task[:80]}")
+    logger.info("任务 #%d → 工作流: %s", task_id, workflow_name)
+    logger.info("  任务内容: %s", task[:80])
 
     try:
         from graph.registry import run_workflow_by_name, list_workflows
@@ -77,10 +80,10 @@ def _execute_workflow_task(task_id: Any, task_text: str) -> Tuple[bool, str]:
 
     # 节点进度打印（供调度器日志查看执行过程）
     def _on_node_start(node: str) -> None:
-        print(f"[Scheduler]   ▸ 节点开始: {node}")
+        logger.info("  ▸ 节点开始: %s", node)
 
     def _on_node_end(node: str) -> None:
-        print(f"[Scheduler]   ✓ 节点完成: {node}")
+        logger.info("  ✓ 节点完成: %s", node)
 
     try:
         result = run_workflow_by_name(
@@ -92,7 +95,7 @@ def _execute_workflow_task(task_id: Any, task_text: str) -> Tuple[bool, str]:
         final_answer = result.get("final_answer", "")
         if not final_answer:
             return False, "工作流执行完成但未返回结果"
-        print(f"[Scheduler]   工作流 {workflow_name} 执行完成")
+        logger.info("  工作流 %s 执行完成", workflow_name)
         return True, final_answer
 
     except KeyError as exc:
@@ -125,7 +128,7 @@ def execute_task(task: Dict[str, Any], agent_factory: AgentFactory) -> Tuple[boo
     if not task_text:
         return False, "任务内容为空，无法执行"
 
-    print(f"\n[Scheduler] 开始执行任务 #{task_id} ({task_type}): {task_text[:80]}")
+    logger.info("开始执行任务 #%d (%s): %s", task_id, task_type, task_text[:80])
 
     # 工作流任务路由
     if _is_workflow_task(task_text):
@@ -141,7 +144,7 @@ def execute_task(task: Dict[str, Any], agent_factory: AgentFactory) -> Tuple[boo
         # AgentCore.run() 返回执行结果字符串
         result = asyncio.run(agent.arun(task_text))
         output = str(result) if result else "(Agent 未返回内容)"
-        print(f"[Scheduler] 任务 #{task_id} 执行完成")
+        logger.info("任务 #%d 执行完成", task_id)
         return True, output
     except Exception as exc:
         return False, f"Agent 执行异常: {exc}"

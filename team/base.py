@@ -6,6 +6,7 @@ TeamAgent 轻量基类 - 为多 Agent 工作流设计的轻量角色
 - 可选工具注入(不默认加载全部工具/MCP/技能)
 - 更快的构建速度,适合团队协作场景
 """
+import logging
 import os
 from typing import ClassVar
 
@@ -13,6 +14,8 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import BaseTool
 
 from agent.llm_client import LLMClient
+
+logger = logging.getLogger(__name__)
 
 # AGENT.md 中工作流提示词小节的标题前缀(角色系统提示词加载时会被剥离)
 WORKFLOW_SECTION_PREFIX = "## workflow:"
@@ -229,7 +232,7 @@ class TeamAgent:
     def _invoke_with_tools(self, task: str) -> str:
         """工具模式执行(带 ReAct 推理循环)"""
         if self.verbose:
-            print(f"[{self.name}] 执行任务(工具模式): {task[:100]}...")
+            logger.info("[%s] 执行任务(工具模式): %s", self.name, task[:100])
         
         try:
             config = {"recursion_limit": self.max_iterations}
@@ -249,13 +252,13 @@ class TeamAgent:
         except Exception as e:
             error_msg = f"任务执行失败: {e!s}"
             if self.verbose:
-                print(f"[{self.name}] 错误: {error_msg}")
+                logger.error("[%s] %s", self.name, error_msg)
             return error_msg
-    
+
     def _invoke_pure_text(self, task: str) -> str:
         """纯文本模式执行(单次 LLM 调用)"""
         if self.verbose:
-            print(f"[{self.name}] 执行任务(纯文本模式): {task[:100]}...")
+            logger.info("[%s] 执行任务(纯文本模式): %s", self.name, task[:100])
         
         try:
             messages = [
@@ -268,5 +271,5 @@ class TeamAgent:
         except Exception as e:
             error_msg = f"任务执行失败: {e!s}"
             if self.verbose:
-                print(f"[{self.name}] 错误: {error_msg}")
+                logger.error("[%s] %s", self.name, error_msg)
             return error_msg

@@ -67,8 +67,7 @@ DEFAULTS: dict[str, Any] = {
     "context_trim_keep": 12,
     "max_execution_history": 100,
     "agent_prompt_file": "agent/AGENT.md",
-    "provider": "zhipu",
-    "model": None
+    "tool_timeout": 120,
 }
 
 

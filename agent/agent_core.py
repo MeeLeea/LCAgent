@@ -4,6 +4,7 @@ Agent核心调度模块 - 基于LangChain 1.x + LangGraph
 支持动态加载本地工具 + MCP Server工具
 """
 import asyncio
+import logging
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -22,12 +23,16 @@ from .compaction import (
     LCAgentCompactionMiddleware,
     LCAgentState,
 )
+from .logging_config import TraceContext, generate_trace_id, get_thread_id
 from tools.mcp_loader import DEFAULT_CONFIG_FILE
 from tools.mcp_pool import MCPPool, ServerStatus
 from tools.skills import SkillManager, default_skills_dir
 from tools.terminal_tools import UserRejectedCommandError
 from tools.tool_wrapper import wrap_tools_with_timeout
 from .exceptions import AgentStateError
+from .metrics import MetricsCollector
+
+logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class AgentTurnResult:
@@ -166,6 +171,11 @@ class AgentCore:
         # 修改 .content 即可让下次 LLM 调用看到最新提示词。
         self._system_message = SystemMessage(content=self._get_system_prompt(""))
 
+        # 运行时指标收集器（LLM tokens / 工具耗时 / 压缩统计）
+        # 必须在 _create_agent_executor 之前初始化，因为后者将 record_compaction
+        # 回调传给压缩中间件
+        self._metrics = MetricsCollector()
+
         # 创建Agent（编译一次，后续不再因技能变化而重建）
         self.agent_executor = self._create_agent_executor()
 
@@ -176,6 +186,15 @@ class AgentCore:
 
         # 流式事件处理器（组合模式）
         self.stream = StreamHandler(self)
+
+    @property
+    def metrics(self) -> MetricsCollector:
+        """运行时指标收集器（惰性初始化，兼容 object.__new__ 创建的测试实例）"""
+        mc = getattr(self, "_metrics", None)
+        if mc is None:
+            mc = MetricsCollector()
+            self._metrics = mc
+        return mc
 
     async def areload_mcp_tools(self) -> int:
         """
@@ -207,7 +226,7 @@ class AgentCore:
                         self._update_system_prompt("")
                 return count
             except Exception as e:
-                print(f"[MCP] 重新加载失败: {e}")
+                logger.error("MCP 重新加载失败: %s", e, exc_info=True)
                 return 0
 
     async def areload_mcp_server(self, name: str) -> bool:
@@ -226,7 +245,7 @@ class AgentCore:
                 success = await self._mcp_pool.reload_server(name)
                 if not success:
                     if self.verbose:
-                        print(f"[MCP] {name}: 重连失败或已移除")
+                        logger.warning("MCP %s: 重连失败或已移除", name)
                 # 从池中获取最新工具列表
                 self.mcp_tools = self._mcp_pool.get_all_tools()
                 self.tools = list(self.local_tools) + list(self.mcp_tools)
@@ -239,7 +258,7 @@ class AgentCore:
                         self._update_system_prompt("")
                 return success
             except Exception as e:
-                print(f"[MCP] {name}: 重连失败 - {e}")
+                logger.error("MCP %s: 重连失败 - %s", name, e, exc_info=True)
                 return False
 
     async def _async_load_mcp_tools(self) -> int:
@@ -250,11 +269,12 @@ class AgentCore:
             # 按 server 分组展示
             for info in self._mcp_pool.get_server_infos():
                 if info.status == ServerStatus.CONNECTED:
-                    print(f"[MCP] {info.name}: {info.tool_count} 个工具 ({', '.join(info.tool_names)})")
+                    logger.info("MCP %s: %d 个工具 (%s)",
+                                info.name, info.tool_count, ", ".join(info.tool_names))
                 elif info.status == ServerStatus.ERROR:
-                    print(f"[MCP] {info.name}: 连接失败 - {info.last_error}")
+                    logger.warning("MCP %s: 连接失败 - %s", info.name, info.last_error)
         elif self.verbose:
-            print("[MCP] 未加载到任何工具(可能配置为空或服务器未启用)")
+            logger.info("MCP 未加载到任何工具(可能配置为空或服务器未启用)")
         return tool_count
 
     def _create_agent_executor(self, skill_block: str = ""):
@@ -273,9 +293,11 @@ class AgentCore:
         self._system_message.content = self._get_system_prompt(skill_block)
 
         # 压缩中间件：消息超阈值时自动增量摘要 + Prune 工具输出
+        # on_compaction 回调：自动触发时也记录到 MetricsCollector
         compaction_middleware = LCAgentCompactionMiddleware(
             model=chat_model,
             config=self.compaction_config,
+            on_compaction=self.metrics.record_compaction,
         )
 
         # create_agent 直接返回可调用的agent
@@ -438,9 +460,8 @@ class AgentCore:
                             continue
                         step_count = len(self.execution_history) + 1
                         if self.verbose:
-                            print(f"\n--- 步骤 {step_count} ---")
-                            print(f"工具: {tc.get('name', 'unknown')}")
-                            print(f"输入: {tc.get('args', {})}")
+                            logger.debug("步骤 %d | 工具: %s | 输入: %s",
+                                         step_count, tc.get("name", "unknown"), tc.get("args", {}))
                         entry = {
                             "step": step_count,
                             "tool": tc.get("name"),
@@ -451,13 +472,34 @@ class AgentCore:
                         if isinstance(call_id, str):
                             recorded_ids.add(call_id)
                             new_entries_by_call_id[call_id] = entry
+
+                # 记录 LLM token 用量（从 response_metadata 提取）
+                # getattr 保护：测试中通过 object.__new__ 创建的实例可能没有 llm
+                _llm = getattr(self, "llm", None)
+                self.metrics.extract_and_record_llm_usage(
+                    msg,
+                    provider=getattr(_llm, "provider", ""),
+                    model=getattr(_llm, "model", "") or "",
+                )
+
             elif hasattr(msg, "content") and hasattr(msg, "tool_call_id"):
                 call_id = getattr(msg, "tool_call_id")
                 entry = new_entries_by_call_id.get(call_id)
                 if entry is not None:
                     entry["observation"] = str(msg.content)[:500]
                 if self.verbose and entry is not None:
-                    print(f"结果: {str(msg.content)[:200]}...")
+                    logger.debug("结果: %s", str(msg.content)[:200])
+
+                # 记录工具调用指标（检测超时和失败）
+                if entry is not None:
+                    content_str = str(msg.content)
+                    timed_out = '"error": "tool_timeout"' in content_str
+                    success = not timed_out and getattr(msg, "status", "success") != "error"
+                    self.metrics.record_tool_call(
+                        name=entry.get("tool", "unknown"),
+                        success=success,
+                        timed_out=timed_out,
+                    )
 
     def _check_and_raise_if_interrupted(self, turn: AgentTurnResult) -> None:
         """检查 turn 是否被中断，如果是则抛出异常
@@ -539,26 +581,30 @@ class AgentCore:
         系统提示词通过 _update_system_prompt 动态更新，不重建 Graph。
         """
         self._ensure_not_closed()
-        config = self._invoke_config()
-        input_msg = HumanMessage(content=task)
+        tid = getattr(self.memory, "thread_id", "-")
+        with TraceContext(trace_id=generate_trace_id(), thread_id=tid):
+            logger.info("arun_structured: %s", task[:100])
+            config = self._invoke_config()
+            input_msg = HumanMessage(content=task)
 
-        # 动态更新系统提示词（技能匹配），不重建 Graph
-        # 加锁防止与 areload_mcp_tools / aload_skill 并发修改共享状态
-        async with self._state_lock:
-            self._update_system_prompt(task)
+            # 动态更新系统提示词（技能匹配），不重建 Graph
+            # 加锁防止与 areload_mcp_tools / aload_skill 并发修改共享状态
+            async with self._state_lock:
+                self._update_system_prompt(task)
 
-        try:
-            result = await asyncio.to_thread(
-                self.agent_executor.invoke,
-                {"messages": [input_msg]},
-                config=config,
-            )
-        except UserRejectedCommandError:
-            return await self._ahandle_rejected_command(config)
+            try:
+                result = await asyncio.to_thread(
+                    self.agent_executor.invoke,
+                    {"messages": [input_msg]},
+                    config=config,
+                )
+            except UserRejectedCommandError:
+                return await self._ahandle_rejected_command(config)
 
-        self._record_tool_steps(result.get("messages", []), input_msg)
-        turn = self._parse_turn_result(result)
-        self._handle_turn_completion(turn, config, "run", task, important=True)
+            self._record_tool_steps(result.get("messages", []), input_msg)
+            turn = self._parse_turn_result(result)
+            self._handle_turn_completion(turn, config, "run", task, important=True)
+            self.metrics.increment_turn()
 
         return turn
 
@@ -569,25 +615,29 @@ class AgentCore:
         系统提示词通过 _update_system_prompt 动态更新，不重建 Graph。
         """
         self._ensure_not_closed()
-        config = self._invoke_config()
+        tid = getattr(self.memory, "thread_id", "-")
+        with TraceContext(trace_id=generate_trace_id(), thread_id=tid):
+            logger.info("achat_structured: %s", message[:100])
+            config = self._invoke_config()
 
-        with self._temp_verbose(False):
-            # 加锁防止与 areload_mcp_tools / aload_skill 并发修改共享状态
-            async with self._state_lock:
-                self._update_system_prompt(message)
-            try:
-                result = await asyncio.to_thread(
-                    self.agent_executor.invoke,
-                    {"messages": [HumanMessage(content=message)]},
-                    config=config,
-                )
-            except UserRejectedCommandError:
-                return await self._ahandle_rejected_command(config)
+            with self._temp_verbose(False):
+                # 加锁防止与 areload_mcp_tools / aload_skill 并发修改共享状态
+                async with self._state_lock:
+                    self._update_system_prompt(message)
+                try:
+                    result = await asyncio.to_thread(
+                        self.agent_executor.invoke,
+                        {"messages": [HumanMessage(content=message)]},
+                        config=config,
+                    )
+                except UserRejectedCommandError:
+                    return await self._ahandle_rejected_command(config)
 
-        turn = self._parse_turn_result(result)
-        self._handle_turn_completion(turn, config, "chat", message)
+            turn = self._parse_turn_result(result)
+            self._handle_turn_completion(turn, config, "chat", message)
+            self.metrics.increment_turn()
 
-        return turn
+            return turn
 
     async def aresume_structured(self, payload: Dict[str, Any]) -> AgentTurnResult:
         """异步恢复中断会话（结构化入口）"""
@@ -646,25 +696,23 @@ class AgentCore:
         Returns:
             执行结果
         """
-        print(f"\n{'='*50}")
-        print(f"开始执行任务: {task}")
-        print(f"{'='*50}\n")
+        logger.info("开始执行任务: %s", task)
 
         try:
             turn = await self.arun_structured(task)
             self._check_and_raise_if_interrupted(turn)
             output = turn.output or ""
-            print(f"\n最终答案: {output}")
+            logger.info("最终答案: %s", output)
             return output
         except RuntimeError as e:
             if "interrupt" in str(e):
                 raise
             error_msg = f"任务执行失败: {str(e)}"
-            print(f"\n错误: {error_msg}")
+            logger.error("%s", error_msg)
             return error_msg
         except Exception as e:
             error_msg = f"任务执行失败: {str(e)}"
-            print(f"\n错误: {error_msg}")
+            logger.error("%s", error_msg, exc_info=True)
             return error_msg
 
     async def achat(self, message: str) -> str:
@@ -726,9 +774,7 @@ class AgentCore:
         Returns:
             推理结果
         """
-        print(f"\n{'='*50}")
-        print(f"链式思考模式: {task}")
-        print(f"{'='*50}\n")
+        logger.info("链式思考模式: %s", task)
 
         system_prompt = (
             "你是一个智能助手，使用链式思考(Chain of Thought)来解决问题。\n"
@@ -745,7 +791,7 @@ class AgentCore:
             temperature=0.7
         )
 
-        print(f"\n最终答案: {response}")
+        logger.info("最终答案: %s", response)
 
         # 存入记忆
         self.memory.add("user", task)
@@ -846,16 +892,29 @@ class AgentCore:
         update = await mw.arun_compaction(msgs, existing_summary=existing_summary)
         if update is None:
             if self.verbose:
-                print("[压缩] 消息数未超阈值，无需压缩")
+                logger.debug("压缩: 消息数未超阈值，无需压缩")
             return None
+
+        import time as _time
+        _compact_start = _time.time()
 
         messages_before = len(msgs)
         # 通过 aupdate_state 写入压缩后的消息和摘要
         await self.agent_executor.aupdate_state(config, update)
         messages_after = len(update["messages"]) - 1  # 减去 RemoveMessage 标记
+        summary_length = len(update.get("summary", ""))
+
+        # 记录压缩指标
+        self.metrics.record_compaction(
+            trigger="manual",
+            messages_before=messages_before,
+            messages_after=messages_after,
+            summary_length=summary_length,
+            duration_ms=(_time.time() - _compact_start) * 1000,
+        )
 
         if self.verbose:
-            print(f"[压缩] {messages_before} → {messages_after} 条消息，摘要已更新")
+            logger.info("压缩: %d → %d 条消息，摘要已更新", messages_before, messages_after)
 
         return {
             "summary": update["summary"],
@@ -909,21 +968,18 @@ class AgentCore:
         try:
             await self._mcp_pool.close()
         except Exception as e:
-            if self.verbose:
-                print(f"[close] MCP 连接池关闭异常: {e}")
+            logger.warning("MCP 连接池关闭异常: %s", e, exc_info=True)
 
         # 2. 关闭 Checkpoint DB 连接
         try:
             self.memory.close()
         except Exception as e:
-            if self.verbose:
-                print(f"[close] Checkpoint DB 关闭异常: {e}")
+            logger.warning("Checkpoint DB 关闭异常: %s", e, exc_info=True)
 
         # 3. 清理执行历史
         self.execution_history.clear()
 
-        if self.verbose:
-            print("[close] AgentCore 资源已释放")
+        logger.info("AgentCore 资源已释放")
 
     def _ensure_not_closed(self) -> None:
         """检查 Agent 是否已关闭，已关闭则抛异常"""

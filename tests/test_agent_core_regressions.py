@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -378,7 +379,7 @@ def test_arun_and_achat_share_the_same_interrupt_error(monkeypatch, capsys):
     # ============ arun() / achat() 异常处理 ============
 
 
-def test_arun_returns_error_message_for_runtime_and_generic_failures(capsys):
+def test_arun_returns_error_message_for_runtime_and_generic_failures(caplog):
     # Given: 异步运行入口分别抛出非中断 RuntimeError 和普通 Exception。
     from agent.agent_core import AgentCore
 
@@ -393,13 +394,14 @@ def test_arun_returns_error_message_for_runtime_and_generic_failures(capsys):
         return asyncio.run(core.arun("task"))
 
     # When: 两类异常先后发生。
-    runtime_result = _raise(RuntimeError("boom"))
-    generic_result = _raise(ValueError("bad value"))
+    with caplog.at_level(logging.ERROR, logger="agent.agent_core"):
+        runtime_result = _raise(RuntimeError("boom"))
+        generic_result = _raise(ValueError("bad value"))
 
     # Then: 两类异常都被转换成同一格式的错误文本而不是向外抛出。
     assert runtime_result == "任务执行失败: boom"
     assert generic_result == "任务执行失败: bad value"
-    assert "错误: 任务执行失败: boom" in capsys.readouterr().out
+    assert any("任务执行失败: boom" in r.message for r in caplog.records)
 
 
 def test_arun_reraises_runtime_error_mentioning_interrupt(capsys):

@@ -13,6 +13,7 @@
     - 周期任务的 cron job ID = f"periodic_{task_id}"，便于取消/重建
     - 支持 BackgroundScheduler（嵌入主进程后台线程）和 BlockingScheduler（独立进程）
 """
+import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import datetime
@@ -25,6 +26,8 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from .executor import execute_task
 from .store import TaskStore
+
+logger = logging.getLogger(__name__)
 
 
 # APScheduler 的 BaseScheduler 类型（两个子类的公共基类）
@@ -106,7 +109,7 @@ class SchedulerEngine:
         """启动调度器：创建线程池 + 注册轮询 job + 同步周期任务。"""
         with self._lock:
             if self._started:
-                print("[Scheduler] 引擎已在运行，跳过重复启动")
+                logger.warning("引擎已在运行，跳过重复启动")
                 return
 
             # 0. 创建任务执行线程池
@@ -114,7 +117,7 @@ class SchedulerEngine:
                 max_workers=self.max_workers,
                 thread_name_prefix="task-worker",
             )
-            print(f"[Scheduler] 任务执行线程池已创建（max_workers={self.max_workers}）")
+            logger.info("任务执行线程池已创建（max_workers=%d）", self.max_workers)
 
             # 1. 一次性任务轮询 job
             self._scheduler.add_job(
@@ -125,7 +128,7 @@ class SchedulerEngine:
                 max_instances=1,  # 防止上一轮还没跑完就启动下一轮
                 coalesce=True,
             )
-            print(f"[Scheduler] 已注册一次性任务轮询（间隔 {self.poll_interval}s）")
+            logger.info("已注册一次性任务轮询（间隔 %ds）", self.poll_interval)
 
             # 2. 同步数据库中的周期任务
             self.sync_periodic_tasks()
@@ -133,10 +136,10 @@ class SchedulerEngine:
             # 3. 启动调度器
             self._scheduler.start()
             self._started = True
-            print("[Scheduler] 调度引擎已启动")
+            logger.info("调度引擎已启动")
 
             if self.blocking:
-                print("[Scheduler] 阻塞模式运行中，按 Ctrl+C 停止...")
+                logger.info("阻塞模式运行中，按 Ctrl+C 停止...")
 
     def stop(self):
         """停止调度器并关闭线程池。"""
@@ -153,7 +156,7 @@ class SchedulerEngine:
                 self._executor.shutdown(wait=True)
                 self._executor = None
                 self._pending_futures.clear()
-            print("[Scheduler] 调度引擎已停止")
+            logger.info("调度引擎已停止")
 
     @property
     def running(self) -> bool:
@@ -174,7 +177,7 @@ class SchedulerEngine:
             if self.register_periodic_task(task):
                 registered += 1
         if registered:
-            print(f"[Scheduler] 从数据库同步了 {registered} 个周期任务")
+            logger.info("从数据库同步了 %d 个周期任务", registered)
 
     def register_periodic_task(self, task: dict) -> bool:
         """
@@ -198,7 +201,7 @@ class SchedulerEngine:
         try:
             trigger = CronTrigger.from_crontab(cron_expr, **self._trigger_kwargs)
         except Exception as exc:
-            print(f"[Scheduler] 任务 #{task_id} 的 cron 表达式无效 [{cron_expr}]: {exc}")
+            logger.error("任务 #%d 的 cron 表达式无效 [%s]: %s", task_id, cron_expr, exc)
             return False
 
         self._scheduler.add_job(
@@ -211,7 +214,7 @@ class SchedulerEngine:
             coalesce=True,
         )
         self._registered_periodic.add(job_id)
-        print(f"[Scheduler] 已注册周期任务 #{task_id} (cron: {cron_expr})")
+        logger.info("已注册周期任务 #%d (cron: %s)", task_id, cron_expr)
         return True
 
     def unregister_periodic_task(self, task_id: int):
@@ -253,13 +256,13 @@ class SchedulerEngine:
         try:
             due_tasks = self.task_store.get_due_tasks()
         except Exception as exc:
-            print(f"[Scheduler] 轮询查询失败: {exc}")
+            logger.error("轮询查询失败: %s", exc, exc_info=True)
             return
 
         if not due_tasks:
             return
 
-        print(f"[Scheduler] 发现 {len(due_tasks)} 个到期的一次性任务，提交线程池并发执行")
+        logger.info("发现 %d 个到期的一次性任务，提交线程池并发执行", len(due_tasks))
 
         for task in due_tasks:
             task_id = task["id"]
@@ -277,7 +280,7 @@ class SchedulerEngine:
         """
         task = self.task_store.get_task(task_id)
         if task is None:
-            print(f"[Scheduler] 周期任务 #{task_id} 不存在，移除 cron job")
+            logger.warning("周期任务 #%d 不存在，移除 cron job", task_id)
             self.unregister_periodic_task(task_id)
             return
 
@@ -299,11 +302,11 @@ class SchedulerEngine:
             # 用 result 字段临时存最近一次执行结果
             self.task_store._update_status(task_id, "pending", result=output[:2000])
             if not success:
-                print(f"[Scheduler] 周期任务 #{task_id} 执行失败: {output[:200]}")
+                logger.error("周期任务 #%d 执行失败: %s", task_id, output[:200])
         else:
             if success:
                 self.task_store.mark_done(task_id, output[:2000])
-                print(f"[Scheduler] 一次性任务 #{task_id} 已完成")
+                logger.info("一次性任务 #%d 已完成", task_id)
             else:
                 self.task_store.mark_failed(task_id, output[:2000])
-                print(f"[Scheduler] 一次性任务 #{task_id} 执行失败（将自动重试或标记 failed）")
+                logger.error("一次性任务 #%d 执行失败（将自动重试或标记 failed）", task_id)

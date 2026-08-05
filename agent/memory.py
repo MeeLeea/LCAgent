@@ -566,9 +566,9 @@ class AgentMemory:
             )
 
         if verbose:
-            print(
-                f"\n[上下文裁剪] 会话过长({len(msgs)} 条),已自动摘要历史并开启新会话: "
-                f"{self.thread_id} (原 {old_tid})"
+            logger.info(
+                "上下文裁剪: 会话过长(%d 条), 已自动摘要历史并开启新会话: %s (原 %s)",
+                len(msgs), self.thread_id, old_tid,
             )
 
         return summary
