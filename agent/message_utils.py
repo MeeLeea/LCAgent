@@ -164,6 +164,8 @@ class StreamHandler:
         对 LLM 提供的瞬时错误(429/5xx/连接超时)做自动重试：仅当错误发生在
         任何事件输出之前才从头重试，避免工具副作用被重复执行或产出重复 token。
         """
+        # 去重：LangGraph stream 的 updates 模式可能多次产出同一条 AIMessage
+        recorded_msg_ids: set[str] = set()
         for attempt in range(RETRY_ATTEMPTS):
             emitted = False
             try:
@@ -188,14 +190,25 @@ class StreamHandler:
                             if not isinstance(state, dict):
                                 continue
                             for m in state.get("messages", []):
-                                if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
-                                    for tc in m.tool_calls:
-                                        yield {
-                                            "type": "tool_call",
-                                            "id": tc.get("id"),
-                                            "name": tc.get("name"),
-                                            "args": tc.get("args"),
-                                        }
+                                if isinstance(m, AIMessage):
+                                    # 记录 LLM token 用量（去重，避免同一消息多次记录）
+                                    msg_id = getattr(m, "id", None) or id(m)
+                                    if msg_id not in recorded_msg_ids:
+                                        recorded_msg_ids.add(msg_id)
+                                        _llm = getattr(self.agent, "llm", None)
+                                        self.agent.metrics.extract_and_record_llm_usage(
+                                            m,
+                                            provider=getattr(_llm, "provider", ""),
+                                            model=getattr(_llm, "model", "") or "",
+                                        )
+                                    if getattr(m, "tool_calls", None):
+                                        for tc in m.tool_calls:
+                                            yield {
+                                                "type": "tool_call",
+                                                "id": tc.get("id"),
+                                                "name": tc.get("name"),
+                                                "args": tc.get("args"),
+                                            }
                                 elif isinstance(m, ToolMessage):
                                     yield {
                                         "type": "tool_result",

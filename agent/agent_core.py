@@ -69,7 +69,6 @@ class AgentCore:
     def __init__(
         self,
         llm_client: LLMClient,
-        name: str = "LCAgent",
         memory_size: int = 10,
         long_term_memory_file: Optional[str] = None,
         checkpoint_file: Optional[str] = None,
@@ -92,7 +91,6 @@ class AgentCore:
 
         Args:
             llm_client: LLM客户端实例
-            name: Agent名称(为 None 时使用默认名)
             memory_size: 仅兼容旧 API(checkpoint 不限容量)
             long_term_memory_file: 长期记忆 JSON 文件(用于 compress)
             checkpoint_file: SQLite checkpoint 文件路径(为 None 时用内存)

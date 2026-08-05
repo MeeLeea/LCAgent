@@ -70,6 +70,7 @@ def build_agent(provider: str, process_type: str = None) -> tuple[AgentCore, obj
         process_type=process_type,
         agent_core_prompt=config["agent_core_prompt"],
         max_execution_history=config.get("max_execution_history", 100),
+        tool_timeout=config.get("tool_timeout", 120),
     )
     return agent, llm
 

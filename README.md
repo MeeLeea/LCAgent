@@ -8,9 +8,15 @@
 - **LangGraph Checkpoint 持久化**（SQLite 自动保存，程序重启可恢复对话）
 - **LangGraph Human-in-the-loop**（`ask_human` 暂停图执行，CLI 结构化选择后 `Command(resume)` 继续）
 - 长期记忆管理（compress 压缩摘要）与长上下文自动裁剪
+- **长上下文压缩中间件**（增量摘要 + 工具输出 Prune，摘要随 checkpoint 持久化、per-thread 隔离；`before_model` 自动触发或 `compact` 命令手动触发）
+- **MCP 连接池**（per-server 隔离、健康探测、单 server 自动重连，替代全量重载）
 - 多会话隔离（thread_id 机制，方向键菜单切换/删除/导出）
 - 命令模式下的会话切换会优先保持当前会话，不会因为菜单参数不兼容而失败
 - 安全护栏（危险终端命令拦截/确认、路径保护）
+- **全套异步 Public API**（`arun` / `achat` / `aresume` / `arun_structured` / `achat_structured` 等）
+- **运行时指标收集**（LLM 调用 / 工具执行 / 压缩统计，`metrics` 命令查询）
+- **结构化日志**（trace_id / thread_id 上下文注入，asyncio 安全）
+- **工具超时保护**与**统一异常层次**（`LCAgentError` 及其子类）
 
 ---
 
@@ -73,6 +79,14 @@
       - [方式 1：添加本地工具](#方式-1添加本地工具)
       - [方式 2：添加 MCP Server](#方式-2添加-mcp-server)
       - [本地工具 vs MCP 工具对比](#本地工具-vs-mcp-工具对比)
+  - [可观测性与可靠性](#可观测性与可靠性)
+    - [长上下文压缩中间件（Compaction）](#长上下文压缩中间件compaction)
+    - [MCP 连接池（MCPPool）](#mcp-连接池mcppool)
+    - [运行时指标（Metrics）](#运行时指标metrics)
+    - [结构化日志（Logging）](#结构化日志logging)
+    - [工具超时保护（Tool Timeout）](#工具超时保护tool-timeout)
+    - [统一异常层次](#统一异常层次)
+  - [异步 Public API](#异步-public-api)
   - [定时任务调度（Scheduler）](#定时任务调度scheduler)
     - [工具接口](#工具接口)
     - [快速开始](#快速开始-1)
@@ -221,7 +235,12 @@ LangChainAgent/
 │   ├── llm_client.py        # 统一大模型封装（多提供商 + 多模型）
 │   ├── config.py            # 运行时配置加载(agent/agent_config.json)
 │   ├── memory.py            # AgentMemory：checkpoint + 长期记忆 + 会话管理
-│   └── agent_core.py        # Agent 核心调度：run/chat/cot 三种模式 + HITL
+│   ├── compaction.py        # 长上下文压缩中间件（增量摘要 + 工具输出 Prune）
+│   ├── metrics.py           # 运行时指标收集（LLM/工具/压缩统计，线程安全）
+│   ├── logging_config.py    # 结构化日志（trace_id/thread_id 上下文注入）
+│   ├── exceptions.py        # 统一异常层次（LCAgentError 及其子类）
+│   ├── message_utils.py     # LLM 异常信息提取（中文化错误提示）
+│   └── agent_core.py        # Agent 核心调度：run/chat/cot 三种模式 + HITL + 异步 API
 ├── team/                    # 多 Agent 团队协作模块
 │   ├── __init__.py          # 导出 ManagerAgent/WorkerAgent/TerminatorAgent
 │   ├── factory.py           # 团队 Agent 工厂函数
@@ -251,7 +270,9 @@ LangChainAgent/
 │   ├── skill_tool.py        # read_skill 工具（LLM 自助读取技能指引）
 │   ├── create_tools.py      # 动态生成工具代码，保存为 .py 并自动注册到 __init__.py
 │   ├── safety.py            # 安全护栏(黑名单/白名单/交互确认/路径保护)
-│   ├── mcp_loader.py        # MCP 工具加载器
+│   ├── mcp_loader.py        # MCP 配置管理与工具加载器
+│   ├── mcp_pool.py          # MCP 连接池（per-server 隔离 + 健康探测 + 自动重连）
+│   ├── tool_wrapper.py      # 工具超时包装器（统一超时保护，超时返回 JSON 错误）
 │   ├── workspace_tool.py    # 工作目录管理 MCP Server
 │   └── scheduler_tool.py    # 定时任务工具（schedule_task/list/cancel/delete/cleanup）
 ├── cli/
@@ -293,6 +314,10 @@ LangChainAgent/
 │   ├── test_graph_rebuild.py
 │   ├── test_mcp_pool.py
 │   ├── test_threads_preview.py
+│   ├── test_metrics.py
+│   ├── test_tool_wrapper.py
+│   ├── test_logging_config.py
+│   ├── test_exceptions_and_close.py
 │   ├── test_provider_models.py        # 在线连通性测试(需 API Key)
 │   └── test_workspace_tool_path_protection.py
 └── exports/                 # 对话导出目录(运行 export 命令时生成)
@@ -306,11 +331,17 @@ LangChainAgent/
 | [agent/llm_client.py](agent/llm_client.py)               | 从`config/llm_config.json` 读取提供商配置，支持运行时切换提供商/模型                                                      |
 | [agent/config.py](agent/config.py)                       | 加载`agent/agent_config.json`，统一运行时配置                                                                             |
 | [agent/memory.py](agent/memory.py)                       | 双层记忆：Checkpoint（自动）+ memory.json（手动）+ 对话导出                                                                 |
-| [agent/agent_core.py](agent/agent_core.py)               | Agent 核心：`run()` / `chat()` / `cot()` 三种模式 + `AgentTurnResult` 结构化暂停/恢复 API + 技能注入 + 长上下文裁剪 |
+| [agent/compaction.py](agent/compaction.py)               | 长上下文压缩中间件：增量摘要 + 工具输出 Prune + 保留近期消息，摘要随 checkpoint 持久化、per-thread 隔离                      |
+| [agent/metrics.py](agent/metrics.py)                     | `MetricsCollector`：线程安全的运行时指标收集（LLM 调用 / 工具执行 / 压缩统计）                                            |
+| [agent/logging_config.py](agent/logging_config.py)       | 结构化日志：`contextvars` 实现 trace_id / thread_id 异步安全注入                                                          |
+| [agent/exceptions.py](agent/exceptions.py)               | 统一异常层次：`LCAgentError` 基类及 MCP/超时/压缩/中断/状态等子类                                                         |
+| [agent/agent_core.py](agent/agent_core.py)               | Agent 核心：`run()` / `chat()` / `cot()` 三种模式 + 全套异步 API + `AgentTurnResult` 结构化暂停/恢复 + 技能注入 + 压缩/裁剪 |
 | [team/](team/)                                           | 多 Agent 团队协作：ManagerAgent（拆解）/ WorkerAgent（执行）/ TerminatorAgent（汇总）+ 工厂函数                             |
 | [graph/simple.py](graph/simple.py)                       | LangGraph 监督者模式工作流编排（Manager→Worker→Terminator）                                                               |
 | [tools/skills.py](tools/skills.py)                       | `SkillManager`：扫描/匹配/渲染本地技能                                                                                    |
 | [tools/skill_tool.py](tools/skill_tool.py)               | `read_skill` 工具：LLM 在任务中自助读取技能指引                                                                           |
+| [tools/mcp_pool.py](tools/mcp_pool.py)                   | `MCPPool`：per-server 连接管理 + 健康探测 + 自动重连，替代全量重载                                                        |
+| [tools/tool_wrapper.py](tools/tool_wrapper.py)           | 工具超时包装：统一超时保护，超时返回 JSON 错误而非抛异常                                                                    |
 | [tools/](tools/)                                         | 本地工具 + MCP 工具加载 + 技能管理                                                                                          |
 | [cli/cli_menu.py](cli/cli_menu.py)                       | 通用终端方向键选择菜单                                                                                                      |
 | [cli/human_input.py](cli/human_input.py)                 | `ask_human` 工具、interrupt 展示和循环恢复编排                                                                            |
@@ -383,6 +414,8 @@ Agent 采用 **LangGraph Checkpoint + 长期记忆** 双层设计，由 [agent/m
 └──────────────────────────────────────────────────────────────┘
 ```
 
+> 在此双层之上，还有一层 **Compaction 压缩中间件**（[agent/compaction.py](agent/compaction.py)）负责控制**单会话内的上下文长度**：当 checkpoint 恢复的消息数超过阈值时，`before_model` 自动把旧消息增量摘要成 `state.summary`（随 checkpoint 持久化、per-thread 隔离），并 Prune 过长的历史工具输出，无需新开 thread。详见[可观测性与可靠性 → 长上下文压缩中间件](#长上下文压缩中间件compaction)。
+
 ### 上下文注入机制（重要）
 
 一个常见疑问：**Agent 在对话时，历史消息从哪里来？** 答案取决于模式。
@@ -443,15 +476,15 @@ self.agent_executor = self._create_agent_executor(
 | ------------ | ----------------------------------------- | ------------------------------------------------- |
 | 手动技能     | `skill:<name>`                          | 后续对话都会注入该技能指引，直到`skill:clear`   |
 | 自动匹配技能 | `auto_match_skills=true`                | 根据任务与技能描述的关键词重叠度自动注入相关技能  |
-| 长上下文摘要 | `max_context_messages > 0` 且消息超阈值 | 旧消息被摘要后注入 system prompt，并开启新 thread |
+| 长上下文压缩 | 消息数超 `max_messages` 时 `before_model` 自动触发 | 由 Compaction 中间件增量摘要旧消息，写入 `state.summary`（随 checkpoint 持久化、per-thread 隔离），无需新开 thread |
 
 #### 对比表
 
-| 模式       | checkpoint  | memory.json    | 技能指引  | 长上下文摘要 | 说明                             |
+| 模式       | checkpoint  | memory.json    | 技能指引  | 长上下文压缩 | 说明                             |
 | ---------- | ----------- | -------------- | --------- | ------------ | -------------------------------- |
-| `react:` | ✅ 自动注入 | ❌ 不参与      | ✅ 可注入 | ✅ 可注入    | LangGraph 自动恢复该 thread 历史 |
-| 普通对话   | ✅ 自动注入 | ❌ 不参与      | ✅ 可注入 | ✅ 可注入    | 同上，但不打印步骤、不存长期     |
-| `cot:`   | ✅ 手动取   | ✅ 取最近 3 条 | ❌ 不注入 | ❌ 不注入    | 绕过 Agent，纯 LLM 推理          |
+| `react:` | ✅ 自动注入 | ❌ 不参与      | ✅ 可注入 | ✅ 中间件触发 | LangGraph 自动恢复该 thread 历史 |
+| 普通对话   | ✅ 自动注入 | ❌ 不参与      | ✅ 可注入 | ✅ 中间件触发 | 同上，但不打印步骤、不存长期     |
+| `cot:`   | ✅ 手动取   | ✅ 取最近 3 条 | ❌ 不注入 | ❌ 不触发    | 绕过 Agent，纯 LLM 推理          |
 
 > ⚠️ **重要副作用**：由于 `react:` 和普通对话**不读 memory.json**，意味着你在会话 A 里用 `react:` 做的事（已存入 memory.json），切到会话 B 再用 `react:` 时，**LLM 看不到**会话 A 的关键信息。只有 `cot:` 模式或 `compress` 命令才会读 memory.json。也就是说 **memory.json 的跨会话"记忆"能力目前只对 cot 生效**。
 
@@ -1200,6 +1233,131 @@ if __name__ == "__main__":
 
 ---
 
+## 可观测性与可靠性
+
+在核心 Agent 之上，项目提供一层**可观测性与可靠性基础设施**，覆盖长上下文压缩、MCP 连接管理、运行时指标、结构化日志、工具超时与统一异常层次。
+
+### 长上下文压缩中间件（Compaction）
+
+[`agent/compaction.py`](agent/compaction.py) 实现了 `LCAgentCompactionMiddleware`，采用**三层压缩策略**，在会话过长时无损释放大量 token：
+
+1. **增量摘要**：已有 `state.summary` + 旧消息 → 更新后的 summary（避免每次全量重做摘要）
+2. **工具输出 Prune**：把保留区中过长的历史工具输出替换为占位符（`[工具输出已裁剪 N→M 字符] ...`），工具输出常占 70%+ token
+3. **保留近期 N 条原始消息**：不做任何修改，确保近期上下文完整
+
+关键设计：
+
+- 摘要存入 LangGraph `state.summary` 字段，随 **checkpoint 自动持久化**，天然实现 **per-thread 隔离**（每个 thread 拥有独立 summary），彻底消除跨会话污染。
+- **安全切割**：不会拆开 `AIMessage(tool_calls)` + `ToolMessage` 配对（切割点落在 `ToolMessage` 上时向前回退到对应的 `AIMessage`）。
+- 压缩后用 `RemoveMessage(REMOVE_ALL_MESSAGES)` 先清空 checkpoint 旧消息，再写入 `SystemMessage(摘要) + Pruned 近期消息`，旧消息彻底移除不再占用存储。
+
+触发方式：
+
+| 触发方式 | 入口                                            | 阈值行为                                       |
+| -------- | ----------------------------------------------- | ---------------------------------------------- |
+| 自动     | `before_model` / `abefore_model` 中间件         | 消息数 > `max_messages`（默认 50）时触发       |
+| 手动     | `AgentCore.manually_compact()` / `compact` 命令 | `force=True` 跳过阈值，仍需消息数 > `keep_recent` |
+
+`CompactionConfig` 关键参数（`agent/compaction.py`）：
+
+| 参数                     | 默认 | 说明                             |
+| ------------------------ | ---- | -------------------------------- |
+| `max_messages`         | 50   | 触发压缩的消息数阈值             |
+| `keep_recent`          | 20   | 保留最近 N 条消息（原样保留）    |
+| `max_tool_output_chars` | 200 | 工具输出超过此长度则触发 Prune   |
+| `tool_prune_preview`   | 100  | Prune 后保留的预览字符数         |
+
+> 可用 `CompactionConfig.from_kwargs(max_context_messages, context_trim_keep)` 从 AgentCore 现有配置参数构建。
+
+### MCP 连接池（MCPPool）
+
+[`tools/mcp_pool.py`](tools/mcp_pool.py) 提供 `MCPPool`，替代旧的 `load_mcp_tools` 全量重载模式：
+
+- **per-server 隔离**：`server-A` 断连不影响 `server-B/C`
+- **健康探测**：感知连接状态（`ServerStatus`：`disconnected` / `connecting` / `connected` / `error`）
+- **自动重连**：连接断开后可 `reconnect()` 恢复
+- **工具缓存 + 连接复用**：连接对象持久化，`reload_server(name)` 只重连单个 server 并重新拉取工具，无需全量重载
+
+```python
+pool = MCPPool(config_file)
+await pool.initialize()            # 启动时并行连接所有已启用 server（单个失败不阻塞其他）
+tools = pool.get_all_tools()       # 聚合所有已连接 server 的工具
+await pool.reload_server("name")  # 重连单个 server
+infos = pool.get_server_infos()    # 各 server 的 ServerInfo（状态/工具数/最后错误等）
+await pool.close()                 # 关闭所有连接
+```
+
+### 运行时指标（Metrics）
+
+[`agent/metrics.py`](agent/metrics.py) 的 `MetricsCollector` 挂在 `AgentCore.metrics` 上，**线程安全**，追踪三类核心指标：
+
+| 类别     | 记录方法                            | 汇总内容                                             |
+| -------- | ----------------------------------- | ---------------------------------------------------- |
+| LLM 调用 | `record_llm_call` / `extract_and_record_llm_usage` | 次数、prompt/completion/total tokens、按 provider 分组 |
+| 工具执行 | `record_tool_call`                | 次数、耗时（min/max/avg）、失败/超时次数，按工具名分组 |
+| 压缩统计 | `record_compaction`               | 触发次数、压缩前后消息数、节省消息数、摘要长度       |
+
+- token 优先从 `AIMessage.response_metadata` 的 `usage_metadata` 提取，缺失时用字符数 `/4` 粗估（`estimate_tokens`）。
+- `get_summary()` 返回结构化字典；`reset()` 清空所有指标。
+- CLI 用 `metrics` / `metrics:reset` 查看与重置。
+
+### 结构化日志（Logging）
+
+[`agent/logging_config.py`](agent/logging_config.py) 提供 **trace_id / thread_id 上下文注入**，基于 `contextvars` 实现 asyncio 安全传递：
+
+```python
+from agent.logging_config import setup_logging, TraceContext
+
+setup_logging(level=logging.INFO)  # 程序入口调用一次（幂等），日志输出到 stderr（不污染 stdout 工具输出）
+
+with TraceContext(trace_id="req-123", thread_id="thread-abc"):
+    logger.info("processing")  # 自动附带 [trace:req-123] [thread:thread-abc]
+```
+
+日志格式：`2026-08-05 14:30:00 [INFO ] [agent.agent_core] [trace:abc123] [thread:t-1] 消息内容`。未设置上下文时显示 `-` 占位；`setup_logging` 支持可选 `log_file` 落盘。
+
+### 工具超时保护（Tool Timeout）
+
+[`tools/tool_wrapper.py`](tools/tool_wrapper.py) 为本地工具和 MCP 工具叠加统一超时保护，防止 Agent 因工具卡死而永久阻塞：
+
+- 在工具 `_arun` 上叠加 `asyncio.wait_for`（同步工具先 `to_thread` 再加超时）
+- **超时后返回 JSON 错误消息**（`{"error": "tool_timeout", ...}`）而非抛异常，让 Agent 能继续推理
+- 优先级：`NO_TIMEOUT_TOOLS` > `TOOL_TIMEOUTS`（按工具名覆盖）> 全局 `DEFAULT_TIMEOUT`（60 秒）
+
+默认覆盖：`ask_human` 600s、`schedule_task` 120s、`search` 90s。
+
+### 统一异常层次
+
+[`agent/exceptions.py`](agent/exceptions.py) 定义分层异常，便于上层精准 `catch`：
+
+```
+LCAgentError                    ← 所有 LCAgent 异常的基类（含 detail 字段）
+├── MCPConnectionError          ← MCP server 连接失败/断连（含 server_name）
+├── ToolTimeoutError            ← 工具执行超时（含 tool_name / timeout）
+├── CompressError               ← 上下文压缩失败（含 stage）
+├── InterruptTimeoutError       ← 中断会话超时（含 thread_id）
+└── AgentStateError             ← AgentCore 状态错误（如已关闭后调用）
+```
+
+---
+
+## 异步 Public API
+
+`AgentCore` 提供全套异步公开方法（[`agent/agent_core.py`](agent/agent_core.py)），供飞书远程控制、调度器等异步入口调用；CLI 命令层亦已全面迁移到异步 API。
+
+| 方法                          | 说明                                                       |
+| ----------------------------- | ---------------------------------------------------------- |
+| `await arun(task)`          | Agent 模式执行任务，返回最终文本                           |
+| `await achat(message)`      | 普通对话模式，返回最终文本                                 |
+| `await aresume(payload)`    | 恢复被 `ask_human` 中断的会话（`Command(resume=...)`）   |
+| `await arun_structured(task)` / `await achat_structured(message)` | 返回 `AgentTurnResult`（含 HITL 结构化中断信息） |
+| `await aswitch_llm(llm_client)` | 运行时切换 LLM 提供商/模型                              |
+| `await areload_mcp_tools()` | 通过 MCP 连接池重载工具并按需重建 Graph                    |
+| `await manually_compact(force=False)` | 手动触发上下文压缩，返回状态更新字典或 `None`    |
+| `await aclose()`            | 释放资源（MCP 连接、checkpoint 等）的生命周期收尾          |
+
+---
+
 ## 定时任务调度（Scheduler）
 
 让 Agent 能"定闹钟"——用户说"明天下午3点生成报告"或"每天9点发送日报"，Agent 登记任务后直接回复，后台调度器在时间到达时自动唤起 Agent 执行。
@@ -1497,6 +1655,9 @@ output = chat_until_completion(agent, "需要人工选择时请先问我")
 | `tools`                                   | 查看可用工具列表（含 MCP 工具）                                            |
 | `clear [long\|short\|all]`                  | 清理记忆（默认 long）                                                      |
 | `compress` 或 `压缩`                    | 压缩长期记忆（LLM 摘要后替换原内容）                                       |
+| `compact`                                 | 手动压缩当前会话上下文（增量摘要 + 工具输出 Prune，`force=True` 跳过阈值） |
+| `metrics` 或 `metrics:status`           | 查看运行时指标（LLM 调用 / 工具执行 / 压缩统计）                           |
+| `metrics:reset`                           | 重置所有运行时指标                                                         |
 | `thread`                                  | 方向键选择切换会话(显示消息数预览);`Enter` 切换, `Ctrl+D` 删除高亮会话 |
 | `thread:new`                              | 开启新会话(原会话保留)                                                     |
 | `thread:delete <id>`                      | 删除指定会话(二次确认,不可恢复)                                            |
@@ -2252,6 +2413,10 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 | `tests/test_mcp_pool.py`                    | `MCPPool` 连接池：连接管理、健康探测、重连（mock 注入）        |
 | `tests/test_threads_preview.py`             | 会话菜单预览：首条用户消息提取与截断                             |
 | `tests/test_workflow.py`                    | 监督者模式工作流编排：Manager→Worker→Terminator 模板            |
+| `tests/test_metrics.py`                     | `MetricsCollector`：LLM/工具/压缩指标记录、token 提取与汇总    |
+| `tests/test_tool_wrapper.py`                | 工具超时包装：超时返回 JSON、按工具名覆盖、无限等待排除          |
+| `tests/test_logging_config.py`              | 结构化日志：trace_id/thread_id 上下文注入、TraceContext 恢复    |
+| `tests/test_exceptions_and_close.py`        | 异常层次与生命周期：`LCAgentError` 子类、`aclose()` 资源释放  |
 
 ### 在线连通性测试
 
@@ -2331,12 +2496,13 @@ uv run pytest tests/test_provider_models.py --provider kimi -v
 
 ## 技术栈
 
-- Python 3.10+
+- Python 3.14+（`requires-python = ">=3.14"`）
 - LangChain 1.x（`langchain`, `langchain-core`, `langchain-openai`）
-- LangGraph 1.x（`create_react_agent`）
-- LangGraph Checkpoint（`langgraph-checkpoint-sqlite`，SQLite 持久化）
+- LangGraph 1.x（`create_react_agent`、自定义 `AgentMiddleware` 压缩中间件）
+- LangGraph Checkpoint（`langgraph-checkpoint-sqlite`，同步/异步 SQLite 持久化）
 - langchain-mcp-adapters 0.3+（MCP 工具适配）
 - mcp 1.9+ / fastmcp 2.x（FastMCP Server）
+- tenacity 9.x（LLM 瞬时错误自动重试）
 - OpenAI SDK（用于 OpenAI 兼容接口）
 - Tavily Python SDK（联网搜索）
 - pytest（离线单元测试）
