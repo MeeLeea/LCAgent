@@ -5,6 +5,7 @@ Agent核心调度模块 - 基于LangChain 1.x + LangGraph
 """
 import asyncio
 import logging
+import os
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -810,6 +811,26 @@ class AgentCore:
         async with self._state_lock:
             self.llm = llm_client
             await self._arebuild_agent_executor("")
+
+    # ============ 团队角色切换(Team Role Switch) ============
+
+    async def arebuild_from_team_dir(self, agent_name: str, *, task: str = "") -> None:
+        """按 team/ 角色文件夹名重建主对话 Agent 的角色(唯一对外入口)
+
+        具体实现委托给 agent.role_sw.arebuild_agent_from_team_dir,
+        就地把当前 AgentCore 切换为目标角色的提示词/LLM。
+
+        Args:
+            agent_name: team/ 下的角色文件夹名(如 "manager"/"worker")
+            task: 可选任务描述,用于切换后自动匹配注入技能
+
+        Raises:
+            KeyError: 角色文件夹不存在或缺少必需文件
+            FileNotFoundError: AGENT.md 读取失败(内容为空)
+        """
+        from agent.role_sw import arebuild_agent_from_team_dir
+
+        await arebuild_agent_from_team_dir(self, agent_name, task=task)
 
     # ============ 技能阅读(Skills) ============
 

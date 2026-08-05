@@ -1352,6 +1352,7 @@ LCAgentError                    ← 所有 LCAgent 异常的基类（含 detail 
 | `await aresume(payload)`    | 恢复被 `ask_human` 中断的会话（`Command(resume=...)`）   |
 | `await arun_structured(task)` / `await achat_structured(message)` | 返回 `AgentTurnResult`（含 HITL 结构化中断信息） |
 | `await aswitch_llm(llm_client)` | 运行时切换 LLM 提供商/模型                              |
+| `await arebuild_from_team_dir(agent_name, *, task="")` | 按 `team/<角色>/` 文件夹名切换主对话 Agent 的角色（读取该目录的 `agent_config.json` + `AGENT.md`，仅提示词变化时不重建 Graph，provider/model 变化时重建 LLM 与 executor） |
 | `await areload_mcp_tools()` | 通过 MCP 连接池重载工具并按需重建 Graph                    |
 | `await manually_compact(force=False)` | 手动触发上下文压缩，返回状态更新字典或 `None`    |
 | `await aclose()`            | 释放资源（MCP 连接、checkpoint 等）的生命周期收尾          |
@@ -1670,6 +1671,9 @@ output = chat_until_completion(agent, "需要人工选择时请先问我")
 | `skill:<name>`                            | 将某技能加载进当前会话(注入 system prompt)                                 |
 | `skill:<name> <任务>`                     | 加载技能并立即以 Agent 模式执行该任务(如`skill:git-commit 提交README`)   |
 | `skill:clear`                             | 清空手动加载的技能                                                         |
+| `role` 或 `roles`                       | 方向键选择切换团队角色(扫描 `team/` 下的可用角色)                          |
+| `role:<name>`                             | 直接切换到指定团队角色(如`role:manager`)                                 |
+| `role:<name> <任务>`                      | 切换角色并立即以 Agent 模式执行该任务                                      |
 | `safety`                                  | 查看当前安全策略                                                           |
 | `safety:mode <blacklist\|whitelist>`       | 切换安全模式                                                               |
 | `safety:confirm <on\|off>`                 | 开关危险命令确认                                                           |

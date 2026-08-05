@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from . import core, execution, mcp, memory, metrics, provider, safety, skills, threads, workflow
+from . import core, execution, mcp, memory, metrics, provider, role, safety, skills, threads, workflow
 from .types import BREAK, HANDLED, UNHANDLED, CommandContext, CommandOutcome
 
 
@@ -53,6 +53,8 @@ def dispatch_command(context: CommandContext, user_input: str) -> CommandOutcome
         return skills.list_skills(context)
     if low.startswith("skill:"):
         return skills.skill_command(context, user_input)
+    if low == "role" or low == "roles" or low.startswith("role:"):
+        return role.role_command(context, user_input)
     if low == "safety":
         return safety.show_safety(context)
     if low.startswith("safety:"):
