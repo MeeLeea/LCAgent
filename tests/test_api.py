@@ -42,15 +42,20 @@ def mock_agent():
     agent = MagicMock()
     agent.memory = MagicMock()
     agent.memory.thread_id = "test-thread-123"
+    agent.memory._async_mode = False
     agent.memory.new_thread = MagicMock(return_value="new-thread-456")
     agent.memory.new_workflow_thread = MagicMock(return_value="server-workflow-simple-abc12345")
     agent.memory.list_threads = MagicMock(return_value=["thread-1", "thread-2"])
     agent.memory.delete_thread = MagicMock(return_value=True)
+    agent.memory.alist_threads = AsyncMock(return_value=["thread-1", "thread-2"])
+    agent.memory.adelete_thread = AsyncMock(return_value=True)
+    agent.memory.aget_messages = AsyncMock(return_value=[])
     agent.memory.is_workflow_thread = MagicMock(return_value=False)
     agent.memory.workflow_name_of = MagicMock(return_value=None)
     agent.get_available_tools = MagicMock(return_value=["calculator", "web_search", "ask_human"])
     agent.switch_llm = MagicMock()
     agent.aswitch_llm = AsyncMock(side_effect=agent.switch_llm)
+    agent.aclose = AsyncMock(return_value=None)
     
     # Mock astream_chat：普通对话返回 token + done 事件
     async def mock_astream_chat(message: str) -> AsyncIterator[Dict[str, Any]]:
@@ -249,8 +254,10 @@ def client(mock_agent, mock_llm, temp_checkpoint_db):
     with patch("api.server.agent", mock_agent), \
          patch("api.server.llm", mock_llm), \
          patch("api.server.CHECKPOINT_FILE", temp_checkpoint_db), \
-         patch("api.server.build_agent", return_value=(mock_agent, mock_llm)), \
-         patch("api.server.LLMClient", return_value=mock_llm):
+         patch("api.server.pick_default_provider", return_value="zhipu"), \
+         patch("api.server.build_agent", AsyncMock(return_value=(mock_agent, mock_llm))), \
+         patch("api.server.LLMClient", return_value=mock_llm), \
+         patch("api.server.safety_module.set_confirm_backend"):
         
         from api.server import app
         
@@ -647,12 +654,12 @@ def test_delete_thread(client, mock_agent):
     assert data["deleted"] is True
     assert data["thread_id"] == "thread-1"
     
-    mock_agent.memory.delete_thread.assert_called_once_with("thread-1")
+    mock_agent.memory.adelete_thread.assert_awaited_once_with("thread-1")
 
 
 def test_delete_thread_not_found(client, mock_agent):
     """测试删除不存在的会话"""
-    mock_agent.memory.delete_thread.return_value = False
+    mock_agent.memory.adelete_thread.return_value = False
     
     response = client.delete("/api/threads/nonexistent")
     assert response.status_code == 404
@@ -660,39 +667,44 @@ def test_delete_thread_not_found(client, mock_agent):
 
 def test_get_thread_messages(client, mock_agent, temp_checkpoint_db):
     """测试读取会话消息"""
-    from agent.memory import AgentMemory
+    mock_agent.memory.aget_messages.return_value = [
+        HumanMessage(content="测试消息1"),
+        AIMessage(content="回复1"),
+        HumanMessage(content="测试消息2"),
+        AIMessage(
+            content="回复2",
+            tool_calls=[
+                {"id": "call_1", "name": "calculator", "args": {"expr": "1+1"}}
+            ],
+        ),
+        ToolMessage(content="2", tool_call_id="call_1", name="calculator"),
+    ]
+    response = client.get("/api/threads/thread-1/messages")
+    assert response.status_code == 200
 
-    memory = AgentMemory(checkpoint_file=temp_checkpoint_db)
-    mock_agent.memory.get_messages.side_effect = memory.get_messages
-    try:
-        response = client.get("/api/threads/thread-1/messages")
-        assert response.status_code == 200
+    data = response.json()
+    assert data["thread_id"] == "thread-1"
+    assert "messages" in data
 
-        data = response.json()
-        assert data["thread_id"] == "thread-1"
-        assert "messages" in data
+    messages = data["messages"]
+    assert len(messages) == 5
 
-        messages = data["messages"]
-        assert len(messages) == 5
+    # 验证消息结构
+    assert messages[0]["role"] == "user"
+    assert messages[0]["content"] == "测试消息1"
 
-        # 验证消息结构
-        assert messages[0]["role"] == "user"
-        assert messages[0]["content"] == "测试消息1"
+    assert messages[1]["role"] == "assistant"
+    assert messages[1]["content"] == "回复1"
 
-        assert messages[1]["role"] == "assistant"
-        assert messages[1]["content"] == "回复1"
+    # 验证工具调用消息
+    assert messages[3]["role"] == "assistant"
+    assert "tool_calls" in messages[3]
+    assert len(messages[3]["tool_calls"]) == 1
+    assert messages[3]["tool_calls"][0]["name"] == "calculator"
 
-        # 验证工具调用消息
-        assert messages[3]["role"] == "assistant"
-        assert "tool_calls" in messages[3]
-        assert len(messages[3]["tool_calls"]) == 1
-        assert messages[3]["tool_calls"][0]["name"] == "calculator"
-
-        assert messages[4]["role"] == "tool"
-        assert messages[4]["name"] == "calculator"
-        assert messages[4]["content"] == "2"
-    finally:
-        memory.close()
+    assert messages[4]["role"] == "tool"
+    assert messages[4]["name"] == "calculator"
+    assert messages[4]["content"] == "2"
 
 
 # --------------------------------------------------------------------------- #
@@ -795,11 +807,11 @@ def test_chat_execution_command(client, mock_agent):
 
 def test_chat_management_command(client, mock_agent):
     """测试管理型命令（help）"""
-    with patch("api.server.dispatch_command") as mock_dispatch:
+    with patch("api.server.dispatch_command", new_callable=AsyncMock) as mock_dispatch:
         mock_dispatch.return_value = "success"
         
         # Mock 输出捕获
-        def side_effect(context, command):
+        async def side_effect(context, command):
             context.print_fn("可用命令列表")
             context.print_fn("- 输入 'help' 查看帮助")
             context.print_fn("- 输入 'info' 查看信息")
@@ -830,8 +842,8 @@ def test_chat_management_command(client, mock_agent):
 
 def test_chat_management_command_realtime_stream(client, mock_agent):
     """测试管理型命令输出实时推送:多段 print 输出是独立 token 事件而非合并一次"""
-    with patch("api.server.dispatch_command") as mock_dispatch:
-        def side_effect(context, command):
+    with patch("api.server.dispatch_command", new_callable=AsyncMock) as mock_dispatch:
+        async def side_effect(context, command):
             context.print_fn("第一段输出")
             context.print_fn("第二段输出")
             return "success"
@@ -890,8 +902,8 @@ def test_unsupported_runner_returns_clear_hint_instead_of_none():
 
 def test_chat_workflow_events_forwarded(client, mock_agent):
     """测试工作流运行事件经 SSE 实时转发(workflow_node / workflow_status)"""
-    with patch("api.server.dispatch_command") as mock_dispatch:
-        def side_effect(context, command):
+    with patch("api.server.dispatch_command", new_callable=AsyncMock) as mock_dispatch:
+        async def side_effect(context, command):
             context.print_fn("构建工作流: simple")
             # 模拟 run_workflow 内部经 workflow_event_cb 转发的事件
             if context.workflow_event_cb:
@@ -937,8 +949,8 @@ def test_chat_workflow_thread_auto_command(client, mock_agent):
     mock_agent.memory.is_workflow_thread.return_value = True
     mock_agent.memory.workflow_name_of.return_value = "simple"
 
-    with patch("api.server.dispatch_command") as mock_dispatch:
-        def side_effect(context, command):
+    with patch("api.server.dispatch_command", new_callable=AsyncMock) as mock_dispatch:
+        async def side_effect(context, command):
             context.print_fn(f"执行工作流命令: {command}")
             return "success"
 
@@ -966,8 +978,8 @@ def test_chat_workflow_thread_explicit_command_not_wrapped(client, mock_agent):
     mock_agent.memory.is_workflow_thread.return_value = True
     mock_agent.memory.workflow_name_of.return_value = "simple"
 
-    with patch("api.server.dispatch_command") as mock_dispatch:
-        def side_effect(context, command):
+    with patch("api.server.dispatch_command", new_callable=AsyncMock) as mock_dispatch:
+        async def side_effect(context, command):
             context.print_fn(f"显式命令: {command}")
             return "success"
 
@@ -1042,8 +1054,8 @@ def test_chat_resume_without_thread(client, mock_agent):
 # --------------------------------------------------------------------------- #
 def test_execute_command_help(client, mock_agent):
     """测试执行 help 命令"""
-    with patch("api.server.dispatch_command") as mock_dispatch:
-        def side_effect(context, command):
+    with patch("api.server.dispatch_command", new_callable=AsyncMock) as mock_dispatch:
+        async def side_effect(context, command):
             context.print_fn("可用命令：")
             context.print_fn("- 输入 'help' 查看帮助")
             context.print_fn("- 输入 'info' 查看配置信息")
@@ -1067,8 +1079,8 @@ def test_execute_command_help(client, mock_agent):
 
 def test_execute_command_info(client, mock_agent):
     """测试执行 info 命令"""
-    with patch("api.server.dispatch_command") as mock_dispatch:
-        def side_effect(context, command):
+    with patch("api.server.dispatch_command", new_callable=AsyncMock) as mock_dispatch:
+        async def side_effect(context, command):
             context.print_fn("当前配置：")
             context.print_fn("提供商：zhipu")
             context.print_fn("模型：glm-4-flash")
@@ -1091,8 +1103,8 @@ def test_execute_command_info(client, mock_agent):
 
 def test_execute_command_threads_uses_current_thread(client, mock_agent):
     """测试 threads 命令不会因为 current 参数导致菜单模拟器崩溃"""
-    with patch("api.server.dispatch_command") as mock_dispatch:
-        def side_effect(context, command):
+    with patch("api.server.dispatch_command", new_callable=AsyncMock) as mock_dispatch:
+        async def side_effect(context, command):
             selected = context.select_menu(
                 "选择会话",
                 [("thread-1 (当前)", "thread-1"), ("thread-2", "thread-2")],
@@ -1118,7 +1130,7 @@ def test_execute_command_threads_uses_current_thread(client, mock_agent):
 
 def test_execute_command_with_exception(client, mock_agent):
     """测试命令执行异常"""
-    with patch("api.server.dispatch_command") as mock_dispatch:
+    with patch("api.server.dispatch_command", new_callable=AsyncMock) as mock_dispatch:
         mock_dispatch.side_effect = RuntimeError("命令执行失败")
         
         response = client.post(
@@ -1166,11 +1178,15 @@ def test_reset_metrics(client, mock_agent):
 def test_get_metrics_no_agent(mock_llm):
     """测试 Agent 未初始化时返回 503"""
     with patch("api.server.agent", None), \
-         patch("api.server.llm", mock_llm):
+         patch("api.server.llm", mock_llm), \
+         patch("api.server.pick_default_provider", return_value="zhipu"), \
+         patch("api.server.build_agent", AsyncMock(return_value=(MagicMock(get_available_tools=MagicMock(return_value=[]), metrics=None, aclose=AsyncMock()), mock_llm))), \
+         patch("api.server.safety_module.set_confirm_backend"):
         from api.server import app
         with TestClient(app) as c:
-            response = c.get("/api/metrics")
-            assert response.status_code == 503
+            with patch("api.server.agent", None), patch("api.server.llm", mock_llm):
+                response = c.get("/api/metrics")
+                assert response.status_code == 503
 
 
 # --------------------------------------------------------------------------- #
@@ -1365,8 +1381,12 @@ def test_get_skills(client, mock_agent):
 # --------------------------------------------------------------------------- #
 # 会话导出
 # --------------------------------------------------------------------------- #
-def test_export_thread(client, mock_agent):
+def test_export_thread(client, mock_agent, temp_checkpoint_db):
     """测试导出会话为文本"""
+    mock_agent.memory.aget_messages.return_value = [
+        HumanMessage(content="测试消息1"),
+        AIMessage(content="回复1"),
+    ]
     response = client.get("/api/threads/thread-1/export")
     assert response.status_code == 200
 
@@ -1374,17 +1394,21 @@ def test_export_thread(client, mock_agent):
     assert data["thread_id"] == "thread-1"
     assert data["format"] == "text"
     assert "测试消息" in data["content"]
-    mock_agent.memory.export_thread.assert_called_once_with(thread_id="thread-1", fmt="text")
+    mock_agent.memory.aget_messages.assert_awaited_once_with(thread_id="thread-1")
 
 
-def test_export_thread_markdown(client, mock_agent):
+def test_export_thread_markdown(client, mock_agent, temp_checkpoint_db):
     """测试导出会话为 Markdown"""
+    mock_agent.memory.aget_messages.return_value = [
+        HumanMessage(content="测试消息1"),
+        AIMessage(content="回复1"),
+    ]
     response = client.get("/api/threads/thread-1/export?fmt=markdown")
     assert response.status_code == 200
 
     data = response.json()
     assert data["format"] == "markdown"
-    mock_agent.memory.export_thread.assert_called_once_with(thread_id="thread-1", fmt="markdown")
+    mock_agent.memory.aget_messages.assert_awaited_once_with(thread_id="thread-1")
 
 
 def test_export_thread_invalid_format(client, mock_agent):
@@ -1446,42 +1470,43 @@ def test_serialize_messages():
 def test_thread_summary(temp_checkpoint_db):
     """测试会话摘要生成"""
     from types import SimpleNamespace
-
-    from agent.memory import AgentMemory
     from api.server import thread_summary
 
-    memory = AgentMemory(checkpoint_file=temp_checkpoint_db)
-    try:
-        with patch("api.server.agent", SimpleNamespace(memory=memory)):
-            summary = thread_summary("thread-1")
+    memory = MagicMock()
+    memory.aget_messages = AsyncMock(return_value=[
+        HumanMessage(content="测试消息1"),
+        AIMessage(content="回复1"),
+        HumanMessage(content="测试消息2"),
+        AIMessage(content="回复2"),
+    ])
+    memory.is_workflow_thread = MagicMock(return_value=False)
+    memory.workflow_name_of = MagicMock(return_value=None)
+    with patch("api.server.agent", SimpleNamespace(memory=memory)):
+        summary = asyncio.run(thread_summary("thread-1"))
 
-            assert summary["thread_id"] == "thread-1"
-            assert summary["message_count"] == 5
-            assert len(summary["preview"]) > 0
-    finally:
-        memory.close()
+        assert summary["thread_id"] == "thread-1"
+        assert summary["message_count"] == 4
+        assert len(summary["preview"]) > 0
 
 
 def test_thread_summary_workflow_type(temp_checkpoint_db):
     """测试工作流会话摘要带类型与工作流名，普通会话不带"""
     from types import SimpleNamespace
-
-    from agent.memory import AgentMemory
     from api.server import thread_summary
 
-    memory = AgentMemory(checkpoint_file=temp_checkpoint_db, process_type="server")
-    wf_tid = memory.new_workflow_thread("simple")
-    try:
-        with patch("api.server.agent", SimpleNamespace(memory=memory)):
-            summary = thread_summary(wf_tid)
-            assert summary["type"] == "workflow"
-            assert summary["workflow_name"] == "simple"
+    memory = MagicMock()
+    memory.aget_messages = AsyncMock(return_value=[])
+    memory.is_workflow_thread = MagicMock(side_effect=lambda thread_id: thread_id.startswith("server-workflow-"))
+    memory.workflow_name_of = MagicMock(side_effect=lambda thread_id: "simple" if thread_id.startswith("server-workflow-") else None)
+    wf_tid = "server-workflow-simple-2571eacc"
+    with patch("api.server.agent", SimpleNamespace(memory=memory)):
+        summary = asyncio.run(thread_summary(wf_tid))
+        assert summary["type"] == "workflow"
+        assert summary["workflow_name"] == "simple"
 
-            chat_summary = thread_summary("thread-1")
-            assert chat_summary["type"] == "chat"
-            assert "workflow_name" not in chat_summary
-    finally:
-        memory.close()
+        chat_summary = asyncio.run(thread_summary("thread-1"))
+        assert chat_summary["type"] == "chat"
+        assert "workflow_name" not in chat_summary
 
 
 # --------------------------------------------------------------------------- #

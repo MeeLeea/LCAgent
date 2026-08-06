@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import sys
+from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
@@ -47,7 +48,6 @@ from agent.llm_client import LLMClient, load_providers
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 from tools import safety as safety_module
 from cli.commands import CommandContext, dispatch_command
-from cli.cli_menu import select_menu
 from cli.commands.provider import create_llm
 
 # --------------------------------------------------------------------------- #
@@ -58,7 +58,7 @@ MCP_CONFIG_FILE = os.path.join(BASE_DIR, "config", "mcp_servers.json")
 AGENT_CONFIG_FILE = os.path.join(BASE_DIR, "agent", "agent_config.json")
 SERVER_CONFIG_FILE = os.path.join(BASE_DIR, "config", "server_config.json")
 MEMORY_FILE = os.path.join(BASE_DIR, "memory", "memory.json")
-CHECKPOINT_FILE = os.path.join(BASE_DIR, "memory", "checkpoints.sqlite")
+CHECKPOINT_FILE = os.path.join(BASE_DIR, "memory", "checkpoints_async.sqlite")
 WEB_DIST = os.path.join(BASE_DIR, "web", "dist")
 
 
@@ -87,18 +87,19 @@ def load_server_config() -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 agent: Optional[AgentCore] = None
 llm: Optional[LLMClient] = None
+_startup_provider: Optional[str] = None
 # 串行化对话轮次：AgentCore 是有状态单例，同一时刻只能跑一轮。
 chat_lock = asyncio.Lock()
 
 
-def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
+async def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
     """根据提供商初始化 LLM 与 Agent（逻辑与 main.py 一致，去掉 CLI 打印）。"""
     new_llm = LLMClient(provider=provider, config_file=LLM_FILE)
     cfg = load_agent_config(AGENT_CONFIG_FILE)
     agent_prompt_file = cfg.get("agent_prompt_file")
     skills_dir = resolve_path(cfg["skills_dir"], BASE_DIR)
     mcp_config_file = resolve_path(cfg["mcp_config_file"], BASE_DIR)
-    new_agent = AgentCore(
+    new_agent = await AgentCore.acreate(
         llm_client=new_llm,
         name=cfg["name"],
         memory_size=cfg["memory_size"],
@@ -118,6 +119,26 @@ def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
         tool_timeout=cfg.get("tool_timeout", 120),
     )
     return new_agent, new_llm
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """在 FastAPI 生命周期内创建和释放 Agent 资源。"""
+    global agent, llm
+    provider = _startup_provider or pick_default_provider()
+    logger.info("初始化提供商: %s", provider)
+    agent, llm = await build_agent(provider)
+    safety_module.set_confirm_backend(safety_module.interrupt_confirm)
+    info = llm.get_info()
+    logger.info("模型: %s / %s", info["provider_name"], info["model"])
+    logger.info("工具: %s", ", ".join(agent.get_available_tools()))
+    try:
+        yield
+    finally:
+        if agent is not None:
+            await agent.aclose()
+        agent = None
+        llm = None
 
 
 def pick_default_provider() -> str:
@@ -159,9 +180,9 @@ def serialize_messages(messages: List[Any]) -> List[Dict[str, Any]]:
     return out
 
 
-def thread_summary(thread_id: str) -> Dict[str, Any]:
+async def thread_summary(thread_id: str) -> Dict[str, Any]:
     """单个会话的摘要信息（消息数 + 预览 + 会话类型）。"""
-    msgs = agent.memory.get_messages(thread_id=thread_id) if agent else []
+    msgs = await agent.memory.aget_messages(thread_id=thread_id) if agent else []
     preview = ""
     for m in msgs:
         if isinstance(m, HumanMessage):
@@ -226,7 +247,7 @@ class SafetyUpdateRequest(BaseModel):
 # --------------------------------------------------------------------------- #
 # FastAPI 应用
 # --------------------------------------------------------------------------- #
-app = FastAPI(title="LangChainAgent API", version="1.0.0")
+app = FastAPI(title="LangChainAgent API", version="1.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -416,8 +437,8 @@ async def list_workflows():
 @app.get("/api/threads")
 async def list_threads():
     """列出所有会话（按消息数倒序，便于最近活跃的靠前）。"""
-    ids = agent.memory.list_threads() if agent else []
-    summaries = [thread_summary(tid) for tid in ids]
+    ids = await agent.memory.alist_threads() if agent else []
+    summaries = [await thread_summary(tid) for tid in ids]
     summaries.sort(key=lambda x: x["message_count"], reverse=True)
     return {"threads": summaries, "current": agent.memory.thread_id if agent else None}
 
@@ -438,7 +459,7 @@ async def create_thread(req: Optional[CreateThreadRequest] = None):
 @app.delete("/api/threads/{thread_id}")
 async def delete_thread(thread_id: str):
     logger.info("删除会话: %s", thread_id)
-    ok = agent.memory.delete_thread(thread_id)
+    ok = await agent.memory.adelete_thread(thread_id)
     if not ok:
         logger.warning("删除失败: %s", thread_id)
         raise HTTPException(status_code=404, detail="会话不存在或删除失败")
@@ -447,7 +468,7 @@ async def delete_thread(thread_id: str):
 
 @app.get("/api/threads/{thread_id}/messages")
 async def get_thread_messages(thread_id: str):
-    msgs = agent.memory.get_messages(thread_id=thread_id) if agent else []
+    msgs = await agent.memory.aget_messages(thread_id=thread_id) if agent else []
     return {"thread_id": thread_id, "messages": serialize_messages(msgs)}
 
 
@@ -625,20 +646,20 @@ async def chat(req: ChatRequest):
                         logger.info("完成 [%s]", tid)
                         return
                     else:
-                        # 管理型命令：dispatch_command 放后台线程执行，print 输出/工作流事件
+                        # 管理型命令：dispatch_command 在当前事件循环执行，print 输出/工作流事件
                         # 经队列实时推送，保证长耗时命令（如 workflow）运行期间前端持续收到进度
                         logger.info("管理型命令 [%s]", tid)
 
-                        def _run_dispatch() -> None:
-                            """后台线程执行 dispatch_command，结果/异常经队列送回主循环"""
+                        async def _run_dispatch() -> None:
+                            """执行 dispatch_command，结果/异常经队列送回主循环"""
                             try:
-                                outcome = dispatch_command(context, command)
+                                outcome = await dispatch_command(context, command)
                                 output_queue.put_nowait(("outcome", outcome))
                             except Exception as e:
                                 logger.error("命令执行异常 [%s]: %s", tid, e)
                                 output_queue.put_nowait(("error", e))
 
-                        dispatch_task = asyncio.create_task(asyncio.to_thread(_run_dispatch))
+                        dispatch_task = asyncio.create_task(_run_dispatch())
 
                         # 实时消费队列：print → token 事件；workflow 事件 → 结构化 SSE 事件
                         outcome = None
@@ -655,7 +676,7 @@ async def chat(req: ChatRequest):
                                 yield _sse({"type": "error", "content": f"命令执行失败: {payload}"})
                                 return
 
-                        await dispatch_task  # 确保后台线程完全退出
+                        await dispatch_task  # 确保命令任务完全退出
 
                         # help 命令：全量输出统一转表格后推送（实时通道已跳过）
                         if is_help:
@@ -766,7 +787,7 @@ async def execute_command(req: CommandRequest):
             return None
         
         # 不支持的命令会 fallback 到聊天模式，提示用户用正常对话
-        def unsupported_runner(agent_obj, text: str) -> str:
+        async def unsupported_runner(agent_obj, text: str) -> str:
             capture_output("未知命令。请直接发送消息进行对话，或输入 /help 查看可用命令。")
             return ""
         
@@ -786,7 +807,7 @@ async def execute_command(req: CommandRequest):
                 mcp_config_file=MCP_CONFIG_FILE,
             )
             
-            outcome = dispatch_command(context, command)
+            outcome = await dispatch_command(context, command)
             output = "\n".join(output_lines)
             
             # 如果是 help 命令，将输出转换成表格格式
@@ -863,7 +884,17 @@ async def get_memory_summary():
     """获取记忆摘要统计（当前会话消息数、长期记忆条数、checkpoint 信息）"""
     if not agent:
         raise HTTPException(status_code=503, detail="Agent 未初始化")
-    return agent.get_memory_summary()
+    memory = agent.memory
+    if not getattr(memory, "_async_mode", False):
+        return agent.get_memory_summary()
+    return {
+        "thread_id": memory.thread_id,
+        "checkpoint_messages": len(await memory.aget_messages()),
+        "checkpoint_backend": "sqlite" if memory.use_sqlite else "memory",
+        "checkpoint_file": memory.checkpoint_file or "(内存)",
+        "long_term_count": len(memory.long_term_memory),
+        "total_threads": len(await memory.alist_threads()),
+    }
 
 
 @app.post("/api/compress")
@@ -956,7 +987,27 @@ async def export_thread(thread_id: str, fmt: str = "text"):
         raise HTTPException(status_code=503, detail="Agent 未初始化")
     if fmt not in ("text", "markdown"):
         raise HTTPException(status_code=400, detail="fmt 必须为 text|markdown")
-    content = agent.memory.export_thread(thread_id=thread_id, fmt=fmt)
+    msgs = await agent.memory.aget_messages(thread_id=thread_id)
+    blocks = []
+    for m in msgs:
+        if isinstance(m, HumanMessage):
+            role = "用户"
+        elif isinstance(m, AIMessage):
+            role = "助手"
+        elif isinstance(m, SystemMessage):
+            role = "系统"
+        else:
+            role = "工具"
+        text = stringify_content(m.content).strip()
+        if not text:
+            continue
+        if fmt == "markdown":
+            blocks.append(f"**{role}**:\n\n{text}")
+        else:
+            blocks.append(f"【{role}】\n{text}")
+    sep = "\n\n---\n\n" if fmt == "markdown" else "\n\n"
+    header = f"# 对话导出 - {thread_id}\n\n" if fmt == "markdown" else f"对话导出 - {thread_id}\n{'=' * 40}\n"
+    content = header + sep.join(blocks)
     return {"thread_id": thread_id, "format": fmt, "content": content}
 
 
@@ -1002,15 +1053,9 @@ def main():
     parser.add_argument("--port", type=int, default=server_cfg["port"], help=f"绑定端口（默认读自 {SERVER_CONFIG_FILE}）")
     args = parser.parse_args()
 
-    global agent, llm
-    provider = args.provider or pick_default_provider()
-    logger.info("初始化提供商: %s", provider)
-    agent, llm = build_agent(provider)
-    # 非交互环境：危险命令确认改为通过 LangGraph interrupt 抛给前端，而不是终端 input()
-    safety_module.set_confirm_backend(safety_module.interrupt_confirm)
-    info = llm.get_info()
-    logger.info("模型: %s / %s", info["provider_name"], info["model"])
-    logger.info("工具: %s", ", ".join(agent.get_available_tools()))
+    global _startup_provider
+    _startup_provider = args.provider or pick_default_provider()
+    logger.info("初始化提供商: %s", _startup_provider)
     logger.info("服务启动: http://%s:%s", args.host, args.port)
 
     import uvicorn

@@ -125,7 +125,7 @@ def _make_minimal_core():
 
     # Mock memory
     core.memory = MagicMock()
-    core.memory.close = MagicMock()
+    core.memory.aclose = AsyncMock()
 
     # Execution history
     from collections import deque
@@ -154,7 +154,7 @@ class TestAgentCoreClose:
 
         asyncio.run(core.aclose())
 
-        core.memory.close.assert_called_once()
+        core.memory.aclose.assert_awaited_once()
 
     def test_close_clears_execution_history(self):
         core = _make_minimal_core()
@@ -175,7 +175,7 @@ class TestAgentCoreClose:
 
         # Then: 不重复调用 close（幂等）
         core._mcp_pool.close.assert_awaited_once()
-        core.memory.close.assert_called_once()
+        core.memory.aclose.assert_awaited_once()
 
     def test_arun_structured_raises_after_close(self):
         core = _make_minimal_core()
@@ -219,7 +219,7 @@ class TestAgentCoreClose:
 
         # MCP pool 和 memory 都被关闭
         core._mcp_pool.close.assert_awaited_once()
-        core.memory.close.assert_called_once()
+        core.memory.aclose.assert_awaited_once()
 
     def test_close_handles_mcp_error_gracefully(self):
         # Given: MCP close 抛异常
@@ -230,13 +230,13 @@ class TestAgentCoreClose:
         asyncio.run(core.aclose())
 
         # Then: 仍然继续关闭 memory
-        core.memory.close.assert_called_once()
+        core.memory.aclose.assert_awaited_once()
         assert core._closed is True
 
     def test_close_handles_memory_error_gracefully(self):
         # Given: memory close 抛异常
         core = _make_minimal_core()
-        core.memory.close = MagicMock(side_effect=RuntimeError("DB boom"))
+        core.memory.aclose = AsyncMock(side_effect=RuntimeError("DB boom"))
 
         # When: 关闭
         asyncio.run(core.aclose())

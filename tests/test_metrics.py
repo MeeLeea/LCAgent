@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,7 +31,6 @@ from agent.metrics import (
     ToolStats,
     estimate_tokens,
 )
-
 
 # ════════════════════════════════════════════════════════════════════════
 #  LLM 指标测试
@@ -572,6 +572,9 @@ class FakeSafetyBackend:
 def _make_context(agent, printed: list[str]) -> Any:
     from cli.commands.types import CommandContext
 
+    async def fake_run(agent, task: str) -> str:
+        return ""
+
     return CommandContext(
         agent=agent,
         base_dir=".",
@@ -582,8 +585,8 @@ def _make_context(agent, printed: list[str]) -> Any:
         select_menu=lambda *args, **kwargs: None,
         create_llm=lambda provider: None,
         list_providers=lambda: {},
-        run_structured_until_completion=lambda agent, task: "",
-        chat_until_completion=lambda agent, task: "",
+        run_structured_until_completion=fake_run,
+        chat_until_completion=fake_run,
         safety_backend=FakeSafetyBackend(),
     )
 
@@ -663,7 +666,7 @@ class TestCLIMetricsCommand:
         printed: list[str] = []
         ctx = _make_context(agent, printed)
 
-        result = dispatch_command(ctx, "metrics")
+        result = asyncio.run(dispatch_command(ctx, "metrics"))
         assert result.handled is True
         assert any("运行时指标" in line for line in printed)
 
@@ -675,7 +678,7 @@ class TestCLIMetricsCommand:
         printed: list[str] = []
         ctx = _make_context(agent, printed)
 
-        result = dispatch_command(ctx, "metrics:status")
+        result = asyncio.run(dispatch_command(ctx, "metrics:status"))
         assert result.handled is True
 
     def test_metrics_reset_dispatch(self):
@@ -687,6 +690,6 @@ class TestCLIMetricsCommand:
         printed: list[str] = []
         ctx = _make_context(agent, printed)
 
-        result = dispatch_command(ctx, "metrics:reset")
+        result = asyncio.run(dispatch_command(ctx, "metrics:reset"))
         assert result.handled is True
         assert agent.metrics.llm_call_count == 0
