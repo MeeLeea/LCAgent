@@ -52,7 +52,11 @@ class FakeExecutor:
 
     def invoke(self, value, config):
         self.invoke_calls += 1
-        return {"messages": [AIMessage(content="done")]}
+        return {"messages": [AIMessage(content="done")]} 
+
+    async def ainvoke(self, value, config):
+        self.invoke_calls += 1
+        return {"messages": [AIMessage(content="done")]} 
 
     def get_state(self, config):
         return SimpleNamespace(values={"messages": [], "summary": ""})

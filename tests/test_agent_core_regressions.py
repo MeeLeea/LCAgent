@@ -37,6 +37,12 @@ def test_compaction_retains_recent_messages_in_new_thread_state():
         def update_state(self, config, values):
             state_updates.append((config, values))
 
+        async def aget_state(self, config):
+            return FakeState()
+
+        async def aupdate_state(self, config, values):
+            state_updates.append((config, values))
+
     core = object.__new__(AgentCore)
     core.memory = FakeMemory()
     core.max_context_messages = 5
@@ -91,6 +97,12 @@ def test_compaction_does_not_change_thread_when_summary_fails():
             return FakeState()
 
         def update_state(self, config, values):
+            raise AssertionError("失败时不应更新状态")
+
+        async def aget_state(self, config):
+            return FakeState()
+
+        async def aupdate_state(self, config, values):
             raise AssertionError("失败时不应更新状态")
 
     core = object.__new__(AgentCore)
@@ -209,7 +221,14 @@ def test_arun_stops_after_user_rejects_command(monkeypatch):
             self.calls += 1
             return run_shell.invoke({"command": "python cleanup.py"})
 
+        async def ainvoke(self, value, config):
+            self.calls += 1
+            return run_shell.invoke({"command": "python cleanup.py"})
+
         def get_state(self, config):
+            return SimpleNamespace(values={"messages": []})
+
+        async def aget_state(self, config):
             return SimpleNamespace(values={"messages": []})
 
     executor = RejectingExecutor()
@@ -247,7 +266,13 @@ def test_aresume_stops_after_user_rejects_command():
         def invoke(self, value, config):
             raise UserRejectedCommandError("python cleanup.py")
 
+        async def ainvoke(self, value, config):
+            raise UserRejectedCommandError("python cleanup.py")
+
         def get_state(self, config):
+            return SimpleNamespace(values={"messages": []})
+
+        async def aget_state(self, config):
             return SimpleNamespace(values={"messages": []})
 
     executor = RejectingExecutor()
@@ -297,10 +322,19 @@ def test_arun_repairs_checkpoint_after_user_rejects_command():
         def invoke(self, value, config):
             raise UserRejectedCommandError("python cleanup.py")
 
+        async def ainvoke(self, value, config):
+            raise UserRejectedCommandError("python cleanup.py")
+
         def get_state(self, config):
             return state
 
         def update_state(self, config, values, as_node=None):
+            updates.append((config, values, as_node))
+
+        async def aget_state(self, config):
+            return state
+
+        async def aupdate_state(self, config, values, as_node=None):
             updates.append((config, values, as_node))
 
     executor = RejectingExecutor()

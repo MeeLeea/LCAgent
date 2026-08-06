@@ -67,6 +67,91 @@ class AgentTurnResult:
 class AgentCore:
     """基于LangChain 1.x 的Agent核心调度器"""
 
+    def _init_common(
+        self,
+        llm_client: LLMClient,
+        name: str,
+        max_iterations: int,
+        verbose: bool,
+        mcp_config_file: Optional[str],
+        enable_mcp: bool,
+        skills_dir: Optional[str],
+        auto_match_skills: bool,
+        max_context_messages: int,
+        context_trim_keep: int,
+        process_type: Optional[str],
+        agent_prompt_file: Optional[str],
+        max_execution_history: int,
+        tool_timeout: float,
+    ) -> None:
+        self.name = name
+        self.llm = llm_client
+        self.max_iterations = max_iterations
+        self.verbose = verbose
+        self.max_context_messages = max_context_messages
+        self.context_trim_keep = context_trim_keep
+        self.tool_timeout = tool_timeout if tool_timeout > 0 else None
+        self._closed = False
+
+        # 压缩配置：before_model 中间件自动触发 + manually_compact 手动触发
+        # summary 存入 LangGraph state（随 checkpoint 持久化），天然 per-thread 隔离
+        self.compaction_config = CompactionConfig.from_kwargs(
+            max_context_messages=max_context_messages,
+            context_trim_keep=context_trim_keep,
+        )
+
+        # 存储核心提示词（从配置加载或使用默认值）
+        from .config import _load_agent_prompt
+
+        self.agent_core_prompt = _load_agent_prompt(agent_prompt_file)
+
+        # 本地工具（lazy import 打破潜在循环依赖）
+        from tools import all_tools as _local_tools
+
+        self.local_tools: List[BaseTool] = list(_local_tools)
+        # MCP 工具(从 MCP Server 加载)
+        self.mcp_tools: List[BaseTool] = []
+        # 合并后的完整工具列表
+        self.tools: List[BaseTool] = list(self.local_tools)
+
+        # MCP 配置
+        self.mcp_config_file = mcp_config_file or DEFAULT_CONFIG_FILE
+        self.enable_mcp = enable_mcp
+
+        # MCP 连接池（per-server 连接管理 + 健康探测 + 自动重连）
+        self._mcp_pool = MCPPool(self.mcp_config_file)
+
+        # 异步互斥锁：保护 tools / mcp_tools / agent_executor / active_skills 等共享状态
+        self._state_lock = asyncio.Lock()
+
+        # 技能阅读(本地 .agents/skills)
+        if skills_dir is None:
+            skills_dir = default_skills_dir()
+        self.skill_manager = SkillManager(skills_dir)
+        self.active_skills: set[str] = set()  # 由 CLI (skill:<name>) 手动加载
+        self.auto_match_skills = auto_match_skills  # 任务开始时自动匹配注入
+
+        # 可变 SystemMessage：content 在每次 invoke 前动态更新（技能匹配）
+        self._system_message = SystemMessage(content=self._get_system_prompt(""))
+
+        # 运行时指标收集器（LLM tokens / 工具耗时 / 压缩统计）
+        self._metrics = MetricsCollector()
+
+        # 创建Agent（编译一次，后续不再因技能变化而重建）
+        self.agent_executor = None
+
+        # 执行历史（deque 有界队列，防止内存泄漏）
+        self.execution_history = deque(maxlen=max_execution_history)
+        self._max_execution_history = max_execution_history
+        self._recorded_tool_call_ids: set[str] = set()
+        self._pending_interrupt_thread_id: str | None = None
+        self._pending_interrupt_mode: str | None = None
+        self._compaction_middleware = None
+        self._tools_signature = frozenset()
+
+        # 流式事件处理器（组合模式）
+        self.stream = StreamHandler(self)
+
     def __init__(
         self,
         llm_client: LLMClient,
@@ -108,79 +193,90 @@ class AgentCore:
             max_execution_history: 执行历史最大条数(防止内存泄漏)
             tool_timeout: 工具执行默认超时秒数(0=禁用超时)
         """
-        self.name = name
-        self.llm = llm_client
+        self._init_common(
+            llm_client=llm_client,
+            name=name,
+            max_iterations=max_iterations,
+            verbose=verbose,
+            mcp_config_file=mcp_config_file,
+            enable_mcp=enable_mcp,
+            skills_dir=skills_dir,
+            auto_match_skills=auto_match_skills,
+            max_context_messages=max_context_messages,
+            context_trim_keep=context_trim_keep,
+            process_type=process_type,
+            agent_prompt_file=agent_prompt_file,
+            max_execution_history=max_execution_history,
+            tool_timeout=tool_timeout,
+        )
         self.memory = AgentMemory(
             checkpoint_file=checkpoint_file,
             long_term_file=long_term_memory_file,
             thread_id=thread_id,
             short_term_size=memory_size,
             use_sqlite=checkpoint_file is not None,
-            process_type=process_type
-        )
-        self.max_iterations = max_iterations
-        self.verbose = verbose
-        self.max_context_messages = max_context_messages
-        self.context_trim_keep = context_trim_keep
-        self.tool_timeout = tool_timeout if tool_timeout > 0 else None
-        self._closed = False
-
-        # 压缩配置：before_model 中间件自动触发 + manually_compact 手动触发
-        # summary 存入 LangGraph state（随 checkpoint 持久化），天然 per-thread 隔离
-        self.compaction_config = CompactionConfig.from_kwargs(
-            max_context_messages=max_context_messages,
-            context_trim_keep=context_trim_keep,
+            process_type=process_type,
         )
 
-        # 存储核心提示词（从配置加载或使用默认值）
-        from .config import _load_agent_prompt
-        self.agent_core_prompt = _load_agent_prompt(agent_prompt_file)
-
-        # 本地工具（lazy import 打破潜在循环依赖）
-        from tools import all_tools as _local_tools
-        self.local_tools: List[BaseTool] = list(_local_tools)
-        # MCP 工具(从 MCP Server 加载)
-        self.mcp_tools: List[BaseTool] = []
-        # 合并后的完整工具列表
-        self.tools: List[BaseTool] = list(self.local_tools)
-
-        # MCP 配置
-        self.mcp_config_file = mcp_config_file or DEFAULT_CONFIG_FILE
-        self.enable_mcp = enable_mcp
-
-        # MCP 连接池（per-server 连接管理 + 健康探测 + 自动重连）
-        self._mcp_pool = MCPPool(self.mcp_config_file)
-
-        # 异步互斥锁：保护 tools / mcp_tools / agent_executor / active_skills 等共享状态
-        self._state_lock = asyncio.Lock()
-
-        # 技能阅读(本地 .agents/skills)
-        if skills_dir is None:
-            skills_dir = default_skills_dir()
-        self.skill_manager = SkillManager(skills_dir)
-        self.active_skills: set = set()      # 由 CLI (skill:<name>) 手动加载
-        self.auto_match_skills = auto_match_skills  # 任务开始时自动匹配注入
-
-        # 启动时加载 MCP 工具（通过连接池）
-        if enable_mcp:
+        if self.enable_mcp:
             asyncio.run(self.areload_mcp_tools())
 
-        # 可变 SystemMessage：content 在每次 invoke 前动态更新（技能匹配），
-        self._system_message = SystemMessage(content=self._get_system_prompt(""))
-
-        # 运行时指标收集器（LLM tokens / 工具耗时 / 压缩统计）
-        self._metrics = MetricsCollector()
-
-        # 创建Agent（编译一次，后续不再因技能变化而重建）
         self.agent_executor = self._create_agent_executor()
 
-        # 执行历史（deque 有界队列，防止内存泄漏）
-        self.execution_history: Deque[Dict[str, Any]] = deque(maxlen=max_execution_history)
-        self._max_execution_history = max_execution_history
-        self._recorded_tool_call_ids: set[str] = set()
+    @classmethod
+    async def acreate(
+        cls,
+        llm_client: LLMClient,
+        name: str = "LCAgent",
+        memory_size: int = 10,
+        long_term_memory_file: Optional[str] = None,
+        checkpoint_file: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        max_iterations: int = 25,
+        verbose: bool = True,
+        mcp_config_file: Optional[str] = None,
+        enable_mcp: bool = True,
+        skills_dir: Optional[str] = None,
+        auto_match_skills: bool = True,
+        max_context_messages: int = 0,
+        context_trim_keep: int = 12,
+        process_type: Optional[str] = None,
+        agent_prompt_file: Optional[str] = None,
+        max_execution_history: int = 100,
+        tool_timeout: float = 60.0,
+    ) -> "AgentCore":
+        """在运行中的事件循环内创建 AgentCore。"""
+        self = cls.__new__(cls)
+        self._init_common(
+            llm_client=llm_client,
+            name=name,
+            max_iterations=max_iterations,
+            verbose=verbose,
+            mcp_config_file=mcp_config_file,
+            enable_mcp=enable_mcp,
+            skills_dir=skills_dir,
+            auto_match_skills=auto_match_skills,
+            max_context_messages=max_context_messages,
+            context_trim_keep=context_trim_keep,
+            process_type=process_type,
+            agent_prompt_file=agent_prompt_file,
+            max_execution_history=max_execution_history,
+            tool_timeout=tool_timeout,
+        )
+        self.memory = await AgentMemory.acreate(
+            checkpoint_file=checkpoint_file,
+            long_term_file=long_term_memory_file,
+            thread_id=thread_id,
+            short_term_size=memory_size,
+            use_sqlite=checkpoint_file is not None,
+            process_type=process_type,
+        )
 
-        # 流式事件处理器（组合模式）
-        self.stream = StreamHandler(self)
+        if self.enable_mcp:
+            await self.areload_mcp_tools()
+
+        self.agent_executor = self._create_agent_executor()
+        return self
 
     @property
     def metrics(self) -> MetricsCollector:
@@ -212,7 +308,7 @@ class AgentCore:
                 self.tools = list(self.local_tools) + list(self.mcp_tools)
                 new_signature = frozenset(t.name for t in self.tools)
 
-                if hasattr(self, "agent_executor"):
+                if getattr(self, "agent_executor", None) is not None:
                     if new_signature != old_signature:
                         # 工具列表变化，必须重建 Graph
                         await self._arebuild_agent_executor("")
@@ -246,7 +342,7 @@ class AgentCore:
                 self.tools = list(self.local_tools) + list(self.mcp_tools)
                 new_signature = frozenset(t.name for t in self.tools)
 
-                if hasattr(self, "agent_executor"):
+                if getattr(self, "agent_executor", None) is not None:
                     if new_signature != old_signature:
                         await self._arebuild_agent_executor("")
                     else:
@@ -523,13 +619,18 @@ class AgentCore:
     async def _arepair_rejected_tool_calls(self, config: Dict[str, Any]) -> None:
         """异步修复 checkpoint 中未完成的工具调用（补齐取消结果）。
 
-        checkpointer 为同步 SqliteSaver，不支持 aupdate_state（会触发
-        "SqliteSaver does not support async methods"）。
-        get_state / update_state 均用 asyncio.to_thread 跑到线程池，
-        与 invoke 路径保持一致，不阻塞事件循环。
+        使用 LangGraph 的异步 state API，避免阻塞事件循环。
         """
-        state = await asyncio.to_thread(self.agent_executor.get_state, config)
-        messages = list(state.values.get("messages", []))
+        try:
+            state = await self.agent_executor.aget_state(config)
+        except (AttributeError, RuntimeError, TypeError, ValueError) as error:
+            logger.warning("读取 checkpoint 状态失败: %s", error, exc_info=True)
+            return
+
+        if state is None:
+            return
+
+        messages = list(getattr(state, "values", {}).get("messages", []))
         existing_results = [message for message in messages if isinstance(message, ToolMessage)]
         answered_ids = {message.tool_call_id for message in existing_results}
         repairs = []
@@ -549,12 +650,16 @@ class AgentCore:
                     )
                 )
                 answered_ids.add(call_id)
-        if repairs:
-            await asyncio.to_thread(
-                self.agent_executor.update_state,
+        if not repairs:
+            return
+
+        try:
+            await self.agent_executor.aupdate_state(
                 config,
                 {"messages": [*existing_results, *repairs]},
             )
+        except (AttributeError, RuntimeError, TypeError, ValueError) as error:
+            logger.warning("修复 checkpoint 状态失败: %s", error, exc_info=True)
 
     async def _ahandle_rejected_command(self, config: Dict[str, Any]) -> AgentTurnResult:
         """异步处理用户拒绝执行危险命令的情况
@@ -574,7 +679,7 @@ class AgentCore:
     async def arun_structured(self, task: str) -> AgentTurnResult:
         """异步执行任务（结构化入口）
 
-        使用 asyncio.to_thread 将同步 invoke 跑在线程池中，避免阻塞事件循环。
+        使用 LangGraph 异步 invoke，避免阻塞事件循环。
         压缩由 before_model 中间件自动触发，无需手动调用。
         系统提示词通过 _update_system_prompt 动态更新，不重建 Graph。
         """
@@ -591,11 +696,7 @@ class AgentCore:
                 self._update_system_prompt(task)
 
             try:
-                result = await asyncio.to_thread(
-                    self.agent_executor.invoke,
-                    {"messages": [input_msg]},
-                    config=config,
-                )
+                result = await self.agent_executor.ainvoke({"messages": [input_msg]}, config=config)
             except UserRejectedCommandError:
                 return await self._ahandle_rejected_command(config)
 
@@ -623,8 +724,7 @@ class AgentCore:
                 async with self._state_lock:
                     self._update_system_prompt(message)
                 try:
-                    result = await asyncio.to_thread(
-                        self.agent_executor.invoke,
+                    result = await self.agent_executor.ainvoke(
                         {"messages": [HumanMessage(content=message)]},
                         config=config,
                     )
@@ -647,11 +747,7 @@ class AgentCore:
             raise ValueError("Cannot resume interrupt on a different thread")
 
         try:
-            result = await asyncio.to_thread(
-                self.agent_executor.invoke,
-                Command(resume=payload),
-                config=config,
-            )
+            result = await self.agent_executor.ainvoke(Command(resume=payload), config=config)
         except UserRejectedCommandError:
             return await self._ahandle_rejected_command(config)
 
@@ -904,7 +1000,7 @@ class AgentCore:
 
         # 读取当前 state 中的已有摘要
         config = self._invoke_config()
-        state = await asyncio.to_thread(self.agent_executor.get_state, config)
+        state = await self.agent_executor.aget_state(config)
         existing_summary = ""
         if state and state.values:
             existing_summary = state.values.get("summary", "") or ""
@@ -924,8 +1020,7 @@ class AgentCore:
         _compact_start = _time.time()
 
         messages_before = len(msgs)
-        # 同步 SqliteSaver 不支持 aupdate_state，用 to_thread 跑同步 update_state
-        await asyncio.to_thread(self.agent_executor.update_state, config, update)
+        await self.agent_executor.aupdate_state(config, update)
         messages_after = len(update["messages"]) - 1  # 减去 RemoveMessage 标记
         summary_length = len(update.get("summary", ""))
 
@@ -997,7 +1092,7 @@ class AgentCore:
 
         # 2. 关闭 Checkpoint DB 连接
         try:
-            self.memory.close()
+            await self.memory.aclose()
         except Exception as e:
             logger.warning("Checkpoint DB 关闭异常: %s", e, exc_info=True)
 

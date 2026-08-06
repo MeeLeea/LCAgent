@@ -135,6 +135,10 @@ def test_resume_structured_invokes_command_resume_with_same_thread_config():
             calls.append((command, config))
             return {"messages": [AIMessage(content="resumed")]} 
 
+        async def ainvoke(self, command, config):
+            calls.append((command, config))
+            return {"messages": [AIMessage(content="resumed")]} 
+
     async def no_compact() -> None:
         return None
 
@@ -516,6 +520,12 @@ def test_resume_after_switching_thread_is_rejected():
                 return {"__interrupt__": [Interrupt(value={"kind": "human_choice"}, id="i-1")]}
             return {"messages": [AIMessage(content="should not resume")]} 
 
+        async def ainvoke(self, value, config):
+            self.calls += 1
+            if self.calls == 1:
+                return {"__interrupt__": [Interrupt(value={"kind": "human_choice"}, id="i-1")]}
+            return {"messages": [AIMessage(content="should not resume")]} 
+
     core = object.__new__(AgentCore)
     core.memory = FakeMemory()
     core.agent_executor = FakeExecutor()
@@ -554,6 +564,12 @@ def test_interrupted_run_records_final_important_assistant_memory_after_resume()
             self.calls = 0
 
         def invoke(self, value, config):
+            self.calls += 1
+            if self.calls == 1:
+                return {"__interrupt__": [Interrupt(value={"kind": "human_choice"}, id="i-1")]}
+            return {"messages": [AIMessage(content="approved result")]} 
+
+        async def ainvoke(self, value, config):
             self.calls += 1
             if self.calls == 1:
                 return {"__interrupt__": [Interrupt(value={"kind": "human_choice"}, id="i-1")]}
