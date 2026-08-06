@@ -1657,8 +1657,10 @@ output = chat_until_completion(agent, "需要人工选择时请先问我")
 | `clear [long\|short\|all]`                  | 清理记忆（默认 long）                                                      |
 | `compress` 或 `压缩`                    | 压缩长期记忆（LLM 摘要后替换原内容）                                       |
 | `compact`                                 | 手动压缩当前会话上下文（增量摘要 + 工具输出 Prune，`force=True` 跳过阈值） |
-| `metrics` 或 `metrics:status`           | 查看运行时指标（LLM 调用 / 工具执行 / 压缩统计）                           |
+| `metrics` 或 `metrics:status`           | 查看运行时指标（LLM 调用 / 工具执行 / 压缩统计）                          |
 | `metrics:reset`                           | 重置所有运行时指标                                                         |
+| `log`                                     | 查看当前日志级别（方向键选择切换）                                         |
+| `log:<级别>`                              | 直接切换日志级别（debug\|info\|warning\|error\|critical）                 |
 | `thread`                                  | 方向键选择切换会话(显示消息数预览);`Enter` 切换, `Ctrl+D` 删除高亮会话 |
 | `thread:new`                              | 开启新会话(原会话保留)                                                     |
 | `thread:delete <id>`                      | 删除指定会话(二次确认,不可恢复)                                            |
