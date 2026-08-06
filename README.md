@@ -11,6 +11,7 @@
 - **长上下文压缩中间件**（增量摘要 + 工具输出 Prune，摘要随 checkpoint 持久化、per-thread 隔离；`before_model` 自动触发或 `compact` 命令手动触发）
 - **MCP 连接池**（per-server 隔离、健康探测、单 server 自动重连，替代全量重载）
 - 多会话隔离（thread_id 机制，方向键菜单切换/删除/导出）
+- **并发多会话**（per-thread 锁 + 独立编译图 + 按线程中断状态，Web 多标签页/多客户端可同时对话互不阻塞，详见「异步 Public API → 并发多会话」）
 - 命令模式下的会话切换会优先保持当前会话，不会因为菜单参数不兼容而失败
 - 安全护栏（危险终端命令拦截/确认、路径保护）
 - **全套异步 Public API**（`arun` / `achat` / `aresume` / `arun_structured` / `achat_structured` 等）
@@ -1360,12 +1361,29 @@ LCAgentError                    ← 所有 LCAgent 异常的基类（含 detail 
 | `await arun(task)`          | Agent 模式执行任务，返回最终文本                           |
 | `await achat(message)`      | 普通对话模式，返回最终文本                                 |
 | `await aresume(payload)`    | 恢复被 `ask_human` 中断的会话（`Command(resume=...)`）   |
-| `await arun_structured(task)` / `await achat_structured(message)` | 返回 `AgentTurnResult`（含 HITL 结构化中断信息） |
+| `await arun_structured(task, thread_id=None)` / `await achat_structured(message, thread_id=None)` | 返回 `AgentTurnResult`（含 HITL 结构化中断信息）；`thread_id` 显式指定目标会话 |
 | `await aswitch_llm(llm_client)` | 运行时切换 LLM 提供商/模型                              |
 | `await arebuild_from_team_dir(agent_name, *, task="")` | 按 `team/<角色>/` 文件夹名切换主对话 Agent 的角色（读取该目录的 `agent_config.json` + `AGENT.md`，仅提示词变化时不重建 Graph，provider/model 变化时重建 LLM 与 executor） |
 | `await areload_mcp_tools()` | 通过 MCP 连接池重载工具并按需重建 Graph                    |
-| `await manually_compact(force=False)` | 手动触发上下文压缩，返回状态更新字典或 `None`    |
+| `await manually_compact(force=False, thread_id=None)` | 手动触发上下文压缩，返回状态更新字典或 `None`；`thread_id` 指定目标会话 |
 | `await aclose()`            | 释放资源（MCP 连接、checkpoint 等）的生命周期收尾          |
+
+### 并发多会话（Per-thread 并发）
+
+`thread_id` 显式贯穿整个异步调用链（`arun_structured` / `achat_structured` / `aresume_structured` / `astream_chat` / `astream_resume` / `manually_compact`），配合 HTTP 服务端实现**真正的并发多会话**：
+
+| 层                  | 隔离机制                                                                                                                                 |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| 锁                 | 普通对话 / 恢复 / 压缩走 **per-thread 锁**（`api/server.py::_thread_lock`），不同会话互不阻塞、同会话严格排队；管理型命令/会话切换仍走全局 `chat_lock` |
+| 编译图（executor） | `_executor_for(thread_id)` 为每个线程缓存独立 compiled graph + `SystemMessage`（LRU 上限 `_MAX_THREAD_EXECUTORS=50`），技能提示词互不覆盖   |
+| 中断状态            | `_pending_interrupts` 按 thread_id 记录 HITL 挂起中断，恢复/清理只作用于目标线程，杜绝跨会话串线 |
+| config              | `_config_for(thread_id)` 构建含 `configurable.thread_id` 的 LangGraph config，`thread_id=None` 时兼容无参旧调用 |
+
+行为要点：
+
+- **同会话串行**：同一 `thread_id` 的请求持有同一把锁，仍严格按到达顺序执行，保证 checkpoint 读写一致。
+- **跨会话并发**：不同 `thread_id` 各自持有独立锁，可同时流式对话，互不阻塞。
+- **缓存淘汰**：超过 `_MAX_THREAD_EXECUTORS` 时淘汰最久未使用的线程图；运行中的流持有旧 executor 对象引用，不受淘汰影响。
 
 ---
 

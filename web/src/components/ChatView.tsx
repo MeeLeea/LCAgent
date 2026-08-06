@@ -12,7 +12,7 @@ import {
   MessageSquare,
   Wrench,
 } from 'lucide-react'
-import { useStore, stripWorkflowPrefix } from '../store'
+import { useStore, stripWorkflowPrefix, selectIsStreaming } from '../store'
 import { Message } from './Message'
 import type { ChatMessage } from '../types'
 
@@ -108,7 +108,7 @@ function exportMarkdown(messages: ChatMessage[], preview: string) {
 
 export function ChatView() {
   const messages = useStore((s) => s.messages)
-  const isStreaming = useStore((s) => s.isStreaming)
+  const isStreaming = useStore(selectIsStreaming)
   const sendMessage = useStore((s) => s.sendMessage)
   const regenerate = useStore((s) => s.regenerate)
   const editAndResend = useStore((s) => s.editAndResend)

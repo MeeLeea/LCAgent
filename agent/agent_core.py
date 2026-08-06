@@ -5,7 +5,7 @@ Agent核心调度模块 - 基于LangChain 1.x + LangGraph
 """
 import asyncio
 import logging
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Literal, Self
@@ -150,10 +150,16 @@ class AgentCore:
         self.execution_history = deque(maxlen=max_execution_history)
         self._max_execution_history = max_execution_history
         self._recorded_tool_call_ids: set[str] = set()
-        self._pending_interrupt_thread_id: str | None = None
-        self._pending_interrupt_mode: str | None = None
+
+        # 中断状态：per-thread（thread_id -> 触发中断的执行模式），支持多会话独立中断/恢复
+        self._pending_interrupts: dict[str, str] = {}
         self._compaction_middleware = None
         self._tools_signature = frozenset()
+
+        # per-thread 编译图缓存（thread_id -> (executor, SystemMessage)）
+        # 每个会话持有独立的 SystemMessage，避免技能提示词跨会话互相覆盖
+        self._executors: OrderedDict[str, tuple[Any, SystemMessage]] = OrderedDict()
+        self._MAX_THREAD_EXECUTORS = 50
 
         # 流式事件处理器（组合模式）
         self.stream = StreamHandler(self)
@@ -373,20 +379,31 @@ class AgentCore:
             logger.info("MCP 未加载到任何工具(可能配置为空或服务器未启用)")
         return tool_count
 
-    def _create_agent_executor(self, skill_block: str = ""):
+    def _create_agent_executor(
+        self,
+        skill_block: str = "",
+        system_message: SystemMessage | None = None,
+    ):
         """创建LangGraph ReAct Agent（仅在工具列表或 LLM 变化时调用）
 
         集成压缩中间件（before_model 自动触发增量摘要 + 工具输出 Prune）。
         summary 存入 LCAgentState.summary，随 checkpoint per-thread 持久化。
 
-        关键优化：system_prompt 传入可变 SystemMessage 对象（self._system_message），
+        关键优化：system_prompt 传入可变 SystemMessage 对象（默认 self._system_message），
         而非字符串。model_node 闭包捕获此对象引用，后续修改 .content 即可动态
         更新提示词，无需重新编译 Graph。
+
+        Args:
+            skill_block: 构建时初始技能指引块（用于同步当前技能状态）
+            system_message: 可选的 SystemMessage 对象。为 None 时使用
+                            self._system_message（默认/base 图）；传入时用于
+                            per-thread 图的独立提示词对象。
         """
         chat_model = self.llm.get_chat_model()
 
-        # 更新 _system_message 内容（重建时同步当前技能状态）
-        self._system_message.content = self._get_system_prompt(skill_block)
+        # 更新提示词内容（重建时同步当前技能状态）
+        sys_msg = system_message if system_message is not None else self._system_message
+        sys_msg.content = self._get_system_prompt(skill_block)
 
         # 压缩中间件：消息超阈值时自动增量摘要 + Prune 工具输出
         # on_compaction 回调：自动触发时也记录到 MetricsCollector
@@ -403,7 +420,7 @@ class AgentCore:
         agent = create_agent(
             model=chat_model,
             tools=wrapped_tools,
-            system_prompt=self._system_message,
+            system_prompt=sys_msg,
             checkpointer=self.memory.get_checkpointer(),
             state_schema=LCAgentState,
             middleware=[compaction_middleware],
@@ -414,23 +431,36 @@ class AgentCore:
         self._tools_signature = frozenset(t.name for t in self.tools)
         return agent
 
-    def _update_system_prompt(self, task: str = "") -> None:
+    def _update_system_prompt(self, task: str = "", thread_id: str | None = None) -> None:
         """动态更新系统提示词（不重建 Graph）
 
-        通过修改 _system_message.content 实现：
+        通过修改 SystemMessage.content 实现：
         - model_node 闭包捕获的是 SystemMessage 对象引用
         - 修改 .content 后，下次 LLM 调用自动使用新提示词
         - 无需重新编译 LangGraph，性能提升约 100x
 
         Args:
             task: 任务描述，用于自动匹配技能（为空时不自动匹配）
+            thread_id: 目标会话线程 ID。为 None 时更新默认（self._system_message），
+                       兼容旧调用；指定时只更新该线程专属的 SystemMessage，
+                       实现多会话提示词隔离。
         """
         skill_block = self._compute_skill_block(task)
         new_content = self._get_system_prompt(skill_block)
-        # _system_message 可能不存在（测试中用 object.__new__ 创建）
-        sys_msg = getattr(self, "_system_message", None)
+
+        sys_msg: SystemMessage | None = None
+        if thread_id is None:
+            sys_msg = getattr(self, "_system_message", None)
+        else:
+            cached = getattr(self, "_executors", {}).get(thread_id)
+            if cached is not None:
+                sys_msg = cached[1]
+
+        # 无对应 SystemMessage（测试中用 object.__new__ 创建或线程图未构建）则新建
         if sys_msg is None:
-            self._system_message = SystemMessage(content=new_content)
+            sys_msg = SystemMessage(content=new_content)
+            if thread_id is None:
+                self._system_message = sys_msg
         else:
             sys_msg.content = new_content
 
@@ -442,6 +472,9 @@ class AgentCore:
         - MCP 工具列表变化（areload_mcp_tools 检测到工具签名不同）
         - LLM 切换（aswitch_llm，model 对象变化）
 
+        除默认（base）图外，同时重建所有 per-thread 缓存图，
+        保证工具/LLM 变化对所有会话生效。
+
         注意：调用方必须已持有 _state_lock（此方法不再自行加锁，
         避免在 areload_mcp_tools 内部调用时死锁）。
 
@@ -450,6 +483,9 @@ class AgentCore:
         """
         skill_block = self._compute_skill_block(task)
         self.agent_executor = self._create_agent_executor(skill_block)
+        for tid in list(getattr(self, "_executors", {})):
+            sys_msg = SystemMessage(content=self._get_system_prompt(skill_block))
+            self._executors[tid] = (self._create_agent_executor(skill_block, sys_msg), sys_msg)
 
     async def _ahandle_turn_completion(
         self,
@@ -475,7 +511,8 @@ class AgentCore:
         if turn.is_interrupted:
             self._capture_pending_interrupt(config, mode)
         elif turn.is_completed:
-            self._clear_pending_interrupt()
+            # 只清理当前线程的中断状态，避免清掉其他会话的挂起中断
+            self._clear_pending_interrupt(self._thread_id_from_config(config))
             if user_message:
                 await self.memory.aadd("user", user_message)
             if save_assistant and turn.output:
@@ -494,8 +531,77 @@ class AgentCore:
             base = base + "\n" + skill_block
         return base
 
-    def _invoke_config(self) -> dict[str, Any]:
-        return {**self.memory.get_config(), "recursion_limit": self.max_iterations}
+    def _invoke_config(self, thread_id: str | None = None) -> dict[str, Any]:
+        """构建 LangGraph 调用 config。
+
+        Args:
+            thread_id: 目标会话线程 ID。为 None 时使用 memory 当前会话
+                       （兼容 CLI/旧调用与测试中对 get_config 的无参 mock）。
+
+        Returns:
+            config 字典（含 configurable.thread_id 与 recursion_limit）
+        """
+        if thread_id is None:
+            cfg = self.memory.get_config()
+        else:
+            cfg = self.memory.get_config(thread_id=thread_id)
+        return {**cfg, "recursion_limit": self.max_iterations}
+
+    def _config_for(self, thread_id: str | None = None) -> dict[str, Any]:
+        """构建 config；thread_id 为 None 时不传参调用 _invoke_config()。
+
+        兼容测试中直接覆盖 `_invoke_config = lambda: {...}`（无参）的场景：
+        只有显式指定 thread_id 时才带参调用。
+        """
+        if thread_id is None:
+            return self._invoke_config()
+        return self._invoke_config(thread_id)
+
+    async def _aget_messages_for_thread(self, thread_id: str | None = None) -> list[Any]:
+        """获取指定线程的消息列表；thread_id 为 None 时无参调用 memory.aget_messages。
+
+        兼容测试中 FakeMemory.aget_messages 只接受无参调用的场景。
+        """
+        if thread_id is None:
+            return await self.memory.aget_messages()
+        return await self.memory.aget_messages(thread_id=thread_id)
+
+    async def _executor_for(self, thread_id: str | None = None) -> Any:
+        """获取指定线程的编译图（per-thread 缓存）。
+
+        每个线程拥有独立的 compiled graph + SystemMessage，从而隔离技能提示词，
+        支持不同会话并发执行而互不覆盖。
+
+        - thread_id 为 None 或未初始化 _executors（测试用 object.__new__ 场景）时
+          回退到 self.agent_executor，保持向后兼容。
+        - 缓存为 LRU（OrderedDict），超出上限时淘汰最久未使用的线程；
+          被淘汰线程的图只影响下一次调用（重新构建），不影响正在运行的流
+          （运行中的流持有旧 executor 的对象引用）。
+        - 新线程的图构建在 _state_lock 内进行，防止同线程并发重复构建。
+
+        Returns:
+            LangGraph CompiledStateGraph 实例
+        """
+        if thread_id is None or not hasattr(self, "_executors"):
+            return self.agent_executor
+        cached = self._executors.get(thread_id)
+        if cached is not None:
+            self._executors.move_to_end(thread_id)
+            return cached[0]
+
+        # 未命中：在锁内构建，避免同一线程并发重复创建
+        async with self._state_lock:
+            cached = self._executors.get(thread_id)
+            if cached is not None:
+                self._executors.move_to_end(thread_id)
+                return cached[0]
+            sys_msg = SystemMessage(content=self._get_system_prompt(""))
+            executor = self._create_agent_executor(system_message=sys_msg)
+            self._executors[thread_id] = (executor, sys_msg)
+            self._executors.move_to_end(thread_id)
+            while len(self._executors) > self._MAX_THREAD_EXECUTORS:
+                self._executors.popitem(last=False)
+            return executor
 
     def _thread_id_from_config(self, config: dict[str, Any]) -> str | None:
         configurable = config.get("configurable")
@@ -529,12 +635,27 @@ class AgentCore:
             self.verbose = original
 
     def _capture_pending_interrupt(self, config: dict[str, Any], mode: str) -> None:
-        self._pending_interrupt_thread_id = self._thread_id_from_config(config)
-        self._pending_interrupt_mode = mode
+        thread_id = self._thread_id_from_config(config)
+        if thread_id:
+            pending = getattr(self, "_pending_interrupts", None)
+            if pending is None:
+                pending = {}
+                self._pending_interrupts = pending
+            pending[thread_id] = mode
 
-    def _clear_pending_interrupt(self) -> None:
-        self._pending_interrupt_thread_id = None
-        self._pending_interrupt_mode = None
+    def _clear_pending_interrupt(self, thread_id: str | None = None) -> None:
+        """清除挂起中断状态。
+
+        Args:
+            thread_id: 指定线程 ID。为 None 时清空全部（兼容旧调用）。
+        """
+        pending = getattr(self, "_pending_interrupts", None)
+        if pending is None:
+            return
+        if thread_id is None:
+            pending.clear()
+        else:
+            pending.pop(thread_id, None)
 
     def _record_tool_steps(self, result_messages: list[BaseMessage], input_msg: HumanMessage) -> None:
         # LangGraph 会返回当前线程的完整消息历史，按 tool_call id 去重避免重复记账。
@@ -621,13 +742,22 @@ class AgentCore:
                 return AgentTurnResult.completed(str(msg.content))
         return AgentTurnResult.completed("")
 
-    async def _arepair_rejected_tool_calls(self, config: dict[str, Any]) -> None:
+    async def _arepair_rejected_tool_calls(
+        self,
+        config: dict[str, Any],
+        executor: Any | None = None,
+    ) -> None:
         """异步修复 checkpoint 中未完成的工具调用（补齐取消结果）。
 
         使用 LangGraph 的异步 state API，避免阻塞事件循环。
+
+        Args:
+            config: LangGraph 配置对象（含 configurable.thread_id）
+            executor: 目标线程的编译图。为 None 时使用 self.agent_executor。
         """
+        graph = executor if executor is not None else self.agent_executor
         try:
-            state = await self.agent_executor.aget_state(config)
+            state = await graph.aget_state(config)
         except (AttributeError, RuntimeError, TypeError, ValueError) as error:
             logger.warning("读取 checkpoint 状态失败: %s", error, exc_info=True)
             return
@@ -659,51 +789,61 @@ class AgentCore:
             return
 
         try:
-            await self.agent_executor.aupdate_state(
+            await graph.aupdate_state(
                 config,
                 {"messages": [*existing_results, *repairs]},
             )
         except (AttributeError, RuntimeError, TypeError, ValueError) as error:
             logger.warning("修复 checkpoint 状态失败: %s", error, exc_info=True)
 
-    async def _ahandle_rejected_command(self, config: dict[str, Any]) -> AgentTurnResult:
+    async def _ahandle_rejected_command(
+        self,
+        config: dict[str, Any],
+        executor: Any | None = None,
+    ) -> AgentTurnResult:
         """异步处理用户拒绝执行危险命令的情况
 
         当工具调用被用户拒绝时，异步修复 checkpoint 状态并返回取消结果。
 
         Args:
             config: LangGraph 配置对象
+            executor: 目标线程的编译图（为 None 时使用 agent_executor）
 
         Returns:
             状态为 'cancelled' 的 AgentTurnResult
         """
-        await self._arepair_rejected_tool_calls(config)
-        self._clear_pending_interrupt()
+        await self._arepair_rejected_tool_calls(config, executor)
+        self._clear_pending_interrupt(self._thread_id_from_config(config))
         return AgentTurnResult.cancelled("用户已拒绝执行危险命令，当前任务已取消。")
 
-    async def arun_structured(self, task: str) -> AgentTurnResult:
+    async def arun_structured(self, task: str, thread_id: str | None = None) -> AgentTurnResult:
         """异步执行任务（结构化入口）
 
         使用 LangGraph 异步 invoke，避免阻塞事件循环。
         压缩由 before_model 中间件自动触发，无需手动调用。
         系统提示词通过 _update_system_prompt 动态更新，不重建 Graph。
+
+        Args:
+            task: 任务描述
+            thread_id: 目标会话线程 ID（为 None 时使用当前会话）
         """
         self._ensure_not_closed()
-        tid = getattr(self.memory, "thread_id", "-")
+        tid = thread_id or getattr(self.memory, "thread_id", "-")
         with TraceContext(trace_id=generate_trace_id(), thread_id=tid):
             logger.info("arun_structured: %s", task[:100])
-            config = self._invoke_config()
+            config = self._config_for(thread_id)
             input_msg = HumanMessage(content=task)
 
             # 动态更新系统提示词（技能匹配），不重建 Graph
             # 加锁防止与 areload_mcp_tools / aload_skill 并发修改共享状态
             async with self._state_lock:
-                self._update_system_prompt(task)
+                self._update_system_prompt(task, thread_id)
+            executor = await self._executor_for(thread_id)
 
             try:
-                result = await self.agent_executor.ainvoke({"messages": [input_msg]}, config=config)
+                result = await executor.ainvoke({"messages": [input_msg]}, config=config)
             except UserRejectedCommandError:
-                return await self._ahandle_rejected_command(config)
+                return await self._ahandle_rejected_command(config, executor)
 
             self._record_tool_steps(result.get("messages", []), input_msg)
             turn = self._parse_turn_result(result)
@@ -712,29 +852,34 @@ class AgentCore:
 
         return turn
 
-    async def achat_structured(self, message: str) -> AgentTurnResult:
+    async def achat_structured(self, message: str, thread_id: str | None = None) -> AgentTurnResult:
         """异步对话（结构化入口）
 
         压缩由 before_model 中间件自动触发，无需手动调用。
         系统提示词通过 _update_system_prompt 动态更新，不重建 Graph。
+
+        Args:
+            message: 用户消息
+            thread_id: 目标会话线程 ID（为 None 时使用当前会话）
         """
         self._ensure_not_closed()
-        tid = getattr(self.memory, "thread_id", "-")
+        tid = thread_id or getattr(self.memory, "thread_id", "-")
         with TraceContext(trace_id=generate_trace_id(), thread_id=tid):
             logger.info("achat_structured: %s", message[:100])
-            config = self._invoke_config()
+            config = self._config_for(thread_id)
 
             with self._temp_verbose(False):
                 # 加锁防止与 areload_mcp_tools / aload_skill 并发修改共享状态
                 async with self._state_lock:
-                    self._update_system_prompt(message)
+                    self._update_system_prompt(message, thread_id)
+                executor = await self._executor_for(thread_id)
                 try:
-                    result = await self.agent_executor.ainvoke(
+                    result = await executor.ainvoke(
                         {"messages": [HumanMessage(content=message)]},
                         config=config,
                     )
                 except UserRejectedCommandError:
-                    return await self._ahandle_rejected_command(config)
+                    return await self._ahandle_rejected_command(config, executor)
 
             turn = self._parse_turn_result(result)
             await self._ahandle_turn_completion(turn, config, "chat", message)
@@ -742,30 +887,41 @@ class AgentCore:
 
             return turn
 
-    async def aresume_structured(self, payload: dict[str, Any]) -> AgentTurnResult:
-        """异步恢复中断会话（结构化入口）"""
-        config = self._invoke_config()
-        pending_thread_id = getattr(self, "_pending_interrupt_thread_id", None)
-        current_thread_id = self._thread_id_from_config(config)
+    async def aresume_structured(
+        self,
+        payload: dict[str, Any],
+        thread_id: str | None = None,
+    ) -> AgentTurnResult:
+        """异步恢复中断会话（结构化入口）
 
-        if pending_thread_id is not None and current_thread_id != pending_thread_id:
+        Args:
+            payload: 恢复数据
+            thread_id: 目标会话线程 ID（为 None 时使用当前会话）
+        """
+        config = self._config_for(thread_id)
+        tid = thread_id or self._thread_id_from_config(config)
+
+        # per-thread 中断状态：请求线程若无挂起中断，而存在其他线程的挂起中断，
+        # 说明会话被切换或尚未中断，拒绝恢复以避免串线。
+        pending = getattr(self, "_pending_interrupts", {})
+        if pending and tid not in pending:
             raise ValueError("Cannot resume interrupt on a different thread")
-
+        executor = await self._executor_for(thread_id)
         try:
-            result = await self.agent_executor.ainvoke(Command(resume=payload), config=config)
+            result = await executor.ainvoke(Command(resume=payload), config=config)
         except UserRejectedCommandError:
-            return await self._ahandle_rejected_command(config)
+            return await self._ahandle_rejected_command(config, executor)
 
         turn = self._parse_turn_result(result)
 
         if turn.is_interrupted:
             self._capture_pending_interrupt(
                 config,
-                getattr(self, "_pending_interrupt_mode", "chat")
+                pending.get(tid, "chat")
             )
         elif turn.is_completed:
-            mode = getattr(self, "_pending_interrupt_mode", None)
-            self._clear_pending_interrupt()
+            mode = pending.get(tid)
+            self._clear_pending_interrupt(tid)
             if mode == "run" and turn.output:
                 await self.memory.aadd("assistant", turn.output, {"important": True})
 
@@ -773,14 +929,24 @@ class AgentCore:
 
 # ============ 流式接口（委托给 StreamHandler） ============
 
-    async def astream_chat(self, message: str):
-        """流式对话，委托给 self.stream。事件格式见 StreamHandler.astream_chat。"""
-        async for ev in self.stream.astream_chat(message):
+    async def astream_chat(self, message: str, thread_id: str | None = None):
+        """流式对话，委托给 self.stream。事件格式见 StreamHandler.astream_chat。
+
+        Args:
+            message: 用户消息
+            thread_id: 目标会话线程 ID（为 None 时使用当前会话）
+        """
+        async for ev in self.stream.astream_chat(message, thread_id=thread_id):
             yield ev
 
-    async def astream_resume(self, payload: dict[str, Any]):
-        """流式恢复中断会话，委托给 self.stream。"""
-        async for ev in self.stream.astream_resume(payload):
+    async def astream_resume(self, payload: dict[str, Any], thread_id: str | None = None):
+        """流式恢复中断会话，委托给 self.stream。
+
+        Args:
+            payload: 恢复数据
+            thread_id: 目标会话线程 ID（为 None 时使用当前会话）
+        """
+        async for ev in self.stream.astream_resume(payload, thread_id=thread_id):
             yield ev
 
     async def arun(self, task: str) -> str:
@@ -985,7 +1151,11 @@ class AgentCore:
 
     # ============ 长上下文裁剪 ============
 
-    async def manually_compact(self, force: bool = False) -> dict[str, Any] | None:
+    async def manually_compact(
+        self,
+        force: bool = False,
+        thread_id: str | None = None,
+    ) -> dict[str, Any] | None:
         """手动触发一次上下文压缩（CLI 命令 compact 调用）
 
         与 before_model 中间件使用相同的压缩逻辑（增量摘要 + 工具输出 Prune），
@@ -995,17 +1165,19 @@ class AgentCore:
         Args:
             force: 为 True 时跳过 max_messages 阈值检查，允许在消息数
                    未超阈值时强制压缩（仍需消息数 > keep_recent 才能安全切割）。
+            thread_id: 目标会话线程 ID（为 None 时使用当前会话）
 
         Returns:
             {"summary": str, "messages_before": int, "messages_after": int} 或 None
         """
-        msgs = await self.memory.aget_messages()
+        msgs = await self._aget_messages_for_thread(thread_id)
         if not msgs:
             return None
 
         # 读取当前 state 中的已有摘要
-        config = self._invoke_config()
-        state = await self.agent_executor.aget_state(config)
+        config = self._config_for(thread_id)
+        executor = await self._executor_for(thread_id)
+        state = await executor.aget_state(config)
         existing_summary = ""
         if state and state.values:
             existing_summary = state.values.get("summary", "") or ""
@@ -1025,7 +1197,7 @@ class AgentCore:
         _compact_start = _time.time()
 
         messages_before = len(msgs)
-        await self.agent_executor.aupdate_state(config, update)
+        await executor.aupdate_state(config, update)
         messages_after = len(update["messages"]) - 1  # 减去 RemoveMessage 标记
         summary_length = len(update.get("summary", ""))
 
@@ -1124,8 +1296,14 @@ class AgentCore:
         except Exception as e:
             logger.warning("Checkpoint DB 关闭异常: %s", e, exc_info=True)
 
-        # 3. 清理执行历史
+        # 3. 清理执行历史与 per-thread 状态
         self.execution_history.clear()
+        pending = getattr(self, "_pending_interrupts", None)
+        if pending is not None:
+            pending.clear()
+        executors = getattr(self, "_executors", None)
+        if executors is not None:
+            executors.clear()
 
         logger.info("AgentCore 资源已释放")
 

@@ -10,7 +10,7 @@ import {
   ChevronUp,
   ChevronDown,
 } from 'lucide-react'
-import { useStore } from '../store'
+import { useStore, selectIsStreaming } from '../store'
 import { WorkflowGraph } from './WorkflowGraph'
 import type { WorkflowInfo, WorkflowNode } from '../types'
 
@@ -64,7 +64,7 @@ export function WorkflowView() {
   const fetchWorkflow = useStore((s) => s.fetchWorkflow)
   const fetchWorkflows = useStore((s) => s.fetchWorkflows)
   const newWorkflowThread = useStore((s) => s.newWorkflowThread)
-  const isStreaming = useStore((s) => s.isStreaming)
+  const isStreaming = useStore(selectIsStreaming)
   const [collapsed, setCollapsed] = useState(false)
   const [panelHeight, setPanelHeight] = useState(loadPanelHeight)
   const [isResizing, setIsResizing] = useState(false)

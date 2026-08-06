@@ -320,9 +320,18 @@ class AgentMemory:
     async def __aexit__(self, exc_type, exc_value, traceback) -> None:
         await self.aclose()
 
-    def get_config(self) -> dict[str, Any]:
-        """获取 invoke 需要传入的 config"""
-        return {"configurable": {"thread_id": self.thread_id}}
+    def get_config(self, thread_id: str | None = None) -> dict[str, Any]:
+        """获取 invoke 需要传入的 config
+
+        Args:
+            thread_id: 显式指定会话线程 ID（并发多会话时用于隔离）。
+                       为 None 时使用当前会话（self.thread_id），兼容旧调用。
+
+        Returns:
+            LangGraph config，形如 {"configurable": {"thread_id": "..."}}
+        """
+        target = thread_id or self.thread_id
+        return {"configurable": {"thread_id": target}}
 
     def _check_not_async(self, method: str) -> None:
         """在异步模式下调用同步方法直接报错，杜绝双模式混跑。

@@ -1,7 +1,7 @@
 // 输入栏：自适应文本框 + 发送/停止按钮 + 工具列表 + 字符计数 + 上下文 Token 估算 + 快捷键
 import { useRef, useState, useEffect, useMemo } from 'react'
 import { ArrowUp, Square, Wrench, Keyboard, Users, Check, Loader2 } from 'lucide-react'
-import { useStore, isWorkflowThread } from '../store'
+import { useStore, isWorkflowThread, selectIsStreaming } from '../store'
 
 export function InputBar() {
   const [text, setText] = useState('')
@@ -13,7 +13,7 @@ export function InputBar() {
   const toolWrapRef = useRef<HTMLDivElement>(null)
   const shortcutWrapRef = useRef<HTMLDivElement>(null)
   const roleWrapRef = useRef<HTMLDivElement>(null)
-  const isStreaming = useStore((s) => s.isStreaming)
+  const isStreaming = useStore(selectIsStreaming)
   const sendMessage = useStore((s) => s.sendMessage)
   const stopStreaming = useStore((s) => s.stopStreaming)
   const tools = useStore((s) => s.tools)

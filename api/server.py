@@ -90,7 +90,38 @@ agent: AgentCore | None = None
 llm: LLMClient | None = None
 _startup_provider: str | None = None
 # 串行化对话轮次：AgentCore 是有状态单例，同一时刻只能跑一轮。
+# 全局管理锁：管理型命令/管理接口串行（dispatch_command 会操作共享管理状态）
 chat_lock = asyncio.Lock()
+
+# per-thread 锁：普通对话/恢复/压缩按会话并发，同会话内串行
+# 不同会话各自持有独立锁，互不阻塞；同一会话的请求仍严格排队
+_thread_locks: dict[str, asyncio.Lock] = {}
+_THREAD_LOCKS_MAX = 200
+
+
+def _thread_lock(thread_id: str) -> asyncio.Lock:
+    """获取指定会话的专用锁（不存在则创建）。
+
+    单线程事件循环内 get-or-create 是原子的，无需额外加锁。
+    超过容量上限时淘汰未持锁的旧锁，防止长期运行后内存无限增长。
+    """
+    lock = _thread_locks.get(thread_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _thread_locks[thread_id] = lock
+        if len(_thread_locks) > _THREAD_LOCKS_MAX:
+            _prune_thread_locks()
+    return lock
+
+
+def _prune_thread_locks() -> None:
+    """清理未持有且过量的 per-thread 锁。"""
+    if len(_thread_locks) <= _THREAD_LOCKS_MAX:
+        return
+    idle = [tid for tid, lock in _thread_locks.items() if not lock.locked()]
+    excess = len(_thread_locks) - _THREAD_LOCKS_MAX
+    for tid in idle[:excess]:
+        del _thread_locks[tid]
 
 
 async def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
@@ -578,27 +609,36 @@ async def chat(req: ChatRequest):
     """SSE 流式聊天。支持普通对话和命令执行（如 /skill:pptx <task>、/json:、/react: 等）。"""
 
     async def event_stream():
-        async with chat_lock:
-            tid = req.thread_id
-            if tid:
-                agent.memory.thread_id = tid
-            else:
-                tid = agent.memory.new_thread()
+        # 确定会话 ID（new_thread 在事件循环内原子执行，无需加锁）
+        is_new_thread = req.thread_id is None
+        tid = req.thread_id if req.thread_id else agent.memory.new_thread()
+
+        message = req.message.strip()
+
+        # 专属工作流会话：未显式以 / 开头时，自动包装为 /workflow:<name> 命令执行
+        if agent.memory.is_workflow_thread(tid):
+            workflow_name = agent.memory.workflow_name_of(tid)
+            if workflow_name and not message.startswith('/'):
+                message = f"/workflow:{workflow_name} {message}"
+                logger.info("工作流会话 [%s] 自动包装命令: %s", tid, message)
+
+        # 区分命令类型：
+        # - 执行型命令（json:/react:/cot:/skill:<task>）与普通对话走流式通道，用 per-thread 锁（并发多会话）
+        # - 管理型命令走 dispatch_command，用全局锁（其内部会切换/新建当前会话等共享管理状态）
+        command_mode = message.startswith('/')
+        command = message.lstrip('/') if command_mode else ""
+        is_management = command_mode and not _is_execution_command(command)
+        lock = chat_lock if is_management else _thread_lock(tid)
+
+        preview = message.replace("\n", " ")[:50]
+        logger.info("收到聊天 [%s]: %s", tid, preview)
+
+        async with lock:
+            if is_new_thread:
                 yield _sse({"type": "thread_created", "thread_id": tid})
-            preview = req.message.strip().replace("\n", " ")[:50]
-            logger.info("收到聊天 [%s]: %s", tid, preview)
-            
-            # 检测是否为命令（以 / 开头）
-            message = req.message.strip()
-            # 专属工作流会话：未显式以 / 开头时，自动包装为 /workflow:<name> 命令执行
-            if agent.memory.is_workflow_thread(tid):
-                workflow_name = agent.memory.workflow_name_of(tid)
-                if workflow_name and not message.startswith('/'):
-                    message = f"/workflow:{workflow_name} {message}"
-                    logger.info("工作流会话 [%s] 自动包装命令: %s", tid, message)
-            if message.startswith('/'):
+
+            if command_mode:
                 # 命令模式：通过 dispatch_command 处理
-                command = message.lstrip('/')
                 logger.info("检测到命令 [%s]: %s", tid, command)
                 
                 # 文本输出包装器：管理型命令的输出包成 token 事件
@@ -636,13 +676,11 @@ async def chat(req: ChatRequest):
                     )
                     
                     # 执行型命令（json:/react:/cot:/skill:<task>）走流式通道
-                    is_execution = _is_execution_command(command)
-                    
-                    if is_execution:
-                        # 执行型命令：走流式 runner
+                    if _is_execution_command(command):
+                        # 执行型命令：走流式 runner，显式传 thread_id 保证多会话隔离
                         logger.info("执行型命令 [%s]，走流式通道", tid)
                         # 把命令原文传给 astream_chat（它会自动匹配技能）
-                        async for ev in agent.astream_chat(command):
+                        async for ev in agent.astream_chat(command, thread_id=tid):
                             yield _sse(_enrich_done(ev))
                         logger.info("完成 [%s]", tid)
                         return
@@ -694,9 +732,9 @@ async def chat(req: ChatRequest):
                     yield _sse({"type": "error", "content": f"命令执行失败: {e}"})
                     return
             
-            # 普通对话模式
+            # 普通对话模式（显式传 thread_id 实现多会话隔离）
             try:
-                async for event in agent.astream_chat(req.message):
+                async for event in agent.astream_chat(message, thread_id=tid):
                     yield _sse(_enrich_done(event))
                 logger.info("完成 [%s]", tid)
             except Exception as e:
@@ -719,13 +757,12 @@ async def chat_resume(req: ResumeRequest):
     """SSE 流式恢复被 ask_human 中断的会话。"""
 
     async def event_stream():
-        async with chat_lock:
-            if req.thread_id:
-                agent.memory.thread_id = req.thread_id
-            tid = req.thread_id or agent.memory.thread_id
-            logger.info("恢复会话 [%s]", tid)
+        # 恢复必须带 thread_id（前端在会话被中断时已知线程）；缺失时回退当前会话
+        tid = req.thread_id or agent.memory.thread_id
+        logger.info("恢复会话 [%s]", tid)
+        async with _thread_lock(tid):
             try:
-                async for event in agent.astream_resume(req.payload):
+                async for event in agent.astream_resume(req.payload, thread_id=tid):
                     yield _sse(event)
                 logger.info("恢复完成 [%s]", tid)
             except Exception as e:
@@ -857,17 +894,15 @@ async def reset_metrics():
 # --------------------------------------------------------------------------- #
 @app.post("/api/compact")
 async def compact_context(thread_id: str | None = None):
-    """手动触发当前会话的上下文压缩（增量摘要 + 工具输出 Prune）
+    """手动触发指定会话的上下文压缩（增量摘要 + 工具输出 Prune）
 
     与 before_model 中间件使用相同的压缩逻辑，适用于对话过长时主动释放 token。
     """
-    async with chat_lock:
-        if thread_id:
-            agent.memory.thread_id = thread_id
-        tid = agent.memory.thread_id
-        logger.info("手动压缩上下文 [%s]", tid)
+    tid = thread_id or agent.memory.thread_id
+    logger.info("手动压缩上下文 [%s]", tid)
+    async with _thread_lock(tid):
         try:
-            result = await agent.manually_compact()
+            result = await agent.manually_compact(thread_id=tid)
         except Exception as e:
             logger.error("压缩失败 [%s]: %s", tid, e)
             raise HTTPException(status_code=500, detail=f"压缩失败: {e}")
@@ -1021,9 +1056,9 @@ def main():
     # 配置日志 - 必须在 uvicorn.run() 之前
     # 1. 生成日志文件名：按日期分目录，文件名为时间 + 哈希
     import hashlib
-    from datetime import datetime,timezone
-    
-    now = datetime.now(timezone.utc).astimezone()
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).astimezone()  # noqa: UP017 - 本环境 Python 构建缺少 datetime.UTC 属性
     date_str = now.strftime("%Y%m%d")
     time_str = now.strftime("%H%M%S")
     time_hash = hashlib.md5(str(now.timestamp()).encode()).hexdigest()[:8]

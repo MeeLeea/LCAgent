@@ -296,8 +296,7 @@ def test_aresume_stops_after_user_rejects_command():
     core.execution_history = []
     core._state_lock = asyncio.Lock()
     core.agent_executor = executor
-    core._pending_interrupt_thread_id = "thread-resume-rejected"
-    core._pending_interrupt_mode = "chat"
+    core._pending_interrupts = {"thread-resume-rejected": "chat"}
 
     # When: 用户以 deny 恢复中断。
     turn = asyncio.run(core.aresume_structured({"choice_id": "deny"}))
@@ -305,8 +304,7 @@ def test_aresume_stops_after_user_rejects_command():
     # Then: 本轮取消并清理中断状态，而不是抛异常给调用方。
     assert turn.status == "cancelled"
     assert turn.output == "用户已拒绝执行危险命令，当前任务已取消。"
-    assert core._pending_interrupt_thread_id is None
-    assert core._pending_interrupt_mode is None
+    assert core._pending_interrupts == {}
 
 
 def test_arun_repairs_checkpoint_after_user_rejects_command():

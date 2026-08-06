@@ -6,6 +6,7 @@ import type {
   InterruptInfo,
   Provider,
   RawMessage,
+  StreamEvent,
   ThreadSummary,
   WorkflowInfo,
 } from './types'
@@ -83,8 +84,14 @@ interface AppState {
   fetchWorkflows: () => Promise<void>
   fetchWorkflow: (name?: string, force?: boolean) => Promise<void>
 
-  // 流式状态
-  isStreaming: boolean
+  // 流式状态（per-thread：支持多会话并发流）
+  /** 各线程的消息缓冲（含进行中流的半成品 assistant 消息），跨会话切换保留 */
+  messagesByThread: Record<string, ChatMessage[]>
+  /** 正在流式输出的线程集合 */
+  streamingThreads: Record<string, boolean>
+  /** 各线程的挂起 HITL 中断 */
+  pendingInterrupts: Record<string, InterruptInfo>
+  /** 当前线程的挂起中断（展示用，随 selectThread 同步） */
   pendingInterrupt: InterruptInfo | null
 
   // 连接状态
@@ -122,37 +129,53 @@ interface AppState {
   switchRole: (role: string) => Promise<void>
 }
 
-let abortFn: (() => void) | null = null
+/** 当前线程是否正在流式输出（派生选择器，供组件订阅） */
+export const selectIsStreaming = (s: AppState): boolean => {
+  return !!s.streamingThreads[normKey(s.currentThreadId)]
+}
+
+type StoreSet = (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void
+type StoreGet = () => AppState
+
+/** 统一线程 key：null（尚无会话，等待后端 thread_created）归一化为 '' */
+function normKey(threadId: string | null): string {
+  return threadId ?? ''
+}
+
+// per-thread 流式基础设施：abort / 终止标记 / 看门狗 均按线程隔离
+let abortFns: Record<string, (() => void) | null> = {}
+let terminatedThreads: Set<string> = new Set()
 let msgSeq = 0
 const nextId = () => `m${++msgSeq}`
 
-/** 看门狗：N 秒内无任何事件则强制复位 isStreaming，防止流卡死 */
-let watchdogTimer: ReturnType<typeof setTimeout> | null = null
+/** 看门狗：N 秒内无任何事件则强制复位该线程的 streaming，防止流卡死 */
+let watchdogTimers: Record<string, ReturnType<typeof setTimeout> | null> = {}
 const WATCHDOG_MS = 90_000
 
-function armWatchdog(onTimeout: () => void) {
-  clearWatchdog()
-  watchdogTimer = setTimeout(onTimeout, WATCHDOG_MS)
+function armWatchdog(threadId: string, onTimeout: () => void) {
+  clearWatchdog(threadId)
+  watchdogTimers[threadId] = setTimeout(onTimeout, WATCHDOG_MS)
 }
-function clearWatchdog() {
-  if (watchdogTimer) {
-    clearTimeout(watchdogTimer)
-    watchdogTimer = null
+function clearWatchdog(threadId: string) {
+  if (watchdogTimers[threadId]) {
+    clearTimeout(watchdogTimers[threadId])
+    watchdogTimers[threadId] = null
   }
 }
 
 /**
- * 构造看门狗超时处理器：把最后一条仍在流式中的 assistant 消息标记为超时错误，
- * 并强制复位 isStreaming。所有事件循环中重挂看门狗时都必须复用同一个处理器，
- * 否则一旦换成空函数，流卡死时 isStreaming 将永久为 true，输入框被锁死。
+ * 构造看门狗超时处理器：把指定线程最后一条仍在流式中的 assistant 消息标记为
+ * 超时错误，并强制复位该线程 streaming。所有事件循环中重挂看门狗时都必须复用
+ * 同一个处理器，否则一旦换成空函数，流卡死时线程将永久处于 streaming 状态。
  */
 function makeWatchdogHandler(
-  get: () => AppState,
-  set: (partial: Partial<AppState>) => void,
+  get: StoreGet,
+  set: StoreSet,
+  threadId: string,
   finish: () => void,
 ) {
   return () => {
-    const msgs = [...get().messages]
+    const msgs = [...(get().messagesByThread[threadId] ?? [])]
     const lastIndex = msgs.length - 1
     const last = msgs[lastIndex]
     if (last && last.role === 'assistant' && last.streaming) {
@@ -162,9 +185,211 @@ function makeWatchdogHandler(
         error: true,
         content: last.content + (last.content ? '\n\n' : '') + '> ⏱️ 响应超时，请重试。',
       }
-      set({ messages: msgs })
+      commitThreadMessages(get, set, threadId, msgs)
     }
     finish()
+  }
+}
+
+/** 把某线程的消息数组写入 messagesByThread；若该线程恰为当前线程，同步 messages */
+function commitThreadMessages(
+  get: StoreGet,
+  set: StoreSet,
+  threadId: string,
+  arr: ChatMessage[],
+) {
+  set((s) => {
+    const messagesByThread = { ...s.messagesByThread, [threadId]: arr }
+    const patch: Partial<AppState> = { messagesByThread }
+    if (normKey(s.currentThreadId) === threadId) patch.messages = arr
+    return patch
+  })
+}
+
+/** 标记某线程是否处于流式输出状态 */
+function markStreaming(get: StoreGet, set: StoreSet, threadId: string, streaming: boolean) {
+  set((s) => {
+    const streamingThreads = { ...s.streamingThreads }
+    if (streaming) streamingThreads[threadId] = true
+    else delete streamingThreads[threadId]
+    return { streamingThreads }
+  })
+}
+
+/** 构造某线程流的终止处理器（幂等：只执行一次） */
+function makeFinish(get: StoreGet, set: StoreSet, threadId: string) {
+  return () => {
+    if (terminatedThreads.has(threadId)) return
+    terminatedThreads.add(threadId)
+    clearWatchdog(threadId)
+    delete abortFns[threadId]
+    markStreaming(get, set, threadId, false)
+  }
+}
+
+/**
+ * 线程重绑定：首条消息无 thread_id 时后端创建新线程并返回 thread_created，
+ * 此时把 sentinel key（''）下的全部流式状态迁移到真实 thread_id。
+ */
+function rebindThread(get: StoreGet, set: StoreSet, oldKey: string, newKey: string) {
+  if (oldKey === newKey) return
+  const s = get()
+  const messagesByThread = { ...s.messagesByThread }
+  if (messagesByThread[oldKey] !== undefined) {
+    messagesByThread[newKey] = messagesByThread[oldKey]
+    delete messagesByThread[oldKey]
+  }
+  const streamingThreads = { ...s.streamingThreads }
+  if (streamingThreads[oldKey] !== undefined) {
+    streamingThreads[newKey] = streamingThreads[oldKey]
+    delete streamingThreads[oldKey]
+  }
+  const pendingInterrupts = { ...s.pendingInterrupts }
+  if (pendingInterrupts[oldKey] !== undefined) {
+    pendingInterrupts[newKey] = pendingInterrupts[oldKey]
+    delete pendingInterrupts[oldKey]
+  }
+  if (abortFns[oldKey]) {
+    abortFns[newKey] = abortFns[oldKey]
+    delete abortFns[oldKey]
+  }
+  if (watchdogTimers[oldKey]) {
+    watchdogTimers[newKey] = watchdogTimers[oldKey]
+    watchdogTimers[oldKey] = null
+  }
+  if (terminatedThreads.has(oldKey)) {
+    terminatedThreads.delete(oldKey)
+    terminatedThreads.add(newKey)
+  }
+  set({
+    messagesByThread,
+    streamingThreads,
+    pendingInterrupts,
+    currentThreadId: newKey,
+    messages: messagesByThread[newKey] ?? [],
+    pendingInterrupt: pendingInterrupts[newKey] ?? null,
+  })
+}
+
+/**
+ * 统一处理某线程的流式事件（sendMessage / resume 共用）。
+ * 事件始终写入该线程的消息缓冲；仅当该线程是当前线程时同步到 messages 展示。
+ */
+function handleStreamEvent(
+  get: StoreGet,
+  set: StoreSet,
+  threadId: string,
+  ev: StreamEvent,
+  ctx: { finish: () => void },
+) {
+  if (terminatedThreads.has(threadId)) return
+  const arr = [...(get().messagesByThread[threadId] ?? [])]
+  const lastIndex = arr.length - 1
+  const last = arr[lastIndex]
+
+  switch (ev.type) {
+    case 'thread_created':
+      rebindThread(get, set, threadId, ev.thread_id)
+      get().fetchThreads()
+      break
+    case 'token':
+      if (!last || last.role !== 'assistant') return
+      arr[lastIndex] = { ...last, content: last.content + ev.content }
+      commitThreadMessages(get, set, threadId, arr)
+      break
+    case 'tool_call':
+      if (!last || last.role !== 'assistant') return
+      arr[lastIndex] = {
+        ...last,
+        toolCalls: [...(last.toolCalls ?? []), { id: ev.id, name: ev.name, args: ev.args }],
+      }
+      commitThreadMessages(get, set, threadId, arr)
+      break
+    case 'tool_result':
+      if (!last || last.role !== 'assistant') return
+      arr[lastIndex] = {
+        ...last,
+        toolResults: [
+          ...(last.toolResults ?? []),
+          { id: ev.id, name: ev.name, content: ev.content },
+        ],
+      }
+      commitThreadMessages(get, set, threadId, arr)
+      break
+    case 'interrupt': {
+      if (!last || last.role !== 'assistant') return
+      arr[lastIndex] = { ...last, streaming: false, interrupted: true }
+      const info: InterruptInfo = { prompt: ev.prompt, choices: ev.choices }
+      set((s) => {
+        const pendingInterrupts = { ...s.pendingInterrupts, [threadId]: info }
+        const patch: Partial<AppState> = { pendingInterrupts }
+        if (normKey(s.currentThreadId) === threadId) patch.pendingInterrupt = info
+        return patch
+      })
+      commitThreadMessages(get, set, threadId, arr)
+      ctx.finish()
+      break
+    }
+    case 'cancelled':
+      if (!last || last.role !== 'assistant') return
+      arr[lastIndex] = {
+        ...last,
+        streaming: false,
+        content: last.content + (last.content ? '\n\n' : '') + `> ⚠️ ${ev.content}`,
+      }
+      commitThreadMessages(get, set, threadId, arr)
+      ctx.finish()
+      get().fetchThreads()
+      break
+    case 'error':
+      if (!last || last.role !== 'assistant') return
+      // 避免重复追加多条错误
+      if (!last.error) {
+        arr[lastIndex] = {
+          ...last,
+          streaming: false,
+          error: true,
+          content: last.content + (last.content ? '\n\n' : '') + `> ❌ ${ev.content}`,
+        }
+        commitThreadMessages(get, set, threadId, arr)
+      }
+      ctx.finish()
+      break
+    case 'workflow_node': {
+      const wf = get().workflow
+      if (wf) {
+        set({
+          workflow: {
+            ...wf,
+            nodes: wf.nodes.map((n) => (n.id === ev.node ? { ...n, status: ev.status } : n)),
+          },
+        })
+      }
+      break
+    }
+    case 'workflow_status': {
+      const wf = get().workflow
+      if (wf) set({ workflow: { ...wf, workflow_status: ev.status } })
+      break
+    }
+    case 'done': {
+      if (!last || last.role !== 'assistant') return
+      arr[lastIndex] = { ...last, streaming: false }
+      commitThreadMessages(get, set, threadId, arr)
+      set((s) => {
+        const pendingInterrupts = { ...s.pendingInterrupts }
+        delete pendingInterrupts[threadId]
+        const patch: Partial<AppState> = {
+          pendingInterrupts,
+          totalTokens: ev.total_tokens ?? s.totalTokens,
+        }
+        if (normKey(s.currentThreadId) === threadId) patch.pendingInterrupt = null
+        return patch
+      })
+      ctx.finish()
+      get().fetchThreads()
+      break
+    }
   }
 }
 
@@ -233,7 +458,9 @@ export const useStore = create<AppState>((set, get) => ({
   workflow: null,
   workflowLoading: false,
   workflowError: null,
-  isStreaming: false,
+  messagesByThread: {},
+  streamingThreads: {},
+  pendingInterrupts: {},
   pendingInterrupt: null,
   connectionStatus: 'checking',
 
@@ -250,7 +477,6 @@ export const useStore = create<AppState>((set, get) => ({
   setViewMode: (mode) => set({ viewMode: mode }),
 
   switchViewMode: async (mode) => {
-    if (get().isStreaming) return
     set({ viewMode: mode })
     if (mode === 'workflow') void get().fetchWorkflow()
     await get().fetchThreads()
@@ -331,12 +557,23 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   selectThread: async (id) => {
-    if (get().isStreaming) return
-    set({ currentThreadId: id, messages: [], pendingInterrupt: null })
+    // 支持并发：切换会话不再被全局 streaming 阻塞；
+    // 目标线程自身正在流式时也能切回，继续展示其进行中的消息。
+    set((s) => ({
+      currentThreadId: id,
+      pendingInterrupt: s.pendingInterrupts[id] ?? null,
+    }))
+    const cached = get().messagesByThread[id]
+    if (cached) {
+      set({ messages: cached })
+      return
+    }
+    set({ messages: [] })
     try {
       const r = await api.getMessages(id)
       if (get().currentThreadId === id) {
-        set({ messages: rawToMessages(r.messages) })
+        const arr = rawToMessages(r.messages)
+        commitThreadMessages(get, set, id, arr)
       }
     } catch {
       /* ignore */
@@ -344,12 +581,16 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   newThread: async () => {
-    if (get().isStreaming) return
     try {
       // 工作流模式下创建专属工作流会话，其余为普通对话
       const type = get().viewMode
       const r = type === 'workflow' ? await api.createThread('workflow', 'simple') : await api.createThread('chat')
-      set({ currentThreadId: r.thread_id, messages: [], pendingInterrupt: null })
+      set((s) => ({
+        currentThreadId: r.thread_id,
+        messages: [],
+        pendingInterrupt: null,
+        messagesByThread: { ...s.messagesByThread, [r.thread_id]: [] },
+      }))
       await get().fetchThreads()
     } catch (e) {
       console.error(e)
@@ -357,10 +598,14 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   newWorkflowThread: async (workflowName) => {
-    if (get().isStreaming) return
     try {
       const r = await api.createThread('workflow', workflowName)
-      set({ currentThreadId: r.thread_id, messages: [], pendingInterrupt: null })
+      set((s) => ({
+        currentThreadId: r.thread_id,
+        messages: [],
+        pendingInterrupt: null,
+        messagesByThread: { ...s.messagesByThread, [r.thread_id]: [] },
+      }))
       await get().fetchThreads()
     } catch (e) {
       console.error(e)
@@ -370,9 +615,31 @@ export const useStore = create<AppState>((set, get) => ({
   deleteThread: async (id) => {
     try {
       await api.deleteThread(id)
-      if (get().currentThreadId === id) {
-        set({ currentThreadId: null, messages: [] })
-      }
+      // 清理该线程的内存状态（含进行中流的 abort/看门狗）
+      clearWatchdog(id)
+      const fn = abortFns[id]
+      if (fn) fn()
+      delete abortFns[id]
+      terminatedThreads.add(id)
+      set((s) => {
+        const messagesByThread = { ...s.messagesByThread }
+        delete messagesByThread[id]
+        const streamingThreads = { ...s.streamingThreads }
+        delete streamingThreads[id]
+        const pendingInterrupts = { ...s.pendingInterrupts }
+        delete pendingInterrupts[id]
+        const patch: Partial<AppState> = {
+          messagesByThread,
+          streamingThreads,
+          pendingInterrupts,
+        }
+        if (s.currentThreadId === id) {
+          patch.currentThreadId = null
+          patch.messages = []
+          patch.pendingInterrupt = null
+        }
+        return patch
+      })
       await get().fetchThreads()
     } catch (e) {
       console.error(e)
@@ -381,8 +648,11 @@ export const useStore = create<AppState>((set, get) => ({
 
   sendMessage: async (text) => {
     const trimmed = text.trim()
-    if (!trimmed || get().isStreaming) return
-    const threadId = get().currentThreadId
+    const rawThreadId = get().currentThreadId
+    if (!trimmed) return
+    // 尚无会话时用哨兵 key（''），后端创建线程后经 thread_created 重绑定
+    const key = normKey(rawThreadId)
+    if (get().streamingThreads[key]) return
 
     // 所有消息（包括 / 命令）统一走流式通道
     console.log('[前端] 发送消息:', trimmed.slice(0, 50) + (trimmed.length > 50 ? '...' : ''))
@@ -398,117 +668,26 @@ export const useStore = create<AppState>((set, get) => ({
       streaming: true,
       timestamp: now,
     }
-    set((s) => ({
-      messages: [...s.messages, userMsg, assistantMsg],
-      isStreaming: true,
-      pendingInterrupt: null,
-    }))
+    // 以当前线程已展示的消息为基底（regenerate / editAndResend 截断后也保持一致）
+    const arr = [...get().messages, userMsg, assistantMsg]
+    commitThreadMessages(get, set, key, arr)
+    markStreaming(get, set, key, true)
 
-    // 终止标记：避免重复处理终止事件（如 error 后流关闭又补发 done）
-    let terminated = false
-    const finish = () => {
-      if (terminated) return
-      terminated = true
-      clearWatchdog()
-      abortFn = null
-      set({ isStreaming: false })
-      console.log('[前端] 消息接收完成')
-    }
+    const finish = makeFinish(get, set, key)
+    const watchdogHandler = makeWatchdogHandler(get, set, key, finish)
+    armWatchdog(key, watchdogHandler)
 
-    const watchdogHandler = makeWatchdogHandler(get, set, finish)
-    armWatchdog(watchdogHandler)
-
-    abortFn = api.streamChat({ message: trimmed, thread_id: threadId }, (ev) => {
+    abortFns[key] = api.streamChat({ message: trimmed, thread_id: rawThreadId }, (ev) => {
       // 每收到任意事件，重置看门狗（复用同一超时处理器，保持兜底有效）
-      if (!terminated) armWatchdog(watchdogHandler)
-      const msgs = [...get().messages]
-      const lastIndex = msgs.length - 1
-      const last = msgs[lastIndex]
-      if (!last || last.role !== 'assistant') return
-
-      switch (ev.type) {
-        case 'thread_created':
-          set({ currentThreadId: ev.thread_id })
-          get().fetchThreads()
-          break
-        case 'token':
-          // 创建新对象，触发不可变更新
-          msgs[lastIndex] = { ...last, content: last.content + ev.content }
-          set({ messages: msgs })
-          break
-        case 'tool_call':
-          console.log('[前端] 工具调用:', ev.name)
-          msgs[lastIndex] = { ...last, toolCalls: [...(last.toolCalls ?? []), { id: ev.id, name: ev.name, args: ev.args }] }
-          set({ messages: msgs })
-          break
-        case 'tool_result':
-          // 保存执行结果内容，供卡片展开时查看（默认收起）
-          msgs[lastIndex] = {
-            ...last,
-            toolResults: [
-              ...(last.toolResults ?? []),
-              { id: ev.id, name: ev.name, content: ev.content },
-            ],
-          }
-          set({ messages: msgs })
-          break
-        case 'interrupt':
-          msgs[lastIndex] = { ...last, streaming: false, interrupted: true }
-          set({ messages: msgs, pendingInterrupt: { prompt: ev.prompt, choices: ev.choices } })
-          finish()
-          break
-        case 'cancelled':
-          msgs[lastIndex] = {
-            ...last,
-            streaming: false,
-            content: last.content + (last.content ? '\n\n' : '') + `> ⚠️ ${ev.content}`,
-          }
-          set({ messages: msgs })
-          finish()
-          get().fetchThreads()
-          break
-        case 'error':
-          // 避免重复追加多条错误
-          if (!last.error) {
-            msgs[lastIndex] = {
-              ...last,
-              streaming: false,
-              error: true,
-              content: last.content + (last.content ? '\n\n' : '') + `> ❌ ${ev.content}`,
-            }
-            set({ messages: msgs })
-          }
-          finish()
-          break
-        case 'workflow_node': {
-          const wf = get().workflow
-          if (wf) {
-            set({
-              workflow: {
-                ...wf,
-                nodes: wf.nodes.map((n) => (n.id === ev.node ? { ...n, status: ev.status } : n)),
-              },
-            })
-          }
-          break
-        }
-        case 'workflow_status': {
-          const wf = get().workflow
-          if (wf) set({ workflow: { ...wf, workflow_status: ev.status } })
-          break
-        }
-        case 'done':
-          msgs[lastIndex] = { ...last, streaming: false }
-          set({ messages: msgs, totalTokens: ev.total_tokens ?? get().totalTokens })
-          finish()
-          get().fetchThreads()
-          break
-      }
+      if (!terminatedThreads.has(key)) armWatchdog(key, watchdogHandler)
+      handleStreamEvent(get, set, key, ev, { finish })
     })
   },
 
   regenerate: () => {
-    if (get().isStreaming) return
+    const threadId = get().currentThreadId
+    if (threadId === null) return
+    if (get().streamingThreads[threadId]) return
     const msgs = [...get().messages]
     if (msgs.length === 0) return
     // 找到最后一条 user 消息
@@ -522,23 +701,30 @@ export const useStore = create<AppState>((set, get) => ({
     if (lastUserIdx === -1) return
     const lastUserText = msgs[lastUserIdx].content
     // 截断到最后一条 user 消息（不含），然后重新发送
-    set({ messages: msgs.slice(0, lastUserIdx) })
+    const truncated = msgs.slice(0, lastUserIdx)
+    set({ messages: truncated })
+    commitThreadMessages(get, set, threadId, truncated)
     void get().sendMessage(lastUserText)
   },
 
   editAndResend: (index, newText) => {
-    if (get().isStreaming) return
+    const threadId = get().currentThreadId
+    if (threadId === null) return
+    if (get().streamingThreads[threadId]) return
     const msgs = [...get().messages]
     if (index < 0 || index >= msgs.length) return
     if (msgs[index].role !== 'user') return
     // 截断到该 user 消息（不含），重新发送新文本
-    set({ messages: msgs.slice(0, index) })
+    const truncated = msgs.slice(0, index)
+    set({ messages: truncated })
+    commitThreadMessages(get, set, threadId, truncated)
     void get().sendMessage(newText)
   },
 
   resume: (payload) => {
-    if (get().isStreaming) return
     const threadId = get().currentThreadId
+    if (threadId === null) return
+    if (get().streamingThreads[threadId]) return
     console.log('[前端] 恢复会话')
     const assistantMsg: ChatMessage = {
       id: nextId(),
@@ -549,123 +735,61 @@ export const useStore = create<AppState>((set, get) => ({
       streaming: true,
       timestamp: Date.now(),
     }
-    set((s) => ({ messages: [...s.messages, assistantMsg], isStreaming: true, pendingInterrupt: null }))
+    const arr = [...get().messages, assistantMsg]
+    commitThreadMessages(get, set, threadId, arr)
+    markStreaming(get, set, threadId, true)
 
-    let terminated = false
-    const finish = () => {
-      if (terminated) return
-      terminated = true
-      clearWatchdog()
-      abortFn = null
-      set({ isStreaming: false })
-      console.log('[前端] 会话恢复完成')
-    }
+    const finish = makeFinish(get, set, threadId)
+    const watchdogHandler = makeWatchdogHandler(get, set, threadId, finish)
+    armWatchdog(threadId, watchdogHandler)
 
-    const watchdogHandler = makeWatchdogHandler(get, set, finish)
-    armWatchdog(watchdogHandler)
-
-    abortFn = api.streamResume({ payload, thread_id: threadId }, (ev) => {
-      if (!terminated) armWatchdog(watchdogHandler)
-      const msgs = [...get().messages]
-      const lastIndex = msgs.length - 1
-      const last = msgs[lastIndex]
-      if (!last || last.role !== 'assistant') return
-      switch (ev.type) {
-        case 'token':
-          msgs[lastIndex] = { ...last, content: last.content + ev.content }
-          set({ messages: msgs })
-          break
-        case 'tool_call':
-          console.log('[前端] 工具调用:', ev.name)
-          msgs[lastIndex] = { ...last, toolCalls: [...(last.toolCalls ?? []), { id: ev.id, name: ev.name, args: ev.args }] }
-          set({ messages: msgs })
-          break
-        case 'tool_result':
-          // 保存执行结果内容，供卡片展开时查看（默认收起）
-          msgs[lastIndex] = {
-            ...last,
-            toolResults: [
-              ...(last.toolResults ?? []),
-              { id: ev.id, name: ev.name, content: ev.content },
-            ],
-          }
-          set({ messages: msgs })
-          break
-        case 'interrupt':
-          msgs[lastIndex] = { ...last, streaming: false, interrupted: true }
-          set({ messages: msgs, pendingInterrupt: { prompt: ev.prompt, choices: ev.choices } })
-          finish()
-          break
-        case 'cancelled':
-          msgs[lastIndex] = {
-            ...last,
-            streaming: false,
-            content: last.content + (last.content ? '\n\n' : '') + `> ⚠️ ${ev.content}`,
-          }
-          set({ messages: msgs })
-          finish()
-          break
-        case 'error':
-          if (!last.error) {
-            msgs[lastIndex] = {
-              ...last,
-              streaming: false,
-              error: true,
-              content: last.content + (last.content ? '\n\n' : '') + `> ❌ ${ev.content}`,
-            }
-            set({ messages: msgs })
-          }
-          finish()
-          break
-        case 'workflow_node': {
-          const wf = get().workflow
-          if (wf) {
-            set({
-              workflow: {
-                ...wf,
-                nodes: wf.nodes.map((n) => (n.id === ev.node ? { ...n, status: ev.status } : n)),
-              },
-            })
-          }
-          break
-        }
-        case 'workflow_status': {
-          const wf = get().workflow
-          if (wf) set({ workflow: { ...wf, workflow_status: ev.status } })
-          break
-        }
-        case 'done':
-          msgs[lastIndex] = { ...last, streaming: false }
-          set({ messages: msgs, totalTokens: ev.total_tokens ?? get().totalTokens })
-          finish()
-          get().fetchThreads()
-          break
-      }
+    abortFns[threadId] = api.streamResume({ payload, thread_id: threadId }, (ev) => {
+      if (!terminatedThreads.has(threadId)) armWatchdog(threadId, watchdogHandler)
+      handleStreamEvent(get, set, threadId, ev, { finish })
     })
   },
 
   stopStreaming: () => {
-    clearWatchdog()
-    if (abortFn) abortFn()
-    abortFn = null
+    const key = normKey(get().currentThreadId)
+    clearWatchdog(key)
+    if (abortFns[key]) abortFns[key]!()
+    delete abortFns[key]
+    // 阻止迟到事件继续写入
+    terminatedThreads.add(key)
     set((s) => {
-      const msgs = [...s.messages]
-      const lastIndex = msgs.length - 1
-      const last = msgs[lastIndex]
+      const arr = [...(s.messagesByThread[key] ?? s.messages)]
+      const lastIndex = arr.length - 1
+      const last = arr[lastIndex]
       if (last && last.role === 'assistant' && last.streaming) {
-        msgs[lastIndex] = {
+        arr[lastIndex] = {
           ...last,
           streaming: false,
           content: last.content || '_(已中止)_',
         }
       }
-      return { messages: msgs, isStreaming: false }
+      const streamingThreads = { ...s.streamingThreads }
+      delete streamingThreads[key]
+      const patch: Partial<AppState> = {
+        streamingThreads,
+        messagesByThread: { ...s.messagesByThread, [key]: arr },
+      }
+      if (normKey(s.currentThreadId) === key) patch.messages = arr
+      return patch
     })
   },
 
   clearMessages: () => {
-    if (get().isStreaming) return
-    set({ messages: [], pendingInterrupt: null })
+    const threadId = get().currentThreadId
+    if (threadId === null) return
+    if (get().streamingThreads[threadId]) return
+    set((s) => {
+      const pendingInterrupts = { ...s.pendingInterrupts }
+      delete pendingInterrupts[threadId]
+      const patch: Partial<AppState> = { messages: [], pendingInterrupt: null, pendingInterrupts }
+      const messagesByThread = { ...s.messagesByThread, [threadId]: [] }
+      patch.messagesByThread = messagesByThread
+      return patch
+    })
   },
 
   switchProvider: async (key) => {

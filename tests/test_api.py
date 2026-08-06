@@ -60,7 +60,7 @@ def mock_agent():
     agent.aclose = AsyncMock(return_value=None)
     
     # Mock astream_chat：普通对话返回 token + done 事件
-    async def mock_astream_chat(message: str) -> AsyncIterator[dict[str, Any]]:
+    async def mock_astream_chat(message: str, thread_id: str | None = None) -> AsyncIterator[dict[str, Any]]:
         if "工具调用" in message:
             # 模拟工具调用场景
             yield {"type": "token", "content": "正在"}
@@ -93,7 +93,7 @@ def mock_agent():
     agent.astream_chat = mock_astream_chat
     
     # Mock astream_resume：HITL 恢复
-    async def mock_astream_resume(payload: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
+    async def mock_astream_resume(payload: dict[str, Any], thread_id: str | None = None) -> AsyncIterator[dict[str, Any]]:
         user_response = payload.get("user_response", "")
         yield {"type": "token", "content": f"收到回复：{user_response}"}
         yield {"type": "token", "content": "，继续执行"}
