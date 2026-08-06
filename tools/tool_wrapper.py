@@ -123,16 +123,8 @@ def wrap_tools_with_timeout(
     Returns:
         包装后的工具列表（原地修改，返回同一批对象引用）
     """
-    if default_timeout is not None:
-        # 临时覆盖全局默认
-        global DEFAULT_TIMEOUT
-        old = DEFAULT_TIMEOUT
-        DEFAULT_TIMEOUT = default_timeout
-        try:
-            return [wrap_tool_with_timeout(t) for t in tools]
-        finally:
-            DEFAULT_TIMEOUT = old
-    return [wrap_tool_with_timeout(t) for t in tools]
+    # default_timeout 直接透传,不再修改全局默认(避免并发包装时全局状态串值)
+    return [wrap_tool_with_timeout(t, default_timeout) for t in tools]
 
 
 __all__ = [

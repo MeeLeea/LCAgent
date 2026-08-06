@@ -95,6 +95,7 @@ def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
     """根据提供商初始化 LLM 与 Agent（逻辑与 main.py 一致，去掉 CLI 打印）。"""
     new_llm = LLMClient(provider=provider, config_file=LLM_FILE)
     cfg = load_agent_config(AGENT_CONFIG_FILE)
+    agent_prompt_file = cfg.get("agent_prompt_file")
     skills_dir = resolve_path(cfg["skills_dir"], BASE_DIR)
     mcp_config_file = resolve_path(cfg["mcp_config_file"], BASE_DIR)
     new_agent = AgentCore(
@@ -112,7 +113,9 @@ def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
         max_context_messages=cfg["max_context_messages"],
         context_trim_keep=cfg["context_trim_keep"],
         process_type="server",
-        agent_core_prompt=cfg["agent_core_prompt"]
+        agent_prompt_file=agent_prompt_file,
+        max_execution_history=cfg.get("max_execution_history", 100),
+        tool_timeout=cfg.get("tool_timeout", 120),
     )
     return new_agent, new_llm
 

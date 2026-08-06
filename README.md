@@ -779,7 +779,6 @@ LLM 生成摘要
 | `get_checkpointer()`               | 获取 checkpointer 实例(传给 create_react_agent)           |
 | `get_config()`                     | 返回`{"configurable": {"thread_id": ...}}`(传给 invoke) |
 | `get_messages()`                   | 从 checkpoint 获取当前 thread 的所有消息                  |
-| `get_langchain_messages()`         | 等同于 get_messages()（兼容旧 API）                       |
 | `get_short_term(limit)`            | 从 checkpoint 取消息转为 dict 格式                        |
 | `get_long_term(limit)`             | 获取最近 N 条长期记忆                                     |
 | `get_all_context(long_term_limit)` | 获取完整上下文(长期+短期)                                 |

@@ -39,9 +39,10 @@ def build_team_agent(
     
     # 解析角色 AGENT.md 绝对路径,供工作流节点提示词模板加载
     prompt_file = resolve_path(config.get("agent_prompt_file", "agent/AGENT.md"), base_dir)
-    
+
+    content = TeamAgent._read_prompt_file(prompt_file) or ""
     # 剥离 AGENT.md 中的 ## workflow:* 小节,避免模板混入系统提示词
-    system_prompt, _ = TeamAgent.parse_prompt_sections(prompt_file)
+    system_prompt, _ = TeamAgent.parse_prompt_sections(content)
     
     # 构建轻量 TeamAgent
     agent = agent_class(
