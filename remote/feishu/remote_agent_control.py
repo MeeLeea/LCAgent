@@ -184,9 +184,9 @@ def start_agent() -> str:
                     _save_remote_thread_id(agent.memory.thread_id)
                 # 主动修复可能残留的孤儿 tool_calls（上次中断可能遗留）
                 try:
-loop.run_until_complete(
-                    agent._arepair_rejected_tool_calls(agent._invoke_config())
-                )
+                    loop.run_until_complete(
+                        agent._arepair_rejected_tool_calls(agent._invoke_config())
+                    )
                     agent._clear_pending_interrupt()
                 except Exception:
                     pass
