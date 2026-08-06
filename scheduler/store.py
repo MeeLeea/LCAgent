@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 定时任务持久化层 - 基于 SQLite
 
@@ -17,10 +16,18 @@ import os
 import sqlite3
 import threading
 from datetime import datetime
-from typing import Any, Dict, List, Optional
-
+from typing import Any
 
 # ------------------------------------------------------------------ SQL ---
+
+
+def _naive_now() -> datetime:
+    """返回本地 naive 时间(无时区)。
+
+    execute_time 由 Agent 计算并生成 naive ISO 字符串(如 2026-08-04T10:00:00),
+    到期判断依赖 execute_time 与 now 的字符串字典序比较,故 must 保持 naive 格式。
+    """
+    return datetime.now()  # noqa: DTZ005 - 见函数 docstring,需保持 naive 格式兼容
 
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS scheduled_tasks (
@@ -49,7 +56,7 @@ _VALID_TYPES = {"one_time", "periodic"}
 
 # ---------------------------------------------------------------- 行转换 ---
 
-def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
         "task_type": row["task_type"],
@@ -104,7 +111,7 @@ class TaskStore:
                 conn.close()
 
     @staticmethod
-    def _iso(dt: Optional[datetime]) -> Optional[str]:
+    def _iso(dt: datetime | None) -> str | None:
         if dt is None:
             return None
         return dt.isoformat()
@@ -115,8 +122,8 @@ class TaskStore:
         self,
         task_type: str,
         task_text: str,
-        execute_time: Optional[str] = None,
-        cron_expr: Optional[str] = None,
+        execute_time: str | None = None,
+        cron_expr: str | None = None,
         max_retries: int = 3,
     ) -> int:
         """
@@ -136,7 +143,7 @@ class TaskStore:
         if task_type == "periodic" and not cron_expr:
             raise ValueError("周期任务必须提供 cron_expr")
 
-        now_iso = self._iso(datetime.now())
+        now_iso = self._iso(_naive_now())
         with self._lock:
             conn = self._connect()
             try:
@@ -162,7 +169,7 @@ class TaskStore:
         通过 ``UPDATE ... WHERE status='pending'`` 保证只有一个调用方能成功，
         返回 True 表示抢占成功（该调用方负责执行），False 表示已被他人抢走。
         """
-        now_iso = self._iso(datetime.now())
+        now_iso = self._iso(_naive_now())
         with self._lock:
             conn = self._connect()
             try:
@@ -243,7 +250,7 @@ class TaskStore:
         self,
         task_id: int,
         status: str,
-        result: Optional[str] = None,
+        result: str | None = None,
     ):
         if status not in _VALID_STATUSES:
             raise ValueError(f"status 必须是 {sorted(_VALID_STATUSES)} 之一")
@@ -266,7 +273,7 @@ class TaskStore:
 
     # ---- 读操作 ----
 
-    def get_task(self, task_id: int) -> Optional[Dict[str, Any]]:
+    def get_task(self, task_id: int) -> dict[str, Any] | None:
         with self._lock:
             conn = self._connect()
             try:
@@ -278,11 +285,11 @@ class TaskStore:
             finally:
                 conn.close()
 
-    def get_due_tasks(self, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    def get_due_tasks(self, now: datetime | None = None) -> list[dict[str, Any]]:
         """
         查询到期的一次性任务：status=pending + task_type=one_time + execute_time <= now。
         """
-        now_iso = self._iso(now or datetime.now())
+        now_iso = self._iso(now or _naive_now())
         with self._lock:
             conn = self._connect()
             try:
@@ -300,7 +307,7 @@ class TaskStore:
             finally:
                 conn.close()
 
-    def list_periodic_tasks(self, status: str = "pending") -> List[Dict[str, Any]]:
+    def list_periodic_tasks(self, status: str = "pending") -> list[dict[str, Any]]:
         """查询周期任务（供调度器启动时同步注册 cron job）。"""
         with self._lock:
             conn = self._connect()
@@ -326,7 +333,7 @@ class TaskStore:
             finally:
                 conn.close()
 
-    def list_tasks(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list_tasks(self, status: str | None = None) -> list[dict[str, Any]]:
         """列出任务，可按状态过滤。"""
         with self._lock:
             conn = self._connect()

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, Dict, List, Set
+from typing import Any
 
 from langchain_core.tools import BaseTool
 
@@ -24,7 +24,7 @@ from langchain_core.tools import BaseTool
 DEFAULT_TIMEOUT: float = 60.0
 
 # 按工具名覆盖超时（优先于全局默认）
-TOOL_TIMEOUTS: Dict[str, float] = {
+TOOL_TIMEOUTS: dict[str, float] = {
     "ask_human": 600.0,       # 人工交互，给 10 分钟
     "schedule_task": 120.0,   # 调度器可能需要更长
     "search": 90.0,           # 搜索可能需要多次请求
@@ -32,7 +32,7 @@ TOOL_TIMEOUTS: Dict[str, float] = {
 
 # 完全排除超时的工具（无限等待）
 # 目前为空，ask_human 通过 TOOL_TIMEOUTS 给了 600 秒上限
-NO_TIMEOUT_TOOLS: Set[str] = set()
+NO_TIMEOUT_TOOLS: set[str] = set()
 
 
 def _get_tool_timeout(tool: BaseTool, default_timeout: float | None = None) -> float | None:
@@ -89,7 +89,7 @@ def wrap_tool_with_timeout(tool: BaseTool, timeout: float | None = None) -> Base
                 # 同步工具放到线程池跑，再加超时
                 coro = asyncio.to_thread(original_run, *args, **kwargs)
             return await asyncio.wait_for(coro, timeout=effective_timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # 不导入 ToolTimeoutError 以避免循环依赖（tool_wrapper ← agent ← tools）
             # 错误消息格式与 ToolTimeoutError 保持一致
             timeout_msg = f"工具 '{tool_name}' 执行超时（{effective_timeout}秒）"
@@ -111,9 +111,9 @@ def wrap_tool_with_timeout(tool: BaseTool, timeout: float | None = None) -> Base
 
 
 def wrap_tools_with_timeout(
-    tools: List[BaseTool],
+    tools: list[BaseTool],
     default_timeout: float | None = None,
-) -> List[BaseTool]:
+) -> list[BaseTool]:
     """批量包装工具列表
 
     Args:
@@ -129,8 +129,8 @@ def wrap_tools_with_timeout(
 
 __all__ = [
     "DEFAULT_TIMEOUT",
-    "TOOL_TIMEOUTS",
     "NO_TIMEOUT_TOOLS",
+    "TOOL_TIMEOUTS",
     "wrap_tool_with_timeout",
     "wrap_tools_with_timeout",
 ]

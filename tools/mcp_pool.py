@@ -21,15 +21,14 @@ import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from langchain_core.tools import BaseTool, StructuredTool
+from langchain_core.tools import BaseTool
 
 from .mcp_loader import (
     DEFAULT_CONFIG_FILE,
     load_mcp_config,
     make_sync_compatible,
-    save_mcp_config,
 )
 
 
@@ -52,7 +51,7 @@ class ServerInfo:
     detail: str
     status: ServerStatus = ServerStatus.DISCONNECTED
     tool_count: int = 0
-    tool_names: List[str] = field(default_factory=list)
+    tool_names: list[str] = field(default_factory=list)
     last_error: str = ""
     last_connected: float = 0.0
 
@@ -69,7 +68,7 @@ class MCPServerConnection:
                         自动重连失败时重新 connect
     """
 
-    def __init__(self, name: str, config: Dict[str, Any]):
+    def __init__(self, name: str, config: dict[str, Any]):
         """
         Args:
             name: server 名称
@@ -78,7 +77,7 @@ class MCPServerConnection:
         self.name = name
         self.config = config
         self._client: Any = None
-        self._tools: List[BaseTool] = []
+        self._tools: list[BaseTool] = []
         self._status: ServerStatus = ServerStatus.DISCONNECTED
         self._last_error: str = ""
         self._last_connected: float = 0.0
@@ -89,18 +88,18 @@ class MCPServerConnection:
         return self._status
 
     @property
-    def tools(self) -> List[BaseTool]:
+    def tools(self) -> list[BaseTool]:
         return list(self._tools)
 
     @property
-    def tool_names(self) -> List[str]:
+    def tool_names(self) -> list[str]:
         return [t.name for t in self._tools]
 
     @property
     def last_error(self) -> str:
         return self._last_error
 
-    def _build_client_config(self) -> Dict[str, Any]:
+    def _build_client_config(self) -> dict[str, Any]:
         """构建 MultiServerMCPClient 格式的配置"""
         transport = self.config.get("transport", "stdio")
         if transport == "stdio":
@@ -222,14 +221,14 @@ class MCPPool:
 
     def __init__(self, config_file: str = DEFAULT_CONFIG_FILE):
         self.config_file = config_file
-        self._connections: Dict[str, MCPServerConnection] = {}
+        self._connections: dict[str, MCPServerConnection] = {}
         self._lock = asyncio.Lock()
 
     @property
-    def connections(self) -> Dict[str, MCPServerConnection]:
+    def connections(self) -> dict[str, MCPServerConnection]:
         return dict(self._connections)
 
-    def _load_config(self) -> Dict[str, Dict[str, Any]]:
+    def _load_config(self) -> dict[str, dict[str, Any]]:
         """读取配置文件中的已启用 server"""
         config = load_mcp_config(self.config_file)
         servers = config.get("servers", {})
@@ -307,19 +306,19 @@ class MCPPool:
         await self.initialize()
         return len(self.get_all_tools())
 
-    def get_all_tools(self) -> List[BaseTool]:
+    def get_all_tools(self) -> list[BaseTool]:
         """获取所有已连接 server 的工具列表"""
-        tools: List[BaseTool] = []
+        tools: list[BaseTool] = []
         for conn in self._connections.values():
             if conn.status == ServerStatus.CONNECTED:
                 tools.extend(conn.tools)
         return tools
 
-    def get_server_infos(self) -> List[ServerInfo]:
+    def get_server_infos(self) -> list[ServerInfo]:
         """获取所有 server 的状态信息"""
         return [conn.get_info() for conn in self._connections.values()]
 
-    def get_server_info(self, name: str) -> Optional[ServerInfo]:
+    def get_server_info(self, name: str) -> ServerInfo | None:
         """获取单个 server 的状态信息"""
         conn = self._connections.get(name)
         return conn.get_info() if conn else None
@@ -335,6 +334,6 @@ class MCPPool:
 __all__ = [
     "MCPPool",
     "MCPServerConnection",
-    "ServerStatus",
     "ServerInfo",
+    "ServerStatus",
 ]

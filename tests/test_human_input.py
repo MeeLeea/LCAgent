@@ -509,6 +509,9 @@ def test_resume_after_switching_thread_is_rejected():
         def add(self, role, content, metadata=None):
             raise AssertionError("memory should not be written while interrupted")
 
+        async def aadd(self, role, content, metadata=None):
+            self.add(role, content, metadata)
+
     class FakeExecutor:
         def __init__(self):
             self.calls = 0
@@ -557,6 +560,9 @@ def test_interrupted_run_records_final_important_assistant_memory_after_resume()
 
         def add(self, role, content, metadata=None):
             recorded_memory.append((role, content, metadata))
+
+        async def aadd(self, role, content, metadata=None):
+            self.add(role, content, metadata)
 
     class FakeExecutor:
         def __init__(self):

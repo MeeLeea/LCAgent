@@ -15,7 +15,7 @@
 """
 import os
 import re
-from typing import Dict, Any, List, Optional
+from typing import ClassVar
 
 
 def default_skills_dir() -> str:
@@ -36,7 +36,7 @@ class SkillManager:
 
     # ============ 扫描与解析 ============
 
-    def list_skills(self) -> List[Dict[str, str]]:
+    def list_skills(self) -> list[dict[str, str]]:
         """
         列出目录下所有技能
 
@@ -62,7 +62,7 @@ class SkillManager:
             })
         return result
 
-    def get_skill(self, name: str) -> Optional[str]:
+    def get_skill(self, name: str) -> str | None:
         """
         读取指定技能的完整 SKILL.md 内容
 
@@ -83,7 +83,7 @@ class SkillManager:
 
     # ============ 自动匹配 ============
 
-    def match_skills(self, task: str, top_k: int = 3) -> List[str]:
+    def match_skills(self, task: str, top_k: int = 3) -> list[str]:
         """
         根据任务描述匹配相关技能(确定性打分,不调用 LLM)
 
@@ -123,7 +123,7 @@ class SkillManager:
 
     # ============ 渲染 ============
 
-    def render_block(self, names: List[str]) -> str:
+    def render_block(self, names: list[str]) -> str:
         """
         将若干技能内容渲染为可注入 system prompt 的指引块
 
@@ -156,7 +156,7 @@ class SkillManager:
 
     # ============ 内部辅助 ============
 
-    def _resolve_skill_path(self, name: str) -> Optional[str]:
+    def _resolve_skill_path(self, name: str) -> str | None:
         """根据技能名(目录名或 frontmatter name)解析 SKILL.md 路径"""
         # 1. 直接匹配目录名
         direct = os.path.join(self.skills_dir, name, "SKILL.md")
@@ -170,7 +170,7 @@ class SkillManager:
         return None
 
     @staticmethod
-    def _parse_frontmatter(skill_md: str) -> Dict[str, str]:
+    def _parse_frontmatter(skill_md: str) -> dict[str, str]:
         """解析 SKILL.md 顶部的 YAML frontmatter,提取 name / description"""
         try:
             with open(skill_md, "r", encoding="utf-8") as f:
@@ -217,7 +217,7 @@ class SkillManager:
         return en | zh
 
     # 中文关键词 → 英文扩展词(仅用于匹配打分,不改变原任务)
-    _ALIASES = {
+    _ALIASES: ClassVar[dict[str, list[str]]] = {
         "提交": ["commit", "git"],
         "推送": ["push", "git"],
         "拉取": ["pull", "git"],

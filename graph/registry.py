@@ -224,7 +224,7 @@ def _load_builtin_workflows() -> None:
     for _finder, _name, _is_pkg in pkgutil.iter_modules(_graph_pkg.__path__):
         if _is_pkg or _name in _NON_WORKFLOW_MODULES:
             continue
-        importlib.import_module(f"graph.{_name}")  # noqa: F401
+        importlib.import_module(f"graph.{_name}")
 
 
 _load_builtin_workflows()

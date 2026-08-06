@@ -17,14 +17,13 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Optional
+from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware, AgentState
 from langchain_core.messages import (
-    AIMessage,
     AnyMessage,
-    HumanMessage,
     SystemMessage,
     ToolMessage,
 )
@@ -63,7 +62,7 @@ class CompactionConfig:
     """Prune 后保留的预览字符数"""
 
     @classmethod
-    def from_kwargs(cls, max_context_messages: int = 0, context_trim_keep: int = 12) -> "CompactionConfig":
+    def from_kwargs(cls, max_context_messages: int = 0, context_trim_keep: int = 12) -> CompactionConfig:
         """从 AgentCore 现有配置参数构建 CompactionConfig。
 
         Args:
@@ -97,7 +96,7 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
         self,
         model: Any,
         config: CompactionConfig | None = None,
-        on_compaction: Optional[Callable[[str, int, int, int, float], None]] = None,
+        on_compaction: Callable[[str, int, int, int, float], None] | None = None,
     ):
         """初始化压缩中间件
 
@@ -215,8 +214,9 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
             duration_ms = (time.time() - _start) * 1000
             try:
                 self._on_compaction("auto", len(messages), messages_after, len(new_summary), duration_ms)
-            except Exception:
-                pass
+            except Exception as error:
+                # 指标回调失败不影响压缩主流程,记录后继续
+                logger.warning("压缩指标回调失败: %s", error)
 
         return result
 
@@ -253,8 +253,9 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
             duration_ms = (time.time() - _start) * 1000
             try:
                 self._on_compaction("auto", len(messages), messages_after, len(new_summary), duration_ms)
-            except Exception:
-                pass
+            except Exception as error:
+                # 指标回调失败不影响压缩主流程,记录后继续
+                logger.warning("压缩指标回调失败: %s", error)
 
         return result
 
@@ -381,7 +382,7 @@ def _make_remove_all():
 
 
 __all__ = [
-    "LCAgentState",
     "CompactionConfig",
     "LCAgentCompactionMiddleware",
+    "LCAgentState",
 ]

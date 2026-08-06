@@ -7,8 +7,8 @@ import json
 import logging
 import os
 import sys
-import functools
-from typing import List, Dict, Any, Optional, Type
+from typing import Any
+
 from langchain_core.tools import BaseTool, StructuredTool
 
 logger = logging.getLogger(__name__)
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONFIG_FILE = "config/mcp_servers.json"
 
 
-def load_mcp_config(config_file: str = DEFAULT_CONFIG_FILE) -> Dict[str, Any]:
+def load_mcp_config(config_file: str = DEFAULT_CONFIG_FILE) -> dict[str, Any]:
     """
     读取 MCP servers 配置文件
 
@@ -32,12 +32,12 @@ def load_mcp_config(config_file: str = DEFAULT_CONFIG_FILE) -> Dict[str, Any]:
     try:
         with open(config_file, 'r', encoding='utf-8') as f:
             return json.load(f)
-    except (json.JSONDecodeError, IOError) as e:
+    except (OSError, json.JSONDecodeError) as e:
         logger.error("MCP 配置文件读取失败: %s", e)
         return {"servers": {}}
 
 
-def save_mcp_config(config: Dict[str, Any], config_file: str = DEFAULT_CONFIG_FILE):
+def save_mcp_config(config: dict[str, Any], config_file: str = DEFAULT_CONFIG_FILE):
     """保存 MCP servers 配置"""
     with open(config_file, 'w', encoding='utf-8') as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
@@ -102,7 +102,7 @@ def make_sync_compatible(tool: BaseTool) -> BaseTool:
     return new_tool
 
 
-async def load_mcp_tools(config_file: str = DEFAULT_CONFIG_FILE) -> List[BaseTool]:
+async def load_mcp_tools(config_file: str = DEFAULT_CONFIG_FILE) -> list[BaseTool]:
     """
     从所有已启用的 MCP Server 异步加载 LangChain 工具
 
@@ -146,7 +146,7 @@ async def load_mcp_tools(config_file: str = DEFAULT_CONFIG_FILE) -> List[BaseToo
         return []
 
     # 逐个服务器加载，避免一个失败导致全部失败
-    all_tools: List[BaseTool] = []
+    all_tools: list[BaseTool] = []
     for name, server_cfg in enabled_servers.items():
         try:
             # 单服务器客户端
@@ -155,15 +155,15 @@ async def load_mcp_tools(config_file: str = DEFAULT_CONFIG_FILE) -> List[BaseToo
             if tools:
                 logger.info("MCP %s: 加载了 %d 个工具", name, len(tools))
                 all_tools.extend(tools)
-        except Exception as e:
-            logger.error("MCP %s: 加载失败 - %s", name, e, exc_info=True)
+        except Exception:
+            logger.exception("MCP %s: 加载失败", name)
 
     # 包装为同步兼容
     sync_tools = [make_sync_compatible(t) for t in all_tools]
     return sync_tools
 
 
-def list_configured_servers(config_file: str = DEFAULT_CONFIG_FILE) -> List[Dict[str, Any]]:
+def list_configured_servers(config_file: str = DEFAULT_CONFIG_FILE) -> list[dict[str, Any]]:
     """
     列出配置文件中所有 MCP 服务器
 
@@ -191,10 +191,10 @@ def list_configured_servers(config_file: str = DEFAULT_CONFIG_FILE) -> List[Dict
 def add_server(
     name: str,
     transport: str,
-    command: Optional[str] = None,
-    args: Optional[List[str]] = None,
-    url: Optional[str] = None,
-    env: Optional[Dict[str, str]] = None,
+    command: str | None = None,
+    args: list[str] | None = None,
+    url: str | None = None,
+    env: dict[str, str] | None = None,
     enabled: bool = True,
     config_file: str = DEFAULT_CONFIG_FILE
 ):

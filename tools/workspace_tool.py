@@ -17,15 +17,15 @@
 """
 import os
 import shutil
-from typing import Dict, Any, Optional, List
-from mcp.server.fastmcp import FastMCP
+from typing import Any
 
+from mcp.server.fastmcp import FastMCP
 
 # 创建 MCP Server 实例
 mcp = FastMCP("workspace-server")
 
 
-def _is_protected_path(folder_path: str) -> Optional[str]:
+def _is_protected_path(folder_path: str) -> str | None:
     """
     路径安全保护:禁止删除/操作系统关键目录与项目根
     返回 None 表示允许;返回字符串表示被拦截的原因
@@ -54,7 +54,7 @@ def _is_protected_path(folder_path: str) -> Optional[str]:
 
 
 @mcp.tool()
-def create_workspace(folder_name: str, parent_dir: Optional[str] = None) -> Dict[str, Any]:
+def create_workspace(folder_name: str, parent_dir: str | None = None) -> dict[str, Any]:
     """
     创建文件夹并获取其作为工作目录
 
@@ -90,7 +90,7 @@ def create_workspace(folder_name: str, parent_dir: Optional[str] = None) -> Dict
         }
 
     except ValueError as e:
-        return {"success": False, "error": f"路径无效: {str(e)}", "workspace_path": None}
+        return {"success": False, "error": f"路径无效: {e!s}", "workspace_path": None}
     except PermissionError:
         return {"success": False, "error": "权限不足，无法创建目录", "workspace_path": None}
     except Exception as e:
@@ -98,7 +98,7 @@ def create_workspace(folder_name: str, parent_dir: Optional[str] = None) -> Dict
 
 
 @mcp.tool()
-def get_current_workspace() -> Dict[str, Any]:
+def get_current_workspace() -> dict[str, Any]:
     """
     获取当前工作目录
 
@@ -117,7 +117,7 @@ def get_current_workspace() -> Dict[str, Any]:
 
 
 @mcp.tool()
-def list_directory(path: Optional[str] = None) -> Dict[str, Any]:
+def list_directory(path: str | None = None) -> dict[str, Any]:
     """
     列出指定目录下的所有文件和文件夹
 
@@ -136,7 +136,7 @@ def list_directory(path: Optional[str] = None) -> Dict[str, Any]:
         if not os.path.isdir(abs_path):
             return {"success": False, "error": f"不是目录: {abs_path}", "entries": []}
 
-        entries: List[Dict[str, Any]] = []
+        entries: list[dict[str, Any]] = []
         for name in sorted(os.listdir(abs_path)):
             full = os.path.join(abs_path, name)
             entries.append({
@@ -159,7 +159,7 @@ def list_directory(path: Optional[str] = None) -> Dict[str, Any]:
 
 
 @mcp.tool()
-def delete_workspace(folder_path: str, recursive: bool = True) -> Dict[str, Any]:
+def delete_workspace(folder_path: str, recursive: bool = True) -> dict[str, Any]:
     """
     删除文件夹
 
@@ -201,13 +201,13 @@ def delete_workspace(folder_path: str, recursive: bool = True) -> Dict[str, Any]
     except PermissionError:
         return {"success": False, "error": "权限不足"}
     except OSError as e:
-        return {"success": False, "error": f"删除失败: {str(e)}"}
+        return {"success": False, "error": f"删除失败: {e!s}"}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 @mcp.tool()
-def move_workspace(src_path: str, dest_path: str) -> Dict[str, Any]:
+def move_workspace(src_path: str, dest_path: str) -> dict[str, Any]:
     """
     移动或重命名文件夹
 
@@ -247,7 +247,7 @@ def move_workspace(src_path: str, dest_path: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
-def copy_workspace(src_path: str, dest_path: str) -> Dict[str, Any]:
+def copy_workspace(src_path: str, dest_path: str) -> dict[str, Any]:
     """
     复制文件夹（含子目录和文件）
 

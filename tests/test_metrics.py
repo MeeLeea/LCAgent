@@ -14,21 +14,13 @@ from __future__ import annotations
 import asyncio
 import threading
 from dataclasses import dataclass, field
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
 
-import pytest
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from agent.metrics import (
-    CompactionMetric,
-    LLMCallMetric,
-    LLMStats,
     MetricsCollector,
-    ToolCallMetric,
-    ToolStats,
     estimate_tokens,
 )
 
@@ -584,7 +576,7 @@ def _make_context(agent, printed: list[str]) -> Any:
         input_fn=lambda prompt="": "y",
         select_menu=lambda *args, **kwargs: None,
         create_llm=lambda provider: None,
-        list_providers=lambda: {},
+        list_providers=dict,
         run_structured_until_completion=fake_run,
         chat_until_completion=fake_run,
         safety_backend=FakeSafetyBackend(),

@@ -8,18 +8,19 @@
 import asyncio
 import logging
 import re
-from typing import Any, AsyncIterator, Dict
+from collections.abc import AsyncIterator
+from typing import Any
 
 from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
     HumanMessage,
-    ToolMessage,
 )
 from langgraph.types import Command
 
-from .llm_client import RETRY_ATTEMPTS, RETRY_MAX_DELAY, should_retry
 from tools.terminal_tools import UserRejectedCommandError
+
+from .llm_client import RETRY_ATTEMPTS, RETRY_MAX_DELAY, should_retry
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +129,7 @@ def stringify_content(content: Any) -> str:
     return str(content)
 
 
-def build_interrupt_event(value: Any) -> Dict[str, Any]:
+def build_interrupt_event(value: Any) -> dict[str, Any]:
     """把 ask_human / 危险命令确认的 interrupt.value 转成前端可消费的事件。
 
     Args:
@@ -162,8 +163,8 @@ class StreamHandler:
     async def _astream_events(
         self,
         input_or_command: Any,
-        config: Dict[str, Any],
-    ) -> AsyncIterator[Dict[str, Any]]:
+        config: dict[str, Any],
+    ) -> AsyncIterator[dict[str, Any]]:
         """直接消费 LangGraph 的异步事件流并映射为前端事件。"""
         recorded_msg_ids: set[str] = set()
         for attempt in range(RETRY_ATTEMPTS):
@@ -232,7 +233,7 @@ class StreamHandler:
                     return
                 await asyncio.sleep(min(RETRY_MAX_DELAY, 2**attempt))
 
-    async def _check_interrupt(self, config: Dict[str, Any]) -> Dict[str, Any] | None:
+    async def _check_interrupt(self, config: dict[str, Any]) -> dict[str, Any] | None:
         """流结束后异步检查是否被 ask_human 中断，返回中断事件或 None。"""
         try:
             state = await self.agent.agent_executor.aget_state(config)
@@ -287,7 +288,7 @@ class StreamHandler:
         self.agent._clear_pending_interrupt()
         yield {"type": "done"}
 
-    async def astream_resume(self, payload: Dict[str, Any]):
+    async def astream_resume(self, payload: dict[str, Any]):
         """流式恢复被 ask_human 中断的会话，事件格式同 astream_chat。"""
         config = self.agent._invoke_config()
         original_verbose = self.agent.verbose
@@ -312,8 +313,8 @@ class StreamHandler:
 
 
 __all__ = [
+    "StreamHandler",
+    "build_interrupt_event",
     "extract_llm_error",
     "stringify_content",
-    "build_interrupt_event",
-    "StreamHandler",
 ]

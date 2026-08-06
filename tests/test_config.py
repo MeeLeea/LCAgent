@@ -7,8 +7,8 @@ if ROOT not in sys.path:
 
 from agent.config import (
     _DEFAULT_AGENT_CORE_PROMPT,
-    _load_agent_prompt,
     DEFAULTS,
+    _load_agent_prompt,
     load_agent_config,
     resolve_path,
 )

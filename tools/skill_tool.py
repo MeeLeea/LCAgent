@@ -3,14 +3,15 @@
 
 依赖 tools/skills.py 的 SkillManager。
 """
+from typing import Any
+
 from langchain_core.tools import tool
-from typing import Dict, Any
 
 from .skills import SkillManager, default_skills_dir
 
 
 @tool
-def read_skill(skill_name: str = "") -> Dict[str, Any]:
+def read_skill(skill_name: str = "") -> dict[str, Any]:
     """
     读取本地技能(SKILL.md)的指引内容。
 

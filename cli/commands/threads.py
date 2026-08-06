@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 
 from langchain_core.messages import HumanMessage
 
 from .types import HANDLED, CommandContext, CommandOutcome
+
+
+def _write_export_file(path: str, text: str) -> None:
+    """把导出文本写入文件(阻塞 IO,由 to_thread 放到线程池执行)"""
+    with open(path, "w", encoding="utf-8") as file:
+        file.write(text)
 
 
 async def manage_threads(context: CommandContext) -> CommandOutcome:
@@ -16,7 +23,7 @@ async def manage_threads(context: CommandContext) -> CommandOutcome:
         if not threads:
             context.print("\n暂无会话记录")
             break
-        options = [_thread_option(context, thread_id, current) for thread_id in threads]
+        options = [await _athread_option(context, thread_id, current) for thread_id in threads]
         selected = context.select_menu(
             f"选择会话 (共 {len(threads)} 个,↑↓ 选择,Enter 切换)",
             options,
@@ -72,8 +79,7 @@ async def export_thread(context: CommandContext, user_input: str) -> CommandOutc
         safe_thread_id = thread_id or context.agent.memory.thread_id
         path = os.path.join(exports_dir, f"{safe_thread_id}.md")
     try:
-        with open(path, "w", encoding="utf-8") as file:
-            file.write(text)
+        await asyncio.to_thread(_write_export_file, path, text)
         context.print(f"\n已导出对话到: {path} ({len(text)} 字符)")
     except OSError as error:
         context.print(f"\n导出失败: {error}")
@@ -82,16 +88,14 @@ async def export_thread(context: CommandContext, user_input: str) -> CommandOutc
     return HANDLED
 
 
-def _thread_option(
+async def _athread_option(
     context: CommandContext,
     thread_id: str,
     current: str,
 ) -> tuple[str, str]:
     try:
         # 直接读取目标会话消息，不再临时变异 thread_id
-        # 注意：这是同步函数，但在菜单渲染中调用，不能改为异步
-        # 使用同步方法的智能切换功能
-        messages = context.agent.memory.get_messages(thread_id=thread_id) or []
+        messages = await context.agent.memory.aget_messages(thread_id=thread_id) or []
         message_count = len(messages)
         # 用第一条用户消息作为会话标题,不调用 LLM,避免菜单渲染变慢
         preview = _messages_preview(messages)

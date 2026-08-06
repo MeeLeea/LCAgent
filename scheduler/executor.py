@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 任务执行桥接 - 接收数据库任务，调用 AgentCore.run() 或工作流执行
 
@@ -12,10 +11,11 @@
     - 捕获所有异常，返回 (success, output/error) 元组，绝不向调度器抛异常
     - 支持 workflow: 前缀: task_text 以 "workflow:" 开头时路由到多 Agent 工作流
 """
-from typing import Any, Callable, Dict, Tuple
 import asyncio
 import inspect
 import logging
+from collections.abc import Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +47,7 @@ def _parse_workflow_task(task_text: str) -> tuple[str, str]:
     return workflow_name, task
 
 
-def _execute_workflow_task(task_id: Any, task_text: str) -> Tuple[bool, str]:
+def _execute_workflow_task(task_id: Any, task_text: str) -> tuple[bool, str]:
     """
     执行工作流任务（延迟导入 graph 模块避免循环依赖）
 
@@ -70,7 +70,7 @@ def _execute_workflow_task(task_id: Any, task_text: str) -> Tuple[bool, str]:
     logger.info("  任务内容: %s", task[:80])
 
     try:
-        from graph.registry import run_workflow_by_name, list_workflows
+        from graph.registry import list_workflows, run_workflow_by_name
     except ImportError as exc:
         return False, f"无法导入工作流模块: {exc}"
 
@@ -150,7 +150,7 @@ async def _run_agent_task(task_text: str, agent_factory: AgentFactory) -> str:
                 logger.warning("Agent 关闭失败: %s", exc, exc_info=True)
 
 
-def execute_task(task: Dict[str, Any], agent_factory: AgentFactory) -> Tuple[bool, str]:
+def execute_task(task: dict[str, Any], agent_factory: AgentFactory) -> tuple[bool, str]:
     """执行单条定时任务。
 
     根据 task_text 自动判断执行路径：

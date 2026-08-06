@@ -9,6 +9,7 @@ if ROOT not in sys.path:
 # tools/__init__ 里 `from .search import search` 让 tools.search 指向工具对象,
 # 因此通过 sys.modules 取到真正的模块
 import tools.search  # noqa: F401  (确保子模块已导入)
+
 search_module = sys.modules["tools.search"]
 
 

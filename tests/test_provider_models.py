@@ -51,7 +51,7 @@ def _chat_completion(prov, api_key, model, timeout=30):
         if resp.status_code == 200:
             return True, None
         return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
-    except Exception as exc:  # noqa: BLE001 - 网络/解析等任何异常都算不可用
+    except Exception as exc:  # 网络/解析等任何异常都算不可用(BLE001 已在项目配置中忽略)
         return False, f"{type(exc).__name__}: {exc}"
 
 
@@ -60,7 +60,7 @@ def unavailable_models(provider_name):
     prov, api_key = _load_provider(provider_name)
     bad = []
     for model in prov.get("models", []):
-        ok, detail = _chat_completion(prov, api_key, model)
+        ok, _detail = _chat_completion(prov, api_key, model)
         if not ok:
             bad.append(model)
     return bad

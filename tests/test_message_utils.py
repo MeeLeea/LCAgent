@@ -1,7 +1,8 @@
 """agent.message_utils.extract_llm_error 与 interrupt 检查的单元测试。"""
 
-import anyio
 from types import SimpleNamespace
+
+import anyio
 
 from agent.message_utils import StreamHandler, extract_llm_error
 

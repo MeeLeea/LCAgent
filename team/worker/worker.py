@@ -1,6 +1,8 @@
 """
 Worker Agent - 负责执行具体子任务
 """
+from typing import ClassVar
+
 from graph.registry import register_agent
 from team.base import TeamAgent
 from tools import all_tools
@@ -19,7 +21,7 @@ class WorkerAgent(TeamAgent):
     max_tokens = 4096
 
     # 工作流节点提示词的默认模板(仅 AGENT.md 缺失或未定义小节时兜底)
-    default_templates: dict[str, str] = {
+    default_templates: ClassVar[dict[str, str]] = {
         "worker_exec": (
             "请执行以下计划:\n\n"
             "{plan}"

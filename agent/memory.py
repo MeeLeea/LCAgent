@@ -16,16 +16,17 @@
 4. 多会话隔离: 不同 thread_id 独立
 5. 工具调用中间状态: 完整保存(tool_calls、tool_outputs)
 """
+import asyncio
 import json
 import logging
 import os
 import sqlite3
 import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import closing
 from datetime import datetime
-from typing import Any
+from typing import Any, Self
 
 import aiosqlite
 from langchain_core.messages import (
@@ -44,6 +45,15 @@ logger = logging.getLogger(__name__)
 
 # 工具输出在降级对话历史中的前缀:标明来源,避免以用户口吻混入上下文
 TOOL_RESULT_PREFIX = "[工具结果] "
+
+
+def _naive_now() -> datetime:
+    """返回本地 naive 时间(无时区)。
+
+    记忆文件历史数据均以 naive ISO 字符串存储(如 2026-08-06T12:00:00),
+    为兼容旧数据并保持格式统一,新增记录沿用 naive 格式。
+    """
+    return datetime.now()  # noqa: DTZ005 - 见函数 docstring,需保持 naive 格式兼容
 
 
 def _message_role(msg: BaseMessage) -> str:
@@ -142,7 +152,7 @@ class AgentMemory:
             assert checkpoint_file is not None
             parent = os.path.dirname(os.path.abspath(checkpoint_file))
             if parent:
-                os.makedirs(parent, exist_ok=True)
+                await asyncio.to_thread(os.makedirs, parent, exist_ok=True)
             conn = await aiosqlite.connect(checkpoint_file)
             await conn.execute("PRAGMA journal_mode=WAL")
             await conn.execute("PRAGMA busy_timeout=10000")
@@ -151,8 +161,8 @@ class AgentMemory:
         else:
             choice._checkpointer = MemorySaver()
 
-        if long_term_file and os.path.exists(long_term_file):
-            choice._load_long_term_memory()
+        if long_term_file and await asyncio.to_thread(os.path.exists, long_term_file):
+            await choice._a_load_long_term_memory()
 
         return choice
 
@@ -288,8 +298,7 @@ class AgentMemory:
         sqlite3 的 connection 上下文管理器只提交事务、不关闭连接,
         因此长驻连接必须显式关闭,否则 WAL 无法回收、Windows 上文件也删不掉。
         """
-        if self._async_mode:
-            return
+        self._check_not_async("close")
         conn = getattr(self._checkpointer, "conn", None)
         if conn is None:
             return
@@ -298,15 +307,34 @@ class AgentMemory:
         except sqlite3.Error as error:
             logger.warning("关闭 checkpoint 连接失败: %s", error)
 
-    def __enter__(self) -> AgentMemory:
+    def __enter__(self) -> Self:
+        self._check_not_async("__enter__")
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.close()
 
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback) -> None:
+        await self.aclose()
+
     def get_config(self) -> dict[str, Any]:
         """获取 invoke 需要传入的 config"""
         return {"configurable": {"thread_id": self.thread_id}}
+
+    def _check_not_async(self, method: str) -> None:
+        """在异步模式下调用同步方法直接报错，杜绝双模式混跑。
+
+        Args:
+            method: 被调用的同步方法名(用于错误提示)
+        """
+        if self._async_mode:
+            raise RuntimeError(
+                f"AgentMemory.{method}() 只能在同步模式(直接 __init__)调用；"
+                f"异步模式(acreate)请使用对应异步版本"
+            )
 
     # ============ 会话(Thread)管理 ============
 
@@ -337,34 +365,24 @@ class AgentMemory:
         Returns:
             True=该 thread 有 checkpoint 记录, False=新会话(无历史)
         """
+        self._check_not_async("switch_thread")
         # 必须先查存量再赋值:否则当前 thread_id 总会出现在列表里,返回值恒为 True
-        if self._async_mode and self._async_conn is not None:
-            import asyncio
-            try:
-                loop = asyncio.get_running_loop()
-                existed = asyncio.run_coroutine_threadsafe(
-                    self._async_stored_thread_ids(), loop
-                ).result(timeout=5)
-                existed = thread_id in existed
-            except RuntimeError:
-                existed = thread_id in asyncio.run(self._async_stored_thread_ids())
+        # 同步模式：直接查询数据库
+        if not self.use_sqlite:
+            existed = False
         else:
-            # 同步模式：直接查询数据库
-            if not self.use_sqlite:
-                existed = False
-            else:
-                try:
-                    with closing(self._connect()) as conn:
-                        cursor = conn.execute(
-                            "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
-                        )
-                        rows = [row[0] for row in cursor.fetchall()]
-                    existed = thread_id in rows
-                except sqlite3.OperationalError as error:
-                    if "no such table" in str(error).lower():
-                        existed = False
-                    else:
-                        raise
+            try:
+                with closing(self._connect()) as conn:
+                    cursor = conn.execute(
+                        "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
+                    )
+                    rows = [row[0] for row in cursor.fetchall()]
+                existed = thread_id in rows
+            except sqlite3.OperationalError as error:
+                if "no such table" in str(error).lower():
+                    existed = False
+                else:
+                    raise
         self.thread_id = thread_id
         return existed
 
@@ -383,35 +401,26 @@ class AgentMemory:
         当前会话可能还没写入 checkpoint,但对用户而言它是存在的,
         因此并入结果,保持 CLI/API 的显示语义不变。
         """
-        if self._async_mode and self._async_conn is not None:
-            import asyncio
-            try:
-                loop = asyncio.get_running_loop()
-                stored = asyncio.run_coroutine_threadsafe(
-                    self._async_stored_thread_ids(all_types=all_types), loop
-                ).result(timeout=5)
-            except RuntimeError:
-                stored = asyncio.run(self._async_stored_thread_ids(all_types=all_types))
+        self._check_not_async("list_threads")
+        # 同步模式：直接查询数据库
+        if not self.use_sqlite:
+            stored = []
         else:
-            # 同步模式：直接查询数据库
-            if not self.use_sqlite:
-                stored = []
-            else:
-                try:
-                    with closing(self._connect()) as conn:
-                        cursor = conn.execute(
-                            "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
-                        )
-                        rows = [row[0] for row in cursor.fetchall()]
-                except sqlite3.OperationalError as error:
-                    if "no such table" in str(error).lower():
-                        rows = []
-                    else:
-                        raise
-                if all_types:
-                    stored = rows
+            try:
+                with closing(self._connect()) as conn:
+                    cursor = conn.execute(
+                        "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
+                    )
+                    rows = [row[0] for row in cursor.fetchall()]
+            except sqlite3.OperationalError as error:
+                if "no such table" in str(error).lower():
+                    rows = []
                 else:
-                    stored = [tid for tid in rows if self._matches_process_type(tid)]
+                    raise
+            if all_types:
+                stored = rows
+            else:
+                stored = [tid for tid in rows if self._matches_process_type(tid)]
         # 当前 thread 始终可见，即使它不匹配 all_types 的查询范围
         if self.thread_id in stored:
             return stored
@@ -434,6 +443,7 @@ class AgentMemory:
         Returns:
             True=删除成功, False=失败或不存在
         """
+        self._check_not_async("delete_thread")
         if not self.use_sqlite:
             # 内存模式:无法删除单个 thread,只能清空
             return False
@@ -474,28 +484,18 @@ class AgentMemory:
 
         # 如果删的是当前会话,自动切到一个剩余的会话(或新建)
         if thread_id == self.thread_id:
-            if self._async_mode and self._async_conn is not None:
-                import asyncio
-                try:
-                    loop = asyncio.get_running_loop()
-                    remaining = asyncio.run_coroutine_threadsafe(
-                        self._async_stored_thread_ids(), loop
-                    ).result(timeout=5)
-                except RuntimeError:
-                    remaining = asyncio.run(self._async_stored_thread_ids())
-            else:
-                # 同步模式：直接查询数据库
-                try:
-                    with closing(self._connect()) as conn:
-                        cursor = conn.execute(
-                            "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
-                        )
-                        remaining = [row[0] for row in cursor.fetchall()]
-                except sqlite3.OperationalError as error:
-                    if "no such table" in str(error).lower():
-                        remaining = []
-                    else:
-                        raise
+            # 同步模式：直接查询数据库
+            try:
+                with closing(self._connect()) as conn:
+                    cursor = conn.execute(
+                        "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
+                    )
+                    remaining = [row[0] for row in cursor.fetchall()]
+            except sqlite3.OperationalError as error:
+                if "no such table" in str(error).lower():
+                    remaining = []
+                else:
+                    raise
             self.thread_id = remaining[0] if remaining else self.new_thread()
         return True
 
@@ -564,6 +564,7 @@ class AgentMemory:
         Returns:
             消息列表。无 checkpoint 或会话不存在时返回空列表。
         """
+        self._check_not_async("get_messages")
         target = thread_id if thread_id is not None else self.thread_id
         config = {"configurable": {"thread_id": target}}
         try:
@@ -640,41 +641,32 @@ class AgentMemory:
         
         @deprecated: 请使用 aexport_thread() 异步版本
         """
-        if self._async_mode and self._async_conn is not None:
-            import asyncio
-            try:
-                loop = asyncio.get_running_loop()
-                return asyncio.run_coroutine_threadsafe(
-                    self.aexport_thread(thread_id=thread_id, fmt=fmt), loop
-                ).result(timeout=10)
-            except RuntimeError:
-                return asyncio.run(self.aexport_thread(thread_id=thread_id, fmt=fmt))
-        else:
-            # 同步模式：直接实现
-            target = thread_id if thread_id is not None else self.thread_id
-            msgs = self.get_messages(thread_id=target) or []
+        self._check_not_async("export_thread")
+        # 同步模式：直接实现
+        target = thread_id if thread_id is not None else self.thread_id
+        msgs = self.get_messages(thread_id=target) or []
 
-            blocks = []
-            for m in msgs:
-                if isinstance(m, HumanMessage):
-                    role = "用户"
-                elif isinstance(m, AIMessage):
-                    role = "助手"
-                elif isinstance(m, SystemMessage):
-                    role = "系统"
-                else:
-                    role = "工具"
-                text = _message_text(m).strip()
-                if not text:
-                    continue
-                if fmt == "markdown":
-                    blocks.append(f"**{role}**:\n\n{text}")
-                else:
-                    blocks.append(f"【{role}】\n{text}")
+        blocks = []
+        for m in msgs:
+            if isinstance(m, HumanMessage):
+                role = "用户"
+            elif isinstance(m, AIMessage):
+                role = "助手"
+            elif isinstance(m, SystemMessage):
+                role = "系统"
+            else:
+                role = "工具"
+            text = _message_text(m).strip()
+            if not text:
+                continue
+            if fmt == "markdown":
+                blocks.append(f"**{role}**:\n\n{text}")
+            else:
+                blocks.append(f"【{role}】\n{text}")
 
-            sep = "\n\n---\n\n" if fmt == "markdown" else "\n\n"
-            header = f"# 对话导出 - {target}\n\n" if fmt == "markdown" else f"对话导出 - {target}\n{'='*40}\n"
-            return header + sep.join(blocks)
+        sep = "\n\n---\n\n" if fmt == "markdown" else "\n\n"
+        header = f"# 对话导出 - {target}\n\n" if fmt == "markdown" else f"对话导出 - {target}\n{'='*40}\n"
+        return header + sep.join(blocks)
 
     def get_short_term(self, limit: int | None = None) -> list[dict[str, str]]:
         """兼容旧 API:从 checkpoint 取消息转为 dict 格式
@@ -684,19 +676,9 @@ class AgentMemory:
 
         工具输出映射为 assistant 角色并加前缀,避免在降级对话中冒充用户。
         """
-        # 在异步模式下使用异步方法，同步模式下使用同步实现
-        if self._async_mode and self._async_conn is not None:
-            import asyncio
-            try:
-                loop = asyncio.get_running_loop()
-                msgs = asyncio.run_coroutine_threadsafe(
-                    self.aget_messages(), loop
-                ).result(timeout=5)
-            except RuntimeError:
-                msgs = asyncio.run(self.aget_messages())
-        else:
-            # 同步模式：直接读取 checkpoint
-            msgs = self.get_messages()
+        self._check_not_async("get_short_term")
+        # 同步模式：直接读取 checkpoint
+        msgs = self.get_messages()
         
         if limit:
             msgs = msgs[-limit:]
@@ -738,15 +720,28 @@ class AgentMemory:
         此方法只处理 important=True 的重要记忆(写入 memory.json 供 compress)。
         普通对话不需要调用此方法(由 checkpoint 自动处理)。
         """
+        self._check_not_async("add")
         if metadata and metadata.get("important", False):
             item = {
                 "role": role,
                 "content": content,
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": _naive_now().isoformat(),
                 "metadata": metadata
             }
             self.long_term_memory.append(item)
             self._save_long_term_memory()
+
+    async def aadd(self, role: str, content: str, metadata: dict[str, Any] | None = None) -> None:
+        """异步添加记忆(语义同 :meth:`add`,仅 important=True 时写入 memory.json)"""
+        if metadata and metadata.get("important", False):
+            item = {
+                "role": role,
+                "content": content,
+                "timestamp": _naive_now().isoformat(),
+                "metadata": metadata
+            }
+            self.long_term_memory.append(item)
+            await self._a_save_long_term_memory()
 
     def get_long_term(self, limit: int = 5) -> list[dict[str, str]]:
         """获取长期记忆"""
@@ -762,9 +757,16 @@ class AgentMemory:
 
     def clear_long_term(self):
         """清空长期记忆"""
+        self._check_not_async("clear_long_term")
         self.long_term_memory.clear()
         if self.long_term_file and os.path.exists(self.long_term_file):
             os.remove(self.long_term_file)
+
+    async def aclear_long_term(self) -> None:
+        """异步清空长期记忆"""
+        self.long_term_memory.clear()
+        if self.long_term_file and await asyncio.to_thread(os.path.exists, self.long_term_file):
+            await asyncio.to_thread(os.remove, self.long_term_file)
 
     async def aclose(self) -> None:
         """关闭异步 checkpointer 持有的 SQLite 连接。"""
@@ -808,6 +810,47 @@ class AgentMemory:
         except (OSError, json.JSONDecodeError):
             self.long_term_memory = []
 
+    async def _a_save_long_term_memory(self) -> None:
+        """异步保存长期记忆到文件(原子写,崩溃时不产生坏 JSON)"""
+        if not self.long_term_file:
+            return
+        parent = os.path.dirname(os.path.abspath(self.long_term_file))
+        if parent:
+            await asyncio.to_thread(os.makedirs, parent, exist_ok=True)
+        fd, tmp_path = await asyncio.to_thread(
+            tempfile.mkstemp, dir=parent, prefix=".memory_", suffix=".json.tmp"
+        )
+
+        def _atomic_write() -> None:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(self.long_term_memory, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self.long_term_file)
+
+        try:
+            await asyncio.to_thread(_atomic_write)
+        except Exception:
+            try:
+                await asyncio.to_thread(os.remove, tmp_path)
+            except OSError:
+                pass
+            raise
+
+    async def _a_load_long_term_memory(self) -> None:
+        """异步从文件加载长期记忆"""
+        if not self.long_term_file:
+            return
+        if not await asyncio.to_thread(os.path.exists, self.long_term_file):
+            return
+
+        def _read() -> list[dict[str, Any]]:
+            with open(self.long_term_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+
+        try:
+            self.long_term_memory = await asyncio.to_thread(_read)
+        except (OSError, json.JSONDecodeError):
+            self.long_term_memory = []
+
     async def asummarize(self) -> dict[str, Any]:
         """获取记忆摘要统计 - 异步版本"""
         msgs = await self.aget_messages()
@@ -827,28 +870,19 @@ class AgentMemory:
         
         @deprecated: 请使用 asummarize() 异步版本
         """
-        if self._async_mode and self._async_conn is not None:
-            import asyncio
-            try:
-                loop = asyncio.get_running_loop()
-                return asyncio.run_coroutine_threadsafe(
-                    self.asummarize(), loop
-                ).result(timeout=5)
-            except RuntimeError:
-                return asyncio.run(self.asummarize())
-        else:
-            # 同步模式：直接实现
-            msgs = self.get_messages()
-            threads = self.list_threads()
-            
-            return {
-                "thread_id": self.thread_id,
-                "checkpoint_messages": len(msgs),
-                "checkpoint_backend": "sqlite" if self.use_sqlite else "memory",
-                "checkpoint_file": self.checkpoint_file or "(内存)",
-                "long_term_count": len(self.long_term_memory),
-                "total_threads": len(threads)
-            }
+        self._check_not_async("summarize")
+        # 同步模式：直接实现
+        msgs = self.get_messages()
+        threads = self.list_threads()
+        
+        return {
+            "thread_id": self.thread_id,
+            "checkpoint_messages": len(msgs),
+            "checkpoint_backend": "sqlite" if self.use_sqlite else "memory",
+            "checkpoint_file": self.checkpoint_file or "(内存)",
+            "long_term_count": len(self.long_term_memory),
+            "total_threads": len(threads)
+        }
 
     # ============ 长上下文裁剪与压缩 ============
 
@@ -872,6 +906,7 @@ class AgentMemory:
                 "error": str (失败时)
             }
         """
+        self._check_not_async("compress_memory")
         if not self.long_term_memory:
             return {
                 "success": False,
@@ -915,8 +950,8 @@ class AgentMemory:
 
         self.long_term_memory = [{
             "role": "system",
-            "content": f"[历史记忆摘要 {datetime.now().isoformat()}]\n{summary}",
-            "timestamp": datetime.now().isoformat(),
+                "content": f"[历史记忆摘要 {_naive_now().isoformat()}]\n{summary}",
+            "timestamp": _naive_now().isoformat(),
             "metadata": {
                 "important": True,
                 "type": "summary",
@@ -928,6 +963,80 @@ class AgentMemory:
 
         # 5. 保存回 memory.json
         self._save_long_term_memory()
+
+        return {
+            "success": True,
+            "original_count": original_count,
+            "original_chars": original_chars,
+            "compressed_chars": compressed_chars,
+            "summary": summary
+        }
+
+    async def acompress_memory(
+        self,
+        summarize_callback: Callable[[str, str], Awaitable[str]],
+    ) -> dict[str, Any]:
+        """异步压缩长期记忆(语义同 :meth:`compress_memory`,回调为异步版本)
+
+        Args:
+            summarize_callback: 生成摘要的异步回调(接收文本与提示,返回摘要字符串)
+        """
+        if not self.long_term_memory:
+            return {
+                "success": False,
+                "error": "没有长期记忆可压缩"
+            }
+
+        # 1. 拼接所有长期记忆为文本
+        history_lines = []
+        original_chars = 0
+        for idx, item in enumerate(self.long_term_memory, 1):
+            role = item.get("role", "unknown")
+            content = item.get("content", "")
+            ts = item.get("timestamp", "")
+            history_lines.append(f"[{idx}] ({ts}) {role}: {content}")
+            original_chars += len(content)
+
+        history_text = "\n\n".join(history_lines)
+
+        # 2. 调用 LLM 生成摘要
+        system_prompt = (
+            "你是一个记忆压缩助手。请将以下历史对话记录压缩成一份简洁的摘要，要求：\n"
+            "1. 保留所有关键信息、用户意图、重要决策和事实\n"
+            "2. 去除重复和冗余内容\n"
+            "3. 按主题分条目组织，使用 '- ' 开头\n"
+            "4. 保持事实准确，不要添加推测内容\n"
+            "5. 用中文输出"
+        )
+        summary = await summarize_callback(
+            f"以下是历史对话记录，请压缩成摘要:\n\n{history_text}",
+            system_prompt,
+        )
+        if not summary:
+            return {
+                "success": False,
+                "error": "LLM 调用失败或返回空摘要"
+            }
+
+        # 3. 用摘要替换原长期记忆
+        original_count = len(self.long_term_memory)
+        compressed_chars = len(summary)
+
+        self.long_term_memory = [{
+            "role": "system",
+                "content": f"[历史记忆摘要 {_naive_now().isoformat()}]\n{summary}",
+            "timestamp": _naive_now().isoformat(),
+            "metadata": {
+                "important": True,
+                "type": "summary",
+                "original_count": original_count,
+                "original_chars": original_chars,
+                "compressed_chars": compressed_chars
+            }
+        }]
+
+        # 4. 保存回 memory.json
+        await self._a_save_long_term_memory()
 
         return {
             "success": True,

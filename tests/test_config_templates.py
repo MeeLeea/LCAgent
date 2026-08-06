@@ -1,8 +1,6 @@
 import json
 import subprocess
 from pathlib import Path
-from typing import TypeAlias
-
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = ROOT / "config"
@@ -11,8 +9,8 @@ EXPECTED_TEMPLATES = {
     "mcp_servers.json.example",
     "safety.json.example",
 }
-JsonScalar: TypeAlias = str | int | float | bool | None
-JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
+type JsonScalar = str | int | float | bool | None
+type JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 
 
 def _load_json(path: Path) -> JsonValue:

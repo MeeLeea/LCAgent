@@ -1,13 +1,14 @@
 """
 文件读写工具 - 使用LangChain @tool装饰器
 """
-from langchain_core.tools import tool
-from typing import Dict, Any
 import os
+from typing import Any
+
+from langchain_core.tools import tool
 
 
 @tool
-def read_file(file_path: str) -> Dict[str, Any]:
+def read_file(file_path: str) -> dict[str, Any]:
     """
     读取文件内容工具。根据给定的文件路径读取文件内容。
 
@@ -44,7 +45,7 @@ def read_file(file_path: str) -> Dict[str, Any]:
 
 
 @tool
-def write_file(file_path: str, content: str, mode: str = 'w') -> Dict[str, Any]:
+def write_file(file_path: str, content: str, mode: str = 'w') -> dict[str, Any]:
     """
     写入文件内容工具。将内容写入指定文件路径。
 

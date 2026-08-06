@@ -78,14 +78,13 @@ class InterruptTimeoutError(LCAgentError):
 class AgentStateError(LCAgentError):
     """AgentCore 状态错误（如在已关闭后调用方法）"""
 
-    pass
 
 
 __all__ = [
+    "AgentStateError",
+    "CompressError",
+    "InterruptTimeoutError",
     "LCAgentError",
     "MCPConnectionError",
     "ToolTimeoutError",
-    "CompressError",
-    "InterruptTimeoutError",
-    "AgentStateError",
 ]

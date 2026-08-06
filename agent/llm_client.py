@@ -5,7 +5,7 @@
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -93,7 +93,7 @@ def should_retry(e: Exception) -> bool:
     return any(k in low for k in _RETRYABLE_KEYWORDS)
 
 
-def load_providers(config_file: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+def load_providers(config_file: str | None = None) -> dict[str, dict[str, Any]]:
     """从配置文件读取提供商定义(配置即唯一来源,不再在代码中维护)
 
     config/llm_config.json 结构:
@@ -115,7 +115,7 @@ def load_providers(config_file: Optional[str] = None) -> Dict[str, Dict[str, Any
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data.get("providers", {})
-    except (json.JSONDecodeError, IOError):
+    except (OSError, json.JSONDecodeError):
         return {}
 
 
@@ -142,10 +142,10 @@ class LLMClient:
 
     def __init__(
         self,
-        provider: Optional[str] = "zhipu",
-        api_key: Optional[str] = None,
-        model: Optional[str] = None,
-        config_file: Optional[str] = None,
+        provider: str | None = "zhipu",
+        api_key: str | None = None,
+        model: str | None = None,
+        config_file: str | None = None,
         temperature: float = 0.7,
         max_tokens: int = 2048
     ):
@@ -198,7 +198,7 @@ class LLMClient:
 
     def _create_chat_model(self) -> BaseChatModel:
         """创建统一聊天模型(init_chat_model, OpenAI 兼容接口)"""
-        kwargs: Dict[str, Any] = {
+        kwargs: dict[str, Any] = {
             "model": self.model,
             "model_provider": "openai",
             "api_key": self.api_key,
@@ -212,9 +212,9 @@ class LLMClient:
 
     def chat(
         self,
-        messages: List[Dict[str, str]],
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None
+        messages: list[dict[str, str]],
+        temperature: float | None = None,
+        max_tokens: int | None = None
     ) -> str:
         """
         发送对话请求
@@ -233,7 +233,7 @@ class LLMClient:
         # 如果有临时参数，通过 bind 轻量覆盖，避免重建客户端
         client = self.client
         if temperature is not None or max_tokens is not None:
-            overrides: Dict[str, Any] = {}
+            overrides: dict[str, Any] = {}
             if temperature is not None:
                 overrides["temperature"] = temperature
             if max_tokens is not None:
@@ -244,13 +244,13 @@ class LLMClient:
             response = _make_retryer()(client.invoke, langchain_messages)
             return response.content
         except Exception as e:
-            raise RuntimeError(f"[{self.provider_config['name']}] 调用失败: {str(e)}")
+            raise RuntimeError(f"[{self.provider_config['name']}] 调用失败: {e!s}")
 
     def chat_with_history(
         self,
         user_input: str,
-        history: List[Dict[str, str]],
-        system_prompt: Optional[str] = None,
+        history: list[dict[str, str]],
+        system_prompt: str | None = None,
         **kwargs
     ) -> str:
         """带历史记录的对话"""
@@ -261,7 +261,7 @@ class LLMClient:
         messages.append({"role": "user", "content": user_input})
         return self.chat(messages, **kwargs)
 
-    def extract_json(self, text: str) -> Optional[Dict[str, Any]]:
+    def extract_json(self, text: str) -> dict[str, Any] | None:
         """从文本中提取JSON对象"""
         try:
             return json.loads(text)
@@ -282,8 +282,8 @@ class LLMClient:
     def switch_provider(
         self,
         provider: str,
-        api_key: Optional[str] = None,
-        model: Optional[str] = None
+        api_key: str | None = None,
+        model: str | None = None
     ):
         """运行时切换提供商"""
         provider = provider.lower()
@@ -322,11 +322,11 @@ class LLMClient:
         self.model = model
         self.client = self._create_chat_model()
 
-    def list_models(self) -> List[str]:
+    def list_models(self) -> list[str]:
         """列出当前提供商支持的所有模型"""
         return list(self.provider_config.get("models", []))
 
-    def get_info(self) -> Dict[str, str]:
+    def get_info(self) -> dict[str, str]:
         """获取当前客户端信息"""
         return {
             "provider": self.provider,
@@ -336,7 +336,7 @@ class LLMClient:
         }
 
     @staticmethod
-    def _to_langchain_messages(messages: List[Dict[str, str]]) -> List[BaseMessage]:
+    def _to_langchain_messages(messages: list[dict[str, str]]) -> list[BaseMessage]:
         """将字典消息列表转换为LangChain消息对象"""
         result = []
         for msg in messages:

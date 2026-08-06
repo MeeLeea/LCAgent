@@ -22,10 +22,11 @@
 
 交互确认: confirm(prompt) 读取终端输入,默认拒绝(空/超时/EOF 均视为拒绝)
 """
+import json
 import os
 import re
-import json
-from typing import Tuple, Dict, Any, List, Optional, Callable
+from collections.abc import Callable
+from typing import Any
 
 # ============ 内置规则 ============
 
@@ -94,13 +95,13 @@ CONFIG_PATH = os.path.join(
 )
 
 # 模块级缓存配置
-_config_cache: Optional[Dict[str, Any]] = None
+_config_cache: dict[str, Any] | None = None
 
 # 交互确认后端：None 时使用终端 input()；server 等非交互环境可替换为 interrupt 后端。
-_confirm_backend: Optional[Callable[[str], bool]] = None
+_confirm_backend: Callable[[str], bool] | None = None
 
 
-def load_config() -> Dict[str, Any]:
+def load_config() -> dict[str, Any]:
     """加载安全配置(合并默认值与 safety.json)"""
     global _config_cache
     if _config_cache is not None:
@@ -126,13 +127,13 @@ def load_config() -> Dict[str, Any]:
                     cfg["path_protection"].update(v)
                 else:
                     cfg[k] = v
-        except (json.JSONDecodeError, IOError):
+        except (OSError, json.JSONDecodeError):
             pass
     _config_cache = cfg
     return cfg
 
 
-def reload_config() -> Dict[str, Any]:
+def reload_config() -> dict[str, Any]:
     """强制重新加载配置(修改配置后调用)"""
     global _config_cache, _protected_paths_cache, _confirm_paths_cache
     _config_cache = None
@@ -141,7 +142,7 @@ def reload_config() -> Dict[str, Any]:
     return load_config()
 
 
-def save_config(cfg: Dict[str, Any]) -> bool:
+def save_config(cfg: dict[str, Any]) -> bool:
     """保存配置到 safety.json"""
     try:
         parent = os.path.dirname(CONFIG_PATH)
@@ -157,7 +158,7 @@ def save_config(cfg: Dict[str, Any]) -> bool:
 
 # ============ 路径分类系统 ============
 
-def _resolve_placeholder(path_template: str) -> List[str]:
+def _resolve_placeholder(path_template: str) -> list[str]:
     """
     解析路径模板中的占位符
     
@@ -243,7 +244,7 @@ def _path_matches(target: str, rule: str) -> bool:
     return target.startswith(rule_with_sep)
 
 
-def _get_protected_paths() -> List[str]:
+def _get_protected_paths() -> list[str]:
     """获取并缓存保护级路径列表（已解析占位符和规范化）"""
     global _protected_paths_cache
     
@@ -270,7 +271,7 @@ def _get_protected_paths() -> List[str]:
     return paths
 
 
-def _get_confirm_paths() -> List[str]:
+def _get_confirm_paths() -> list[str]:
     """获取并缓存询问级路径列表（已解析占位符和规范化）"""
     global _confirm_paths_cache
     
@@ -353,19 +354,19 @@ FILE_OPERATION_COMMANDS = {
 }
 
 # 模块级缓存：解析后的保护级和询问级路径
-_protected_paths_cache: Optional[List[str]] = None
-_confirm_paths_cache: Optional[List[str]] = None
+_protected_paths_cache: list[str] | None = None
+_confirm_paths_cache: list[str] | None = None
 
-def _compile(patterns: List[str]) -> List[re.Pattern]:
+def _compile(patterns: list[str]) -> list[re.Pattern]:
     return [re.compile(p, re.IGNORECASE) for p in patterns]
 
 
-def _blocklist() -> List[re.Pattern]:
+def _blocklist() -> list[re.Pattern]:
     cfg = load_config()
     return _compile(BUILTIN_BLOCKLIST + list(cfg.get("blacklist", [])))
 
 
-def _confirm_list() -> List[re.Pattern]:
+def _confirm_list() -> list[re.Pattern]:
     return _compile(BUILTIN_CONFIRM)
 
 
@@ -391,7 +392,7 @@ def _is_file_operation(command: str) -> bool:
     return first in FILE_OPERATION_COMMANDS
 
 
-def _extract_paths_from_command(command: str) -> List[str]:
+def _extract_paths_from_command(command: str) -> list[str]:
     """
     从命令中提取所有路径参数（通用版本）
     
@@ -407,7 +408,7 @@ def _extract_paths_from_command(command: str) -> List[str]:
     if not command:
         return []
     
-    cmd_lower = command.lower()
+    command.lower()
     first = _first_token(command).lower()
     
     # 不是文件操作命令，返回空
@@ -440,7 +441,7 @@ def _extract_paths_from_command(command: str) -> List[str]:
             continue
         
         # 跳过选项
-        if token.startswith('-') or token.startswith('/'):
+        if token.startswith(('-', '/')):
             # 某些选项后面跟参数，需要跳过
             if token in {'-o', '-t', '--output', '--target'}:
                 skip_next = True
@@ -456,7 +457,7 @@ def _extract_paths_from_command(command: str) -> List[str]:
 
 # ============ 决策函数 ============
 
-def check_command(command: str) -> Tuple[str, str]:
+def check_command(command: str) -> tuple[str, str]:
     """
     判断命令是否允许执行（基于两级路径分类保护）
 
@@ -504,13 +505,11 @@ def check_command(command: str) -> Tuple[str, str]:
         
         if paths:
             # 检查所有路径，取最严格的保护级别
-            has_protected = False
             has_confirm = False
             
             for path in paths:
                 classification = _classify_path(path)
                 if classification == "protected":
-                    has_protected = True
                     # 保护级路径 + CONFIRM 命令 -> deny
                     return "deny", f"禁止操作保护级路径: {path}"
                 elif classification == "confirm":
@@ -518,7 +517,7 @@ def check_command(command: str) -> Tuple[str, str]:
             
             # 所有路径都是询问级或普通级 + CONFIRM 命令 -> confirm
             if has_confirm:
-                return "confirm", f"操作询问级路径，需要确认"
+                return "confirm", "操作询问级路径，需要确认"
             
             # 所有路径都是普通级 + CONFIRM 命令 -> confirm
             return "confirm", f"匹配危险模式: {matched_pattern}"
@@ -530,7 +529,7 @@ def check_command(command: str) -> Tuple[str, str]:
     return "allow", ""
 
 
-def check_exec() -> Tuple[str, str]:
+def check_exec() -> tuple[str, str]:
     """
     执行脚本文件(.py/.ps1/.bat)时的判定
     运行任意脚本本质危险,默认需确认(除非关闭 confirm_dangerous)
@@ -541,7 +540,7 @@ def check_exec() -> Tuple[str, str]:
     return "allow", ""
 
 
-def check_path(path: str, is_delete: bool = False) -> Tuple[bool, str]:
+def check_path(path: str, is_delete: bool = False) -> tuple[bool, str]:
     """
     路径保护(用于删除/移动等操作)
     
@@ -573,7 +572,7 @@ def check_path(path: str, is_delete: bool = False) -> Tuple[bool, str]:
     return True, ""
 
 
-def set_confirm_backend(backend: Optional[Callable[[str], bool]]) -> None:
+def set_confirm_backend(backend: Callable[[str], bool] | None) -> None:
     """替换危险命令的交互确认后端。
 
     - None（默认）：使用终端 input()，CLI 场景。

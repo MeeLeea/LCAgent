@@ -3,9 +3,13 @@ Workflow 命令处理 - 多 Agent 工作流执行
 """
 from __future__ import annotations
 
+import logging
+
 from langchain_core.messages import AIMessage, HumanMessage
 
 from .types import HANDLED, CommandContext, CommandOutcome
+
+logger = logging.getLogger(__name__)
 
 # 注入工作流的原始记忆文本上限,防止超长上下文撑爆 summarize 的 LLM 调用
 MAX_RAW_CONTEXT_CHARS = 6000
@@ -85,9 +89,9 @@ def _record_workflow_result(context: CommandContext, name: str, task: str, resul
                 AIMessage(content=final_answer),
             ]},
         )
-    except Exception:
-        # 写回失败不影响工作流主流程,静默跳过
-        pass
+    except Exception as error:
+        # 写回失败不影响工作流主流程,记录后跳过
+        logger.warning("工作流记忆写回失败: %s", error)
 
 
 async def run_workflow(context: CommandContext, name: str, task: str) -> dict:

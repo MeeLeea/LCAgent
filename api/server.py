@@ -26,7 +26,7 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from functools import lru_cache
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 logger = logging.getLogger("api.server")
 
@@ -41,14 +41,15 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+
 from agent import AgentCore
-from agent.message_utils import stringify_content  # 消息内容序列化
 from agent.config import load_agent_config, resolve_path
 from agent.llm_client import LLMClient, load_providers
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
-from tools import safety as safety_module
+from agent.message_utils import stringify_content  # 消息内容序列化
 from cli.commands import CommandContext, dispatch_command
 from cli.commands.provider import create_llm
+from tools import safety as safety_module
 
 # --------------------------------------------------------------------------- #
 # 路径常量（与 main.py 保持一致）
@@ -62,12 +63,12 @@ CHECKPOINT_FILE = os.path.join(BASE_DIR, "memory", "checkpoints_async.sqlite")
 WEB_DIST = os.path.join(BASE_DIR, "web", "dist")
 
 
-def load_server_config() -> Dict[str, Any]:
+def load_server_config() -> dict[str, Any]:
     """加载服务端口配置（config/server_config.json）。
 
     文件不存在或解析失败时回退到默认值（127.0.0.1:8000），不抛异常。
     """
-    defaults: Dict[str, Any] = {"host": "127.0.0.1", "port": 8000}
+    defaults: dict[str, Any] = {"host": "127.0.0.1", "port": 8000}
     if not os.path.exists(SERVER_CONFIG_FILE):
         return defaults
     try:
@@ -78,16 +79,16 @@ def load_server_config() -> Dict[str, Any]:
                 defaults["host"] = data["host"]
             if isinstance(data.get("port"), int):
                 defaults["port"] = data["port"]
-    except (json.JSONDecodeError, IOError):
+    except (OSError, json.JSONDecodeError):
         pass
     return defaults
 
 # --------------------------------------------------------------------------- #
 # 全局状态
 # --------------------------------------------------------------------------- #
-agent: Optional[AgentCore] = None
-llm: Optional[LLMClient] = None
-_startup_provider: Optional[str] = None
+agent: AgentCore | None = None
+llm: LLMClient | None = None
+_startup_provider: str | None = None
 # 串行化对话轮次：AgentCore 是有状态单例，同一时刻只能跑一轮。
 chat_lock = asyncio.Lock()
 
@@ -150,16 +151,16 @@ def pick_default_provider() -> str:
     return "zhipu" if "zhipu" in providers else (next(iter(providers), "zhipu"))
 
 
-def serialize_messages(messages: List[Any]) -> List[Dict[str, Any]]:
+def serialize_messages(messages: list[Any]) -> list[dict[str, Any]]:
     """把 LangGraph 消息对象序列化为前端可消费的 JSON。"""
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for m in messages:
         if isinstance(m, SystemMessage):
             continue
         if isinstance(m, HumanMessage):
             out.append({"role": "user", "content": stringify_content(m.content)})
         elif isinstance(m, AIMessage):
-            entry: Dict[str, Any] = {
+            entry: dict[str, Any] = {
                 "role": "assistant",
                 "content": stringify_content(m.content),
             }
@@ -180,7 +181,7 @@ def serialize_messages(messages: List[Any]) -> List[Dict[str, Any]]:
     return out
 
 
-async def thread_summary(thread_id: str) -> Dict[str, Any]:
+async def thread_summary(thread_id: str) -> dict[str, Any]:
     """单个会话的摘要信息（消息数 + 预览 + 会话类型）。"""
     msgs = await agent.memory.aget_messages(thread_id=thread_id) if agent else []
     preview = ""
@@ -190,7 +191,7 @@ async def thread_summary(thread_id: str) -> Dict[str, Any]:
             break
     if not preview and msgs:
         preview = stringify_content(msgs[-1].content).strip().replace("\n", " ")[:50]
-    summary: Dict[str, Any] = {
+    summary: dict[str, Any] = {
         "thread_id": thread_id,
         "message_count": len(msgs),
         "preview": preview,
@@ -208,17 +209,17 @@ async def thread_summary(thread_id: str) -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 class ChatRequest(BaseModel):
     message: str
-    thread_id: Optional[str] = None
+    thread_id: str | None = None
 
 
 class CreateThreadRequest(BaseModel):
-    type: Optional[str] = "chat"
-    workflow_name: Optional[str] = None
+    type: str | None = "chat"
+    workflow_name: str | None = None
 
 
 class ResumeRequest(BaseModel):
-    payload: Dict[str, Any]
-    thread_id: Optional[str] = None
+    payload: dict[str, Any]
+    thread_id: str | None = None
 
 
 class SwitchProviderRequest(BaseModel):
@@ -231,17 +232,17 @@ class SwitchModelRequest(BaseModel):
 
 class CommandRequest(BaseModel):
     command: str
-    thread_id: Optional[str] = None
+    thread_id: str | None = None
 
 
 class SwitchRoleRequest(BaseModel):
     role: str
-    task: Optional[str] = None
+    task: str | None = None
 
 
 class SafetyUpdateRequest(BaseModel):
-    mode: Optional[str] = None
-    confirm_dangerous: Optional[bool] = None
+    mode: str | None = None
+    confirm_dangerous: bool | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -294,7 +295,7 @@ async def get_providers():
 async def switch_provider(req: SwitchProviderRequest):
     logger.info("切换提供商: %s", req.provider)
     async with chat_lock:
-        global agent, llm
+        global llm
         try:
             new_llm = LLMClient(provider=req.provider, config_file=LLM_FILE)
         except Exception as e:
@@ -444,7 +445,7 @@ async def list_threads():
 
 
 @app.post("/api/threads")
-async def create_thread(req: Optional[CreateThreadRequest] = None):
+async def create_thread(req: CreateThreadRequest | None = None):
     """新建会话，返回 thread_id。type=workflow 时创建专属工作流会话。"""
     async with chat_lock:
         if req and req.type == "workflow":
@@ -472,7 +473,7 @@ async def get_thread_messages(thread_id: str):
     return {"thread_id": thread_id, "messages": serialize_messages(msgs)}
 
 
-def _sse(data: Dict[str, Any]) -> str:
+def _sse(data: dict[str, Any]) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
@@ -487,7 +488,7 @@ def _get_total_tokens() -> int:
         return 0
 
 
-def _enrich_done(ev: Dict[str, Any]) -> Dict[str, Any]:
+def _enrich_done(ev: dict[str, Any]) -> dict[str, Any]:
     """为 done 事件附加 total_tokens，前端据此更新输入栏 token 计数"""
     if ev.get("type") == "done":
         ev["total_tokens"] = _get_total_tokens()
@@ -763,7 +764,7 @@ async def execute_command(req: CommandRequest):
         # 对于菜单选择，优先返回当前项，否则返回第一项
         def fake_select_menu(
             title: str,
-            choices: List[str],
+            choices: list[str],
             current: str | None = None,
             action_keys: dict | None = None,
             hint: str | None = None,
@@ -855,7 +856,7 @@ async def reset_metrics():
 # 上下文压缩
 # --------------------------------------------------------------------------- #
 @app.post("/api/compact")
-async def compact_context(thread_id: Optional[str] = None):
+async def compact_context(thread_id: str | None = None):
     """手动触发当前会话的上下文压缩（增量摘要 + 工具输出 Prune）
 
     与 before_model 中间件使用相同的压缩逻辑，适用于对话过长时主动释放 token。
@@ -901,12 +902,12 @@ async def get_memory_summary():
 async def compress_long_term_memory():
     """压缩长期记忆（用 LLM 生成摘要并替换原始记忆条目）
 
-    compress_memory 内部调用同步 LLM，用 to_thread 避免阻塞事件循环。
+    acompress_memory 内部将同步 LLM 调用放入线程池，避免阻塞事件循环。
     """
     async with chat_lock:
         logger.info("压缩长期记忆")
         try:
-            result = await asyncio.to_thread(agent.compress_memory)
+            result = await agent.acompress_memory()
         except Exception as e:
             logger.error("长期记忆压缩失败: %s", e)
             raise HTTPException(status_code=500, detail=f"压缩失败: {e}")
@@ -924,13 +925,13 @@ async def clear_memory(scope: str = "long"):
     """
     async with chat_lock:
         if scope in ("long", "长期"):
-            agent.memory.clear_long_term()
+            await agent.memory.aclear_long_term()
             logger.info("已清空长期记忆")
         elif scope in ("short", "短期"):
             agent.memory.clear_short_term()
             logger.info("已清空短期记忆")
         elif scope in ("all", "全部"):
-            agent.memory.clear_long_term()
+            await agent.memory.aclear_long_term()
             agent.memory.clear_short_term()
             logger.info("已清空全部记忆")
         else:
@@ -1019,10 +1020,10 @@ if os.path.isdir(WEB_DIST):
 def main():
     # 配置日志 - 必须在 uvicorn.run() 之前
     # 1. 生成日志文件名：按日期分目录，文件名为时间 + 哈希
-    from datetime import datetime
     import hashlib
+    from datetime import datetime,timezone
     
-    now = datetime.now()
+    now = datetime.now(timezone.utc).astimezone()
     date_str = now.strftime("%Y%m%d")
     time_str = now.strftime("%H%M%S")
     time_hash = hashlib.md5(str(now.timestamp()).encode()).hexdigest()[:8]

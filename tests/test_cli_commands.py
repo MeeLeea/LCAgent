@@ -25,6 +25,9 @@ class FakeMemory:
     def clear_long_term(self) -> None:
         self.calls.append(("clear_long_term", None))
 
+    async def aclear_long_term(self) -> None:
+        self.calls.append(("aclear_long_term", None))
+
     def clear_short_term(self) -> None:
         self.calls.append(("clear_short_term", None))
 
@@ -53,6 +56,19 @@ class FakeAgent:
             "checkpoint_messages": 3,
             "long_term_count": 2,
             "total_threads": 1,
+        }
+
+    async def aget_memory_summary(self) -> dict[str, Any]:
+        return self.get_memory_summary()
+
+    async def acompress_memory(self) -> dict[str, Any]:
+        self.calls.append(("acompress_memory", None))
+        return {
+            "success": True,
+            "original_count": 2,
+            "original_chars": 100,
+            "compressed_chars": 10,
+            "summary": "压缩摘要",
         }
 
     def reload_mcp_tools(self) -> int:
@@ -255,7 +271,7 @@ def test_dispatch_thread_new_and_clear_mutate_memory(harness: Harness) -> None:
     assert thread_result.handled is True
     assert clear_result.handled is True
     assert ("new_thread", None) in harness.agent.memory.calls
-    assert ("clear_long_term", None) in harness.agent.memory.calls
+    assert ("aclear_long_term", None) in harness.agent.memory.calls
     assert ("clear_short_term", None) in harness.agent.memory.calls
 
 

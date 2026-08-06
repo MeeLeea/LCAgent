@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 定时任务调度子系统测试
 
@@ -9,18 +8,14 @@
     - Tool: schedule_task / list / cancel（@tool 直接调用 .invoke）
 """
 import json
-import os
-import time
-from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from scheduler.store import TaskStore
-from scheduler.executor import execute_task
 from scheduler.engine import SchedulerEngine
+from scheduler.executor import execute_task
+from scheduler.store import TaskStore
 from tools import scheduler_tool as scheduler_tool_mod
-
 
 # ================================================================ Fixtures ===
 

@@ -8,7 +8,7 @@ import asyncio
 import os
 
 try:
-    import readline
+    import readline  # noqa: F401 - 为交互式 CLI 提供历史/方向键支持
 except ImportError:
     pass
 
@@ -123,7 +123,7 @@ async def main() -> None:
                 print("\n\n程序被中断，再见!")
                 break
             # CLI 最外层兜底只负责保持会话可用；业务模块仍应捕获具体异常。
-            except Exception as error:  # noqa: BROAD_EXCEPT_OK - CLI boundary keeps the session alive.
+            except Exception as error:
                 print(f"\n错误: {error}")
                 print("请重试...")
     finally:

@@ -1,9 +1,7 @@
 """Compaction 中间件测试：增量摘要 + 工具输出 Prune + 安全切割 + 手动触发"""
 import asyncio
 from types import SimpleNamespace
-from typing import Any
 
-import pytest
 from langchain_core.messages import (
     AIMessage,
     HumanMessage,
@@ -16,7 +14,6 @@ from agent.compaction import (
     LCAgentCompactionMiddleware,
     LCAgentState,
 )
-
 
 # ============ 测试用 FakeModel ============
 

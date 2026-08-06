@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 获取本地时间的工具
 """
-from langchain_core.tools import tool
 import datetime
 import json
-import sys
+
+from langchain_core.tools import tool
+
 
 @tool
 def get_local_time():
@@ -14,8 +14,8 @@ def get_local_time():
     获取本地时间
     """
     try:
-        # 获取当前本地时间
-        current_time = datetime.datetime.now()
+        # 获取当前本地时间(aware UTC → 转换到本地时区)
+        current_time = datetime.datetime.now(datetime.timezone.UTC).astimezone()
         
         # 返回格式化的时间字符串
         time_str = current_time.strftime("%Y-%m-%d %H:%M:%S")
@@ -43,7 +43,7 @@ def get_local_time():
     except Exception as e:
         error_result = {
             "success": False,
-            "message": f"获取本地时间失败: {str(e)}",
+            "message": f"获取本地时间失败: {e!s}",
             "error": str(e)
         }
         return json.dumps(error_result, ensure_ascii=False, indent=2)

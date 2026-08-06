@@ -8,7 +8,7 @@ from team.worker.worker import WorkerAgent
 
 __all__ = [
     "ManagerAgent",
-    "WorkerAgent",
     "TerminatorAgent",
+    "WorkerAgent",
     "build_team_agent",
 ]

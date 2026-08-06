@@ -33,9 +33,27 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "ruff>=0.11",
+    "ruff>=0.16,<0.17",
 ]
 
 # ⚠️删掉 [project.scripts]！
 # 因为 --no-install‑project 模式，scripts不会注册。
 # 启动只能 uv run python main.py
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+extend-exclude = [
+    "node_modules",
+    "dist",
+    "build",
+    "*.pyc",
+]
+# 不显式 select：沿用 ruff 0.16 默认规则集（已通过 ruff>=0.16,<0.17 锁版本保证可复现）
+# 中文注释/标点多的项目，开启全量规则会产生大量噪音，故维持默认即可
+
+[tool.ruff.lint]
+# 有意宽异常捕获：agent 工具层/API 边界/调度作业需捕获一切异常转成错误信息
+# 返回给 LLM/用户或记入日志，收窄会导致错误处理退化，故全项目忽略 BLE001
+ignore = ["BLE001"]
+

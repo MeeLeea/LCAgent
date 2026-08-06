@@ -7,12 +7,10 @@ model_node 闭包捕获该对象引用。修改 .content 即可动态更新提�
 import asyncio
 from types import SimpleNamespace
 
-import pytest
 from langchain_core.messages import AIMessage, SystemMessage
 
 from agent.agent_core import AgentCore
 from agent.compaction import CompactionConfig, LCAgentCompactionMiddleware
-
 
 # ============ 辅助：创建最小化 AgentCore 测试实例 ============
 
@@ -163,6 +161,9 @@ def test_arun_structured_uses_update_not_rebuild():
         def add(self, role, content, metadata=None):
             pass
 
+        async def aadd(self, role, content, metadata=None):
+            self.add(role, content, metadata)
+
     core.memory = FakeMemory()
 
     def real_compute(task):
@@ -184,7 +185,7 @@ def test_arun_structured_uses_update_not_rebuild():
     core._arebuild_agent_executor = counting_rebuild
 
     # When: 执行任务（"git" 关键词匹配 git-commit 技能）
-    turn = asyncio.run(core.arun_structured("git commit my code"))
+    asyncio.run(core.arun_structured("git commit my code"))
 
     # Then: Graph 没有被重建
     assert rebuild_count == 0
@@ -347,6 +348,9 @@ def test_achat_structured_updates_prompt_without_rebuild():
         def add(self, role, content, metadata=None):
             pass
 
+        async def aadd(self, role, content, metadata=None):
+            self.add(role, content, metadata)
+
     core.memory = FakeMemory()
 
     def real_compute(task):
@@ -368,7 +372,7 @@ def test_achat_structured_updates_prompt_without_rebuild():
     core._arebuild_agent_executor = counting_rebuild
 
     # When: 对话（"code" 关键词匹配 code-review 技能）
-    turn = asyncio.run(core.achat_structured("review my code"))
+    asyncio.run(core.achat_structured("review my code"))
 
     # Then: Graph 没有被重建，但提示词更新了
     assert rebuild_count == 0

@@ -15,9 +15,8 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
-
+from dataclasses import dataclass
+from typing import Any
 
 # ── 数据结构 ────────────────────────────────────────────────────
 
@@ -97,9 +96,9 @@ class MetricsCollector:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._llm_calls: List[LLMCallMetric] = []
-        self._tool_calls: List[ToolCallMetric] = []
-        self._compactions: List[CompactionMetric] = []
+        self._llm_calls: list[LLMCallMetric] = []
+        self._tool_calls: list[ToolCallMetric] = []
+        self._compactions: list[CompactionMetric] = []
         self._session_start: float = time.time()
         self._turn_count: int = 0
 
@@ -231,11 +230,11 @@ class MetricsCollector:
 
     # ============ 汇总查询 ============
 
-    def get_summary(self) -> Dict[str, Any]:
+    def get_summary(self) -> dict[str, Any]:
         """获取所有指标的汇总字典"""
         with self._lock:
             # LLM 汇总（按 provider 分组）
-            llm_by_provider: Dict[str, LLMStats] = {}
+            llm_by_provider: dict[str, LLMStats] = {}
             total_prompt = 0
             total_completion = 0
             total_tokens = 0
@@ -256,7 +255,7 @@ class MetricsCollector:
                 llm_total_ms += call.duration_ms
 
             # 工具汇总（按 name 分组）
-            tool_by_name: Dict[str, ToolStats] = {}
+            tool_by_name: dict[str, ToolStats] = {}
             tool_total_ms = 0.0
             for tc in self._tool_calls:
                 key = tc.name or "unknown"
@@ -362,11 +361,11 @@ def estimate_tokens(text: str) -> int:
 
 
 __all__ = [
-    "MetricsCollector",
-    "LLMCallMetric",
-    "ToolCallMetric",
     "CompactionMetric",
+    "LLMCallMetric",
     "LLMStats",
+    "MetricsCollector",
+    "ToolCallMetric",
     "ToolStats",
     "estimate_tokens",
 ]

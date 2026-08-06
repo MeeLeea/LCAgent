@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 独立调度器进程入口 - 逻辑 B 的启动点
 
@@ -26,11 +25,11 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+from agent import AgentCore
 from agent.config import load_agent_config, resolve_path
 from agent.llm_client import LLMClient, load_providers
 from agent.logging_config import setup_logging
-from agent import AgentCore
-from scheduler import TaskStore, SchedulerEngine
+from scheduler import SchedulerEngine, TaskStore
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +73,7 @@ def load_scheduler_config(config_file: str) -> dict:
             for key in SCHEDULER_DEFAULTS:
                 if key in data:
                     cfg[key] = data[key]
-        except (json.JSONDecodeError, IOError):
+        except (OSError, json.JSONDecodeError):
             pass
     return cfg
 
@@ -177,7 +176,7 @@ def main():
     #     使 executor 中的 workflow: 任务能正确构建所需 Agent
     try:
         import team  # noqa: F401  触发各 agent 模块的 @register_agent
-        from graph.registry import list_workflows, AGENT_REGISTRY
+        from graph.registry import AGENT_REGISTRY, list_workflows
         wf_list = list_workflows()
         logger.info("已注册 Agent: %s", ", ".join(sorted(AGENT_REGISTRY.keys())))
         logger.info("可用工作流: %s", ", ".join(name for name, _ in wf_list))

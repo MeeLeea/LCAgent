@@ -5,17 +5,17 @@ from __future__ import annotations
 from .types import HANDLED, CommandContext, CommandOutcome
 
 
-def clear_memory(context: CommandContext, user_input: str) -> CommandOutcome:
+async def clear_memory(context: CommandContext, user_input: str) -> CommandOutcome:
     parts = user_input.split(None, 1)
     target = parts[1].strip().lower() if len(parts) > 1 else "long"
     if target in ("long", "长期"):
-        context.agent.memory.clear_long_term()
+        await context.agent.memory.aclear_long_term()
         context.print("\n已清空长期记忆(并删除 memory.json)")
     elif target in ("short", "短期"):
         context.agent.memory.clear_short_term()
         context.print("\n已清空短期记忆")
     elif target in ("all", "全部"):
-        context.agent.memory.clear_long_term()
+        await context.agent.memory.aclear_long_term()
         context.agent.memory.clear_short_term()
         context.print("\n已清空全部记忆(长期+短期)")
     else:
@@ -23,13 +23,13 @@ def clear_memory(context: CommandContext, user_input: str) -> CommandOutcome:
     return HANDLED
 
 
-def compress_memory(context: CommandContext) -> CommandOutcome:
-    mem = context.agent.get_memory_summary()
+async def compress_memory(context: CommandContext) -> CommandOutcome:
+    mem = await context.agent.aget_memory_summary()
     if mem["long_term_count"] == 0:
         context.print("\n没有长期记忆可压缩")
         return HANDLED
     context.print(f"\n开始压缩长期记忆 (共 {mem['long_term_count']} 条)...")
-    result = context.agent.compress_memory()
+    result = await context.agent.acompress_memory()
     if result["success"]:
         context.print("压缩完成！")
         context.print(f"  原记忆条数:   {result['original_count']} 条")

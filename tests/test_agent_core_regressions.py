@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -31,7 +32,7 @@ def test_compaction_retains_recent_messages_in_new_thread_state():
             return {"configurable": {"thread_id": self.thread_id}}
 
     class FakeState:
-        values = {"summary": ""}
+        values: ClassVar[dict[str, str]] = {"summary": ""}
 
     class FakeExecutor:
         def get_state(self, config):
@@ -96,7 +97,7 @@ def test_compaction_does_not_change_thread_when_summary_fails():
             return {"configurable": {"thread_id": self.thread_id}}
 
     class FakeState:
-        values = {"summary": "existing"}
+        values: ClassVar[dict[str, str]] = {"summary": "existing"}
 
     class FakeExecutor:
         def get_state(self, config):
@@ -215,6 +216,9 @@ def test_arun_stops_after_user_rejects_command(monkeypatch):
         def add(self, role, content, metadata=None):
             raise AssertionError("取消的任务不应写入长期记忆")
 
+        async def aadd(self, role, content, metadata=None):
+            self.add(role, content, metadata)
+
     from tools.terminal_tools import run_shell
 
     monkeypatch.setattr("tools.terminal_tools.confirm", lambda prompt: False)
@@ -267,6 +271,9 @@ def test_aresume_stops_after_user_rejects_command():
 
         def add(self, role, content, metadata=None):
             raise AssertionError("取消的任务不应写入长期记忆")
+
+        async def aadd(self, role, content, metadata=None):
+            self.add(role, content, metadata)
 
     class RejectingExecutor:
         def invoke(self, value, config):
@@ -323,6 +330,9 @@ def test_arun_repairs_checkpoint_after_user_rejects_command():
 
         def add(self, role, content, metadata=None):
             raise AssertionError("取消的任务不应写入长期记忆")
+
+        async def aadd(self, role, content, metadata=None):
+            self.add(role, content, metadata)
 
     class RejectingExecutor:
         def invoke(self, value, config):
@@ -472,6 +482,9 @@ def test_achat_falls_back_for_non_interrupt_failures():
         
         def add(self, role, content, metadata=None):
             pass
+
+        async def aadd(self, role, content, metadata=None):
+            self.add(role, content, metadata)
 
     class FakeLLM:
         def chat_with_history(self, user_input, history, system_prompt):

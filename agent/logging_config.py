@@ -23,6 +23,7 @@ import contextvars
 import logging
 import sys
 import uuid
+from typing import Self
 
 # ── 上下文变量（asyncio 安全） ──────────────────────────────────
 
@@ -209,7 +210,7 @@ class TraceContext:
         self._token_trace: contextvars.Token | None = None
         self._token_thread: contextvars.Token | None = None
 
-    def __enter__(self) -> TraceContext:
+    def __enter__(self) -> Self:
         if self.trace_id is not None:
             self._token_trace = _trace_id.set(self.trace_id)
         if self.thread_id is not None:
@@ -222,7 +223,7 @@ class TraceContext:
         if self._token_thread is not None:
             _thread_id.reset(self._token_thread)
 
-    async def __aenter__(self) -> TraceContext:
+    async def __aenter__(self) -> Self:
         return self.__enter__()
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:

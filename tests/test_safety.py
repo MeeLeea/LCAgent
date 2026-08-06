@@ -9,7 +9,6 @@ if ROOT not in sys.path:
 
 from tools import safety
 
-
 # ============ BLOCKLIST 测试（灾难性命令，任何路径都拒绝） ============
 
 def test_blocklist_format():
@@ -106,13 +105,13 @@ def test_deny_windows_delete_protected_path():
     """Windows 删除命令操作保护级路径应该被拒绝"""
     project_root = safety.PROJECT_ROOT
     
-    status, reason = safety.check_command(f"Remove-Item -Recurse -Force {os.path.join(project_root, 'agent')}")
+    status, _reason = safety.check_command(f"Remove-Item -Recurse -Force {os.path.join(project_root, 'agent')}")
     assert status == "deny"
     
-    status, reason = safety.check_command(f"del {os.path.join(project_root, 'main.py')}")
+    status, _reason = safety.check_command(f"del {os.path.join(project_root, 'main.py')}")
     assert status == "deny"
     
-    status, reason = safety.check_command(f"rd /s {os.path.join(project_root, 'config')}")
+    status, _reason = safety.check_command(f"rd /s {os.path.join(project_root, 'config')}")
     assert status == "deny"
 
 
@@ -144,10 +143,10 @@ def test_confirm_windows_delete_confirm_path():
     """Windows 删除命令操作询问级路径应该需要确认"""
     project_root = safety.PROJECT_ROOT
     
-    status, reason = safety.check_command(f"Remove-Item -Recurse -Force {os.path.join(project_root, 'tests')}")
+    status, _reason = safety.check_command(f"Remove-Item -Recurse -Force {os.path.join(project_root, 'tests')}")
     assert status == "confirm"
     
-    status, reason = safety.check_command(f"del {os.path.join(project_root, 'README.md')}")
+    status, _reason = safety.check_command(f"del {os.path.join(project_root, 'README.md')}")
     assert status == "confirm"
 
 
@@ -155,10 +154,10 @@ def test_confirm_windows_delete_confirm_path():
 
 def test_confirm_rm_normal_path():
     """rm 命令操作普通路径应该需要确认"""
-    status, reason = safety.check_command("rm -rf /tmp/test")
+    status, _reason = safety.check_command("rm -rf /tmp/test")
     assert status == "confirm"
     
-    status, reason = safety.check_command("rm C:\\temp\\file.txt")
+    status, _reason = safety.check_command("rm C:\\temp\\file.txt")
     assert status == "confirm"
 
 
@@ -186,7 +185,7 @@ def test_multiple_paths_has_protected():
     
     # tests/ (询问级) + agent/ (保护级) -> deny (因为有保护级)
     cmd = f"rm -rf {os.path.join(project_root, 'tests')} {os.path.join(project_root, 'agent')}"
-    status, reason = safety.check_command(cmd)
+    status, _reason = safety.check_command(cmd)
     assert status == "deny"
 
 
@@ -196,7 +195,7 @@ def test_multiple_paths_all_confirm():
     
     # tests/ + docs/ (都是询问级) -> confirm
     cmd = f"rm -rf {os.path.join(project_root, 'tests')} {os.path.join(project_root, 'docs')}"
-    status, reason = safety.check_command(cmd)
+    status, _reason = safety.check_command(cmd)
     assert status == "confirm"
 
 

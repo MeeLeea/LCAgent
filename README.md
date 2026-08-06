@@ -777,24 +777,32 @@ LLM 生成摘要
 
 ### 记忆相关 API
 
-| 方法                                 | 说明                                                      |
-| ------------------------------------ | --------------------------------------------------------- |
-| `get_checkpointer()`               | 获取 checkpointer 实例(传给 create_react_agent)           |
-| `get_config()`                     | 返回`{"configurable": {"thread_id": ...}}`(传给 invoke) |
-| `get_messages()`                   | 从 checkpoint 获取当前 thread 的所有消息                  |
-| `get_short_term(limit)`            | 从 checkpoint 取消息转为 dict 格式                        |
-| `get_long_term(limit)`             | 获取最近 N 条长期记忆                                     |
-| `get_all_context(long_term_limit)` | 获取完整上下文(长期+短期)                                 |
-| `add(role, content, metadata)`     | 添加记忆，`important=True` 触发写 memory.json           |
-| `new_thread()`                     | 开启新会话                                                |
-| `switch_thread(thread_id)`         | 切换到指定会话(代码层 API,CLI 用`thread` 菜单)          |
-| `delete_thread(thread_id)`         | 删除指定会话(删当前会话时自动切换到其他会话)              |
-| `list_threads()`                   | 列出所有会话 ID                                           |
-| `export_thread(thread_id, fmt)`    | 导出指定会话为可读文本/Markdown                           |
-| `clear_short_term()`               | 开启新会话(替代删除)                                      |
-| `clear_long_term()`                | 清空长期记忆并删除文件                                    |
-| `summarize()`                      | 返回记忆统计信息(含 thread_id、消息数、会话数)            |
-| `compress_memory()`                | 压缩长期记忆（LLM 摘要后替换原内容）                      |
+`AgentMemory` 提供**双模式强隔离**：
+
+- **同步模式**：直接 `AgentMemory(...)`（脚本 / 同步 CLI / 测试），使用 `sqlite3` + `SqliteSaver`
+- **异步模式**：`await AgentMemory.acreate(...)`（`AgentCore.acreate` / API Server），使用 `aiosqlite` + `AsyncSqliteSaver`
+
+> ⚠️ **隔离规则**：异步实例（`acreate`）上调用同步方法会直接抛 `RuntimeError`（`_check_not_async` 守卫），防止事件循环内阻塞与跨线程混跑。请在异步环境统一使用带 `a` 前缀的异步版本；`close()` / `__enter__` 在异步模式同样被禁用，改用 `aclose()` / `async with`。
+
+| 同步（已废弃，仅同步实例可用）        | 异步（推荐）                             | 说明                                                   |
+| ------------------------------------ | ---------------------------------------- | ------------------------------------------------------ |
+| `get_checkpointer()`                 | -                                        | 获取 checkpointer 实例(传给 create_react_agent)        |
+| `get_config()`                       | -                                        | 返回`{"configurable": {"thread_id": ...}}`(传给 invoke) |
+| `get_messages()`                     | `aget_messages()`                        | 从 checkpoint 获取指定 thread 的所有消息               |
+| `get_short_term(limit)`              | `aget_short_term(limit)`                 | 从 checkpoint 取消息转为 dict 格式                     |
+| `get_long_term(limit)`               | `get_long_term(limit)`（纯内存，共用）   | 获取最近 N 条长期记忆                                  |
+| `add(role, content, metadata)`       | `aadd(role, content, metadata)`          | 添加记忆，`important=True` 触发写 memory.json          |
+| `new_thread()`                       | `new_thread()`（纯内存，共用）           | 开启新会话                                             |
+| `switch_thread(thread_id)`           | `aswitch_thread(thread_id)`              | 切换到指定会话                                         |
+| `delete_thread(thread_id)`           | `adelete_thread(thread_id)`              | 删除指定会话(删当前会话时自动切换到其他会话)           |
+| `list_threads()`                     | `alist_threads()`                        | 列出所有会话 ID                                        |
+| `export_thread(thread_id, fmt)`      | `aexport_thread(thread_id, fmt)`         | 导出指定会话为可读文本/Markdown                        |
+| `clear_short_term()`                 | `clear_short_term()`（纯内存，共用）     | 开启新会话(替代删除)                                   |
+| `clear_long_term()`                  | `aclear_long_term()`                     | 清空长期记忆并删除文件                                 |
+| `summarize()`                        | `asummarize()`                           | 返回记忆统计信息(含 thread_id、消息数、会话数)         |
+| `compress_memory(cb)`                | `acompress_memory(cb)`                   | 压缩长期记忆（LLM 摘要后替换原内容）                   |
+
+`AgentCore` 侧对应新增：`aget_memory_summary()` 与 `acompress_memory()`（后者内部把阻塞的 LLM 调用放入 `asyncio.to_thread`，避免阻塞事件循环）。
 
 ---
 
@@ -2163,20 +2171,20 @@ async def main() -> None:
     print(llm.list_models())           # 查看当前提供商的可用模型
     await agent.aswitch_llm(llm)       # 重建 Agent 以使用新模型
 
-    # 会话管理（异步接口）
-    agent.memory.new_thread()                      # 开启新会话（同步保留接口）
-    agent.memory.switch_thread("thread-abc123")    # 切换到已有会话
-    await agent.memory.adelete_thread("thread-xxx")  # 删除指定会话
-    print(await agent.memory.alist_threads())      # 列出所有会话
-    print(agent.memory.export_thread(fmt="markdown"))  # 导出当前会话为 Markdown 文本
+    # 会话管理（异步接口，acreate 实例上同步方法会抛 RuntimeError）
+    agent.memory.new_thread()                          # 开启新会话（纯内存接口，两模式共用）
+    await agent.memory.aswitch_thread("thread-abc123") # 切换到已有会话
+    await agent.memory.adelete_thread("thread-xxx")    # 删除指定会话
+    print(await agent.memory.alist_threads())          # 列出所有会话
+    print(await agent.memory.aexport_thread(fmt="markdown"))  # 导出当前会话为 Markdown 文本
 
     # 记忆管理（异步接口）
-    agent.memory.clear_long_term()   # 清空长期记忆
-    agent.memory.clear_short_term()  # 开启新会话(替代删除)
-    print(agent.memory.summarize())  # 查看记忆统计(含 thread_id、消息数)
+    await agent.memory.aclear_long_term()  # 清空长期记忆
+    agent.memory.clear_short_term()        # 开启新会话(替代删除，纯内存接口)
+    print(await agent.memory.asummarize()) # 查看记忆统计(含 thread_id、消息数)
 
     # 压缩长期记忆
-    result = agent.compress_memory()
+    result = await agent.acompress_memory()
     print(f"压缩率: {1 - result['compressed_chars']/result['original_chars']:.1%}")
 
     # MCP 工具管理
@@ -2513,6 +2521,26 @@ uv run pytest tests/test_provider_models.py --provider kimi -v
 > 不传 `--provider` 时检测 `config/llm_config.json` 中配置的**全部**提供商；传入未知提供商会直接报 UsageError。
 
 测试配置见 `pytest.ini`（`pythonpath = .` 保证 `import tools`/`import agent` 可用；`testpaths = tests` 指定默认收集目录；`addopts = -q` 默认静默模式），`conftest.py` 提供安全配置缓存隔离的 autouse fixture。
+
+### 静态检查（ruff）
+
+```bash
+# uv 方式（推荐）
+uv run ruff check .
+```
+
+项目在 `pyproject.toml` 中固化了两项约束，保证结果可复现：
+
+- **锁版本**：dev 依赖固定 `ruff>=0.16,<0.17`，避免升级引入新默认规则导致检查结果漂移。
+- **默认规则集**：不显式 `select`，沿用 ruff 0.16 默认规则集（仅配置 `line-length = 100`、`target-version = "py314"`、排除目录）。默认规则已包含 `UP`/`B`/`SIM`/`S`/`DTZ` 等质量规则；显式全选会额外激活大量中文标点/魔法数噪音规则（如 `RUF002`、`PLR2004`），故不采用。
+
+**有意忽略的规则：**
+
+| 规则 | 原因 |
+| --- | --- |
+| `BLE001`（盲捕获 `Exception`） | agent 工具层 / API 边界 / 调度作业需捕获一切异常并转成错误信息返回给 LLM/用户或记日志，属有意设计；收窄会让错误处理退化 |
+
+涉及宽异常捕获的代码不写 `# noqa`，由上述项目级 `ignore = ["BLE001"]` 统一裁决。
 
 ---
 

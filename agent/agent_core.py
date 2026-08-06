@@ -5,32 +5,38 @@ Agent核心调度模块 - 基于LangChain 1.x + LangGraph
 """
 import asyncio
 import logging
-import os
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Dict, Any, Deque, List, Optional, Literal
+from typing import Any, Literal, Self
+
 from langchain.agents import create_agent
 from langchain_core.messages import (
-    HumanMessage, AIMessage, SystemMessage, ToolMessage, BaseMessage,
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
 )
 from langchain_core.tools import BaseTool
 from langgraph.types import Command, Interrupt
-from .llm_client import LLMClient
-from .memory import AgentMemory
-from .message_utils import StreamHandler
-from .compaction import (
-    CompactionConfig,
-    LCAgentCompactionMiddleware,
-    LCAgentState,
-)
-from .logging_config import TraceContext, generate_trace_id, get_thread_id
+
 from tools.mcp_loader import DEFAULT_CONFIG_FILE
 from tools.mcp_pool import MCPPool, ServerStatus
 from tools.skills import SkillManager, default_skills_dir
 from tools.terminal_tools import UserRejectedCommandError
 from tools.tool_wrapper import wrap_tools_with_timeout
+
+from .compaction import (
+    CompactionConfig,
+    LCAgentCompactionMiddleware,
+    LCAgentState,
+)
 from .exceptions import AgentStateError
+from .llm_client import LLMClient
+from .logging_config import TraceContext, generate_trace_id
+from .memory import AgentMemory
+from .message_utils import StreamHandler
 from .metrics import MetricsCollector
 
 logger = logging.getLogger(__name__)
@@ -44,15 +50,15 @@ class AgentTurnResult:
     interrupts: list[Interrupt] = field(default_factory=list)
 
     @classmethod
-    def completed(cls, output: str) -> "AgentTurnResult":
+    def completed(cls, output: str) -> AgentTurnResult:
         return cls(status="completed", output=output, interrupts=[])
 
     @classmethod
-    def interrupted(cls, interrupts: list[Interrupt]) -> "AgentTurnResult":
+    def interrupted(cls, interrupts: list[Interrupt]) -> AgentTurnResult:
         return cls(status="interrupted", output=None, interrupts=interrupts)
 
     @classmethod
-    def cancelled(cls, output: str) -> "AgentTurnResult":
+    def cancelled(cls, output: str) -> AgentTurnResult:
         return cls(status="cancelled", output=output, interrupts=[])
 
     @property
@@ -73,14 +79,14 @@ class AgentCore:
         name: str,
         max_iterations: int,
         verbose: bool,
-        mcp_config_file: Optional[str],
+        mcp_config_file: str | None,
         enable_mcp: bool,
-        skills_dir: Optional[str],
+        skills_dir: str | None,
         auto_match_skills: bool,
         max_context_messages: int,
         context_trim_keep: int,
-        process_type: Optional[str],
-        agent_prompt_file: Optional[str],
+        process_type: str | None,
+        agent_prompt_file: str | None,
         max_execution_history: int,
         tool_timeout: float,
     ) -> None:
@@ -108,11 +114,11 @@ class AgentCore:
         # 本地工具（lazy import 打破潜在循环依赖）
         from tools import all_tools as _local_tools
 
-        self.local_tools: List[BaseTool] = list(_local_tools)
+        self.local_tools: list[BaseTool] = list(_local_tools)
         # MCP 工具(从 MCP Server 加载)
-        self.mcp_tools: List[BaseTool] = []
+        self.mcp_tools: list[BaseTool] = []
         # 合并后的完整工具列表
-        self.tools: List[BaseTool] = list(self.local_tools)
+        self.tools: list[BaseTool] = list(self.local_tools)
 
         # MCP 配置
         self.mcp_config_file = mcp_config_file or DEFAULT_CONFIG_FILE
@@ -157,19 +163,19 @@ class AgentCore:
         llm_client: LLMClient,
         name: str = "LCAgent",
         memory_size: int = 10,
-        long_term_memory_file: Optional[str] = None,
-        checkpoint_file: Optional[str] = None,
-        thread_id: Optional[str] = None,
+        long_term_memory_file: str | None = None,
+        checkpoint_file: str | None = None,
+        thread_id: str | None = None,
         max_iterations: int = 25,
         verbose: bool = True,
-        mcp_config_file: Optional[str] = None,
+        mcp_config_file: str | None = None,
         enable_mcp: bool = True,
-        skills_dir: Optional[str] = None,
+        skills_dir: str | None = None,
         auto_match_skills: bool = True,
         max_context_messages: int = 0,
         context_trim_keep: int = 12,
-        process_type: Optional[str] = None,
-        agent_prompt_file: Optional[str] = None,
+        process_type: str | None = None,
+        agent_prompt_file: str | None = None,
         max_execution_history: int = 100,
         tool_timeout: float = 60.0,
     ):
@@ -229,22 +235,22 @@ class AgentCore:
         llm_client: LLMClient,
         name: str = "LCAgent",
         memory_size: int = 10,
-        long_term_memory_file: Optional[str] = None,
-        checkpoint_file: Optional[str] = None,
-        thread_id: Optional[str] = None,
+        long_term_memory_file: str | None = None,
+        checkpoint_file: str | None = None,
+        thread_id: str | None = None,
         max_iterations: int = 25,
         verbose: bool = True,
-        mcp_config_file: Optional[str] = None,
+        mcp_config_file: str | None = None,
         enable_mcp: bool = True,
-        skills_dir: Optional[str] = None,
+        skills_dir: str | None = None,
         auto_match_skills: bool = True,
         max_context_messages: int = 0,
         context_trim_keep: int = 12,
-        process_type: Optional[str] = None,
-        agent_prompt_file: Optional[str] = None,
+        process_type: str | None = None,
+        agent_prompt_file: str | None = None,
         max_execution_history: int = 100,
         tool_timeout: float = 60.0,
-    ) -> "AgentCore":
+    ) -> AgentCore:
         """在运行中的事件循环内创建 AgentCore。"""
         self = cls.__new__(cls)
         self._init_common(
@@ -316,8 +322,8 @@ class AgentCore:
                         # 工具列表不变，只更新系统提示词
                         self._update_system_prompt("")
                 return count
-            except Exception as e:
-                logger.error("MCP 重新加载失败: %s", e, exc_info=True)
+            except Exception:
+                logger.exception("MCP 重新加载失败")
                 return 0
 
     async def areload_mcp_server(self, name: str) -> bool:
@@ -334,9 +340,8 @@ class AgentCore:
             try:
                 old_signature = getattr(self, "_tools_signature", frozenset())
                 success = await self._mcp_pool.reload_server(name)
-                if not success:
-                    if self.verbose:
-                        logger.warning("MCP %s: 重连失败或已移除", name)
+                if not success and self.verbose:
+                    logger.warning("MCP %s: 重连失败或已移除", name)
                 # 从池中获取最新工具列表
                 self.mcp_tools = self._mcp_pool.get_all_tools()
                 self.tools = list(self.local_tools) + list(self.mcp_tools)
@@ -348,8 +353,8 @@ class AgentCore:
                     else:
                         self._update_system_prompt("")
                 return success
-            except Exception as e:
-                logger.error("MCP %s: 重连失败 - %s", name, e, exc_info=True)
+            except Exception:
+                logger.exception("MCP %s: 重连失败", name)
                 return False
 
     async def _async_load_mcp_tools(self) -> int:
@@ -446,12 +451,12 @@ class AgentCore:
         skill_block = self._compute_skill_block(task)
         self.agent_executor = self._create_agent_executor(skill_block)
 
-    def _handle_turn_completion(
+    async def _ahandle_turn_completion(
         self,
         turn: AgentTurnResult,
-        config: Dict[str, Any],
+        config: dict[str, Any],
         mode: str,
-        user_message: Optional[str] = None,
+        user_message: str | None = None,
         save_assistant: bool = True,
         important: bool = False
     ) -> None:
@@ -472,10 +477,10 @@ class AgentCore:
         elif turn.is_completed:
             self._clear_pending_interrupt()
             if user_message:
-                self.memory.add("user", user_message)
+                await self.memory.aadd("user", user_message)
             if save_assistant and turn.output:
                 metadata = {"important": True} if important else {}
-                self.memory.add("assistant", turn.output, metadata)
+                await self.memory.aadd("assistant", turn.output, metadata)
 
     def _get_system_prompt(self, skill_block: str = "") -> str:
         """获取系统提示词(可附加技能指引块)
@@ -489,10 +494,10 @@ class AgentCore:
             base = base + "\n" + skill_block
         return base
 
-    def _invoke_config(self) -> Dict[str, Any]:
+    def _invoke_config(self) -> dict[str, Any]:
         return {**self.memory.get_config(), "recursion_limit": self.max_iterations}
 
-    def _thread_id_from_config(self, config: Dict[str, Any]) -> str | None:
+    def _thread_id_from_config(self, config: dict[str, Any]) -> str | None:
         configurable = config.get("configurable")
         if isinstance(configurable, dict):
             thread_id = configurable.get("thread_id")
@@ -523,7 +528,7 @@ class AgentCore:
         finally:
             self.verbose = original
 
-    def _capture_pending_interrupt(self, config: Dict[str, Any], mode: str) -> None:
+    def _capture_pending_interrupt(self, config: dict[str, Any], mode: str) -> None:
         self._pending_interrupt_thread_id = self._thread_id_from_config(config)
         self._pending_interrupt_mode = mode
 
@@ -531,13 +536,13 @@ class AgentCore:
         self._pending_interrupt_thread_id = None
         self._pending_interrupt_mode = None
 
-    def _record_tool_steps(self, result_messages: List[BaseMessage], input_msg: HumanMessage) -> None:
+    def _record_tool_steps(self, result_messages: list[BaseMessage], input_msg: HumanMessage) -> None:
         # LangGraph 会返回当前线程的完整消息历史，按 tool_call id 去重避免重复记账。
         recorded_ids = getattr(self, "_recorded_tool_call_ids", None)
         if recorded_ids is None:
             recorded_ids = set()
             self._recorded_tool_call_ids = recorded_ids
-        new_entries_by_call_id: dict[str, Dict[str, Any]] = {}
+        new_entries_by_call_id: dict[str, dict[str, Any]] = {}
         for msg in result_messages:
             if msg in (input_msg,):
                 continue
@@ -574,7 +579,7 @@ class AgentCore:
                 )
 
             elif hasattr(msg, "content") and hasattr(msg, "tool_call_id"):
-                call_id = getattr(msg, "tool_call_id")
+                call_id = msg.tool_call_id
                 entry = new_entries_by_call_id.get(call_id)
                 if entry is not None:
                     entry["observation"] = str(msg.content)[:500]
@@ -604,7 +609,7 @@ class AgentCore:
         if turn.status == "interrupted":
             raise RuntimeError("Agent turn interrupted; resume with resume_structured().")
 
-    def _parse_turn_result(self, result: Dict[str, Any]) -> AgentTurnResult:
+    def _parse_turn_result(self, result: dict[str, Any]) -> AgentTurnResult:
         interrupts = result.get("__interrupt__")
         if interrupts:
             return AgentTurnResult.interrupted(list(interrupts))
@@ -616,7 +621,7 @@ class AgentCore:
                 return AgentTurnResult.completed(str(msg.content))
         return AgentTurnResult.completed("")
 
-    async def _arepair_rejected_tool_calls(self, config: Dict[str, Any]) -> None:
+    async def _arepair_rejected_tool_calls(self, config: dict[str, Any]) -> None:
         """异步修复 checkpoint 中未完成的工具调用（补齐取消结果）。
 
         使用 LangGraph 的异步 state API，避免阻塞事件循环。
@@ -661,7 +666,7 @@ class AgentCore:
         except (AttributeError, RuntimeError, TypeError, ValueError) as error:
             logger.warning("修复 checkpoint 状态失败: %s", error, exc_info=True)
 
-    async def _ahandle_rejected_command(self, config: Dict[str, Any]) -> AgentTurnResult:
+    async def _ahandle_rejected_command(self, config: dict[str, Any]) -> AgentTurnResult:
         """异步处理用户拒绝执行危险命令的情况
 
         当工具调用被用户拒绝时，异步修复 checkpoint 状态并返回取消结果。
@@ -702,7 +707,7 @@ class AgentCore:
 
             self._record_tool_steps(result.get("messages", []), input_msg)
             turn = self._parse_turn_result(result)
-            self._handle_turn_completion(turn, config, "run", task, important=True)
+            await self._ahandle_turn_completion(turn, config, "run", task, important=True)
             self.metrics.increment_turn()
 
         return turn
@@ -732,12 +737,12 @@ class AgentCore:
                     return await self._ahandle_rejected_command(config)
 
             turn = self._parse_turn_result(result)
-            self._handle_turn_completion(turn, config, "chat", message)
+            await self._ahandle_turn_completion(turn, config, "chat", message)
             self.metrics.increment_turn()
 
             return turn
 
-    async def aresume_structured(self, payload: Dict[str, Any]) -> AgentTurnResult:
+    async def aresume_structured(self, payload: dict[str, Any]) -> AgentTurnResult:
         """异步恢复中断会话（结构化入口）"""
         config = self._invoke_config()
         pending_thread_id = getattr(self, "_pending_interrupt_thread_id", None)
@@ -762,7 +767,7 @@ class AgentCore:
             mode = getattr(self, "_pending_interrupt_mode", None)
             self._clear_pending_interrupt()
             if mode == "run" and turn.output:
-                self.memory.add("assistant", turn.output, {"important": True})
+                await self.memory.aadd("assistant", turn.output, {"important": True})
 
         return turn
 
@@ -773,7 +778,7 @@ class AgentCore:
         async for ev in self.stream.astream_chat(message):
             yield ev
 
-    async def astream_resume(self, payload: Dict[str, Any]):
+    async def astream_resume(self, payload: dict[str, Any]):
         """流式恢复中断会话，委托给 self.stream。"""
         async for ev in self.stream.astream_resume(payload):
             yield ev
@@ -801,12 +806,12 @@ class AgentCore:
         except RuntimeError as e:
             if "interrupt" in str(e):
                 raise
-            error_msg = f"任务执行失败: {str(e)}"
+            error_msg = f"任务执行失败: {e!s}"
             logger.error("%s", error_msg)
             return error_msg
         except Exception as e:
-            error_msg = f"任务执行失败: {str(e)}"
-            logger.error("%s", error_msg, exc_info=True)
+            error_msg = f"任务执行失败: {e!s}"
+            logger.exception("%s", error_msg)
             return error_msg
 
     async def achat(self, message: str) -> str:
@@ -834,7 +839,7 @@ class AgentCore:
             logger.warning("achat 降级到 fallback: %s", e, exc_info=True)
             return await self._afallback_chat(message)
 
-    async def aresume(self, payload: Dict[str, Any]) -> str:
+    async def aresume(self, payload: dict[str, Any]) -> str:
         """
         异步恢复中断会话（推荐使用）
 
@@ -851,13 +856,13 @@ class AgentCore:
     async def _afallback_chat(self, message: str) -> str:
         """Agent 执行失败时降级为纯 LLM 对话（异步版本）"""
         history = await self.memory.aget_short_term()
-        self.memory.add("user", message)
+        await self.memory.aadd("user", message)
         response = self.llm.chat_with_history(
             user_input=message,
             history=history,
             system_prompt="你是一个有帮助的AI助手，请用中文回答。"
         )
-        self.memory.add("assistant", response)
+        await self.memory.aadd("assistant", response)
         return response
 
     async def acot(self, task: str) -> str:
@@ -890,8 +895,8 @@ class AgentCore:
         logger.info("最终答案: %s", response)
 
         # 存入记忆
-        self.memory.add("user", task)
-        self.memory.add("assistant", response, {"important": True})
+        await self.memory.aadd("user", task)
+        await self.memory.aadd("assistant", response, {"important": True})
 
         return response
 
@@ -930,7 +935,7 @@ class AgentCore:
 
     # ============ 技能阅读(Skills) ============
 
-    def list_skills(self) -> List[Dict[str, str]]:
+    def list_skills(self) -> list[dict[str, str]]:
         """列出所有本地可用技能"""
         return self.skill_manager.list_skills()
 
@@ -1042,11 +1047,11 @@ class AgentCore:
             "messages_after": messages_after,
         }
 
-    def get_available_tools(self) -> List[str]:
+    def get_available_tools(self) -> list[str]:
         """获取可用工具名称列表"""
         return [t.name for t in self.tools]
 
-    def get_execution_history(self) -> List[Dict[str, Any]]:
+    def get_execution_history(self) -> list[dict[str, Any]]:
         """获取执行历史"""
         return list(self.execution_history)
 
@@ -1055,11 +1060,15 @@ class AgentCore:
         self.execution_history.clear()
         self._recorded_tool_call_ids = set()
 
-    def get_memory_summary(self) -> Dict[str, Any]:
+    def get_memory_summary(self) -> dict[str, Any]:
         """获取记忆摘要"""
         return self.memory.summarize()
 
-    def compress_memory(self) -> Dict[str, Any]:
+    async def aget_memory_summary(self) -> dict[str, Any]:
+        """异步获取记忆摘要"""
+        return await self.memory.asummarize()
+
+    def compress_memory(self) -> dict[str, Any]:
         """压缩长期记忆: 委托给 memory.compress_memory,用 LLM 生成摘要。"""
         def _summarize_text(text: str, prompt: str) -> str:
             try:
@@ -1071,6 +1080,25 @@ class AgentCore:
                 return ""
 
         return self.memory.compress_memory(_summarize_text)
+
+    async def acompress_memory(self) -> dict[str, Any]:
+        """异步压缩长期记忆: 委托给 memory.acompress_memory,用 LLM 生成摘要。
+
+        LLMClient 无异步 chat 接口,阻塞的 LLM 调用放入线程池执行,避免阻塞事件循环。
+        """
+        async def _asummarize_text(text: str, prompt: str) -> str:
+            def _sync_call() -> str:
+                try:
+                    return self.llm.chat([
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": text},
+                    ]).strip()
+                except Exception:
+                    return ""
+
+            return await asyncio.to_thread(_sync_call)
+
+        return await self.memory.acompress_memory(_asummarize_text)
 
     # ============ 生命周期管理 ============
 
@@ -1106,7 +1134,7 @@ class AgentCore:
         if getattr(self, "_closed", False):
             raise AgentStateError("AgentCore 已关闭，不再可用")
 
-    async def __aenter__(self) -> "AgentCore":
+    async def __aenter__(self) -> Self:
         return self
 
     async def __aexit__(self, exc_type, exc_value, traceback) -> None:

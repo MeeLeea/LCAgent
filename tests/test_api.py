@@ -18,17 +18,19 @@ import asyncio
 import json
 import os
 import sqlite3
+
+# 测试前需要 mock 全局状态，避免真实初始化
+import sys
 import tempfile
-from typing import Any, AsyncIterator, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from collections.abc import AsyncIterator
+from datetime import UTC
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
-
-# 测试前需要 mock 全局状态，避免真实初始化
-import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -58,7 +60,7 @@ def mock_agent():
     agent.aclose = AsyncMock(return_value=None)
     
     # Mock astream_chat：普通对话返回 token + done 事件
-    async def mock_astream_chat(message: str) -> AsyncIterator[Dict[str, Any]]:
+    async def mock_astream_chat(message: str) -> AsyncIterator[dict[str, Any]]:
         if "工具调用" in message:
             # 模拟工具调用场景
             yield {"type": "token", "content": "正在"}
@@ -91,7 +93,7 @@ def mock_agent():
     agent.astream_chat = mock_astream_chat
     
     # Mock astream_resume：HITL 恢复
-    async def mock_astream_resume(payload: Dict[str, Any]) -> AsyncIterator[Dict[str, Any]]:
+    async def mock_astream_resume(payload: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
         user_response = payload.get("user_response", "")
         yield {"type": "token", "content": f"收到回复：{user_response}"}
         yield {"type": "token", "content": "，继续执行"}
@@ -168,7 +170,9 @@ def mock_agent():
         "compressed_chars": 500,
         "summary": "压缩后的摘要内容",
     })
+    agent.acompress_memory = AsyncMock(return_value=agent.compress_memory.return_value)
     agent.memory.clear_long_term = MagicMock()
+    agent.memory.aclear_long_term = AsyncMock()
     agent.memory.clear_short_term = MagicMock()
     agent.memory.export_thread = MagicMock(return_value="用户: 测试消息\n助手: 回复")
 
@@ -221,15 +225,15 @@ def temp_checkpoint_db():
     ]
     
     # SqliteSaver.put 需要完整的 checkpoint 结构，包含 id, ts 等字段
-    from datetime import datetime, timezone
     import uuid
+    from datetime import datetime
     
     checkpoint_id = str(uuid.uuid4())
     saver.put(
         {"configurable": {"thread_id": "thread-1", "checkpoint_ns": ""}},
         {
             "id": checkpoint_id,
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": datetime.now(UTC).isoformat(),
             "channel_values": {"messages": test_messages},
         },
         {},
@@ -243,7 +247,8 @@ def temp_checkpoint_db():
     # 清理
     try:
         os.unlink(path)
-    except:
+    except OSError:
+        # 清理夹具时文件可能已不存在,静默忽略
         pass
 
 
@@ -1183,10 +1188,9 @@ def test_get_metrics_no_agent(mock_llm):
          patch("api.server.build_agent", AsyncMock(return_value=(MagicMock(get_available_tools=MagicMock(return_value=[]), metrics=None, aclose=AsyncMock()), mock_llm))), \
          patch("api.server.safety_module.set_confirm_backend"):
         from api.server import app
-        with TestClient(app) as c:
-            with patch("api.server.agent", None), patch("api.server.llm", mock_llm):
-                response = c.get("/api/metrics")
-                assert response.status_code == 503
+        with TestClient(app) as c, patch("api.server.agent", None), patch("api.server.llm", mock_llm):
+            response = c.get("/api/metrics")
+            assert response.status_code == 503
 
 
 # --------------------------------------------------------------------------- #
@@ -1248,7 +1252,7 @@ def test_compress_memory(client, mock_agent):
     assert data["success"] is True
     assert data["original_count"] == 5
     assert data["compressed_chars"] == 500
-    mock_agent.compress_memory.assert_called_once()
+    mock_agent.acompress_memory.assert_awaited_once()
 
 
 def test_clear_memory_long(client, mock_agent):
@@ -1259,7 +1263,7 @@ def test_clear_memory_long(client, mock_agent):
     data = response.json()
     assert data["cleared"] is True
     assert data["scope"] == "long"
-    mock_agent.memory.clear_long_term.assert_called_once()
+    mock_agent.memory.aclear_long_term.assert_awaited_once()
     mock_agent.memory.clear_short_term.assert_not_called()
 
 
@@ -1281,7 +1285,7 @@ def test_clear_memory_all(client, mock_agent):
 
     data = response.json()
     assert data["scope"] == "all"
-    mock_agent.memory.clear_long_term.assert_called_once()
+    mock_agent.memory.aclear_long_term.assert_awaited_once()
     mock_agent.memory.clear_short_term.assert_called_once()
 
 
@@ -1470,6 +1474,7 @@ def test_serialize_messages():
 def test_thread_summary(temp_checkpoint_db):
     """测试会话摘要生成"""
     from types import SimpleNamespace
+
     from api.server import thread_summary
 
     memory = MagicMock()
@@ -1492,6 +1497,7 @@ def test_thread_summary(temp_checkpoint_db):
 def test_thread_summary_workflow_type(temp_checkpoint_db):
     """测试工作流会话摘要带类型与工作流名，普通会话不带"""
     from types import SimpleNamespace
+
     from api.server import thread_summary
 
     memory = MagicMock()

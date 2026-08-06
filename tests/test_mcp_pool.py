@@ -14,17 +14,15 @@ import sys
 import types
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
 from tools.mcp_pool import (
     MCPPool,
     MCPServerConnection,
-    ServerInfo,
     ServerStatus,
 )
-
 
 # ── Fake tool: 避免 BaseTool 的 pydantic 校验开销 ─────────────────────
 
@@ -48,12 +46,12 @@ class FakeMCPClient:
     """模拟 langchain_mcp_adapters.client.MultiServerMCPClient"""
 
     # 类级配置：控制每个 server 返回的工具列表和是否抛异常
-    _tools_map: dict[str, list[Any]] = {}
-    _should_fail: set[str] = set()
+    _tools_map: ClassVar[dict[str, list[Any]]] = {}
+    _should_fail: ClassVar[set[str]] = set()
 
     def __init__(self, config: dict[str, Any]):
         self._config = config
-        self._server_name = list(config.keys())[0] if config else ""
+        self._server_name = next(iter(config.keys())) if config else ""
 
     async def get_tools(self) -> list[Any]:
         if self._server_name in FakeMCPClient._should_fail:

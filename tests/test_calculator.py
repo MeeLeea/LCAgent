@@ -11,7 +11,7 @@ from tools.calculator import calculate
         ("-2.5 * +4", -10.0),
     ],
 )
-def test_calculate_supports_bounded_arithmetic(expression: str, expected: int | float) -> None:
+def test_calculate_supports_bounded_arithmetic(expression: str, expected: float) -> None:
     result = calculate.invoke({"expression": expression})
     assert result["success"] is True
     assert result["result"] == expected
