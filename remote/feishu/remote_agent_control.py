@@ -57,6 +57,22 @@ _processing_lock = threading.Lock()
 _interrupt_cache: dict[str, dict] = {}
 _model_menu_cache: dict[str, list[tuple[str, str]]] = {}
 _seen_msg: set[str] = set()
+_agent_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _start_agent_loop() -> asyncio.AbstractEventLoop:
+    """确保存在一个专属长驻事件循环线程，Agent 所有 async 操作都在其上运行。"""
+    global _agent_loop
+    if _agent_loop is None or _agent_loop.is_closed():
+        _agent_loop = asyncio.new_event_loop()
+        threading.Thread(target=_agent_loop.run_forever, name="agent-loop", daemon=True).start()
+    return _agent_loop
+
+
+def _run_on_agent_loop(coro_factory, timeout: float = 300.0):
+    """在专属 agent loop 上执行 async 操作并同步等待结果。"""
+    loop = _start_agent_loop()
+    return asyncio.run_coroutine_threadsafe(coro_factory(), loop).result(timeout=timeout)
 
 # ===================== 消息发送 =====================
 
@@ -160,52 +176,29 @@ def _has_api_key(key: str) -> bool:
         return False
 
 def start_agent() -> str:
-    """初始化或重启 Agent。在独立线程中运行以避免 asyncio 事件循环冲突。"""
+    """初始化或重启 Agent，在专属长驻事件循环中构造异步资源。"""
     global _agent, _agent_info
     try:
-        # 在独立线程中构建 Agent，解决 MCP 加载的 asyncio.run() 与 WS 事件循环冲突
-        result_container: list[tuple] = []
-        error_container: list[Exception] = []
-
-        def _build():
+        async def _astart_agent():
+            agent, llm = await build_agent(_auto_detect_provider(), process_type="feishu")
+            agent.verbose = False
+            # 非交互环境：危险命令确认改为通过 LangGraph interrupt 抛给飞书交互，而不是终端 input()
+            import tools.safety as _safety
+            _safety.set_confirm_backend(_safety.interrupt_confirm)
+            tid = _load_remote_thread_id()
+            if tid:
+                agent.memory.switch_thread(tid)
+            else:
+                _save_remote_thread_id(agent.memory.thread_id)
+            # 主动修复可能残留的孤儿 tool_calls（上次中断可能遗留）
             try:
-                # 为 MCP 异步加载创建独立事件循环
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                tid = _load_remote_thread_id()
-                agent, llm = build_agent(_auto_detect_provider(), process_type="feishu")
-                agent.verbose = False
-                # 非交互环境：危险命令确认改为通过 LangGraph interrupt 抛给飞书交互，而不是终端 input()
-                import tools.safety as _safety
-                _safety.set_confirm_backend(_safety.interrupt_confirm)
-                if tid:
-                    agent.memory.switch_thread(tid)
-                else:
-                    _save_remote_thread_id(agent.memory.thread_id)
-                # 主动修复可能残留的孤儿 tool_calls（上次中断可能遗留）
-                try:
-                    loop.run_until_complete(
-                        agent._arepair_rejected_tool_calls(agent._invoke_config())
-                    )
-                    agent._clear_pending_interrupt()
-                except Exception as error:
-                    logger.warning("修复孤儿 tool_call 失败: %s", error, exc_info=True)
-                result_container.append((agent, llm, agent.memory.thread_id))
-            except Exception as e:
-                error_container.append(e)
-            finally:
-                loop.close()
+                await agent._arepair_rejected_tool_calls(agent._invoke_config())
+                agent._clear_pending_interrupt()
+            except Exception as error:
+                logger.warning("修复孤儿 tool_call 失败: %s", error, exc_info=True)
+            return agent, llm, agent.memory.thread_id
 
-        t = threading.Thread(target=_build, daemon=True)
-        t.start()
-        t.join(timeout=30)
-
-        if error_container:
-            raise error_container[0]
-        if not result_container:
-            raise RuntimeError("Agent 初始化超时（30s）")
-
-        agent, llm, tid = result_container[0]
+        agent, llm, tid = _run_on_agent_loop(_astart_agent, timeout=30)
         with _agent_lock:
             _agent = agent
             _agent_info = {"provider": llm.provider, "model": llm.model, "status": "running"}
@@ -252,7 +245,7 @@ def _auto_send_files(chat_id: str, text: str) -> int:
 def _clear_pending_interrupt(agent: Any) -> None:
     """清理未完成的中断，确保 checkpoint 干净。"""
     try:
-        asyncio.run(agent._arepair_rejected_tool_calls(agent._invoke_config()))
+        _run_on_agent_loop(lambda: agent._arepair_rejected_tool_calls(agent._invoke_config()), timeout=60)
         agent._clear_pending_interrupt()
     except Exception as e:
         logger.warning("中断清理失败: %s", e, exc_info=True)
@@ -304,7 +297,7 @@ def _resume_interrupt(chat_id: str, content: str) -> None:
     else:
         payload = {"text": content}
     try:
-        _handle_turn_result(chat_id, agent, asyncio.run(agent.aresume_structured(payload)),
+        _handle_turn_result(chat_id, agent, _run_on_agent_loop(lambda: agent.aresume_structured(payload)),
                             getattr(agent, "_pending_interrupt_mode", "chat"))
     except Exception as e:
         _send_text(chat_id, f"❌ 恢复失败: {e}")
@@ -398,13 +391,19 @@ def _handle_model_menu(chat_id: str, inp: str = "") -> None:
 def _do_switch(chat_id: str, agent, pk: str, mn: str) -> None:
     old = f"{agent.llm.provider}: {agent.llm.model}"
     try:
-        if agent.llm.provider != pk:
-            from cli.commands.provider import create_llm
-            agent.llm = create_llm(pk, LLM_FILE)
-            if agent.llm.model != mn: agent.llm.switch_model(mn)
-        else:
-            agent.llm.switch_model(mn)
-        agent.agent_executor = agent._create_agent_executor()
+        def _switch() -> None:
+            if agent.llm.provider != pk:
+                from cli.commands.provider import create_llm
+                agent.llm = create_llm(pk, LLM_FILE)
+                if agent.llm.model != mn: agent.llm.switch_model(mn)
+            else:
+                agent.llm.switch_model(mn)
+            agent.agent_executor = agent._create_agent_executor()
+
+        async def _switch_async() -> None:
+            _switch()
+
+        _run_on_agent_loop(lambda: _switch_async())
         with _agent_lock: _agent_info.update(provider=agent.llm.provider, model=agent.llm.model)
         _send_text(chat_id, f"✅ {old} → {pk}: {mn}")
     except Exception as e:
@@ -426,7 +425,7 @@ def _agent_task(chat_id: str, method: str, payload: str) -> None:
             agent = get_agent()
             if not agent: return _send_text(chat_id, "⚠️ 请先启动agent")
             _clear_pending_interrupt(agent)
-            turn = asyncio.run(agent.arun_structured(payload)) if method == "run" else asyncio.run(agent.achat_structured(payload))
+            turn = _run_on_agent_loop(lambda: agent.arun_structured(payload)) if method == "run" else _run_on_agent_loop(lambda: agent.achat_structured(payload))
             _handle_turn_result(chat_id, agent, turn, method)
         except Exception as e:
             _send_text(chat_id, f"❌ {e}")
