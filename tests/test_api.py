@@ -858,6 +858,36 @@ def test_chat_management_command_realtime_stream(client, mock_agent):
         assert events[-1]["type"] == "done"
 
 
+def test_is_execution_command_classification():
+    """测试执行型命令分类函数(_is_execution_command)"""
+    from api.server import _is_execution_command
+
+    # 执行型
+    assert _is_execution_command("json: 生成配置") is True
+    assert _is_execution_command("react: 帮我写代码") is True
+    assert _is_execution_command("cot: 推理一下") is True
+    assert _is_execution_command("skill:pptx 帮我做 PPT") is True
+
+    # 管理型(skill 无任务 / clear / 其他管理命令)
+    assert _is_execution_command("skill:pptx") is False      # 无任务文本
+    assert _is_execution_command("skill:clear") is False     # clear 是管理型
+    assert _is_execution_command("skill: 清空") is False
+    assert _is_execution_command("help") is False
+    assert _is_execution_command("info") is False
+    assert _is_execution_command("threads") is False
+    assert _is_execution_command("") is False
+
+
+def test_unsupported_runner_returns_clear_hint_instead_of_none():
+    """测试 Web 端 runner 兜底返回明确提示而非静默 None"""
+    from api.server import _unsupported_runner
+
+    result = _unsupported_runner(None, "任意任务")
+    assert isinstance(result, str)
+    assert result  # 非空
+    assert "json:" in result or "react:" in result  # 引导用户走流式/普通对话
+
+
 def test_chat_workflow_events_forwarded(client, mock_agent):
     """测试工作流运行事件经 SSE 实时转发(workflow_node / workflow_status)"""
     with patch("api.server.dispatch_command") as mock_dispatch:

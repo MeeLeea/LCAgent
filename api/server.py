@@ -514,6 +514,42 @@ def _format_help_as_table(help_text: str) -> str:
     return "\n".join(table_lines)
 
 
+def _is_execution_command(command: str) -> bool:
+    """判断命令是否为"执行型"（需要走流式 Runner，而非管理型同步命令）。
+
+    执行型命令会把任务交给 Agent 流式执行：
+    - ``json:`` / ``react:`` / ``cot:`` 直接进入任务执行
+    - ``skill:<name> <task>`` 带任务文本时执行；``skill:clear`` / 仅列出技能时是管理型
+
+    Args:
+        command: 去掉了前导 ``/`` 的命令字符串
+
+    Returns:
+        是否为执行型命令。是则走 astream_chat 流式通道，否则走 dispatch_command 管理通道。
+    """
+    low = command.lower()
+    if low.startswith(("json:", "react:", "cot:")):
+        return True
+    if low.startswith("skill:"):
+        # skill:<name> <task> 是执行型；skill:clear 或 skill:<name>（无任务）是管理型
+        rest = command[6:].strip()
+        parts = rest.split(None, 1)
+        skill_name = parts[0].strip() if parts else ""
+        task_text = parts[1].strip() if len(parts) > 1 else ""
+        return bool(skill_name and task_text and skill_name.lower() not in ("clear", "清空", "reset"))
+    return False
+
+
+def _unsupported_runner(agent_obj: object, text: str) -> str:
+    """Web 端 Runner 兜底：不支持交互式执行时返回明确提示，避免静默 `None`。
+
+    当管理型命令内部嵌套执行型调用（如 ``role:<name> <task>``）时，
+    返回标记文本代替 `None`，由命令层打印出来，用户能看到原因而非空结果。
+    """
+    return "[Web 通道暂不支持该嵌套执行，请改用 json:/react:/普通对话发送]"
+
+
+# 双方共用：捕获执行型命令统一走流式，其余走管理型 dispatch_command
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
     """SSE 流式聊天。支持普通对话和命令执行（如 /skill:pptx <task>、/json:、/react: 等）。"""
@@ -567,8 +603,8 @@ async def chat(req: ChatRequest):
                         select_menu=lambda title, choices: choices[0] if choices else "",
                         create_llm=lambda provider: create_llm(provider, LLM_FILE),
                         list_providers=lambda: load_providers(LLM_FILE),
-                        run_structured_until_completion=lambda agent_obj, text: None,  # 占位，实际用 stream_runner
-                        chat_until_completion=lambda agent_obj, text: None,  # 占位
+                        run_structured_until_completion=_unsupported_runner,  # 嵌套执行返回明确提示,不静默 None
+                        chat_until_completion=_unsupported_runner,  # 同上
                         safety_backend=safety_module,
                         base_dir=BASE_DIR,
                         config_file=AGENT_CONFIG_FILE,
@@ -576,21 +612,8 @@ async def chat(req: ChatRequest):
                         workflow_event_cb=emit_workflow_event,
                     )
                     
-                    # 检测执行型命令（json:/react:/cot:/skill:<task>）
-                    low = command.lower()
-                    is_execution = False
-                    
-                    if low.startswith("json:") or low.startswith("react:") or low.startswith("cot:"):
-                        is_execution = True
-                    elif low.startswith("skill:"):
-                        # skill:<name> <task> 是执行型，skill:clear 或 skill:<name>（无任务）是管理型
-                        rest = command[6:].strip()
-                        parts = rest.split(None, 1)
-                        skill_name = parts[0].strip() if parts else ""
-                        task_text = parts[1].strip() if len(parts) > 1 else ""
-                        # 有技能名且有任务文本，且不是 clear
-                        if skill_name and task_text and skill_name.lower() not in ("clear", "清空", "reset"):
-                            is_execution = True
+                    # 执行型命令（json:/react:/cot:/skill:<task>）走流式通道
+                    is_execution = _is_execution_command(command)
                     
                     if is_execution:
                         # 执行型命令：走流式 runner
