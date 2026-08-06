@@ -16,15 +16,18 @@ import logging
 import pytest
 
 from agent.logging_config import (
+    LOG_LEVELS,
     StructuredFormatter,
     TraceContext,
     generate_trace_id,
+    get_log_level,
+    get_log_level_name,
     get_thread_id,
     get_trace_id,
+    set_log_level,
     set_trace_context,
     setup_logging,
 )
-
 
 # ════════════════════════════════════════════════════════════════
 #  TraceContext 测试
@@ -289,3 +292,74 @@ class TestAsyncTraceContext:
         tid, thid = asyncio.run(run())
         assert tid == "aio-ctx"
         assert thid == "aio-th"
+
+
+# ════════════════════════════════════════════════════════════════
+#  运行时日志级别测试
+# ════════════════════════════════════════════════════════════════
+
+
+class TestRuntimeLogLevel:
+    """运行时动态调整日志级别测试"""
+
+    def test_set_log_level_with_string_name(self):
+        """通过字符串名称设置级别（不区分大小写）"""
+        original = get_log_level()
+        try:
+            set_log_level("DEBUG")
+            assert get_log_level() == logging.DEBUG
+            assert get_log_level_name() == "DEBUG"
+
+            set_log_level("warning")
+            assert get_log_level() == logging.WARNING
+            assert get_log_level_name() == "WARNING"
+        finally:
+            logging.getLogger().setLevel(original)
+
+    def test_set_log_level_with_int_constant(self):
+        """通过 logging 整型常量设置级别"""
+        original = get_log_level()
+        try:
+            set_log_level(logging.ERROR)
+            assert get_log_level() == logging.ERROR
+            assert get_log_level_name() == "ERROR"
+        finally:
+            logging.getLogger().setLevel(original)
+
+    def test_set_log_level_invalid_name_raises(self):
+        """传入未知级别名称时抛出 ValueError"""
+        with pytest.raises(ValueError, match="未知日志级别"):
+            set_log_level("INVALID")
+
+    def test_set_log_level_wrong_type_raises(self):
+        """传入非 str/int 类型时抛出 TypeError"""
+        with pytest.raises(TypeError, match="必须为 str 或 int"):
+            set_log_level(None)  # type: ignore[arg-type]
+
+    def test_get_log_level_returns_current(self):
+        """get_log_level 返回当前 root logger 级别"""
+        original = get_log_level()
+        try:
+            logging.getLogger().setLevel(logging.CRITICAL)
+            assert get_log_level() == logging.CRITICAL
+        finally:
+            logging.getLogger().setLevel(original)
+
+    def test_get_log_level_name_returns_readable_string(self):
+        """get_log_level_name 返回可读级别名称"""
+        original = get_log_level()
+        try:
+            logging.getLogger().setLevel(logging.INFO)
+            assert get_log_level_name() == "INFO"
+        finally:
+            logging.getLogger().setLevel(original)
+
+    def test_log_levels_dict_complete(self):
+        """LOG_LEVELS 包含所有标准级别"""
+        assert "DEBUG" in LOG_LEVELS
+        assert "INFO" in LOG_LEVELS
+        assert "WARNING" in LOG_LEVELS
+        assert "ERROR" in LOG_LEVELS
+        assert "CRITICAL" in LOG_LEVELS
+        assert LOG_LEVELS["DEBUG"] == logging.DEBUG
+        assert LOG_LEVELS["CRITICAL"] == logging.CRITICAL

@@ -2,7 +2,20 @@
 
 from __future__ import annotations
 
-from . import core, execution, mcp, memory, metrics, provider, role, safety, skills, threads, workflow
+from . import (
+    core,
+    execution,
+    log_level,
+    mcp,
+    memory,
+    metrics,
+    provider,
+    role,
+    safety,
+    skills,
+    threads,
+    workflow,
+)
 from .types import BREAK, HANDLED, UNHANDLED, CommandContext, CommandOutcome
 
 
@@ -63,6 +76,8 @@ def dispatch_command(context: CommandContext, user_input: str) -> CommandOutcome
         return workflow.workflow_command(context, user_input)
     if low == "metrics" or low.startswith("metrics:"):
         return metrics.metrics_command(context, user_input)
+    if low == "log" or low.startswith("log:"):
+        return log_level.log_command(context, user_input)
     if low.startswith("json:"):
         return execution.json_mode(context, user_input)
     if low.startswith("react:"):
@@ -72,4 +87,4 @@ def dispatch_command(context: CommandContext, user_input: str) -> CommandOutcome
     return execution.chat_mode(context, user_input)
 
 
-__all__ = ["CommandContext", "CommandOutcome", "dispatch_command", "HANDLED"]
+__all__ = ["HANDLED", "CommandContext", "CommandOutcome", "dispatch_command"]

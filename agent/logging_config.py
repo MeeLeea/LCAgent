@@ -23,7 +23,6 @@ import contextvars
 import logging
 import sys
 import uuid
-from typing import Optional
 
 # ── 上下文变量（asyncio 安全） ──────────────────────────────────
 
@@ -54,8 +53,8 @@ class StructuredFormatter(logging.Formatter):
 # ── 公开 API ───────────────────────────────────────────────────
 
 def set_trace_context(
-    trace_id: Optional[str] = None,
-    thread_id: Optional[str] = None,
+    trace_id: str | None = None,
+    thread_id: str | None = None,
 ) -> None:
     """设置当前上下文的 trace_id 和 thread_id
 
@@ -84,9 +83,63 @@ def generate_trace_id() -> str:
     return uuid.uuid4().hex[:8]
 
 
+# ── 运行时日志级别 ─────────────────────────────────────────────
+
+# 支持的级别名称 → logging 级别常量（大写规范化后查表）
+LOG_LEVELS: dict[str, int] = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
+
+
+def set_log_level(level: str | int) -> int:
+    """运行时调整全局（root logger）日志级别
+
+    无需重启即可在交互式 CLI 中切换日志粒度。仅改变级别，
+    不触碰已有 handler / formatter 配置（区别于 setup_logging 的重建）。
+
+    Args:
+        level: 级别名称（不区分大小写，如 "debug"/"INFO"）或
+               logging 整型常量（如 logging.DEBUG）。
+
+    Returns:
+        实际生效的 logging 整型级别。
+
+    Raises:
+        ValueError: 传入未知的级别名称。
+        TypeError:  传入既非 str 也非 int 的类型。
+    """
+    if isinstance(level, str):
+        name = level.strip().upper()
+        if name not in LOG_LEVELS:
+            valid = ", ".join(LOG_LEVELS)
+            raise ValueError(f"未知日志级别 {level!r}，可选: {valid}")
+        resolved = LOG_LEVELS[name]
+    elif isinstance(level, int):
+        resolved = level
+    else:
+        raise TypeError(f"level 必须为 str 或 int，收到 {type(level).__name__}")
+
+    logging.getLogger().setLevel(resolved)
+    return resolved
+
+
+def get_log_level() -> int:
+    """获取当前 root logger 的整型日志级别"""
+    return logging.getLogger().level
+
+
+def get_log_level_name() -> str:
+    """获取当前 root logger 的日志级别名称（如 "INFO"）"""
+    return logging.getLevelName(logging.getLogger().level)
+
+
 def setup_logging(
     level: int = logging.INFO,
-    log_file: Optional[str] = None,
+    log_file: str | None = None,
 ) -> None:
     """初始化全局日志配置
 
@@ -138,8 +191,8 @@ class TraceContext:
 
     def __init__(
         self,
-        trace_id: Optional[str] = None,
-        thread_id: Optional[str] = None,
+        trace_id: str | None = None,
+        thread_id: str | None = None,
         *,
         auto_generate_trace: bool = False,
     ):
@@ -153,10 +206,10 @@ class TraceContext:
             trace_id = generate_trace_id()
         self.trace_id = trace_id
         self.thread_id = thread_id
-        self._token_trace: Optional[contextvars.Token] = None
-        self._token_thread: Optional[contextvars.Token] = None
+        self._token_trace: contextvars.Token | None = None
+        self._token_thread: contextvars.Token | None = None
 
-    def __enter__(self) -> "TraceContext":
+    def __enter__(self) -> TraceContext:
         if self.trace_id is not None:
             self._token_trace = _trace_id.set(self.trace_id)
         if self.thread_id is not None:
@@ -169,7 +222,7 @@ class TraceContext:
         if self._token_thread is not None:
             _thread_id.reset(self._token_thread)
 
-    async def __aenter__(self) -> "TraceContext":
+    async def __aenter__(self) -> TraceContext:
         return self.__enter__()
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
@@ -177,11 +230,15 @@ class TraceContext:
 
 
 __all__ = [
+    "LOG_LEVELS",
     "StructuredFormatter",
-    "set_trace_context",
-    "get_trace_id",
-    "get_thread_id",
-    "generate_trace_id",
-    "setup_logging",
     "TraceContext",
+    "generate_trace_id",
+    "get_log_level",
+    "get_log_level_name",
+    "get_thread_id",
+    "get_trace_id",
+    "set_log_level",
+    "set_trace_context",
+    "setup_logging",
 ]
