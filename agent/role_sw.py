@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 # 项目根目录(基于本文件位置计算: agent/role_sw.py -> 上两级)
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 默认 agent/ 目录
+_DEFAULT_AGENT_DIR = os.path.join(_BASE_DIR, "agent")
 # 多 Agent 角色目录
 _TEAM_DIR = os.path.join(_BASE_DIR, "team")
 # team/ 下的非角色目录(基础设施,跳过)
@@ -34,7 +36,7 @@ def get_available_team_roles() -> list[str]:
     if not os.path.isdir(_TEAM_DIR):
         return []
 
-    available: list[str] = []
+    available: list[str] = ["default"]
     for entry in sorted(os.listdir(_TEAM_DIR)):
         if entry in _NON_ROLE_DIRS:
             continue
@@ -73,6 +75,9 @@ def _locate_team_agent_dir(agent_name: str) -> str:
         roles = ", ".join(available) or "(空)"
         raise KeyError(f"未找到 team 角色: {agent_name}。可用角色: {roles}")
 
+    if agent_name == "default":
+        # 默认角色不在 team/ 下,直接返回空路径
+        return _DEFAULT_AGENT_DIR
     # 直接拼接路径，不用再次扫描磁盘
     agent_dir = os.path.join(_TEAM_DIR, agent_name)
     return agent_dir
