@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -131,11 +132,11 @@ class FakeSafetyBackend:
 class FakeRunners:
     calls: list[tuple[str, str]] = field(default_factory=list)
 
-    def structured(self, agent: FakeAgent, task: str) -> str:
+    async def structured(self, agent: FakeAgent, task: str) -> str:
         self.calls.append(("structured", task))
         return f"structured:{task}"
 
-    def chat(self, agent: FakeAgent, task: str) -> str:
+    async def chat(self, agent: FakeAgent, task: str) -> str:
         self.calls.append(("chat", task))
         return f"chat:{task}"
 
@@ -196,7 +197,7 @@ def dispatch(harness: Harness, command: str) -> Any:
         chat_until_completion=harness.runners.chat,
         safety_backend=harness.safety,
     )
-    return dispatch_command(context, command)
+    return asyncio.run(dispatch_command(context, command))
 
 
 @pytest.mark.parametrize("command", ["quit", "exit"])
