@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Callable, Protocol, TypeAlias
-
+from typing import Protocol, TypeAlias
 
 JsonScalar: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonScalar | list[JsonScalar]
@@ -62,6 +61,13 @@ class AgentLike(Protocol):
     def compress_memory(self) -> dict[str, JsonValue]: ...
     def list_skills(self) -> list[dict[str, str]]: ...
     def cot(self, task: str) -> str: ...
+    async def aswitch_llm(self, llm: LlmLike) -> None: ...
+    async def manually_compact(self, force: bool = False) -> dict[str, JsonValue] | None: ...
+    async def arebuild_from_team_dir(self, role_name: str, task: str = "") -> None: ...
+    async def areload_mcp_server(self, server_name: str) -> bool: ...
+    async def areload_mcp_tools(self) -> int: ...
+    async def aclear_skills(self) -> None: ...
+    async def aload_skill(self, name: str) -> bool: ...
 
 
 class SafetyBackend(Protocol):
@@ -89,7 +95,7 @@ InputFn: TypeAlias = Callable[[str], str]
 SelectMenuFn: TypeAlias = Callable[..., str | tuple[str, str] | None]
 CreateLlmFn: TypeAlias = Callable[[str], LlmLike]
 ListProvidersFn: TypeAlias = Callable[[], dict[str, dict[str, JsonValue]]]
-RunnerFn: TypeAlias = Callable[[AgentLike, str], str]
+RunnerFn: TypeAlias = Callable[[AgentLike, str], Awaitable[str]]
 # 工作流运行跟踪事件回调:接收结构化事件字典(如 {"type": "workflow_node", "node": ..., "status": ...})
 WorkflowEventFn: TypeAlias = Callable[[dict[str, str]], None]
 
@@ -128,9 +134,9 @@ class CommandContext:
     def input(self, prompt: str = "") -> str:
         return self.input_fn(prompt)
 
-    def replace_llm(self, llm: LlmLike) -> None:
+    async def replace_llm(self, llm: LlmLike) -> None:
         # Agent 执行器持有唯一 LLM 客户端，切换后命令层直接经 agent.llm 访问。
-        asyncio.run(self.agent.aswitch_llm(llm))
+        await self.agent.aswitch_llm(llm)
 
 
 HANDLED = CommandOutcome(handled=True)

@@ -4,6 +4,7 @@ LangChain Agent 项目入口 - 支持多提供商(智谱/千问/DeepSeek/Kimi) +
 
 from __future__ import annotations
 
+import asyncio
 import os
 
 try:
@@ -14,19 +15,19 @@ except ImportError:
 from agent import AgentCore
 from agent.config import load_agent_config, resolve_path
 from agent.logging_config import setup_logging
-from tools import safety as safety_module
 from cli.cli_menu import select_menu
 from cli.commands import CommandContext, dispatch_command
 from cli.commands.core import show_ready
 from cli.commands.provider import create_llm, select_provider
 from cli.human_input import chat_until_completion, run_structured_until_completion
+from tools import safety as safety_module
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LLM_FILE = os.path.join(BASE_DIR, "config", "llm_config.json")
 MCP_CONFIG_FILE = os.path.join(BASE_DIR, "config", "mcp_servers.json")
 AGENT_CONFIG_FILE = os.path.join(BASE_DIR, "agent", "agent_config.json")
 MEMORY_FILE = os.path.join(BASE_DIR, "memory", "memory.json")
-CHECKPOINT_FILE = os.path.join(BASE_DIR, "memory", "checkpoints.sqlite")
+CHECKPOINT_FILE = os.path.join(BASE_DIR, "memory", "checkpoints_async.sqlite")
 
 
 def render_print(value: str = "") -> None:
@@ -35,7 +36,7 @@ def render_print(value: str = "") -> None:
         print(line.strip())
 
 
-def build_agent(provider: str, process_type: str = None) -> tuple[AgentCore, object]:
+async def build_agent(provider: str, process_type: str | None = None) -> tuple[AgentCore, object]:
     """根据提供商和运行时配置初始化 LLM 与 Agent。
     
     Args:
@@ -54,7 +55,7 @@ def build_agent(provider: str, process_type: str = None) -> tuple[AgentCore, obj
     skills_dir = resolve_path(config["skills_dir"], BASE_DIR)
     mcp_config_file = resolve_path(config["mcp_config_file"], BASE_DIR)
     print("初始化Agent(含MCP工具加载 + Checkpoint 持久化)...")
-    agent = AgentCore(
+    agent = await AgentCore.acreate(
         llm_client=llm,
         name=config["name"],
         memory_size=config["memory_size"],
@@ -97,7 +98,7 @@ def make_context(agent: AgentCore) -> CommandContext:
     )
 
 
-def main() -> None:
+async def main() -> None:
     """运行交互式命令行主循环。"""
     setup_logging()
     # 启动 banner（保持 print，面向用户）
@@ -105,26 +106,29 @@ def main() -> None:
     print("  LC Agent (基于LangChain框架)")
     print("=" * 50)
     provider = select_provider(LLM_FILE, select_menu)
-    agent, _ = build_agent(provider)
+    agent, _ = await build_agent(provider)
     context = make_context(agent)
     show_ready(context)
 
-    while True:
-        try:
-            user_input = input("\n你: ").strip()
-            if not user_input:
-                continue
-            outcome = dispatch_command(context, user_input)
-            if outcome.should_break:
+    try:
+        while True:
+            try:
+                user_input = (await asyncio.to_thread(input, "\n你: ")).strip()
+                if not user_input:
+                    continue
+                outcome = await dispatch_command(context, user_input)
+                if outcome.should_break:
+                    break
+            except KeyboardInterrupt:
+                print("\n\n程序被中断，再见!")
                 break
-        except KeyboardInterrupt:
-            print("\n\n程序被中断，再见!")
-            break
-        # CLI 最外层兜底只负责保持会话可用；业务模块仍应捕获具体异常。
-        except Exception as error:  # noqa: BROAD_EXCEPT_OK - CLI boundary keeps the session alive.
-            print(f"\n错误: {error}")
-            print("请重试...")
+            # CLI 最外层兜底只负责保持会话可用；业务模块仍应捕获具体异常。
+            except Exception as error:  # noqa: BROAD_EXCEPT_OK - CLI boundary keeps the session alive.
+                print(f"\n错误: {error}")
+                print("请重试...")
+    finally:
+        await agent.aclose()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
