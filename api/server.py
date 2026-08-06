@@ -95,6 +95,7 @@ def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
     """根据提供商初始化 LLM 与 Agent（逻辑与 main.py 一致，去掉 CLI 打印）。"""
     new_llm = LLMClient(provider=provider, config_file=LLM_FILE)
     cfg = load_agent_config(AGENT_CONFIG_FILE)
+    agent_prompt_file = cfg.get("agent_prompt_file")
     skills_dir = resolve_path(cfg["skills_dir"], BASE_DIR)
     mcp_config_file = resolve_path(cfg["mcp_config_file"], BASE_DIR)
     new_agent = AgentCore(
@@ -112,7 +113,9 @@ def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
         max_context_messages=cfg["max_context_messages"],
         context_trim_keep=cfg["context_trim_keep"],
         process_type="server",
-        agent_core_prompt=cfg["agent_core_prompt"]
+        agent_prompt_file=agent_prompt_file,
+        max_execution_history=cfg.get("max_execution_history", 100),
+        tool_timeout=cfg.get("tool_timeout", 120),
     )
     return new_agent, new_llm
 
@@ -210,6 +213,16 @@ class CommandRequest(BaseModel):
     thread_id: Optional[str] = None
 
 
+class SwitchRoleRequest(BaseModel):
+    role: str
+    task: Optional[str] = None
+
+
+class SafetyUpdateRequest(BaseModel):
+    mode: Optional[str] = None
+    confirm_dangerous: Optional[bool] = None
+
+
 # --------------------------------------------------------------------------- #
 # FastAPI 应用
 # --------------------------------------------------------------------------- #
@@ -266,7 +279,7 @@ async def switch_provider(req: SwitchProviderRequest):
         except Exception as e:
             logger.error("切换失败: %s", e)
             raise HTTPException(status_code=400, detail=str(e))
-        agent.switch_llm(new_llm)
+        await agent.aswitch_llm(new_llm)
         llm = new_llm
     info = llm.get_info()
     logger.info("已切换 → %s / %s", info["provider_name"], info["model"])
@@ -279,7 +292,7 @@ async def switch_model(req: SwitchModelRequest):
     async with chat_lock:
         try:
             llm.switch_model(req.model)
-            agent.switch_llm(llm)
+            await agent.aswitch_llm(llm)
         except Exception as e:
             logger.error("切换失败: %s", e)
             raise HTTPException(status_code=400, detail=str(e))
@@ -291,6 +304,46 @@ async def switch_model(req: SwitchModelRequest):
 @app.get("/api/tools")
 async def get_tools():
     return {"tools": agent.get_available_tools() if agent else []}
+
+
+@app.get("/api/roles")
+async def get_roles():
+    """列出 team/ 下的可用团队角色与当前角色名（对应 CLI 的 role 命令）。"""
+    from agent.role_sw import get_available_team_roles
+
+    return {
+        "roles": get_available_team_roles(),
+        "current": agent.name if agent else None,
+    }
+
+
+@app.post("/api/roles/switch")
+async def switch_role(req: SwitchRoleRequest):
+    """切换主对话 Agent 的团队角色。
+
+    就地把 AgentCore 重建为 team/<role>/ 定义的角色（提示词/LLM）。
+    可选 task：切换后由角色自动匹配注入相应技能。
+
+    错误映射：未知角色 → 404；角色提示词文件为空 → 400；其他异常 → 500。
+    """
+    logger.info("切换团队角色: %s", req.role)
+    async with chat_lock:
+        try:
+            await agent.arebuild_from_team_dir(req.role, task=req.task or "")
+        except KeyError as e:
+            from agent.role_sw import get_available_team_roles
+
+            available = ", ".join(get_available_team_roles()) or "(无)"
+            logger.warning("角色不存在 [%s]，可用: %s", req.role, available)
+            raise HTTPException(status_code=404, detail=f"{e}")
+        except FileNotFoundError as e:
+            logger.error("角色提示词读取失败 [%s]: %s", req.role, e)
+            raise HTTPException(status_code=400, detail=f"{e}")
+        except (RuntimeError, ValueError) as e:
+            logger.error("切换角色失败 [%s]: %s", req.role, e)
+            raise HTTPException(status_code=500, detail=f"{e}")
+    logger.info("已切换到团队角色: %s", req.role)
+    return {"role": req.role, "current": agent.name if agent else None}
 
 
 # LangGraph 内部哨兵节点与前端友好标签的映射
@@ -402,6 +455,24 @@ def _sse(data: Dict[str, Any]) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _get_total_tokens() -> int:
+    """获取当前 LLM 累计 total_tokens（供前端输入栏实时展示）"""
+    metrics = getattr(agent, "metrics", None) if agent else None
+    if metrics is None:
+        return 0
+    try:
+        return metrics.get_summary()["llm"]["total_tokens"]
+    except (KeyError, TypeError):
+        return 0
+
+
+def _enrich_done(ev: Dict[str, Any]) -> Dict[str, Any]:
+    """为 done 事件附加 total_tokens，前端据此更新输入栏 token 计数"""
+    if ev.get("type") == "done":
+        ev["total_tokens"] = _get_total_tokens()
+    return ev
+
+
 def _format_help_as_table(help_text: str) -> str:
     """将帮助文本转换成 Markdown 表格格式。"""
     lines = help_text.strip().split('\n')
@@ -444,6 +515,42 @@ def _format_help_as_table(help_text: str) -> str:
     return "\n".join(table_lines)
 
 
+def _is_execution_command(command: str) -> bool:
+    """判断命令是否为"执行型"（需要走流式 Runner，而非管理型同步命令）。
+
+    执行型命令会把任务交给 Agent 流式执行：
+    - ``json:`` / ``react:`` / ``cot:`` 直接进入任务执行
+    - ``skill:<name> <task>`` 带任务文本时执行；``skill:clear`` / 仅列出技能时是管理型
+
+    Args:
+        command: 去掉了前导 ``/`` 的命令字符串
+
+    Returns:
+        是否为执行型命令。是则走 astream_chat 流式通道，否则走 dispatch_command 管理通道。
+    """
+    low = command.lower()
+    if low.startswith(("json:", "react:", "cot:")):
+        return True
+    if low.startswith("skill:"):
+        # skill:<name> <task> 是执行型；skill:clear 或 skill:<name>（无任务）是管理型
+        rest = command[6:].strip()
+        parts = rest.split(None, 1)
+        skill_name = parts[0].strip() if parts else ""
+        task_text = parts[1].strip() if len(parts) > 1 else ""
+        return bool(skill_name and task_text and skill_name.lower() not in ("clear", "清空", "reset"))
+    return False
+
+
+def _unsupported_runner(agent_obj: object, text: str) -> str:
+    """Web 端 Runner 兜底：不支持交互式执行时返回明确提示，避免静默 `None`。
+
+    当管理型命令内部嵌套执行型调用（如 ``role:<name> <task>``）时，
+    返回标记文本代替 `None`，由命令层打印出来，用户能看到原因而非空结果。
+    """
+    return "[Web 通道暂不支持该嵌套执行，请改用 json:/react:/普通对话发送]"
+
+
+# 双方共用：捕获执行型命令统一走流式，其余走管理型 dispatch_command
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
     """SSE 流式聊天。支持普通对话和命令执行（如 /skill:pptx <task>、/json:、/react: 等）。"""
@@ -497,8 +604,8 @@ async def chat(req: ChatRequest):
                         select_menu=lambda title, choices: choices[0] if choices else "",
                         create_llm=lambda provider: create_llm(provider, LLM_FILE),
                         list_providers=lambda: load_providers(LLM_FILE),
-                        run_structured_until_completion=lambda agent_obj, text: None,  # 占位，实际用 stream_runner
-                        chat_until_completion=lambda agent_obj, text: None,  # 占位
+                        run_structured_until_completion=_unsupported_runner,  # 嵌套执行返回明确提示,不静默 None
+                        chat_until_completion=_unsupported_runner,  # 同上
                         safety_backend=safety_module,
                         base_dir=BASE_DIR,
                         config_file=AGENT_CONFIG_FILE,
@@ -506,28 +613,15 @@ async def chat(req: ChatRequest):
                         workflow_event_cb=emit_workflow_event,
                     )
                     
-                    # 检测执行型命令（json:/react:/cot:/skill:<task>）
-                    low = command.lower()
-                    is_execution = False
-                    
-                    if low.startswith("json:") or low.startswith("react:") or low.startswith("cot:"):
-                        is_execution = True
-                    elif low.startswith("skill:"):
-                        # skill:<name> <task> 是执行型，skill:clear 或 skill:<name>（无任务）是管理型
-                        rest = command[6:].strip()
-                        parts = rest.split(None, 1)
-                        skill_name = parts[0].strip() if parts else ""
-                        task_text = parts[1].strip() if len(parts) > 1 else ""
-                        # 有技能名且有任务文本，且不是 clear
-                        if skill_name and task_text and skill_name.lower() not in ("clear", "清空", "reset"):
-                            is_execution = True
+                    # 执行型命令（json:/react:/cot:/skill:<task>）走流式通道
+                    is_execution = _is_execution_command(command)
                     
                     if is_execution:
                         # 执行型命令：走流式 runner
                         logger.info("执行型命令 [%s]，走流式通道", tid)
                         # 把命令原文传给 astream_chat（它会自动匹配技能）
                         async for ev in agent.astream_chat(command):
-                            yield _sse(ev)
+                            yield _sse(_enrich_done(ev))
                         logger.info("完成 [%s]", tid)
                         return
                     else:
@@ -569,7 +663,7 @@ async def chat(req: ChatRequest):
                             if output:
                                 yield _sse({"type": "token", "content": output})
 
-                        yield _sse({"type": "done"})
+                        yield _sse({"type": "done", "total_tokens": _get_total_tokens()})
                         logger.info("命令完成 [%s]: %s", tid, outcome)
                         return
                         
@@ -581,7 +675,7 @@ async def chat(req: ChatRequest):
             # 普通对话模式
             try:
                 async for event in agent.astream_chat(req.message):
-                    yield _sse(event)
+                    yield _sse(_enrich_done(event))
                 logger.info("完成 [%s]", tid)
             except Exception as e:
                 logger.error("异常 [%s]: %s", tid, e)
@@ -711,6 +805,159 @@ async def execute_command(req: CommandRequest):
             error_trace = traceback.format_exc()
             logger.error("命令执行异常 [%s]: %s\n%s", tid, e, error_trace)
             raise HTTPException(status_code=500, detail=f"{e}\n\n{error_trace}")
+
+
+# --------------------------------------------------------------------------- #
+# 运行时指标
+# --------------------------------------------------------------------------- #
+@app.get("/api/metrics")
+async def get_metrics():
+    """获取运行时指标（LLM 调用、工具执行、压缩统计的结构化 JSON）"""
+    metrics = getattr(agent, "metrics", None) if agent else None
+    if metrics is None:
+        raise HTTPException(status_code=503, detail="指标收集不可用")
+    return metrics.get_summary()
+
+
+@app.post("/api/metrics/reset")
+async def reset_metrics():
+    """重置所有运行时指标"""
+    metrics = getattr(agent, "metrics", None) if agent else None
+    if metrics is None:
+        raise HTTPException(status_code=503, detail="指标收集不可用")
+    metrics.reset()
+    logger.info("指标已重置")
+    return {"reset": True}
+
+
+# --------------------------------------------------------------------------- #
+# 上下文压缩
+# --------------------------------------------------------------------------- #
+@app.post("/api/compact")
+async def compact_context(thread_id: Optional[str] = None):
+    """手动触发当前会话的上下文压缩（增量摘要 + 工具输出 Prune）
+
+    与 before_model 中间件使用相同的压缩逻辑，适用于对话过长时主动释放 token。
+    """
+    async with chat_lock:
+        if thread_id:
+            agent.memory.thread_id = thread_id
+        tid = agent.memory.thread_id
+        logger.info("手动压缩上下文 [%s]", tid)
+        try:
+            result = await agent.manually_compact()
+        except Exception as e:
+            logger.error("压缩失败 [%s]: %s", tid, e)
+            raise HTTPException(status_code=500, detail=f"压缩失败: {e}")
+        if result is None:
+            return {"compacted": False, "message": "消息数未超阈值或无消息可压缩", "thread_id": tid}
+        logger.info("压缩完成 [%s]: %d → %d 条消息", tid, result["messages_before"], result["messages_after"])
+        return {"compacted": True, "thread_id": tid, **result}
+
+
+# --------------------------------------------------------------------------- #
+# 记忆管理
+# --------------------------------------------------------------------------- #
+@app.get("/api/memory")
+async def get_memory_summary():
+    """获取记忆摘要统计（当前会话消息数、长期记忆条数、checkpoint 信息）"""
+    if not agent:
+        raise HTTPException(status_code=503, detail="Agent 未初始化")
+    return agent.get_memory_summary()
+
+
+@app.post("/api/compress")
+async def compress_long_term_memory():
+    """压缩长期记忆（用 LLM 生成摘要并替换原始记忆条目）
+
+    compress_memory 内部调用同步 LLM，用 to_thread 避免阻塞事件循环。
+    """
+    async with chat_lock:
+        logger.info("压缩长期记忆")
+        try:
+            result = await asyncio.to_thread(agent.compress_memory)
+        except Exception as e:
+            logger.error("长期记忆压缩失败: %s", e)
+            raise HTTPException(status_code=500, detail=f"压缩失败: {e}")
+        if result.get("success"):
+            logger.info("长期记忆压缩完成: %d 条 → %d 字符", result.get("original_count", 0), result.get("compressed_chars", 0))
+        return result
+
+
+@app.delete("/api/memory")
+async def clear_memory(scope: str = "long"):
+    """清空记忆
+
+    Args:
+        scope: long=仅长期记忆, short=仅短期记忆(当前会话), all=全部
+    """
+    async with chat_lock:
+        if scope in ("long", "长期"):
+            agent.memory.clear_long_term()
+            logger.info("已清空长期记忆")
+        elif scope in ("short", "短期"):
+            agent.memory.clear_short_term()
+            logger.info("已清空短期记忆")
+        elif scope in ("all", "全部"):
+            agent.memory.clear_long_term()
+            agent.memory.clear_short_term()
+            logger.info("已清空全部记忆")
+        else:
+            raise HTTPException(status_code=400, detail="scope 必须为 long|short|all")
+        return {"cleared": True, "scope": scope}
+
+
+# --------------------------------------------------------------------------- #
+# 安全策略
+# --------------------------------------------------------------------------- #
+@app.get("/api/safety")
+async def get_safety():
+    """获取安全策略配置"""
+    return safety_module.load_config()
+
+
+@app.put("/api/safety")
+async def update_safety(req: SafetyUpdateRequest):
+    """更新安全策略配置（mode 和/或 confirm_dangerous）"""
+    config = safety_module.load_config()
+    if req.mode is not None:
+        if req.mode not in ("blacklist", "whitelist"):
+            raise HTTPException(status_code=400, detail="mode 必须为 blacklist|whitelist")
+        config["mode"] = req.mode
+    if req.confirm_dangerous is not None:
+        config["confirm_dangerous"] = req.confirm_dangerous
+    if safety_module.save_config(config):
+        logger.info("安全策略已更新: mode=%s, confirm=%s", config.get("mode"), config.get("confirm_dangerous"))
+        return config
+    raise HTTPException(status_code=500, detail="保存失败")
+
+
+# --------------------------------------------------------------------------- #
+# 技能列表
+# --------------------------------------------------------------------------- #
+@app.get("/api/skills")
+async def get_skills():
+    """列出所有本地可用技能"""
+    return {"skills": agent.list_skills() if agent else []}
+
+
+# --------------------------------------------------------------------------- #
+# 会话导出
+# --------------------------------------------------------------------------- #
+@app.get("/api/threads/{thread_id}/export")
+async def export_thread(thread_id: str, fmt: str = "text"):
+    """导出指定会话的对话为可读文本
+
+    Args:
+        thread_id: 会话 ID
+        fmt: 导出格式，支持 text（默认）与 markdown
+    """
+    if not agent:
+        raise HTTPException(status_code=503, detail="Agent 未初始化")
+    if fmt not in ("text", "markdown"):
+        raise HTTPException(status_code=400, detail="fmt 必须为 text|markdown")
+    content = agent.memory.export_thread(thread_id=thread_id, fmt=fmt)
+    return {"thread_id": thread_id, "format": fmt, "content": content}
 
 
 # 生产环境：如果前端已构建（web/dist），则由本服务直接托管静态文件

@@ -1,5 +1,6 @@
 """LangGraph human-input tool and CLI pause/resume orchestration."""
 
+import asyncio
 from typing import Any
 from typing_extensions import TypedDict
 
@@ -59,13 +60,13 @@ def _resume_payload_for_interrupts(interrupts, read_resume):
 
 def run_human_input_loop(agent, message, render_interrupt, read_resume):
     """启动对话并持续恢复人工中断，直到本轮完成。"""
-    turn = agent.chat_structured(message)
+    turn = asyncio.run(agent.achat_structured(message))
     return complete_human_input_turn(
         turn,
         render_interrupt,
-        lambda interrupts: agent.resume_structured(
+        lambda interrupts: asyncio.run(agent.aresume_structured(
             _resume_payload_for_interrupts(interrupts, read_resume)
-        ),
+        )),
     )
 
 
@@ -100,13 +101,13 @@ def read_human_resume(interrupt):
 
 def run_structured_until_completion(agent, message):
     """Run an Agent task and finish any human-input interruptions."""
-    turn = agent.run_structured(message)
+    turn = asyncio.run(agent.arun_structured(message))
     return complete_human_input_turn(
         turn,
         render_human_interrupt,
-        lambda interrupts: agent.resume_structured(
+        lambda interrupts: asyncio.run(agent.aresume_structured(
             _resume_payload_for_interrupts(interrupts, read_human_resume)
-        ),
+        )),
     )
 
 

@@ -1,14 +1,84 @@
 import ast
 import io
 import os
+import re
 import textwrap
 import tokenize
-from typing import Any, Dict, Optional
+from typing import Final
 
 from langchain.tools import tool
 
 # 默认工具存放目录：create_tools.py 的同级目录
 DEFAULT_TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
+DANGEROUS_IMPORTS: Final[frozenset[str]] = frozenset(
+    {
+        "ctypes",
+        "importlib",
+        "os",
+        "pathlib",
+        "requests",
+        "shutil",
+        "socket",
+        "subprocess",
+        "sys",
+        "urllib",
+    }
+)
+TOOL_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+
+
+def _build_error_result(tool_name: str, error: str) -> dict[str, str | bool | None]:
+    return {
+        "success": False,
+        "error": f"工具生成失败：{error}",
+        "source_code": None,
+        "tool_name": tool_name,
+        "file_path": None,
+        "registered": False,
+    }
+
+
+def _validate_tool_name(tool_name: str) -> str | None:
+    if not TOOL_NAME_PATTERN.fullmatch(tool_name):
+        return "工具名必须是合法 Python 标识符，且不能以下划线开头"
+    return None
+
+
+def _is_within_tool_dir(path: str) -> bool:
+    tool_root = os.path.realpath(DEFAULT_TOOL_DIR)
+    target = os.path.realpath(path)
+    try:
+        return os.path.commonpath([tool_root, target]) == tool_root
+    except ValueError:
+        return False
+
+
+def _resolve_tool_path(tool_name: str, tool_path: str | None) -> str:
+    if not tool_path:
+        return os.path.join(DEFAULT_TOOL_DIR, f"{tool_name}.py")
+    if os.path.isdir(tool_path):
+        return os.path.join(tool_path, f"{tool_name}.py")
+    return tool_path
+
+
+def _find_disallowed_import(source_code: str) -> str | None:
+    tree = ast.parse(source_code)
+    for node in ast.walk(tree):
+        match node:
+            case ast.Import(names=names):
+                for alias in names:
+                    root_name = alias.name.split(".", maxsplit=1)[0]
+                    if root_name in DANGEROUS_IMPORTS:
+                        return alias.name
+            case ast.ImportFrom(module=module):
+                if module is None:
+                    continue
+                root_name = module.split(".", maxsplit=1)[0]
+                if root_name in DANGEROUS_IMPORTS:
+                    return module
+            case _:
+                continue
+    return None
 
 
 def _sync_tools_init(tool_name: str, init_path: str) -> bool:
@@ -107,7 +177,14 @@ def _indent_body(body: str, prefix: str = "        ") -> str:
 
 
 @tool
-def create_tool(tool_name: str, tool_description: str, args_spec: str, tool_logic: str, tool_path: Optional[str] = None) -> Dict[str, Any]:
+def create_tool(
+    tool_name: str,
+    tool_description: str,
+    args_spec: str,
+    tool_logic: str,
+    tool_path: str | None = None,
+    force: bool = False,
+) -> dict[str, str | bool | None]:
     """
     动态生成Langchain标准@tool装饰器工具源码。
     使用统一规范模板输出可直接运行的Python工具代码，遵循项目统一返回结构。
@@ -121,11 +198,16 @@ def create_tool(tool_name: str, tool_description: str, args_spec: str, tool_logi
         tool_logic: 工具主体业务逻辑（函数内部实现代码，不要写函数定义、装饰器）
         tool_path: 工具存放的路径，可传目录或.py文件路径；
                    为空时默认保存到 create_tools.py 同级目录（tools/）下 tool_name.py
+        force: 是否覆盖已存在文件，默认禁止覆盖
 
     Returns:
         字典包含生成的完整源码、状态，成功可直接写入文件运行
     """
     try:
+        invalid_tool_name = _validate_tool_name(tool_name)
+        if invalid_tool_name is not None:
+            return _build_error_result(tool_name, invalid_tool_name)
+
         # 模板：使用占位符 + str.replace 拼接，而不是 str.format。
         # 这样模板内的花括号无需转义，用户 tool_logic 中的 f-string 花括号也不会被误解析。
         template = '''from langchain_core.tools import tool
@@ -182,13 +264,20 @@ def @TOOL_NAME@(@PARAMS@) -> Dict[str, Any]:
         # 校验生成的源码语法，不合法则不写入文件
         ast.parse(source_code)
 
-        # 解析保存路径：为空 -> 默认同级目录；已有目录 -> 拼接 tool_name.py；否则视为完整文件路径
-        if not tool_path:
-            tool_path = os.path.join(DEFAULT_TOOL_DIR, f"{tool_name}.py")
-        elif os.path.isdir(tool_path):
-            tool_path = os.path.join(tool_path, f"{tool_name}.py")
+        disallowed_import = _find_disallowed_import(source_code)
+        if disallowed_import is not None:
+            return _build_error_result(tool_name, f"禁止导入高风险模块：{disallowed_import}")
+
+        # 解析保存路径并限制在 tools 目录内
+        tool_path = _resolve_tool_path(tool_name, tool_path)
 
         abs_path = os.path.abspath(tool_path)
+        if not _is_within_tool_dir(abs_path):
+            return _build_error_result(tool_name, "路径逃逸被禁止")
+
+        if os.path.exists(abs_path) and not force:
+            return _build_error_result(tool_name, f"目标文件已存在：{abs_path}")
+
         parent = os.path.dirname(abs_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -204,8 +293,8 @@ def @TOOL_NAME@(@PARAMS@) -> Dict[str, Any]:
                 registered = _sync_tools_init(tool_name, os.path.join(DEFAULT_TOOL_DIR, "__init__.py"))
                 if registered:
                     message += "，并已注册到 tools/__init__.py"
-            except Exception as err:
-                message += f"，但注册到 tools/__init__.py 失败：{str(err)}"
+            except (IndexError, OSError, ValueError) as err:
+                message += f"，但注册到 tools/__init__.py 失败：{err!s}"
 
         return {
             "success": True,
@@ -216,12 +305,5 @@ def @TOOL_NAME@(@PARAMS@) -> Dict[str, Any]:
             "message": message
         }
 
-    except Exception as err:
-        return {
-            "success": False,
-            "error": f"工具生成失败：{str(err)}",
-            "source_code": None,
-            "tool_name": tool_name,
-            "file_path": None,
-            "registered": False
-        }
+    except (IndexError, KeyError, OSError, SyntaxError, TypeError, ValueError) as err:
+        return _build_error_result(tool_name, str(err))

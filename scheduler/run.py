@@ -17,6 +17,7 @@
     - 启动时自动从数据库同步未完成的周期任务（程序重启不丢失）
 """
 import json
+import logging
 import os
 import sys
 
@@ -27,8 +28,11 @@ if _PROJECT_ROOT not in sys.path:
 
 from agent.config import load_agent_config, resolve_path
 from agent.llm_client import LLMClient, load_providers
+from agent.logging_config import setup_logging
 from agent import AgentCore
 from scheduler import TaskStore, SchedulerEngine
+
+logger = logging.getLogger(__name__)
 
 
 # ---- 默认路径 ----
@@ -86,12 +90,13 @@ def make_agent_factory(provider: str):
     """
     # 预加载配置（避免每次创建 agent 都读文件）
     agent_config = load_agent_config(AGENT_CONFIG_FILE)
+    agent_prompt_file = agent_config.get("agent_prompt_file")
     skills_dir = resolve_path(agent_config["skills_dir"], BASE_DIR)
     mcp_config_file = resolve_path(agent_config["mcp_config_file"], BASE_DIR)
 
     # 预创建 LLM 客户端（创建 chat model 是最重的部分，只做一次）
     llm = LLMClient(provider=provider, config_file=LLM_CONFIG_FILE)
-    print(f"[Scheduler] LLM 已就绪: {llm.get_info()['provider_name']} / {llm.model}")
+    logger.info("LLM 已就绪: %s / %s", llm.get_info()["provider_name"], llm.model)
 
     def factory() -> AgentCore:
         return AgentCore(
@@ -109,7 +114,9 @@ def make_agent_factory(provider: str):
             max_context_messages=agent_config["max_context_messages"],
             context_trim_keep=agent_config["context_trim_keep"],
             process_type="scheduler",
-            agent_core_prompt=agent_config["agent_core_prompt"]
+            agent_prompt_file=agent_prompt_file,
+            max_execution_history=agent_config.get("max_execution_history", 100),
+            tool_timeout=agent_config.get("tool_timeout", 120),
         )
 
     return factory
@@ -131,7 +138,7 @@ def pick_provider(config_provider):
     # 自动选择第一个已配置 API Key 的提供商
     providers = load_providers(LLM_CONFIG_FILE)
     if not providers:
-        print("错误: config/llm_config.json 中未配置任何 LLM 提供商")
+        logger.error("config/llm_config.json 中未配置任何 LLM 提供商")
         sys.exit(1)
 
     for key, cfg in providers.items():
@@ -142,10 +149,13 @@ def pick_provider(config_provider):
 
 
 def main():
+    # 0. 初始化结构化日志
+    setup_logging()
+
     # 1. 加载配置文件（config/scheduler_config.json）
     config = load_scheduler_config(SCHEDULER_CONFIG_FILE)
 
-    print(f"[Scheduler] 使用配置文件: {SCHEDULER_CONFIG_FILE}")
+    logger.info("使用配置文件: %s", SCHEDULER_CONFIG_FILE)
 
     # 从配置文件取值
     provider = pick_provider(config.get("provider"))
@@ -154,12 +164,13 @@ def main():
     timezone = config.get("timezone")
     max_workers = config["max_workers"]
 
+    # 启动 banner（保持 print，面向用户）
     print("=" * 60)
     print("  定时任务调度器 (Scheduler Engine)")
     print("=" * 60)
 
     # 2. 构造 agent_factory
-    print(f"\n[Scheduler] 使用 LLM 提供商: {provider}")
+    logger.info("使用 LLM 提供商: %s", provider)
     agent_factory = make_agent_factory(provider)
 
     # 2.5 预加载 team 模块,触发 @register_agent 装饰器注册工作流角色
@@ -168,14 +179,14 @@ def main():
         import team  # noqa: F401  触发各 agent 模块的 @register_agent
         from graph.registry import list_workflows, AGENT_REGISTRY
         wf_list = list_workflows()
-        print(f"[Scheduler] 已注册 Agent: {', '.join(sorted(AGENT_REGISTRY.keys()))}")
-        print(f"[Scheduler] 可用工作流: {', '.join(name for name, _ in wf_list)}")
+        logger.info("已注册 Agent: %s", ", ".join(sorted(AGENT_REGISTRY.keys())))
+        logger.info("可用工作流: %s", ", ".join(name for name, _ in wf_list))
     except Exception as exc:
-        print(f"[Scheduler] 警告: 工作流模块加载失败({exc}),workflow: 任务将不可用")
+        logger.warning("工作流模块加载失败(%s),workflow: 任务将不可用", exc)
 
     # 3. 初始化 TaskStore
     task_store = TaskStore(db_path)
-    print(f"[Scheduler] 数据库: {db_path}")
+    logger.info("数据库: %s", db_path)
 
     # 4. 创建调度引擎（阻塞模式）
     engine = SchedulerEngine(
@@ -188,17 +199,16 @@ def main():
     )
 
     # 5. 启动（阻塞直到 Ctrl+C）
-    print(f"\n[Scheduler] 轮询间隔: {poll_interval}s")
-    print(f"[Scheduler] 并发线程数: {max_workers}")
-    print(f"[Scheduler] 时区: {timezone or '系统默认'}")
-    print()
+    logger.info("轮询间隔: %ds", poll_interval)
+    logger.info("并发线程数: %d", max_workers)
+    logger.info("时区: %s", timezone or "系统默认")
 
     try:
         engine.start()  # BlockingScheduler 会阻塞在这里
     except KeyboardInterrupt:
-        print("\n[Scheduler] 收到中断信号，正在停止...")
+        logger.info("收到中断信号，正在停止...")
         engine.stop()
-        print("[Scheduler] 已安全退出")
+        logger.info("已安全退出")
 
 
 if __name__ == "__main__":

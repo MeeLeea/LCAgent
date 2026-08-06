@@ -4,12 +4,14 @@ MCP 工具加载器 - 从 MCP Server 动态加载 LangChain 工具
 """
 import asyncio
 import json
+import logging
 import os
 import sys
 import functools
 from typing import List, Dict, Any, Optional, Type
 from langchain_core.tools import BaseTool, StructuredTool
 
+logger = logging.getLogger(__name__)
 
 # 默认配置文件路径
 DEFAULT_CONFIG_FILE = "config/mcp_servers.json"
@@ -31,7 +33,7 @@ def load_mcp_config(config_file: str = DEFAULT_CONFIG_FILE) -> Dict[str, Any]:
         with open(config_file, 'r', encoding='utf-8') as f:
             return json.load(f)
     except (json.JSONDecodeError, IOError) as e:
-        print(f"[MCP] 配置文件读取失败: {e}")
+        logger.error("MCP 配置文件读取失败: %s", e)
         return {"servers": {}}
 
 
@@ -151,10 +153,10 @@ async def load_mcp_tools(config_file: str = DEFAULT_CONFIG_FILE) -> List[BaseToo
             client = MultiServerMCPClient({name: server_cfg})
             tools = await client.get_tools()
             if tools:
-                print(f"[MCP] {name}: 加载了 {len(tools)} 个工具")
+                logger.info("MCP %s: 加载了 %d 个工具", name, len(tools))
                 all_tools.extend(tools)
         except Exception as e:
-            print(f"[MCP] {name}: 加载失败 - {e}")
+            logger.error("MCP %s: 加载失败 - %s", name, e, exc_info=True)
 
     # 包装为同步兼容
     sync_tools = [make_sync_compatible(t) for t in all_tools]

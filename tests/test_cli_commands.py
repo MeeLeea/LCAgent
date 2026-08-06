@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from cli.commands.dispatcher import dispatch_command
 from cli.commands.types import CommandContext
-
-import pytest
 
 
 @dataclass
@@ -39,6 +40,9 @@ class FakeAgent:
         self.calls.append(("switch_llm", llm))
         self.llm = llm
 
+    async def aswitch_llm(self, llm: Any) -> None:
+        self.switch_llm(llm)
+
     def get_memory_summary(self) -> dict[str, Any]:
         self.calls.append(("get_memory_summary", None))
         return {
@@ -54,6 +58,9 @@ class FakeAgent:
         self.calls.append(("reload_mcp_tools", None))
         return 4
 
+    async def areload_mcp_tools(self) -> int:
+        return self.reload_mcp_tools()
+
     def list_skills(self) -> list[dict[str, str]]:
         self.calls.append(("list_skills", None))
         return [{"name": "git-commit", "description": "commit helper"}]
@@ -61,6 +68,15 @@ class FakeAgent:
     def load_skill(self, name: str) -> bool:
         self.calls.append(("load_skill", name))
         return True
+
+    async def aclear_skills(self) -> None:
+        self.calls.append(("clear_skills", None))
+
+    def clear_skills(self) -> None:
+        self.calls.append(("clear_skills", None))
+
+    async def aload_skill(self, name: str) -> bool:
+        return self.load_skill(name)
 
     def cot(self, task: str) -> str:
         self.calls.append(("cot", task))
@@ -273,3 +289,35 @@ def test_dispatch_execution_modes_call_expected_runner(
     assert result.handled is True
     calls = harness.runners.calls + harness.agent.calls
     assert any(call[0] == expected_call for call in calls)
+
+
+def test_dispatch_log_shows_current_level_and_handles(harness: Harness) -> None:
+    # Given: logging is configured.
+    # When: log command is dispatched without arguments.
+    result = dispatch(harness, "log")
+    # Then: the command is handled locally and shows the current level.
+    assert result.handled is True
+    assert any("日志级别" in msg or "log" in msg.lower() for msg in harness.printed)
+
+
+def test_dispatch_log_with_level_changes_and_confirms(harness: Harness) -> None:
+    # Given: an initial log level.
+    original = logging.getLogger().level
+    try:
+        # When: log:debug is dispatched.
+        result = dispatch(harness, "log:debug")
+        # Then: the level changes to DEBUG and user sees confirmation.
+        assert result.handled is True
+        assert logging.getLogger().level == logging.DEBUG
+        assert any("DEBUG" in msg for msg in harness.printed)
+    finally:
+        logging.getLogger().setLevel(original)
+
+
+def test_dispatch_log_with_invalid_level_shows_error(harness: Harness) -> None:
+    # Given: an invalid level name.
+    # When: log:invalid is dispatched.
+    result = dispatch(harness, "log:invalid")
+    # Then: the command is handled and an error message is shown.
+    assert result.handled is True
+    assert any("失败" in msg or "未知" in msg for msg in harness.printed)

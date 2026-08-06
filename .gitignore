@@ -52,8 +52,8 @@ Thumbs.db
 calibrate_*.png
 *.log
 
-llm_config.json
 
+drafts
 node_modules/
 memory/
 .agents/

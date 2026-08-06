@@ -13,6 +13,7 @@ except ImportError:
 
 from agent import AgentCore
 from agent.config import load_agent_config, resolve_path
+from agent.logging_config import setup_logging
 from tools import safety as safety_module
 from cli.cli_menu import select_menu
 from cli.commands import CommandContext, dispatch_command
@@ -47,7 +48,8 @@ def build_agent(provider: str, process_type: str = None) -> tuple[AgentCore, obj
     print(f"\n初始化 {list_providers(LLM_FILE)[provider]['name']} 客户端...")
     llm = create_llm(provider, LLM_FILE)
     print("加载运行时配置...")
-    config = load_agent_config(AGENT_CONFIG_FILE, base_dir=BASE_DIR)
+    config = load_agent_config(AGENT_CONFIG_FILE)
+    agent_prompt_file = config.get("agent_prompt_file")
     # 配置中的相对路径统一锚定项目根，避免调用方工作目录影响资源加载。
     skills_dir = resolve_path(config["skills_dir"], BASE_DIR)
     mcp_config_file = resolve_path(config["mcp_config_file"], BASE_DIR)
@@ -67,7 +69,9 @@ def build_agent(provider: str, process_type: str = None) -> tuple[AgentCore, obj
         max_context_messages=config["max_context_messages"],
         context_trim_keep=config["context_trim_keep"],
         process_type=process_type,
-        agent_core_prompt=config["agent_core_prompt"]
+        agent_prompt_file=agent_prompt_file,
+        max_execution_history=config.get("max_execution_history", 100),
+        tool_timeout=config.get("tool_timeout", 120),
     )
     return agent, llm
 
@@ -95,8 +99,10 @@ def make_context(agent: AgentCore) -> CommandContext:
 
 def main() -> None:
     """运行交互式命令行主循环。"""
+    setup_logging()
+    # 启动 banner（保持 print，面向用户）
     print("=" * 50)
-    print("  LangChain Agent (基于LangChain框架)")
+    print("  LC Agent (基于LangChain框架)")
     print("=" * 50)
     provider = select_provider(LLM_FILE, select_menu)
     agent, _ = build_agent(provider)
