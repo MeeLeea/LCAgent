@@ -188,8 +188,8 @@ def start_agent() -> str:
                         agent._arepair_rejected_tool_calls(agent._invoke_config())
                     )
                     agent._clear_pending_interrupt()
-                except Exception:
-                    pass
+                except Exception as error:
+                    logger.warning("修复孤儿 tool_call 失败: %s", error, exc_info=True)
                 result_container.append((agent, llm, agent.memory.thread_id))
             except Exception as e:
                 error_container.append(e)

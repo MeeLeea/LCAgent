@@ -15,6 +15,7 @@ self.compaction_summary 的跨会话污染问题。
 """
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Optional
@@ -30,6 +31,8 @@ from langchain_core.messages import (
 from langchain_core.messages.utils import get_buffer_string
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.runtime import Runtime
+
+logger = logging.getLogger(__name__)
 
 
 class LCAgentState(AgentState):
@@ -266,7 +269,8 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
         try:
             response = self.model.invoke(prompt)
             return response.text.strip()
-        except Exception:
+        except Exception as error:
+            logger.warning("增量摘要生成失败，跳过压缩: %s", error, exc_info=True)
             return ""
 
     async def _aincremental_summary(
@@ -284,7 +288,8 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
         try:
             response = await self.model.ainvoke(prompt)
             return response.text.strip()
-        except Exception:
+        except Exception as error:
+            logger.warning("增量摘要生成失败，跳过压缩: %s", error, exc_info=True)
             return ""
 
     @staticmethod

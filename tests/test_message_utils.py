@@ -1,5 +1,8 @@
-"""agent.message_utils.extract_llm_error 的单元测试。"""
-from agent.message_utils import extract_llm_error
+"""agent.message_utils.extract_llm_error 与 interrupt 检查的单元测试。"""
+
+from types import SimpleNamespace
+
+from agent.message_utils import StreamHandler, extract_llm_error
 
 
 def test_extract_429_json_message():
@@ -49,3 +52,20 @@ def test_extract_empty_exception_fallback():
     """空错误信息：使用异常类型名兜底。"""
     result = extract_llm_error(RuntimeError())
     assert result == "执行出错: RuntimeError"
+
+
+def test_check_interrupt_logs_and_returns_none_when_state_lookup_fails(caplog):
+    """interrupt 读取失败时记录 warning 并返回 None。"""
+
+    class _BrokenExecutor:
+        def get_state(self, config):
+            raise RuntimeError("state 读取失败")
+
+    agent = SimpleNamespace(agent_executor=_BrokenExecutor())
+    handler = StreamHandler(agent)
+
+    with caplog.at_level("WARNING"):
+        result = handler._check_interrupt({"configurable": {"thread_id": "thread-1"}})
+
+    assert result is None
+    assert "检查 interrupt 失败" in caplog.text

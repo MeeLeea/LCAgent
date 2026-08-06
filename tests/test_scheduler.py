@@ -355,6 +355,22 @@ class TestSchedulerEngine:
 
         engine.stop()
 
+    def test_unregister_missing_periodic_task_does_not_raise(self, store, caplog):
+        mock_agent = MagicMock()
+        engine = SchedulerEngine(
+            task_store=store,
+            agent_factory=lambda: mock_agent,
+            poll_interval=3600,
+        )
+        engine.start()
+
+        with caplog.at_level("DEBUG"):
+            engine.unregister_periodic_task(999999)
+
+        assert "移除周期任务 job 失败，按缺省处理忽略" in caplog.text
+
+        engine.stop()
+
     def test_concurrent_execution_of_multiple_due_tasks(self, store):
         """同一轮到期的多个任务在线程池中并发执行，而非串行。"""
         import threading as _threading

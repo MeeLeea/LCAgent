@@ -6,6 +6,7 @@
 3. 流式事件生成 Mixin（StreamMixin），供 AgentCore 继承
 """
 import asyncio
+import logging
 import re
 import threading
 import time
@@ -21,6 +22,8 @@ from langgraph.types import Command
 
 from .llm_client import RETRY_ATTEMPTS, RETRY_MAX_DELAY, should_retry
 from tools.terminal_tools import UserRejectedCommandError
+
+logger = logging.getLogger(__name__)
 
 # ============ LLM 异常提取 ============
 
@@ -275,8 +278,8 @@ class StreamHandler:
                 for task in getattr(state, "tasks", []) or []:
                     for intr in getattr(task, "interrupts", []) or []:
                         return build_interrupt_event(getattr(intr, "value", None))
-        except Exception:
-            pass
+        except Exception as error:
+            logger.warning("检查 interrupt 失败: %s", error, exc_info=True)
         return None
 
     async def astream_chat(self, message: str):

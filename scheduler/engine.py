@@ -19,6 +19,8 @@ from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import datetime
 from typing import Any, Callable, Optional
 
+from apscheduler.schedulers.base import SchedulerNotRunningError
+from apscheduler.jobstores.base import JobLookupError
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -222,8 +224,8 @@ class SchedulerEngine:
         job_id = f"periodic_{task_id}"
         try:
             self._scheduler.remove_job(job_id)
-        except Exception:
-            pass  # job 不存在或调度器未启动，忽略
+        except (JobLookupError, SchedulerNotRunningError) as error:
+            logger.debug("移除周期任务 job 失败，按缺省处理忽略 [%s]: %s", job_id, error)
         self._registered_periodic.discard(job_id)
 
     # ---- 执行逻辑 ----

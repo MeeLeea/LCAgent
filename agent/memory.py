@@ -372,8 +372,8 @@ class AgentMemory:
                 channel_values = tup.checkpoint.get("channel_values", {})
                 if "messages" in channel_values:
                     return list(channel_values["messages"])
-        except Exception:
-            pass
+        except Exception as error:
+            logger.warning("读取 checkpoint 消息失败 [%s]: %s", target, error, exc_info=True)
         return []
 
     def export_thread(self, thread_id: Optional[str] = None, fmt: str = "text") -> str:

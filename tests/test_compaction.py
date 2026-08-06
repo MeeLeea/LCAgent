@@ -130,6 +130,35 @@ def test_compaction_summary_failure_returns_none():
     assert result is None  # 不压缩
 
 
+def test_compaction_summary_failure_returns_empty_string(caplog):
+    """摘要失败时返回空串并记录 warning。"""
+    model = FakeModel(fail=True)
+    mw = LCAgentCompactionMiddleware(model, CompactionConfig())
+    msgs = _build_messages(4)
+
+    with caplog.at_level("WARNING"):
+        sync_result = mw._create_summary_sync("旧摘要", msgs)
+
+    assert sync_result == ""
+    assert "增量摘要生成失败，跳过压缩" in caplog.text
+
+
+def test_async_compaction_summary_failure_returns_empty_string(caplog):
+    """异步摘要失败时返回空串并记录 warning。"""
+    model = FakeModel(fail=True)
+    mw = LCAgentCompactionMiddleware(model, CompactionConfig())
+    msgs = _build_messages(4)
+
+    async def run():
+        with caplog.at_level("WARNING"):
+            return await mw._aincremental_summary("旧摘要", msgs)
+
+    result = asyncio.run(run())
+
+    assert result == ""
+    assert "增量摘要生成失败，跳过压缩" in caplog.text
+
+
 # ============ 工具输出 Prune ============
 
 
