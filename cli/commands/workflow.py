@@ -11,9 +11,39 @@ from .types import HANDLED, CommandContext, CommandOutcome
 MAX_RAW_CONTEXT_CHARS = 6000
 
 
+async def abuild_memory_context(memory) -> str:
+    """
+    从 AgentMemory 提取当前会话短期记忆与长期记忆,拼装为文本并截断 - 异步版本
+    
+    Args:
+        memory: AgentMemory 实例
+        
+    Returns:
+        记忆文本;无记忆时返回空串
+    """
+    blocks = []
+
+    short_term = await memory.aget_short_term() or []
+    if short_term:
+        lines = [f"{item.get('role', 'user')}: {item.get('content', '')}" for item in short_term]
+        blocks.append("【当前会话】\n" + "\n".join(lines))
+
+    long_term = memory.get_long_term() or []
+    if long_term:
+        lines = [f"{item.get('role', 'user')}: {item.get('content', '')}" for item in long_term]
+        blocks.append("【长期记忆】\n" + "\n".join(lines))
+
+    text = "\n\n".join(blocks).strip()
+    if len(text) > MAX_RAW_CONTEXT_CHARS:
+        text = text[:MAX_RAW_CONTEXT_CHARS] + "\n...(记忆文本过长,已截断)"
+    return text
+
+
 def build_memory_context(memory) -> str:
     """
-    从 AgentMemory 提取当前会话短期记忆与长期记忆,拼装为文本并截断
+    从 AgentMemory 提取当前会话短期记忆与长期记忆,拼装为文本并截断 - 同步版本（已废弃）
+    
+    @deprecated: 请使用 abuild_memory_context() 异步版本
     
     Args:
         memory: AgentMemory 实例
@@ -60,9 +90,9 @@ def _record_workflow_result(context: CommandContext, name: str, task: str, resul
         pass
 
 
-def run_workflow(context: CommandContext, name: str, task: str) -> dict:
+async def run_workflow(context: CommandContext, name: str, task: str) -> dict:
     """
-    运行指定工作流
+    运行指定工作流 - 异步版本
 
     Args:
         context: 命令上下文
@@ -107,7 +137,7 @@ def run_workflow(context: CommandContext, name: str, task: str) -> dict:
         result = runner(
             graph,
             task,
-            raw_context=build_memory_context(context.agent.memory),
+            raw_context=await abuild_memory_context(context.agent.memory),
             on_node_start=_on_node_start,
             on_node_end=_on_node_end,
         )
@@ -118,9 +148,9 @@ def run_workflow(context: CommandContext, name: str, task: str) -> dict:
     return result
 
 
-def workflow_command(context: CommandContext, user_input: str) -> CommandOutcome:
+async def workflow_command(context: CommandContext, user_input: str) -> CommandOutcome:
     """
-    处理 workflow 相关命令
+    处理 workflow 相关命令 - 异步版本
     
     支持命令:
         workflow              - 列出可用工作流
@@ -170,7 +200,7 @@ def workflow_command(context: CommandContext, user_input: str) -> CommandOutcome
         
         # 执行工作流
         try:
-            result = run_workflow(context, workflow_name, task)
+            result = await run_workflow(context, workflow_name, task)
             
             # 输出最终答案
             context.print("\n" + "=" * 50)

@@ -187,7 +187,7 @@ def start_agent() -> str:
             _safety.set_confirm_backend(_safety.interrupt_confirm)
             tid = _load_remote_thread_id()
             if tid:
-                agent.memory.switch_thread(tid)
+                await agent.memory.aswitch_thread(tid)
             else:
                 _save_remote_thread_id(agent.memory.thread_id)
             # 主动修复可能残留的孤儿 tool_calls（上次中断可能遗留）

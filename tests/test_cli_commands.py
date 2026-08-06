@@ -83,6 +83,10 @@ class FakeAgent:
         self.calls.append(("cot", task))
         return f"cot:{task}"
 
+    async def acot(self, task: str) -> str:
+        self.calls.append(("cot", task))
+        return f"cot:{task}"
+
 
 @dataclass
 class FakeLlm:

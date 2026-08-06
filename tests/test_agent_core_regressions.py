@@ -24,6 +24,9 @@ def test_compaction_retains_recent_messages_in_new_thread_state():
         def get_messages(self):
             return messages
 
+        async def aget_messages(self):
+            return messages
+
         def get_config(self):
             return {"configurable": {"thread_id": self.thread_id}}
 
@@ -84,6 +87,9 @@ def test_compaction_does_not_change_thread_when_summary_fails():
             self.thread_id = "thread-before"
 
         def get_messages(self):
+            return messages
+
+        async def aget_messages(self):
             return messages
 
         def get_config(self):
@@ -460,9 +466,21 @@ def test_achat_falls_back_for_non_interrupt_failures():
     # Given: 异步对话入口抛出非中断的 RuntimeError 与普通 Exception。
     from agent.agent_core import AgentCore
 
+    class FakeMemory:
+        async def aget_short_term(self):
+            return []
+        
+        def add(self, role, content, metadata=None):
+            pass
+
+    class FakeLLM:
+        def chat_with_history(self, user_input, history, system_prompt):
+            return f"fallback:{user_input}"
+
     core = object.__new__(AgentCore)
     core._state_lock = asyncio.Lock()
-    core._fallback_chat = lambda message: f"fallback:{message}"
+    core.memory = FakeMemory()
+    core.llm = FakeLLM()
 
     def _raise(exc):
         async def _raise_exc(message):

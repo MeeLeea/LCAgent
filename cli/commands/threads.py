@@ -9,9 +9,9 @@ from langchain_core.messages import HumanMessage
 from .types import HANDLED, CommandContext, CommandOutcome
 
 
-def manage_threads(context: CommandContext) -> CommandOutcome:
+async def manage_threads(context: CommandContext) -> CommandOutcome:
     while True:
-        threads = context.agent.memory.list_threads()
+        threads = await context.agent.memory.alist_threads()
         current = context.agent.memory.thread_id
         if not threads:
             context.print("\n暂无会话记录")
@@ -27,13 +27,13 @@ def manage_threads(context: CommandContext) -> CommandOutcome:
         if selected is None:
             break
         if isinstance(selected, tuple) and selected[0] == "delete":
-            _delete_thread(context, selected[1])
+            await _adelete_thread(context, selected[1])
             continue
         if selected == current:
             context.print(f"\n已在当前会话: {current}")
             break
-        context.agent.memory.switch_thread(str(selected))
-        messages = context.agent.memory.get_messages()
+        await context.agent.memory.aswitch_thread(str(selected))
+        messages = await context.agent.memory.aget_messages()
         context.print(f"\n已切换到会话: {selected} (恢复 {len(messages or [])} 条历史消息)")
         break
     return HANDLED
@@ -47,22 +47,22 @@ def new_thread(context: CommandContext) -> CommandOutcome:
     return HANDLED
 
 
-def delete_thread_command(context: CommandContext, user_input: str) -> CommandOutcome:
+async def delete_thread_command(context: CommandContext, user_input: str) -> CommandOutcome:
     parts = user_input.split(None, 1)
     if len(parts) < 2:
         context.print("用法: thread:delete <thread_id>")
         return HANDLED
-    _delete_thread(context, parts[1].strip())
+    await _adelete_thread(context, parts[1].strip())
     return HANDLED
 
 
-def export_thread(context: CommandContext, user_input: str) -> CommandOutcome:
+async def export_thread(context: CommandContext, user_input: str) -> CommandOutcome:
     low = user_input.lower()
     rest = user_input[7:].strip() if low.startswith("export:") else user_input[6:].strip()
     parts = rest.split(None, 1)
     thread_id = parts[0] if parts else None
     path = parts[1] if len(parts) > 1 else None
-    text = context.agent.memory.export_thread(thread_id)
+    text = await context.agent.memory.aexport_thread(thread_id)
     if not text.strip():
         context.print("\n该会话没有可导出的消息")
         return HANDLED
@@ -89,6 +89,8 @@ def _thread_option(
 ) -> tuple[str, str]:
     try:
         # 直接读取目标会话消息，不再临时变异 thread_id
+        # 注意：这是同步函数，但在菜单渲染中调用，不能改为异步
+        # 使用同步方法的智能切换功能
         messages = context.agent.memory.get_messages(thread_id=thread_id) or []
         message_count = len(messages)
         # 用第一条用户消息作为会话标题,不调用 LLM,避免菜单渲染变慢
@@ -140,14 +142,14 @@ def _message_text(content: object) -> str:
     return str(content)
 
 
-def _delete_thread(context: CommandContext, thread_id: str) -> None:
+async def _adelete_thread(context: CommandContext, thread_id: str) -> None:
     # 会话删除不可恢复，因此命令行入口始终执行二次确认。
     confirm = context.input(f"确认删除会话 '{thread_id}'? 此操作不可恢复 [y/N]: ").strip().lower()
     if confirm not in ("y", "yes"):
         context.print("已取消")
         return
     was_current = thread_id == context.agent.memory.thread_id
-    if context.agent.memory.delete_thread(thread_id):
+    if await context.agent.memory.adelete_thread(thread_id):
         context.print(f"\n已删除会话: {thread_id}")
         if was_current:
             context.print(f"当前会话已被删除,自动切换到: {context.agent.memory.thread_id}")

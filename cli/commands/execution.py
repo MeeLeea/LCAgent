@@ -35,9 +35,9 @@ async def react_mode(context: CommandContext, user_input: str) -> CommandOutcome
     return HANDLED
 
 
-def cot_mode(context: CommandContext, user_input: str) -> CommandOutcome:
+async def cot_mode(context: CommandContext, user_input: str) -> CommandOutcome:
     task = user_input[4:].strip()
-    result = context.agent.cot(task)
+    result = await context.agent.acot(task)
     context.print(f"\n助手: {result}")
     return HANDLED
 

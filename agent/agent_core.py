@@ -827,12 +827,12 @@ class AgentCore:
             if "interrupt" in str(e):
                 raise
             logger.warning("achat 降级到 fallback: %s", e, exc_info=True)
-            return self._fallback_chat(message)
+            return await self._afallback_chat(message)
         except Exception as e:
             if e.__class__.__name__ in {"GraphInterrupt", "NodeInterrupt"}:
                 raise
             logger.warning("achat 降级到 fallback: %s", e, exc_info=True)
-            return self._fallback_chat(message)
+            return await self._afallback_chat(message)
 
     async def aresume(self, payload: Dict[str, Any]) -> str:
         """
@@ -848,9 +848,9 @@ class AgentCore:
         self._check_and_raise_if_interrupted(turn)
         return turn.output or ""
 
-    def _fallback_chat(self, message: str) -> str:
-        """Agent 执行失败时降级为纯 LLM 对话"""
-        history = self.memory.get_short_term()
+    async def _afallback_chat(self, message: str) -> str:
+        """Agent 执行失败时降级为纯 LLM 对话（异步版本）"""
+        history = await self.memory.aget_short_term()
         self.memory.add("user", message)
         response = self.llm.chat_with_history(
             user_input=message,
@@ -860,9 +860,9 @@ class AgentCore:
         self.memory.add("assistant", response)
         return response
 
-    def cot(self, task: str) -> str:
+    async def acot(self, task: str) -> str:
         """
-        CoT链式思考模式（不调用工具，纯推理）
+        CoT链式思考模式（不调用工具，纯推理）- 异步版本
 
         Args:
             task: 任务描述
@@ -879,7 +879,7 @@ class AgentCore:
         )
 
         # CoT 模式不调用工具,直接用 LLM + checkpoint 历史
-        context = self.memory.get_short_term() + self.memory.get_long_term(3)
+        context = await self.memory.aget_short_term() + self.memory.get_long_term(3)
         response = self.llm.chat_with_history(
             user_input=task,
             history=context,
@@ -994,7 +994,7 @@ class AgentCore:
         Returns:
             {"summary": str, "messages_before": int, "messages_after": int} 或 None
         """
-        msgs = self.memory.get_messages()
+        msgs = await self.memory.aget_messages()
         if not msgs:
             return None
 

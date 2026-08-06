@@ -3,6 +3,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 
 import pytest
@@ -424,7 +425,7 @@ class FakeContext:
 def test_workflow_list_command():
     """测试 workflow 命令列出可用工作流"""
     context = FakeContext()
-    outcome = workflow_command(context, "workflow")
+    outcome = asyncio.run(workflow_command(context, "workflow"))
     
     assert outcome.handled
     output_text = "\n".join(context.output)
@@ -436,7 +437,7 @@ def test_workflow_list_command():
 def test_workflow_execute_command_missing_task():
     """测试缺少任务描述时的错误提示"""
     context = FakeContext()
-    outcome = workflow_command(context, "workflow:simple")
+    outcome = asyncio.run(workflow_command(context, "workflow:simple"))
     
     assert outcome.handled
     output_text = "\n".join(context.output)
@@ -446,7 +447,7 @@ def test_workflow_execute_command_missing_task():
 def test_workflow_execute_command_unknown_workflow():
     """测试未知工作流的错误提示"""
     context = FakeContext()
-    outcome = workflow_command(context, "workflow:unknown 测试任务")
+    outcome = asyncio.run(workflow_command(context, "workflow:unknown 测试任务"))
     
     assert outcome.handled
     output_text = "\n".join(context.output)
@@ -463,7 +464,7 @@ def test_workflow_command_parse():
     import cli.commands.workflow as wf_module
     original_run = None
     
-    def mock_run(context, name: str, task: str):
+    async def mock_run(context, name: str, task: str):
         return {"final_answer": f"Mock 结果: {name} / {task}"}
     
     # 暂存原函数(如果存在)
@@ -474,7 +475,7 @@ def test_workflow_command_parse():
     wf_module.run_workflow = mock_run
     
     try:
-        outcome = workflow_command(context, "workflow:simple 帮我分析项目")
+        outcome = asyncio.run(workflow_command(context, "workflow:simple 帮我分析项目"))
         
         assert outcome.handled
         output_text = "\n".join(context.output)
@@ -670,6 +671,9 @@ def test_run_workflow_injects_memory(monkeypatch):
         def get_short_term(self, limit=None):
             return [{"role": "user", "content": "之前聊过X"}]
 
+        async def aget_short_term(self, limit=None):
+            return [{"role": "user", "content": "之前聊过X"}]
+
         def get_long_term(self, limit=5):
             return []
 
@@ -695,7 +699,7 @@ def test_run_workflow_injects_memory(monkeypatch):
 
     monkeypatch.setitem(WORKFLOWS["simple"], "runner", fake_run)
 
-    result = wf_module.run_workflow(ctx, "simple", "测试任务")
+    result = asyncio.run(wf_module.run_workflow(ctx, "simple", "测试任务"))
 
     assert result["final_answer"] == "答案"
     assert "user: 之前聊过X" in captured["raw_context"]
@@ -768,6 +772,9 @@ def test_run_workflow_emits_workflow_events(monkeypatch):
         def get_short_term(self, limit=None):
             return []
 
+        async def aget_short_term(self, limit=None):
+            return []
+
         def get_long_term(self, limit=5):
             return []
 
@@ -792,7 +799,7 @@ def test_run_workflow_emits_workflow_events(monkeypatch):
         workflow_event_cb=events.append,
     )
 
-    wf_module.run_workflow(ctx, "simple", "测试任务")
+    asyncio.run(wf_module.run_workflow(ctx, "simple", "测试任务"))
 
     # 整体状态:先 running 后 done
     statuses = [e["status"] for e in events if e["type"] == "workflow_status"]
