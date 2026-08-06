@@ -1,5 +1,5 @@
 // API 客户端：REST 请求 + SSE 流式解析
-import type { ProvidersInfo, ThreadSummary, RawMessage, StreamEvent, WorkflowInfo } from './types'
+import type { ProvidersInfo, ThreadSummary, RawMessage, StreamEvent, WorkflowInfo, MetricsSummary, CompactResult, MemorySummary, CompressResult, SafetyConfig, SkillInfo, ExportResult } from './types'
 
 // Vite 构建期从 config/server_config.json 注入的后端地址（Tauri 模式使用）
 declare const __SERVER_HOST__: string
@@ -148,6 +148,15 @@ export const api = {
 
   getTools: () => jsonFetch<{ tools: string[] }>(`${BASE}/tools`),
 
+  // ── 团队角色 ──
+  getRoles: () => jsonFetch<{ roles: string[]; current: string | null }>(`${BASE}/roles`),
+  switchRole: (role: string, task?: string) =>
+    jsonFetch<{ role: string; current: string | null }>(`${BASE}/roles/switch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role, task }),
+    }),
+
   getWorkflows: () => jsonFetch<{ workflows: string[] }>(`${BASE}/workflows`),
 
   getWorkflow: (name = 'simple') =>
@@ -189,5 +198,44 @@ export const api = {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ command, thread_id }),
       },
+    ),
+
+  // ── 运行时指标 ──
+  getMetrics: () => jsonFetch<MetricsSummary>(`${BASE}/metrics`),
+  resetMetrics: () => jsonFetch<{ reset: boolean }>(`${BASE}/metrics/reset`, { method: 'POST' }),
+
+  // ── 上下文压缩 ──
+  compact: (thread_id?: string | null) =>
+    jsonFetch<CompactResult>(`${BASE}/compact`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ thread_id }),
+    }),
+
+  // ── 记忆管理 ──
+  getMemorySummary: () => jsonFetch<MemorySummary>(`${BASE}/memory`),
+  compressMemory: () => jsonFetch<CompressResult>(`${BASE}/compress`, { method: 'POST' }),
+  clearMemory: (scope: 'long' | 'short' | 'all' = 'long') =>
+    jsonFetch<{ cleared: boolean; scope: string }>(
+      `${BASE}/memory?scope=${scope}`,
+      { method: 'DELETE' },
+    ),
+
+  // ── 安全策略 ──
+  getSafety: () => jsonFetch<SafetyConfig>(`${BASE}/safety`),
+  updateSafety: (body: { mode?: string; confirm_dangerous?: boolean }) =>
+    jsonFetch<SafetyConfig>(`${BASE}/safety`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+
+  // ── 技能列表 ──
+  getSkills: () => jsonFetch<{ skills: SkillInfo[] }>(`${BASE}/skills`),
+
+  // ── 会话导出 ──
+  exportThread: (thread_id: string, fmt: 'text' | 'markdown' = 'text') =>
+    jsonFetch<ExportResult>(
+      `${BASE}/threads/${encodeURIComponent(thread_id)}/export?fmt=${fmt}`,
     ),
 }

@@ -172,9 +172,97 @@ button {
 /* ---------- 主布局 ---------- */
 .app {
   display: flex;
+  flex-direction: column;
   height: 100vh;
   width: 100vw;
   overflow: hidden;
+}
+
+.app-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ---------- 自定义窗口标题栏 ---------- */
+.titlebar {
+  height: 36px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 0 0 12px;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.titlebar-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 100%;
+}
+
+.titlebar-logo {
+  width: 20px;
+  height: 20px;
+  border-radius: 5px;
+  background: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.titlebar-logo-text {
+  font-size: 10px;
+  font-weight: 800;
+  color: #0d0d0d;
+  letter-spacing: -0.5px;
+}
+
+.titlebar-title {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.titlebar-controls {
+  display: flex;
+  align-items: center;
+  height: 100%;
+}
+
+.titlebar-btn {
+  width: 46px;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  transition: background 0.15s, color 0.15s;
+}
+
+.titlebar-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.titlebar-btn:active {
+  background: var(--border-soft);
+}
+
+.titlebar-close:hover {
+  background: #e02424;
+  color: #fff;
+}
+
+.titlebar-close:active {
+  background: #c01a1a;
 }
 
 /* ---------- 侧边栏 ---------- */
@@ -778,6 +866,16 @@ tool-group,
   font-size: 11.5px;
 }
 
+.tool-card-result-label {
+  margin-top: 8px;
+}
+
+/* 滑动窗口：固定最大高度 + 垂直滚动，避免长输出撑爆卡片 */
+.tool-card-result {
+  max-height: 240px;
+  overflow-y: auto;
+}
+
 .tool-args-key {
   color: var(--accent);
 }
@@ -989,6 +1087,20 @@ tool-group,
   display: flex;
   align-items: center;
   gap: 4px;
+}
+
+.input-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.token-count {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+  white-space: nowrap;
 }
 
 .input-tool-btn {
@@ -1414,6 +1526,48 @@ tool-group,
   text-align: center;
   font-size: 12px;
   color: var(--text-faint);
+}
+
+/* ============================================================
+   角色选择 popover（InputBar）
+   ============================================================ */
+.role-popover {
+  min-width: 180px;
+}
+
+.role-popover-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--text);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.role-popover-item:hover {
+  background: var(--bg-hover);
+}
+
+.role-popover-item.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.role-popover-item svg {
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.role-popover-name {
+  flex: 1;
+}
+
+.role-check {
+  margin-left: auto;
+  color: var(--accent);
 }
 
 /* ============================================================

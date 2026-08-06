@@ -7,6 +7,7 @@ import { TopBar } from './components/TopBar'
 import { ChatView } from './components/ChatView'
 import { WorkflowView } from './components/WorkflowView'
 import { InputBar } from './components/InputBar'
+import { TitleBar } from './components/TitleBar'
 
 const DEFAULT_SIDEBAR_WIDTH = 264
 const MIN_SIDEBAR_WIDTH = 180
@@ -64,20 +65,23 @@ export default function App() {
 
   return (
     <div className="app">
-      <aside
-        className={`sidebar${sidebarCollapsed ? ' collapsed' : ''}${isResizing ? ' resizing' : ''}`}
-        style={{ width: sidebarCollapsed ? 0 : sidebarWidth }}
-      >
-        <Sidebar onCollapse={() => setSidebarCollapsed(true)} />
-        <div className="sidebar-resizer" onPointerDown={onResizeStart} />
-      </aside>
-      <div className="main">
-        <TopBar onExpand={() => setSidebarCollapsed(false)} />
-        <div className="main-content">
-          {viewMode === 'workflow' && <WorkflowView />}
-          <ChatView />
+      <TitleBar />
+      <div className="app-body">
+        <aside
+          className={`sidebar${sidebarCollapsed ? ' collapsed' : ''}${isResizing ? ' resizing' : ''}`}
+          style={{ width: sidebarCollapsed ? 0 : sidebarWidth }}
+        >
+          <Sidebar />
+          <div className="sidebar-resizer" onPointerDown={onResizeStart} />
+        </aside>
+        <div className="main">
+          <TopBar collapsed={sidebarCollapsed} onToggle={() => setSidebarCollapsed((v) => !v)} />
+          <div className="main-content">
+            {viewMode === 'workflow' && <WorkflowView />}
+            <ChatView />
+          </div>
+          <InputBar />
         </div>
-        <InputBar />
       </div>
     </div>
   )

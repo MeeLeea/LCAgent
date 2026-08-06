@@ -93,7 +93,86 @@ def mock_agent():
         yield {"type": "done"}
     
     agent.astream_resume = mock_astream_resume
-    
+
+    # Mock metrics 收集器
+    agent.metrics = MagicMock()
+    agent.metrics.get_summary = MagicMock(return_value={
+        "session": {"duration_seconds": 12.5, "turn_count": 3},
+        "llm": {
+            "total_calls": 5,
+            "total_prompt_tokens": 1000,
+            "total_completion_tokens": 500,
+            "total_tokens": 1500,
+            "total_duration_ms": 3000.0,
+            "by_provider": {
+                "zhipu": {
+                    "count": 5,
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 500,
+                    "total_tokens": 1500,
+                    "avg_tokens": 300.0,
+                    "total_ms": 3000.0,
+                }
+            },
+        },
+        "tools": {
+            "total_calls": 2,
+            "total_duration_ms": 500.0,
+            "by_name": {
+                "calculator": {
+                    "count": 2,
+                    "total_ms": 500.0,
+                    "min_ms": 200.0,
+                    "max_ms": 300.0,
+                    "avg_ms": 250.0,
+                    "failures": 0,
+                    "timeouts": 0,
+                }
+            },
+        },
+        "compaction": {
+            "total_count": 1,
+            "total_messages_before": 60,
+            "total_messages_after": 22,
+            "total_duration_ms": 800.0,
+            "messages_saved": 38,
+        },
+    })
+    agent.metrics.reset = MagicMock()
+
+    # Mock manually_compact（异步）
+    agent.manually_compact = AsyncMock(return_value={
+        "summary": "用户讨论了 API 设计和测试策略",
+        "messages_before": 60,
+        "messages_after": 22,
+    })
+
+    # Mock 记忆相关方法
+    agent.get_memory_summary = MagicMock(return_value={
+        "thread_id": "test-thread-123",
+        "checkpoint_messages": 10,
+        "checkpoint_backend": "sqlite",
+        "checkpoint_file": "/tmp/test.sqlite",
+        "long_term_count": 5,
+        "total_threads": 3,
+    })
+    agent.compress_memory = MagicMock(return_value={
+        "success": True,
+        "original_count": 5,
+        "original_chars": 2000,
+        "compressed_chars": 500,
+        "summary": "压缩后的摘要内容",
+    })
+    agent.memory.clear_long_term = MagicMock()
+    agent.memory.clear_short_term = MagicMock()
+    agent.memory.export_thread = MagicMock(return_value="用户: 测试消息\n助手: 回复")
+
+    # Mock 技能列表
+    agent.list_skills = MagicMock(return_value=[
+        {"name": "pptx", "description": "PPT 生成技能"},
+        {"name": "pdf", "description": "PDF 处理技能"},
+    ])
+
     return agent
 
 
@@ -293,6 +372,80 @@ def test_get_tools(client, mock_agent):
     assert "calculator" in data["tools"]
     assert "web_search" in data["tools"]
     assert "ask_human" in data["tools"]
+
+
+# --------------------------------------------------------------------------- #
+# 团队角色
+# --------------------------------------------------------------------------- #
+def test_get_roles(client, mock_agent):
+    """测试列出可用团队角色与当前角色名"""
+    mock_agent.name = "manager"
+    with patch(
+        "agent.role_sw.get_available_team_roles",
+        return_value=["manager", "terminator", "worker"],
+    ):
+        response = client.get("/api/roles")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["roles"] == ["manager", "terminator", "worker"]
+    assert data["current"] == "manager"
+
+
+def test_switch_role(client, mock_agent):
+    """测试切换团队角色：调用 arebuild_from_team_dir 并返回新角色"""
+    mock_agent.name = "worker"
+    mock_agent.arebuild_from_team_dir = AsyncMock()
+
+    response = client.post("/api/roles/switch", json={"role": "worker"})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["role"] == "worker"
+    assert data["current"] == "worker"
+    mock_agent.arebuild_from_team_dir.assert_awaited_once_with("worker", task="")
+
+
+def test_switch_role_with_task(client, mock_agent):
+    """测试切换角色时携带 task，task 透传给 arebuild_from_team_dir"""
+    mock_agent.name = "manager"
+    mock_agent.arebuild_from_team_dir = AsyncMock()
+
+    response = client.post(
+        "/api/roles/switch",
+        json={"role": "manager", "task": "分析项目结构"},
+    )
+
+    assert response.status_code == 200
+    mock_agent.arebuild_from_team_dir.assert_awaited_once_with(
+        "manager", task="分析项目结构"
+    )
+
+
+def test_switch_role_unknown(client, mock_agent):
+    """测试切换到未知角色返回 404"""
+    mock_agent.arebuild_from_team_dir = AsyncMock(
+        side_effect=KeyError("未找到 team 角色: ghost。可用角色: manager, worker")
+    )
+    with patch(
+        "agent.role_sw.get_available_team_roles",
+        return_value=["manager", "worker"],
+    ):
+        response = client.post("/api/roles/switch", json={"role": "ghost"})
+
+    assert response.status_code == 404
+    assert "ghost" in response.json()["detail"]
+
+
+def test_switch_role_empty_prompt(client, mock_agent):
+    """测试角色提示词文件为空返回 400"""
+    mock_agent.arebuild_from_team_dir = AsyncMock(
+        side_effect=FileNotFoundError("角色提示词文件为空或无法读取: team/broken/AGENT.md")
+    )
+    response = client.post("/api/roles/switch", json={"role": "broken"})
+
+    assert response.status_code == 400
+    assert "提示词" in response.json()["detail"]
 
 
 # --------------------------------------------------------------------------- #
@@ -705,6 +858,36 @@ def test_chat_management_command_realtime_stream(client, mock_agent):
         assert events[-1]["type"] == "done"
 
 
+def test_is_execution_command_classification():
+    """测试执行型命令分类函数(_is_execution_command)"""
+    from api.server import _is_execution_command
+
+    # 执行型
+    assert _is_execution_command("json: 生成配置") is True
+    assert _is_execution_command("react: 帮我写代码") is True
+    assert _is_execution_command("cot: 推理一下") is True
+    assert _is_execution_command("skill:pptx 帮我做 PPT") is True
+
+    # 管理型(skill 无任务 / clear / 其他管理命令)
+    assert _is_execution_command("skill:pptx") is False      # 无任务文本
+    assert _is_execution_command("skill:clear") is False     # clear 是管理型
+    assert _is_execution_command("skill: 清空") is False
+    assert _is_execution_command("help") is False
+    assert _is_execution_command("info") is False
+    assert _is_execution_command("threads") is False
+    assert _is_execution_command("") is False
+
+
+def test_unsupported_runner_returns_clear_hint_instead_of_none():
+    """测试 Web 端 runner 兜底返回明确提示而非静默 None"""
+    from api.server import _unsupported_runner
+
+    result = _unsupported_runner(None, "任意任务")
+    assert isinstance(result, str)
+    assert result  # 非空
+    assert "json:" in result or "react:" in result  # 引导用户走流式/普通对话
+
+
 def test_chat_workflow_events_forwarded(client, mock_agent):
     """测试工作流运行事件经 SSE 实时转发(workflow_node / workflow_status)"""
     with patch("api.server.dispatch_command") as mock_dispatch:
@@ -945,6 +1128,269 @@ def test_execute_command_with_exception(client, mock_agent):
         
         assert response.status_code == 500
         assert "命令执行失败" in response.text
+
+
+# --------------------------------------------------------------------------- #
+# 运行时指标
+# --------------------------------------------------------------------------- #
+def test_get_metrics(client, mock_agent):
+    """测试获取运行时指标"""
+    response = client.get("/api/metrics")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert "session" in data
+    assert data["session"]["turn_count"] == 3
+    assert "llm" in data
+    assert data["llm"]["total_calls"] == 5
+    assert data["llm"]["total_tokens"] == 1500
+    assert "zhipu" in data["llm"]["by_provider"]
+    assert "tools" in data
+    assert data["tools"]["total_calls"] == 2
+    assert "calculator" in data["tools"]["by_name"]
+    assert "compaction" in data
+    assert data["compaction"]["total_count"] == 1
+    assert data["compaction"]["messages_saved"] == 38
+
+
+def test_reset_metrics(client, mock_agent):
+    """测试重置运行时指标"""
+    response = client.post("/api/metrics/reset")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["reset"] is True
+    mock_agent.metrics.reset.assert_called_once()
+
+
+def test_get_metrics_no_agent(mock_llm):
+    """测试 Agent 未初始化时返回 503"""
+    with patch("api.server.agent", None), \
+         patch("api.server.llm", mock_llm):
+        from api.server import app
+        with TestClient(app) as c:
+            response = c.get("/api/metrics")
+            assert response.status_code == 503
+
+
+# --------------------------------------------------------------------------- #
+# 上下文压缩
+# --------------------------------------------------------------------------- #
+def test_compact_success(client, mock_agent):
+    """测试手动触发上下文压缩"""
+    response = client.post("/api/compact", json={"thread_id": "test-thread-123"})
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["compacted"] is True
+    assert data["thread_id"] == "test-thread-123"
+    assert data["messages_before"] == 60
+    assert data["messages_after"] == 22
+    assert "summary" in data
+
+
+def test_compact_no_need(client, mock_agent):
+    """测试消息数未超阈值时返回 compacted=False"""
+    mock_agent.manually_compact = AsyncMock(return_value=None)
+    response = client.post("/api/compact")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["compacted"] is False
+    assert "message" in data
+
+
+def test_compact_error(client, mock_agent):
+    """测试压缩异常返回 500"""
+    mock_agent.manually_compact = AsyncMock(side_effect=RuntimeError("压缩失败"))
+    response = client.post("/api/compact")
+    assert response.status_code == 500
+    assert "压缩失败" in response.json()["detail"]
+
+
+# --------------------------------------------------------------------------- #
+# 记忆管理
+# --------------------------------------------------------------------------- #
+def test_get_memory_summary(client, mock_agent):
+    """测试获取记忆摘要"""
+    response = client.get("/api/memory")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["thread_id"] == "test-thread-123"
+    assert data["checkpoint_messages"] == 10
+    assert data["long_term_count"] == 5
+    assert data["total_threads"] == 3
+
+
+def test_compress_memory(client, mock_agent):
+    """测试压缩长期记忆"""
+    response = client.post("/api/compress")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["success"] is True
+    assert data["original_count"] == 5
+    assert data["compressed_chars"] == 500
+    mock_agent.compress_memory.assert_called_once()
+
+
+def test_clear_memory_long(client, mock_agent):
+    """测试清空长期记忆"""
+    response = client.delete("/api/memory?scope=long")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["cleared"] is True
+    assert data["scope"] == "long"
+    mock_agent.memory.clear_long_term.assert_called_once()
+    mock_agent.memory.clear_short_term.assert_not_called()
+
+
+def test_clear_memory_short(client, mock_agent):
+    """测试清空短期记忆"""
+    response = client.delete("/api/memory?scope=short")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["scope"] == "short"
+    mock_agent.memory.clear_short_term.assert_called_once()
+    mock_agent.memory.clear_long_term.assert_not_called()
+
+
+def test_clear_memory_all(client, mock_agent):
+    """测试清空全部记忆"""
+    response = client.delete("/api/memory?scope=all")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["scope"] == "all"
+    mock_agent.memory.clear_long_term.assert_called_once()
+    mock_agent.memory.clear_short_term.assert_called_once()
+
+
+def test_clear_memory_invalid_scope(client, mock_agent):
+    """测试无效 scope 返回 400"""
+    response = client.delete("/api/memory?scope=invalid")
+    assert response.status_code == 400
+
+
+def test_clear_memory_default_scope(client, mock_agent):
+    """测试默认 scope 为 long"""
+    response = client.delete("/api/memory")
+    assert response.status_code == 200
+    assert response.json()["scope"] == "long"
+
+
+# --------------------------------------------------------------------------- #
+# 安全策略
+# --------------------------------------------------------------------------- #
+def test_get_safety(client):
+    """测试获取安全策略配置"""
+    with patch("api.server.safety_module") as mock_safety:
+        mock_safety.load_config.return_value = {
+            "mode": "blacklist",
+            "confirm_dangerous": True,
+            "blacklist": ["rm", "del"],
+        }
+        response = client.get("/api/safety")
+        assert response.status_code == 200
+
+        data = response.json()
+        assert data["mode"] == "blacklist"
+        assert data["confirm_dangerous"] is True
+
+
+def test_update_safety_mode(client):
+    """测试更新安全模式"""
+    with patch("api.server.safety_module") as mock_safety:
+        mock_safety.load_config.return_value = {
+            "mode": "blacklist",
+            "confirm_dangerous": True,
+        }
+        mock_safety.save_config.return_value = True
+        response = client.put("/api/safety", json={"mode": "whitelist"})
+        assert response.status_code == 200
+
+        data = response.json()
+        assert data["mode"] == "whitelist"
+        mock_safety.save_config.assert_called_once()
+
+
+def test_update_safety_confirm(client):
+    """测试更新危险确认开关"""
+    with patch("api.server.safety_module") as mock_safety:
+        mock_safety.load_config.return_value = {
+            "mode": "blacklist",
+            "confirm_dangerous": True,
+        }
+        mock_safety.save_config.return_value = True
+        response = client.put("/api/safety", json={"confirm_dangerous": False})
+        assert response.status_code == 200
+
+        data = response.json()
+        assert data["confirm_dangerous"] is False
+
+
+def test_update_safety_invalid_mode(client):
+    """测试无效模式返回 400"""
+    with patch("api.server.safety_module"):
+        response = client.put("/api/safety", json={"mode": "invalid"})
+        assert response.status_code == 400
+
+
+def test_update_safety_save_failed(client):
+    """测试保存失败返回 500"""
+    with patch("api.server.safety_module") as mock_safety:
+        mock_safety.load_config.return_value = {"mode": "blacklist", "confirm_dangerous": True}
+        mock_safety.save_config.return_value = False
+        response = client.put("/api/safety", json={"mode": "whitelist"})
+        assert response.status_code == 500
+
+
+# --------------------------------------------------------------------------- #
+# 技能列表
+# --------------------------------------------------------------------------- #
+def test_get_skills(client, mock_agent):
+    """测试获取技能列表"""
+    response = client.get("/api/skills")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert len(data["skills"]) == 2
+    assert data["skills"][0]["name"] == "pptx"
+    assert data["skills"][1]["name"] == "pdf"
+
+
+# --------------------------------------------------------------------------- #
+# 会话导出
+# --------------------------------------------------------------------------- #
+def test_export_thread(client, mock_agent):
+    """测试导出会话为文本"""
+    response = client.get("/api/threads/thread-1/export")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["thread_id"] == "thread-1"
+    assert data["format"] == "text"
+    assert "测试消息" in data["content"]
+    mock_agent.memory.export_thread.assert_called_once_with(thread_id="thread-1", fmt="text")
+
+
+def test_export_thread_markdown(client, mock_agent):
+    """测试导出会话为 Markdown"""
+    response = client.get("/api/threads/thread-1/export?fmt=markdown")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["format"] == "markdown"
+    mock_agent.memory.export_thread.assert_called_once_with(thread_id="thread-1", fmt="markdown")
+
+
+def test_export_thread_invalid_format(client, mock_agent):
+    """测试无效格式返回 400"""
+    response = client.get("/api/threads/thread-1/export?fmt=pdf")
+    assert response.status_code == 400
 
 
 # --------------------------------------------------------------------------- #

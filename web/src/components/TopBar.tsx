@@ -1,6 +1,6 @@
 // 顶栏：会话标题 + 连接状态 + 提供商/模型选择器
 import { useEffect } from 'react'
-import { PanelLeft, Cpu } from 'lucide-react'
+import { PanelLeft, PanelLeftClose, Cpu } from 'lucide-react'
 import { useStore, stripWorkflowPrefix } from '../store'
 
 const STATUS_META = {
@@ -9,7 +9,7 @@ const STATUS_META = {
   checking: { color: 'var(--text-faint)', label: '检测中…' },
 } as const
 
-export function TopBar({ onExpand }: { onExpand: () => void }) {
+export function TopBar({ collapsed, onToggle }: { collapsed: boolean; onToggle: () => void }) {
   const providers = useStore((s) => s.providers)
   const currentProvider = useStore((s) => s.currentProvider)
   const currentModel = useStore((s) => s.currentModel)
@@ -33,8 +33,8 @@ export function TopBar({ onExpand }: { onExpand: () => void }) {
 
   return (
     <div className="topbar">
-      <button className="icon-btn" onClick={onExpand} title="展开侧栏">
-        <PanelLeft size={16} />
+      <button className="icon-btn" onClick={onToggle} title={collapsed ? '展开侧栏' : '收起侧栏'}>
+        {collapsed ? <PanelLeft size={16} /> : <PanelLeftClose size={16} />}
       </button>
       <div className="topbar-title">
         {currentThread?.preview ? stripWorkflowPrefix(currentThread.preview) : '新会话'}
