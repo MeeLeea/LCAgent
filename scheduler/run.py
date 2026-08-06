@@ -90,6 +90,7 @@ def make_agent_factory(provider: str):
     """
     # 预加载配置（避免每次创建 agent 都读文件）
     agent_config = load_agent_config(AGENT_CONFIG_FILE)
+    agent_prompt_file = agent_config.get("agent_prompt_file")
     skills_dir = resolve_path(agent_config["skills_dir"], BASE_DIR)
     mcp_config_file = resolve_path(agent_config["mcp_config_file"], BASE_DIR)
 
@@ -113,7 +114,9 @@ def make_agent_factory(provider: str):
             max_context_messages=agent_config["max_context_messages"],
             context_trim_keep=agent_config["context_trim_keep"],
             process_type="scheduler",
-            agent_core_prompt=agent_config["agent_core_prompt"]
+            agent_prompt_file=agent_prompt_file,
+            max_execution_history=agent_config.get("max_execution_history", 100),
+            tool_timeout=agent_config.get("tool_timeout", 120),
         )
 
     return factory

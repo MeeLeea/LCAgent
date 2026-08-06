@@ -41,7 +41,7 @@ def build_team_agent(
     prompt_file = resolve_path(config.get("agent_prompt_file", "agent/AGENT.md"), base_dir)
     
     # 剥离 AGENT.md 中的 ## workflow:* 小节,避免模板混入系统提示词
-    system_prompt, _ = TeamAgent.parse_prompt_sections(config["agent_core_prompt"])
+    system_prompt, _ = TeamAgent.parse_prompt_sections(prompt_file)
     
     # 构建轻量 TeamAgent
     agent = agent_class(
