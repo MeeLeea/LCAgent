@@ -1,5 +1,6 @@
 """agent.message_utils.extract_llm_error 与 interrupt 检查的单元测试。"""
 
+import anyio
 from types import SimpleNamespace
 
 from agent.message_utils import StreamHandler, extract_llm_error
@@ -58,14 +59,14 @@ def test_check_interrupt_logs_and_returns_none_when_state_lookup_fails(caplog):
     """interrupt 读取失败时记录 warning 并返回 None。"""
 
     class _BrokenExecutor:
-        def get_state(self, config):
+        async def aget_state(self, config):
             raise RuntimeError("state 读取失败")
 
     agent = SimpleNamespace(agent_executor=_BrokenExecutor())
     handler = StreamHandler(agent)
 
     with caplog.at_level("WARNING"):
-        result = handler._check_interrupt({"configurable": {"thread_id": "thread-1"}})
+        result = anyio.run(handler._check_interrupt, {"configurable": {"thread_id": "thread-1"}})
 
     assert result is None
     assert "检查 interrupt 失败" in caplog.text

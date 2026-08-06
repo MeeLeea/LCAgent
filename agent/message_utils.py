@@ -8,9 +8,7 @@
 import asyncio
 import logging
 import re
-import threading
-import time
-from typing import Any, Dict
+from typing import Any, AsyncIterator, Dict
 
 from langchain_core.messages import (
     AIMessage,
@@ -161,119 +159,83 @@ class StreamHandler:
     def __init__(self, agent: Any):
         self.agent = agent
 
-    def _stream_events(self, input_or_command, config: Dict[str, Any]):
-        """同步流式生成事件（在线程中执行，配合 SqliteSaver 的同步接口）。
-
-        对 LLM 提供的瞬时错误(429/5xx/连接超时)做自动重试：仅当错误发生在
-        任何事件输出之前才从头重试，避免工具副作用被重复执行或产出重复 token。
-        """
-        # 去重：LangGraph stream 的 updates 模式可能多次产出同一条 AIMessage
+    async def _astream_events(
+        self,
+        input_or_command: Any,
+        config: Dict[str, Any],
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """直接消费 LangGraph 的异步事件流并映射为前端事件。"""
         recorded_msg_ids: set[str] = set()
         for attempt in range(RETRY_ATTEMPTS):
             emitted = False
             try:
-                for mode, payload in self.agent.agent_executor.stream(
+                async for ev in self.agent.agent_executor.astream_events(
                     input_or_command,
                     config=config,
-                    stream_mode=["messages", "updates"],
+                    version="v2",
                 ):
-                    emitted = True
-                    if mode == "messages":
-                        chunk, metadata = payload
-                        node = metadata.get("langgraph_node", "") if isinstance(metadata, dict) else ""
-                        # 兼容不同 LangGraph 版本：token 可能从 agent 或 model 节点产出
+                    event_name = ev.get("event", "") if isinstance(ev, dict) else ""
+                    metadata = ev.get("metadata") if isinstance(ev, dict) else None
+                    data = ev.get("data") if isinstance(ev, dict) else None
+                    metadata_dict = metadata if isinstance(metadata, dict) else {}
+                    data_dict = data if isinstance(data, dict) else {}
+
+                    if event_name == "on_chat_model_stream":
+                        node = metadata_dict.get("langgraph_node", "")
+                        chunk = data_dict.get("chunk")
                         if isinstance(chunk, AIMessageChunk) and node in ("agent", "model"):
                             text = stringify_content(chunk.content)
                             if text:
+                                emitted = True
                                 yield {"type": "token", "content": text}
-                    elif mode == "updates":
-                        if not isinstance(payload, dict):
-                            continue
-                        for _node_name, state in payload.items():
-                            if not isinstance(state, dict):
-                                continue
-                            for m in state.get("messages", []):
-                                if isinstance(m, AIMessage):
-                                    # 记录 LLM token 用量（去重，避免同一消息多次记录）
-                                    msg_id = getattr(m, "id", None) or id(m)
-                                    if msg_id not in recorded_msg_ids:
-                                        recorded_msg_ids.add(msg_id)
-                                        _llm = getattr(self.agent, "llm", None)
-                                        self.agent.metrics.extract_and_record_llm_usage(
-                                            m,
-                                            provider=getattr(_llm, "provider", ""),
-                                            model=getattr(_llm, "model", "") or "",
-                                        )
-                                    if getattr(m, "tool_calls", None):
-                                        for tc in m.tool_calls:
-                                            yield {
-                                                "type": "tool_call",
-                                                "id": tc.get("id"),
-                                                "name": tc.get("name"),
-                                                "args": tc.get("args"),
-                                            }
-                                elif isinstance(m, ToolMessage):
-                                    yield {
-                                        "type": "tool_result",
-                                        "id": getattr(m, "tool_call_id", ""),
-                                        "name": getattr(m, "name", "") or "",
-                                        "content": stringify_content(m.content),
-                                    }
+                    elif event_name == "on_tool_start":
+                        name = data_dict.get("name")
+                        tool_input = data_dict.get("input")
+                        emitted = True
+                        yield {
+                            "type": "tool_call",
+                            "id": data_dict.get("tool_call_id") or name,
+                            "name": name,
+                            "args": tool_input,
+                        }
+                    elif event_name == "on_tool_end":
+                        output = data_dict.get("output")
+                        content = getattr(output, "content", None) if output is not None else data_dict.get("output")
+                        emitted = True
+                        yield {
+                            "type": "tool_result",
+                            "id": data_dict.get("tool_call_id") or getattr(output, "tool_call_id", None) or data_dict.get("name", ""),
+                            "name": data_dict.get("name", "") or "",
+                            "content": stringify_content(content),
+                        }
+                    elif event_name == "on_chat_model_end":
+                        output = data_dict.get("output")
+                        if isinstance(output, AIMessage):
+                            msg_id = getattr(output, "id", None) or str(id(output))
+                            if msg_id not in recorded_msg_ids:
+                                recorded_msg_ids.add(msg_id)
+                                llm = getattr(self.agent, "llm", None)
+                                self.agent.metrics.extract_and_record_llm_usage(
+                                    output,
+                                    provider=getattr(llm, "provider", ""),
+                                    model=getattr(llm, "model", "") or "",
+                                )
                 return
-            except Exception as e:
-                # 已产出事件(部分 token/工具调用)或非瞬时错误：不再重试，交给上层处理
-                if emitted or not should_retry(e) or attempt == RETRY_ATTEMPTS - 1:
-                    raise
-                delay = min(RETRY_MAX_DELAY, 2**attempt)
-                time.sleep(delay)
-
-    async def _astream_from_sync(self, input_or_command, config: Dict[str, Any]):
-        """把同步 .stream() 跑在后台线程，异步吐出事件。
-
-        SqliteSaver 仅支持同步接口，无法直接用 astream；这里用线程 + 队列桥接，
-        同时保持 SSE 端点的异步非阻塞特性。
-        """
-        loop = asyncio.get_running_loop()
-        queue: "asyncio.Queue[Any]" = asyncio.Queue()
-        sentinel = object()
-
-        def _worker():
-            try:
-                for ev in self._stream_events(input_or_command, config):
-                    asyncio.run_coroutine_threadsafe(queue.put(ev), loop)
             except UserRejectedCommandError:
-                # 修复 checkpoint 中悬挂的 tool_call，必须等待完成后再清状态，
-                # 否则后续 invoke 会读到未修复的 checkpoint 而报错
-                repair_future = asyncio.run_coroutine_threadsafe(
-                    self.agent._arepair_rejected_tool_calls(config), loop,
-                )
-                try:
-                    repair_future.result(timeout=10)
-                except Exception:
-                    pass
+                await self.agent._arepair_rejected_tool_calls(config)
                 self.agent._clear_pending_interrupt()
-                asyncio.run_coroutine_threadsafe(
-                    queue.put({"type": "cancelled", "content": "用户已拒绝执行危险命令，当前任务已取消。"}),
-                    loop,
-                )
-            except Exception as e:
-                asyncio.run_coroutine_threadsafe(
-                    queue.put({"type": "error", "content": extract_llm_error(e)}), loop
-                )
-            finally:
-                asyncio.run_coroutine_threadsafe(queue.put(sentinel), loop)
+                yield {"type": "cancelled", "content": "用户已拒绝执行危险命令，当前任务已取消。"}
+                return
+            except Exception as error:
+                if emitted or not should_retry(error) or attempt == RETRY_ATTEMPTS - 1:
+                    yield {"type": "error", "content": extract_llm_error(error)}
+                    return
+                await asyncio.sleep(min(RETRY_MAX_DELAY, 2**attempt))
 
-        threading.Thread(target=_worker, daemon=True).start()
-        while True:
-            item = await queue.get()
-            if item is sentinel:
-                break
-            yield item
-
-    def _check_interrupt(self, config: Dict[str, Any]) -> Dict[str, Any] | None:
-        """流结束后同步检查是否被 ask_human 中断，返回中断事件或 None。"""
+    async def _check_interrupt(self, config: Dict[str, Any]) -> Dict[str, Any] | None:
+        """流结束后异步检查是否被 ask_human 中断，返回中断事件或 None。"""
         try:
-            state = self.agent.agent_executor.get_state(config)
+            state = await self.agent.agent_executor.aget_state(config)
             if state is not None:
                 for task in getattr(state, "tasks", []) or []:
                     for intr in getattr(task, "interrupts", []) or []:
@@ -309,7 +271,7 @@ class StreamHandler:
         self.agent.verbose = False
         had_terminal = False
         try:
-            async for ev in self._astream_from_sync({"messages": [input_msg]}, config):
+            async for ev in self._astream_events({"messages": [input_msg]}, config):
                 if ev.get("type") in ("error", "cancelled"):
                     had_terminal = True
                 yield ev
@@ -318,7 +280,7 @@ class StreamHandler:
 
         if had_terminal:
             return
-        interrupt = self._check_interrupt(config)
+        interrupt = await self._check_interrupt(config)
         if interrupt is not None:
             yield interrupt
             return
@@ -332,7 +294,7 @@ class StreamHandler:
         self.agent.verbose = False
         had_terminal = False
         try:
-            async for ev in self._astream_from_sync(Command(resume=payload), config):
+            async for ev in self._astream_events(Command(resume=payload), config):
                 if ev.get("type") in ("error", "cancelled"):
                     had_terminal = True
                 yield ev
@@ -341,7 +303,7 @@ class StreamHandler:
 
         if had_terminal:
             return
-        interrupt = self._check_interrupt(config)
+        interrupt = await self._check_interrupt(config)
         if interrupt is not None:
             yield interrupt
             return
