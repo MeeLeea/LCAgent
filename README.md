@@ -5,7 +5,7 @@
 - 配置驱动的多 LLM 提供商（见 `config/llm_config.json`），运行时可切换提供商/模型
 - 本地工具调用（搜索、文件读写、计算、终端命令、文件打开、技能读取）
 - **MCP Server 工具动态加载**（已预置 workspace 文件夹管理服务，可扩展任意 MCP 服务）
-- **LangGraph Checkpoint 持久化**（SQLite 自动保存，程序重启可恢复对话）
+- **LangGraph Checkpoint 持久化**（服务器异步运行时使用 `memory/checkpoints_async.sqlite`，程序重启可恢复对话）
 - **LangGraph Human-in-the-loop**（`ask_human` 暂停图执行，CLI 结构化选择后 `Command(resume)` 继续）
 - 长期记忆管理（compress 压缩摘要）与长上下文自动裁剪
 - **长上下文压缩中间件**（增量摘要 + 工具输出 Prune，摘要随 checkpoint 持久化、per-thread 隔离；`before_model` 自动触发或 `compact` 命令手动触发）
@@ -221,11 +221,11 @@ LangChainAgent/
 │   └── scheduler_config.json# 定时任务调度配置
 ├── scheduler/               # 定时任务调度模块
 │   ├── store.py             # SQLite CRUD + 原子抢占
-│   ├── executor.py          # AgentCore.run() 执行桥接
+│   ├── executor.py          # AgentCore 异步执行桥接(acreate/arun/aclose 单 loop)
 │   ├── engine.py            # APScheduler 引擎
 │   └── run.py               # 独立进程入口
 ├── memory/                  # 运行时数据库目录（自动生成）
-│   ├── checkpoints.sqlite   # Checkpoint 持久化数据库
+│   ├── checkpoints_async.sqlite # Checkpoint 持久化数据库（异步 saver）
 │   ├── memory.json          # 长期记忆文件（用于 compress 摘要）
 │   └── scheduled_tasks.sqlite# 定时任务数据库
 ├── agent/
@@ -492,7 +492,7 @@ self.agent_executor = self._create_agent_executor(
 
 | 类型                 | 存储方式                               | 触发时机                   | 保存内容                           | 持久化  | 用途                              |
 | -------------------- | -------------------------------------- | -------------------------- | ---------------------------------- | ------- | --------------------------------- |
-| **Checkpoint** | `memory/checkpoints.sqlite` (SQLite) | Agent 每步执行后自动       | 完整状态(消息+工具调用链+中间变量) | ✅ 永久 | 程序重启恢复对话、多会话隔离      |
+| **Checkpoint** | `memory/checkpoints_async.sqlite` (SQLite) | Agent 每步执行后自动       | 完整状态(消息+工具调用链+中间变量) | ✅ 永久 | 程序重启恢复对话、多会话隔离      |
 | **长期记忆**   | `memory/memory.json` (JSON)          | 手动标记`important=True` | 仅 react/cot 的最终结果            | ✅ 永久 | 跨会话保留关键决策、用于 compress |
 
 ### 三种模式的记忆行为
@@ -577,14 +577,17 @@ self.memory.add("assistant", output)  # ← 无 important,不写 memory.json
 
 ```python
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CHECKPOINT_FILE = os.path.join(BASE_DIR, "memory", "checkpoints.sqlite")  # Checkpoint 数据库
+CHECKPOINT_FILE = os.path.join(BASE_DIR, "memory", "checkpoints_async.sqlite")  # Checkpoint 数据库（异步 saver）
 MEMORY_FILE = os.path.join(BASE_DIR, "memory", "memory.json")            # 长期记忆
 ```
 
 | 文件                          | 格式      | 内容                                |
 | ----------------------------- | --------- | ----------------------------------- |
-| `memory/checkpoints.sqlite` | SQLite    | Agent 执行状态(按 thread_id 隔离)   |
+| `memory/checkpoints_async.sqlite` | SQLite    | Agent 执行状态(按 thread_id 隔离)   |
 | `memory/memory.json`        | JSON 数组 | react/cot 的最终结果(用于 compress) |
+
+> 全异步迁移后 CLI / API / 飞书均使用 `AsyncSqliteSaver`，checkpoint 数据库为
+> `checkpoints_async.sqlite`。旧版同步运行的 `checkpoints.sqlite` 不再写入，可手动删除。
 
 `memory.json` 文件格式：
 
@@ -607,7 +610,7 @@ MEMORY_FILE = os.path.join(BASE_DIR, "memory", "memory.json")            # 长�
 
 > 两个文件都会**自动创建父目录**，无需手动建 `memory/` 文件夹。
 >
-> **查看 checkpoints.sqlite**：可用 [DB Browser for SQLite](https://sqlitebrowser.org/dl/) 打开，或让 Agent 调用 `open_sqlite` 工具自动打开。
+> **查看 checkpoints_async.sqlite**：可用 [DB Browser for SQLite](https://sqlitebrowser.org/dl/) 打开，或让 Agent 调用 `open_sqlite` 工具自动打开。
 
 ### 会话(Thread)管理
 
@@ -678,7 +681,7 @@ API地址:    https://api.deepseek.com
 
 --- 记忆状态 ---
 当前会话:   thread-a4d099d2
-Checkpoint: sqlite → D:\work\LangChainAgent\memory\checkpoints.sqlite
+Checkpoint: sqlite → D:\work\LangChainAgent\memory\checkpoints_async.sqlite
 已存消息:   8 条
 长期记忆:   5 条
 总会话数:   2
@@ -688,7 +691,7 @@ Checkpoint: sqlite → D:\work\LangChainAgent\memory\checkpoints.sqlite
 
 随着 `react:` / `cot:` 不断积累，`memory.json` 会越来越大。`compress` 命令通过 LLM 把所有长期记忆压缩成一份摘要，再写回 `memory.json`。
 
-> **注意**：compress 只压缩 `memory.json`，不影响 `checkpoints.sqlite`。
+> **注意**：compress 只压缩 `memory.json`，不影响 `checkpoints_async.sqlite`。
 
 #### 工作流程
 
@@ -768,7 +771,7 @@ LLM 生成摘要
 | 可多次压缩        | 再次`compress` 会对已有摘要再压缩                     |
 | LLM 失败不丢数据  | 调用失败则原记忆不变，不会写回                          |
 | **不可逆**  | 压缩后原条目无法恢复，建议重要数据先备份`memory.json` |
-| 不影响 checkpoint | 只压缩 memory.json，checkpoints.sqlite 保留完整历史     |
+| 不影响 checkpoint | 只压缩 memory.json，checkpoints_async.sqlite 保留完整历史     |
 
 > 💡 **建议**：在长期记忆较多时（如 50+ 条）使用，平时少量记忆无需压缩。
 
@@ -1429,10 +1432,15 @@ Agent 会自动处理，无需记忆参数。示例：
 ```
 scheduler/
 ├── store.py       # SQLite CRUD + 原子抢占 + 重试
-├── executor.py    # agent_factory → AgentCore.run() 执行桥接
+├── executor.py    # agent_factory → AgentCore.acreate/arun/aclose 异步执行桥接
+                    # （在单个事件循环内完成构造+执行+释放，适配 AsyncSqliteSaver 绑定创建时 loop 的约束）
 ├── engine.py      # APScheduler 引擎（轮询一次性 + cron 周期 + 线程池）
-└── run.py         # 独立进程入口
+└── run.py         # 独立进程入口（make_agent_factory 返回 async factory）
 ```
+
+> **异步执行**：`make_agent_factory` 是 `async` 工厂，`_run_agent_task` 在同一个事件循环内完成
+> `await AgentCore.acreate()` → `await agent.arun()` → `await agent.aclose()`。因为
+> `AsyncSqliteSaver` 绑定创建它的事件循环，跨 loop 使用会挂起，因此整个 task 生命周期不可拆到不同线程。
 
 详细技术文档见 [scheduler/README.md](scheduler/README.md)。
 
@@ -1520,6 +1528,10 @@ AgentTurnResult.status = "completed" → 输出最终答案
 ### CLI 编排
 
 [cli/human_input.py](cli/human_input.py) 提供了一组辅助函数，把「invoke → 渲染 → 收集 → resume」封装成循环：
+
+> **全异步**：以下辅助函数均为 `async`（`await agent.arun_structured(...)` 等），CLI 入口
+> `main.py` 以 `asyncio.run(main())` 建立**单个长驻事件循环**，REPL、命令分发
+> （`dispatch_command`）、HITL 循环全部在该 loop 内完成，不自行创建/关闭临时事件循环。
 
 | 函数                                                   | 作用                                                  |
 | ------------------------------------------------------ | ----------------------------------------------------- |
@@ -1995,7 +2007,7 @@ API地址:    https://api.deepseek.com
 
 --- 记忆状态 ---
 当前会话:   thread-a4d099d2
-Checkpoint: sqlite → D:\work\LangChainAgent\memory\checkpoints.sqlite
+Checkpoint: sqlite → D:\work\LangChainAgent\memory\checkpoints_async.sqlite
 已存消息:   8 条
 长期记忆:   2 条
 总会话数:   1
@@ -2092,89 +2104,94 @@ MCP Servers:
 ## 代码使用示例
 
 ```python
+import asyncio
 from agent import AgentCore
 from agent.llm_client import LLMClient
 
-# 创建客户端和Agent
-llm = LLMClient(provider="deepseek", config_file="config/llm_config.json")
-agent = AgentCore(
-    llm_client=llm,
-    name="LCAgent",                                    # Agent 名称（默认 LCAgent）
-    memory_size=10,
-    long_term_memory_file="memory/memory.json",        # 长期记忆(用于 compress)
-    checkpoint_file="memory/checkpoints.sqlite",       # Checkpoint 持久化
-    max_iterations=15,
-    mcp_config_file="config/mcp_servers.json",
-    enable_mcp=True,
-    skills_dir=".agents/skills",
-    auto_match_skills=True,
-    max_context_messages=0,                           # 0=关闭长上下文裁剪
-    context_trim_keep=12
-)
+async def main() -> None:
+    # 创建客户端和Agent（异步工厂：AsyncSqliteSaver 绑定创建它的事件循环）
+    llm = LLMClient(provider="deepseek", config_file="config/llm_config.json")
+    agent = await AgentCore.acreate(
+        llm_client=llm,
+        name="LCAgent",                                    # Agent 名称（默认 LCAgent）
+        memory_size=10,
+        long_term_memory_file="memory/memory.json",        # 长期记忆(用于 compress)
+        checkpoint_file="memory/checkpoints_async.sqlite", # Checkpoint 持久化（异步 saver）
+        max_iterations=15,
+        mcp_config_file="config/mcp_servers.json",
+        enable_mcp=True,
+        skills_dir=".agents/skills",
+        auto_match_skills=True,
+        max_context_messages=0,                           # 0=关闭长上下文裁剪
+        context_trim_keep=12
+    )
 
 # 内置变量：agent.name 与 agent.llm（LLM 是 Agent 的内置变量）
-print(agent.name)   # -> LCAgent
-print(agent.llm.get_info())  # 直接通过 agent.llm 访问当前 LLM 客户端
+    print(agent.name)   # -> LCAgent
+    print(agent.llm.get_info())  # 直接通过 agent.llm 访问当前 LLM 客户端
 
-# 普通对话（自动判断是否调用工具，自动写 checkpoint，不存长期记忆）
-response = agent.chat("帮我创建一个叫 test 的文件夹")
+    # 普通对话（自动判断是否调用工具，自动写 checkpoint，不存长期记忆）
+    response = await agent.achat("帮我创建一个叫 test 的文件夹")
 
-# Agent模式（自动调用工具，打印步骤，写 checkpoint + 存长期记忆）
-result = agent.run("计算 123 * 456 并把结果写入 result.txt")
+    # Agent模式（自动调用工具，打印步骤，写 checkpoint + 存长期记忆）
+    result = await agent.arun("计算 123 * 456 并把结果写入 result.txt")
 
-# CoT模式（纯推理，不调用工具，不写 checkpoint，存长期记忆）
-result = agent.cot("分析机器学习的应用场景")
+    # CoT模式（纯推理，不调用工具，不写 checkpoint，存长期记忆）
+    result = agent.cot("分析机器学习的应用场景")
 
-# Human-in-the-loop 结构化入口：chat_structured/run_structured 返回 AgentTurnResult
-turn = agent.chat_structured("需要人工选择时请先问我")
-while turn.is_interrupted:
-    # 单个 interrupt 可直接 resume；并行多个 interrupt 要按 interrupt.id 提交映射
-    if len(turn.interrupts) == 1:
-        resume = {"choice_id": "approve"}
-    else:
-        resume = {
-            interrupt.id: {"choice_id": "approve"}
-            for interrupt in turn.interrupts
-        }
-    # CLI 中由 select_menu 生成选择；Esc 会向 Agent 发送 {"cancelled": True}
-    turn = agent.resume_structured(resume)
-print(turn.output)
+    # Human-in-the-loop 结构化入口：achat_structured/arun_structured 返回 AgentTurnResult
+    turn = await agent.achat_structured("需要人工选择时请先问我")
+    while turn.is_interrupted:
+        # 单个 interrupt 可直接 resume；并行多个 interrupt 要按 interrupt.id 提交映射
+        if len(turn.interrupts) == 1:
+            resume_body = {"choice_id": "approve"}
+        else:
+            resume_body = {
+                interrupt.id: {"choice_id": "approve"}
+                for interrupt in turn.interrupts
+            }
+        # CLI 中由 select_menu 生成选择；Esc 会向 Agent 发送 {"cancelled": True}
+        turn = await agent.aresume_structured(resume_body)
+    print(turn.output)
 
-# 切换LLM提供商
-from agent.llm_client import LLMClient
-new_llm = LLMClient(provider="qwen", config_file="config/llm_config.json")
-agent.switch_llm(new_llm)
+    # 切换LLM提供商
+    new_llm = LLMClient(provider="qwen", config_file="config/llm_config.json")
+    await agent.aswitch_llm(new_llm)
 
-# 切换模型(同一提供商内)
-llm.switch_model("glm-4-flash")    # 切到 glm-4-flash
-print(llm.list_models())           # 查看当前提供商的可用模型
-agent.switch_llm(llm)              # 重建 Agent 以使用新模型
+    # 切换模型(同一提供商内)
+    llm.switch_model("glm-4-flash")    # 切到 glm-4-flash
+    print(llm.list_models())           # 查看当前提供商的可用模型
+    await agent.aswitch_llm(llm)       # 重建 Agent 以使用新模型
 
-# 会话管理
-agent.memory.new_thread()                    # 开启新会话
-agent.memory.switch_thread("thread-abc123")  # 切换到已有会话
-agent.memory.delete_thread("thread-xxx")     # 删除指定会话
-print(agent.memory.list_threads())           # 列出所有会话
-print(agent.memory.export_thread(fmt="markdown"))  # 导出当前会话为 Markdown 文本
+    # 会话管理（异步接口）
+    agent.memory.new_thread()                      # 开启新会话（同步保留接口）
+    agent.memory.switch_thread("thread-abc123")    # 切换到已有会话
+    await agent.memory.adelete_thread("thread-xxx")  # 删除指定会话
+    print(await agent.memory.alist_threads())      # 列出所有会话
+    print(agent.memory.export_thread(fmt="markdown"))  # 导出当前会话为 Markdown 文本
 
-# 记忆管理
-agent.memory.clear_long_term()   # 清空长期记忆
-agent.memory.clear_short_term()  # 开启新会话(替代删除)
-print(agent.memory.summarize())  # 查看记忆统计(含 thread_id、消息数)
+    # 记忆管理（异步接口）
+    agent.memory.clear_long_term()   # 清空长期记忆
+    agent.memory.clear_short_term()  # 开启新会话(替代删除)
+    print(agent.memory.summarize())  # 查看记忆统计(含 thread_id、消息数)
 
-# 压缩长期记忆
-result = agent.compress_memory()
-print(f"压缩率: {1 - result['compressed_chars']/result['original_chars']:.1%}")
+    # 压缩长期记忆
+    result = agent.compress_memory()
+    print(f"压缩率: {1 - result['compressed_chars']/result['original_chars']:.1%}")
 
-# MCP 工具管理
-agent.reload_mcp_tools()         # 重新加载 MCP 工具
-print(agent.get_available_tools())  # 查看所有工具
+    # MCP 工具管理
+    await agent.areload_mcp_tools()  # 重新加载 MCP 工具
+    print(agent.get_available_tools())  # 查看所有工具
 
-# 技能管理
-print(agent.list_skills())       # 列出所有本地技能
-agent.load_skill("git-commit")   # 手动加载技能到当前会话
-agent.clear_skills()             # 清空手动加载的技能
-agent.set_auto_match(False)      # 关闭任务自动匹配
+    # 技能管理
+    print(agent.list_skills())       # 列出所有本地技能
+    await agent.aload_skill("git-commit")  # 手动加载技能到当前会话
+    await agent.aclear_skills()      # 清空手动加载的技能
+    agent.set_auto_match(False)      # 关闭任务自动匹配
+
+    await agent.aclose()             # 释放异步资源
+
+asyncio.run(main())
 ```
 
 ## 运行时配置
