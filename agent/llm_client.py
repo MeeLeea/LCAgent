@@ -19,7 +19,7 @@ from tenacity import (
 
 # 提供商配置(单一来源: 见 config/llm_config.json 的 providers 字段)
 DEFAULT_CONFIG_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "config",
     "llm_config.json",
 )
@@ -142,7 +142,7 @@ class LLMClient:
 
     def __init__(
         self,
-        provider: Optional[str] = "openai",
+        provider: Optional[str] = "zhipu",
         api_key: Optional[str] = None,
         model: Optional[str] = None,
         config_file: Optional[str] = None,

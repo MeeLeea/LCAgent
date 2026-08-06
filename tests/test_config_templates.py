@@ -7,7 +7,6 @@ from typing import TypeAlias
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = ROOT / "config"
 EXPECTED_TEMPLATES = {
-    "agent_config.json.example",
     "llm_config.json.example",
     "mcp_servers.json.example",
     "safety.json.example",

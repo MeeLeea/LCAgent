@@ -7,6 +7,7 @@ import type {
   Provider,
   RawMessage,
   ThreadSummary,
+  WorkflowInfo,
 } from './types'
 
 export type ThemeId = 'dark' | 'deepblue' | 'midnight' | 'forest' | 'light' | 'sepia'
@@ -33,10 +34,30 @@ export const THEMES: ThemeMeta[] = [
   { id: 'light', name: '皓月白', swatch: '#ffffff', swatchAlt: '#f7f7f8', accent: '#00b85a', isDark: false },
 ]
 
+/** 判断会话是否属于工作流类型（兼容后端 type 缺失时按 thread_id 前缀兜底） */
+export function isWorkflowThread(t: { thread_id: string; type?: 'chat' | 'workflow' }): boolean {
+  return t.type === 'workflow' || t.thread_id.includes('workflow')
+}
+
+/**
+ * 剥离后端写回记忆的 "workflow:" 命令前缀（仅显示层使用，不动原始消息数据，
+ * 以保证重新生成/编辑重发时仍携带完整命令）。
+ * 例：`workflow:pipline 帮我分析` -> `pipline 帮我分析`
+ */
+export function stripWorkflowPrefix(text: string): string {
+  return text.replace(/^workflow:/, '')
+}
+
 interface AppState {
   // 主题
   theme: ThemeId
   setTheme: (id: ThemeId) => void
+
+  // 视图模式（对话 / 工作流）
+  viewMode: 'chat' | 'workflow'
+  setViewMode: (mode: 'chat' | 'workflow') => void
+  /** 切换视图模式并同步选中对应模式的会话 */
+  switchViewMode: (mode: 'chat' | 'workflow') => Promise<void>
 
   // 数据
   threads: ThreadSummary[]
@@ -47,9 +68,28 @@ interface AppState {
   currentModel: string | null
   tools: string[]
 
+  // 团队角色
+  roles: string[]
+  currentRole: string | null
+
+  // LLM 累计 token 用量（输入栏右下角展示）
+  totalTokens: number
+
+  // 工作流
+  workflows: string[]
+  workflow: WorkflowInfo | null
+  workflowLoading: boolean
+  workflowError: string | null
+  fetchWorkflows: () => Promise<void>
+  fetchWorkflow: (name?: string, force?: boolean) => Promise<void>
+
   // 流式状态
   isStreaming: boolean
   pendingInterrupt: InterruptInfo | null
+
+  // 连接状态
+  connectionStatus: 'connected' | 'disconnected' | 'checking'
+  checkConnection: () => Promise<void>
 
   // 初始化与元数据
   init: () => Promise<void>
@@ -59,16 +99,27 @@ interface AppState {
   // 会话操作
   selectThread: (id: string) => Promise<void>
   newThread: () => Promise<void>
+  newWorkflowThread: (workflowName: string) => Promise<void>
   deleteThread: (id: string) => Promise<void>
 
   // 聊天
   sendMessage: (text: string) => void
+  /** 重新生成最后一条 assistant 回复：截断到上一条 user 消息后重发 */
+  regenerate: () => void
+  /** 编辑某条 user 消息后重发：截断到该消息（含）并重新发送 */
+  editAndResend: (index: number, newText: string) => void
   resume: (payload: Record<string, unknown>) => void
   stopStreaming: () => void
+  /** 清空当前会话的前端消息显示（不删后端历史） */
+  clearMessages: () => void
 
   // 提供商/模型
   switchProvider: (key: string) => Promise<void>
   switchModel: (model: string) => Promise<void>
+
+  // 团队角色
+  fetchRoles: () => Promise<void>
+  switchRole: (role: string) => Promise<void>
 }
 
 let abortFn: (() => void) | null = null
@@ -174,13 +225,80 @@ export const useStore = create<AppState>((set, get) => ({
   currentProvider: null,
   currentModel: null,
   tools: [],
+  roles: [],
+  currentRole: null,
+  totalTokens: 0,
+  viewMode: 'chat',
+  workflows: [],
+  workflow: null,
+  workflowLoading: false,
+  workflowError: null,
   isStreaming: false,
   pendingInterrupt: null,
+  connectionStatus: 'checking',
+
+  checkConnection: async () => {
+    set({ connectionStatus: 'checking' })
+    try {
+      await api.health()
+      set({ connectionStatus: 'connected' })
+    } catch {
+      set({ connectionStatus: 'disconnected' })
+    }
+  },
+
+  setViewMode: (mode) => set({ viewMode: mode }),
+
+  switchViewMode: async (mode) => {
+    if (get().isStreaming) return
+    set({ viewMode: mode })
+    if (mode === 'workflow') void get().fetchWorkflow()
+    await get().fetchThreads()
+    // 切换到目标模式的第一个会话；若无则清空，避免主区域显示跨模式会话
+    const wantWorkflow = mode === 'workflow'
+    const first = get().threads.find((t) => isWorkflowThread(t) === wantWorkflow)
+    if (first) {
+      if (get().currentThreadId !== first.thread_id) {
+        await get().selectThread(first.thread_id)
+      }
+    } else {
+      set({ currentThreadId: null, messages: [], pendingInterrupt: null })
+    }
+  },
+
+  fetchWorkflows: async () => {
+    try {
+      const r = await api.getWorkflows()
+      set({ workflows: r.workflows })
+    } catch {
+      /* ignore */
+    }
+  },
+
+  fetchWorkflow: async (name = 'simple', force = false) => {
+    // 已加载同名称工作流且非强制刷新时复用缓存，避免重复请求
+    if (!force && get().workflow?.name === name) return
+    set({ workflowLoading: true, workflowError: null })
+    try {
+      const info = await api.getWorkflow(name)
+      set({ workflow: info, workflowLoading: false })
+    } catch (e) {
+      set({
+        workflowLoading: false,
+        workflowError: `获取工作流失败: ${(e as Error).message}`,
+      })
+    }
+  },
 
   init: async () => {
     applyTheme(get().theme)
-    await Promise.all([get().refreshProviders(), get().fetchThreads()])
+    void get().checkConnection()
+    await Promise.all([get().refreshProviders(), get().fetchThreads(), get().fetchWorkflows()])
     api.getTools().then((r) => set({ tools: r.tools })).catch(() => {})
+    // 拉取初始 token 用量
+    api.getMetrics().then((m) => set({ totalTokens: m.llm.total_tokens })).catch(() => {})
+    // 拉取团队角色列表与当前角色
+    void get().fetchRoles()
   },
 
   refreshProviders: async () => {
@@ -200,9 +318,12 @@ export const useStore = create<AppState>((set, get) => ({
     try {
       const r = await api.listThreads()
       set({ threads: r.threads })
-      // 没有选中会话时，自动选第一个
+      // 没有选中会话时，自动选当前模式的第一个会话（无匹配则退回首个）
       if (!get().currentThreadId && r.threads.length) {
-        await get().selectThread(r.threads[0].thread_id)
+        const wantWorkflow = get().viewMode === 'workflow'
+        const first =
+          r.threads.find((t) => isWorkflowThread(t) === wantWorkflow) ?? r.threads[0]
+        await get().selectThread(first.thread_id)
       }
     } catch {
       /* ignore */
@@ -225,7 +346,20 @@ export const useStore = create<AppState>((set, get) => ({
   newThread: async () => {
     if (get().isStreaming) return
     try {
-      const r = await api.createThread()
+      // 工作流模式下创建专属工作流会话，其余为普通对话
+      const type = get().viewMode
+      const r = type === 'workflow' ? await api.createThread('workflow', 'simple') : await api.createThread('chat')
+      set({ currentThreadId: r.thread_id, messages: [], pendingInterrupt: null })
+      await get().fetchThreads()
+    } catch (e) {
+      console.error(e)
+    }
+  },
+
+  newWorkflowThread: async (workflowName) => {
+    if (get().isStreaming) return
+    try {
+      const r = await api.createThread('workflow', workflowName)
       set({ currentThreadId: r.thread_id, messages: [], pendingInterrupt: null })
       await get().fetchThreads()
     } catch (e) {
@@ -253,7 +387,8 @@ export const useStore = create<AppState>((set, get) => ({
     // 所有消息（包括 / 命令）统一走流式通道
     console.log('[前端] 发送消息:', trimmed.slice(0, 50) + (trimmed.length > 50 ? '...' : ''))
 
-    const userMsg: ChatMessage = { id: nextId(), role: 'user', content: trimmed }
+    const now = Date.now()
+    const userMsg: ChatMessage = { id: nextId(), role: 'user', content: trimmed, timestamp: now }
     const assistantMsg: ChatMessage = {
       id: nextId(),
       role: 'assistant',
@@ -261,6 +396,7 @@ export const useStore = create<AppState>((set, get) => ({
       toolCalls: [],
       toolResults: [],
       streaming: true,
+      timestamp: now,
     }
     set((s) => ({
       messages: [...s.messages, userMsg, assistantMsg],
@@ -306,12 +442,12 @@ export const useStore = create<AppState>((set, get) => ({
           set({ messages: msgs })
           break
         case 'tool_result':
-          // 接收 tool_result 标记完成状态，但不保存内容
+          // 保存执行结果内容，供卡片展开时查看（默认收起）
           msgs[lastIndex] = {
             ...last,
             toolResults: [
               ...(last.toolResults ?? []),
-              { id: ev.id, name: ev.name, content: '' }, // 内容置空
+              { id: ev.id, name: ev.name, content: ev.content },
             ],
           }
           set({ messages: msgs })
@@ -344,14 +480,60 @@ export const useStore = create<AppState>((set, get) => ({
           }
           finish()
           break
+        case 'workflow_node': {
+          const wf = get().workflow
+          if (wf) {
+            set({
+              workflow: {
+                ...wf,
+                nodes: wf.nodes.map((n) => (n.id === ev.node ? { ...n, status: ev.status } : n)),
+              },
+            })
+          }
+          break
+        }
+        case 'workflow_status': {
+          const wf = get().workflow
+          if (wf) set({ workflow: { ...wf, workflow_status: ev.status } })
+          break
+        }
         case 'done':
           msgs[lastIndex] = { ...last, streaming: false }
-          set({ messages: msgs })
+          set({ messages: msgs, totalTokens: ev.total_tokens ?? get().totalTokens })
           finish()
           get().fetchThreads()
           break
       }
     })
+  },
+
+  regenerate: () => {
+    if (get().isStreaming) return
+    const msgs = [...get().messages]
+    if (msgs.length === 0) return
+    // 找到最后一条 user 消息
+    let lastUserIdx = -1
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].role === 'user') {
+        lastUserIdx = i
+        break
+      }
+    }
+    if (lastUserIdx === -1) return
+    const lastUserText = msgs[lastUserIdx].content
+    // 截断到最后一条 user 消息（不含），然后重新发送
+    set({ messages: msgs.slice(0, lastUserIdx) })
+    void get().sendMessage(lastUserText)
+  },
+
+  editAndResend: (index, newText) => {
+    if (get().isStreaming) return
+    const msgs = [...get().messages]
+    if (index < 0 || index >= msgs.length) return
+    if (msgs[index].role !== 'user') return
+    // 截断到该 user 消息（不含），重新发送新文本
+    set({ messages: msgs.slice(0, index) })
+    void get().sendMessage(newText)
   },
 
   resume: (payload) => {
@@ -365,6 +547,7 @@ export const useStore = create<AppState>((set, get) => ({
       toolCalls: [],
       toolResults: [],
       streaming: true,
+      timestamp: Date.now(),
     }
     set((s) => ({ messages: [...s.messages, assistantMsg], isStreaming: true, pendingInterrupt: null }))
 
@@ -398,12 +581,12 @@ export const useStore = create<AppState>((set, get) => ({
           set({ messages: msgs })
           break
         case 'tool_result':
-          // 接收 tool_result 标记完成状态，但不保存内容
+          // 保存执行结果内容，供卡片展开时查看（默认收起）
           msgs[lastIndex] = {
             ...last,
             toolResults: [
               ...(last.toolResults ?? []),
-              { id: ev.id, name: ev.name, content: '' }, // 内容置空
+              { id: ev.id, name: ev.name, content: ev.content },
             ],
           }
           set({ messages: msgs })
@@ -434,9 +617,26 @@ export const useStore = create<AppState>((set, get) => ({
           }
           finish()
           break
+        case 'workflow_node': {
+          const wf = get().workflow
+          if (wf) {
+            set({
+              workflow: {
+                ...wf,
+                nodes: wf.nodes.map((n) => (n.id === ev.node ? { ...n, status: ev.status } : n)),
+              },
+            })
+          }
+          break
+        }
+        case 'workflow_status': {
+          const wf = get().workflow
+          if (wf) set({ workflow: { ...wf, workflow_status: ev.status } })
+          break
+        }
         case 'done':
           msgs[lastIndex] = { ...last, streaming: false }
-          set({ messages: msgs })
+          set({ messages: msgs, totalTokens: ev.total_tokens ?? get().totalTokens })
           finish()
           get().fetchThreads()
           break
@@ -463,6 +663,11 @@ export const useStore = create<AppState>((set, get) => ({
     })
   },
 
+  clearMessages: () => {
+    if (get().isStreaming) return
+    set({ messages: [], pendingInterrupt: null })
+  },
+
   switchProvider: async (key) => {
     console.log('[前端] 切换提供商:', key)
     try {
@@ -482,6 +687,26 @@ export const useStore = create<AppState>((set, get) => ({
       console.log('[前端] 模型切换完成')
     } catch (e) {
       console.error('[前端] 切换模型失败:', e)
+    }
+  },
+
+  fetchRoles: async () => {
+    try {
+      const r = await api.getRoles()
+      set({ roles: r.roles, currentRole: r.current })
+    } catch {
+      /* ignore */
+    }
+  },
+
+  switchRole: async (role) => {
+    console.log('[前端] 切换角色:', role)
+    try {
+      await api.switchRole(role)
+      await get().fetchRoles()
+      console.log('[前端] 角色切换完成')
+    } catch (e) {
+      console.error('[前端] 切换角色失败:', e)
     }
   },
 }))

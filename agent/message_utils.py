@@ -6,6 +6,7 @@
 3. 流式事件生成 Mixin（StreamMixin），供 AgentCore 继承
 """
 import asyncio
+import logging
 import re
 import threading
 import time
@@ -19,8 +20,10 @@ from langchain_core.messages import (
 )
 from langgraph.types import Command
 
-from llm_client import RETRY_ATTEMPTS, RETRY_MAX_DELAY, should_retry
+from .llm_client import RETRY_ATTEMPTS, RETRY_MAX_DELAY, should_retry
 from tools.terminal_tools import UserRejectedCommandError
+
+logger = logging.getLogger(__name__)
 
 # ============ LLM 异常提取 ============
 
@@ -151,7 +154,7 @@ class StreamHandler:
     """流式事件处理器，通过组合方式注入 AgentCore。
 
     构造时接收 agent 引用，通过 agent 访问其 agent_executor、verbose
-    以及 _invoke_config、_create_agent_executor 等业务方法。
+    以及 _invoke_config、_update_system_prompt 等业务方法。
     提供 astream_chat / astream_resume 两个流式接口。
     """
 
@@ -164,6 +167,8 @@ class StreamHandler:
         对 LLM 提供的瞬时错误(429/5xx/连接超时)做自动重试：仅当错误发生在
         任何事件输出之前才从头重试，避免工具副作用被重复执行或产出重复 token。
         """
+        # 去重：LangGraph stream 的 updates 模式可能多次产出同一条 AIMessage
+        recorded_msg_ids: set[str] = set()
         for attempt in range(RETRY_ATTEMPTS):
             emitted = False
             try:
@@ -188,14 +193,25 @@ class StreamHandler:
                             if not isinstance(state, dict):
                                 continue
                             for m in state.get("messages", []):
-                                if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
-                                    for tc in m.tool_calls:
-                                        yield {
-                                            "type": "tool_call",
-                                            "id": tc.get("id"),
-                                            "name": tc.get("name"),
-                                            "args": tc.get("args"),
-                                        }
+                                if isinstance(m, AIMessage):
+                                    # 记录 LLM token 用量（去重，避免同一消息多次记录）
+                                    msg_id = getattr(m, "id", None) or id(m)
+                                    if msg_id not in recorded_msg_ids:
+                                        recorded_msg_ids.add(msg_id)
+                                        _llm = getattr(self.agent, "llm", None)
+                                        self.agent.metrics.extract_and_record_llm_usage(
+                                            m,
+                                            provider=getattr(_llm, "provider", ""),
+                                            model=getattr(_llm, "model", "") or "",
+                                        )
+                                    if getattr(m, "tool_calls", None):
+                                        for tc in m.tool_calls:
+                                            yield {
+                                                "type": "tool_call",
+                                                "id": tc.get("id"),
+                                                "name": tc.get("name"),
+                                                "args": tc.get("args"),
+                                            }
                                 elif isinstance(m, ToolMessage):
                                     yield {
                                         "type": "tool_result",
@@ -217,7 +233,7 @@ class StreamHandler:
         SqliteSaver 仅支持同步接口，无法直接用 astream；这里用线程 + 队列桥接，
         同时保持 SSE 端点的异步非阻塞特性。
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[Any]" = asyncio.Queue()
         sentinel = object()
 
@@ -226,7 +242,15 @@ class StreamHandler:
                 for ev in self._stream_events(input_or_command, config):
                     asyncio.run_coroutine_threadsafe(queue.put(ev), loop)
             except UserRejectedCommandError:
-                self.agent._repair_rejected_tool_calls(config)
+                # 修复 checkpoint 中悬挂的 tool_call，必须等待完成后再清状态，
+                # 否则后续 invoke 会读到未修复的 checkpoint 而报错
+                repair_future = asyncio.run_coroutine_threadsafe(
+                    self.agent._arepair_rejected_tool_calls(config), loop,
+                )
+                try:
+                    repair_future.result(timeout=10)
+                except Exception:
+                    pass
                 self.agent._clear_pending_interrupt()
                 asyncio.run_coroutine_threadsafe(
                     queue.put({"type": "cancelled", "content": "用户已拒绝执行危险命令，当前任务已取消。"}),
@@ -254,13 +278,15 @@ class StreamHandler:
                 for task in getattr(state, "tasks", []) or []:
                     for intr in getattr(task, "interrupts", []) or []:
                         return build_interrupt_event(getattr(intr, "value", None))
-        except Exception:
-            pass
+        except Exception as error:
+            logger.warning("检查 interrupt 失败: %s", error, exc_info=True)
         return None
 
     async def astream_chat(self, message: str):
         """
         流式对话：异步生成事件字典，供 SSE 推送。
+
+        压缩由 before_model 中间件自动触发，无需手动调用。
 
         事件类型:
           {"type": "token", "content": str}                 # LLM 文本增量
@@ -273,11 +299,11 @@ class StreamHandler:
 
         说明：checkpoint 会自动持久化整轮对话，故无需手动 memory.add。
         """
-        self.agent._compact_if_needed()
         config = self.agent._invoke_config()
-        self.agent.agent_executor = self.agent._create_agent_executor(
-            self.agent._compute_skill_block(message)
-        )
+        # 动态更新系统提示词（技能匹配），不重建 Graph
+        # 加锁防止与 areload_mcp_tools / aload_skill 并发修改共享状态
+        async with self.agent._state_lock:
+            self.agent._update_system_prompt(message)
         input_msg = HumanMessage(content=message)
         original_verbose = self.agent.verbose
         self.agent.verbose = False

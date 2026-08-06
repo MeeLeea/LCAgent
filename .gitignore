@@ -1,6 +1,8 @@
 # Python
 __pycache__/
 *.py[cod]
+.ruff_cache/
+.pytest_cache/
 *$py.class
 *.so
 .Python
@@ -50,8 +52,8 @@ Thumbs.db
 calibrate_*.png
 *.log
 
-llm_config.json
 
+drafts
 node_modules/
 memory/
 .agents/
@@ -60,6 +62,8 @@ config/*
 docs/
 *.json
 # 必需入库的 JSON 配置（放回白名单）
+!agent/agent_config.json
+!team/*/agent_config.json
 !web/package.json
 !web/package-lock.json
 !web/tsconfig.json

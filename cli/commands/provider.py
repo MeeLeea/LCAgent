@@ -10,7 +10,7 @@ from .types import CommandContext, CommandOutcome, HANDLED, LlmLike
 
 
 def select_provider(config_file: str, select_menu) -> str:
-    from llm_client import load_providers
+    from agent.llm_client import load_providers
 
     providers = load_providers(config_file)
     # 环境变量和本地配置文件任一提供密钥，都应在菜单中标记为已配置。
@@ -27,7 +27,7 @@ def select_provider(config_file: str, select_menu) -> str:
 
 
 def create_llm(provider: str, config_file: str) -> LlmLike:
-    from llm_client import LLMClient
+    from agent.llm_client import LLMClient
 
     try:
         return LLMClient(provider=provider, config_file=config_file)
@@ -41,7 +41,7 @@ def switch_provider(context: CommandContext, user_input: str) -> CommandOutcome:
     if user_input.lower() == "switch":
         providers = context.list_providers()
         options = [(f"{provider}  ({providers[provider]['name']})", provider) for provider in providers]
-        selected = context.select_menu("选择提供商", options, current=context.llm.provider)
+        selected = context.select_menu("选择提供商", options, current=context.agent.llm.provider)
         if selected is None:
             return HANDLED
         new_provider = str(selected)
@@ -50,7 +50,7 @@ def switch_provider(context: CommandContext, user_input: str) -> CommandOutcome:
     try:
         new_llm = context.create_llm(new_provider)
         context.replace_llm(new_llm)
-        info = context.llm.get_info()
+        info = context.agent.llm.get_info()
         context.print(f"\n已切换到: {info['provider_name']} ({info['model']})")
     except SystemExit:
         return HANDLED
@@ -60,18 +60,18 @@ def switch_provider(context: CommandContext, user_input: str) -> CommandOutcome:
 
 
 def choose_model(context: CommandContext) -> CommandOutcome:
-    info = context.llm.get_info()
-    models = context.llm.list_models()
+    info = context.agent.llm.get_info()
+    models = context.agent.llm.list_models()
     selected = context.select_menu(
         f"选择模型 [{info['provider_name']}]",
         [(model, model) for model in models],
-        current=context.llm.model,
+        current=context.agent.llm.model,
     )
     if selected is None:
         return HANDLED
     # 选择当前模型时不重建 Agent，避免无意义地刷新执行器。
-    if selected == context.llm.model:
-        context.print(f"\n模型未变: {context.llm.model}")
+    if selected == context.agent.llm.model:
+        context.print(f"\n模型未变: {context.agent.llm.model}")
         return HANDLED
     return _switch_model(context, str(selected))
 
@@ -92,9 +92,9 @@ def switch_model(context: CommandContext, user_input: str) -> CommandOutcome:
 
 def _switch_model(context: CommandContext, model: str) -> CommandOutcome:
     try:
-        context.llm.switch_model(model)
-        context.replace_llm(context.llm)
-        info = context.llm.get_info()
+        context.agent.llm.switch_model(model)
+        context.replace_llm(context.agent.llm)
+        info = context.agent.llm.get_info()
         context.print(f"\n已切换模型: {info['model']} (提供商: {info['provider_name']})")
     except (AttributeError, KeyError, RuntimeError, ValueError) as error:
         context.print(f"\n切换失败: {error}")

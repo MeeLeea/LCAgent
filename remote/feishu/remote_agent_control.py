@@ -9,7 +9,7 @@ LangChainAgent 飞书远程控制机器人 (lark-oapi v2)
 
 from __future__ import annotations
 
-import asyncio, json, os, re, subprocess, sys, threading, traceback
+import asyncio, json, logging, os, re, subprocess, sys, threading, traceback
 from typing import Any, Dict, Optional
 
 import pyautogui
@@ -31,6 +31,8 @@ from main import BASE_DIR as _, LLM_FILE, AGENT_CONFIG_FILE, MEMORY_FILE, CHECKP
 
 REMOTE_CONFIG_FILE = os.path.join(BASE_DIR, "config", "remote_control.json")
 REMOTE_THREAD_FILE = os.path.join(BASE_DIR, "memory", "remote_thread_id.txt")
+
+logger = logging.getLogger(__name__)
 
 # ── 飞书远程配置 ──
 def _load_remote_config():
@@ -69,7 +71,7 @@ def _send_lark_msg(chat_id: str, msg_type: str, content: dict) -> None:
             .build()
         )
     except Exception as e:
-        print(f"[飞书] 发送失败: {e}")
+        logger.error("飞书发送失败: %s", e, exc_info=True)
 
 _send_text = lambda c, t: _send_lark_msg(c, "text", {"text": t})
 
@@ -105,7 +107,7 @@ def _send_image_file(chat_id: str, path: str) -> bool:
             return True
         return False
     except Exception as e:
-        print(f"[图片] {path}: {e}")
+        logger.error("图片 %s 上传失败: %s", path, e)
         return False
 
 def _send_file(chat_id: str, path: str) -> bool:
@@ -127,23 +129,27 @@ def _send_file(chat_id: str, path: str) -> bool:
         _send_text(chat_id, f"❌ 上传失败: {resp.msg}")
         return False
     except Exception as e:
-        print(f"[文件] {path}: {e}")
+        logger.error("文件 %s 上传失败: %s", path, e)
         return _send_text(chat_id, f"❌ 发送失败: {e}")
 
 # ===================== Agent 生命周期 =====================
 
 def _auto_detect_provider() -> str:
-    from llm_client import load_providers
+    from agent.llm_client import load_providers
     providers = load_providers(LLM_FILE)
     if not providers:
-        return print("[Agent] 无 provider，回退 zhipu") or "zhipu"
+        logger.warning("无 provider，回退 zhipu")
+        return "zhipu"
     if AGENT_PROVIDER and AGENT_PROVIDER in providers:
-        return print(f"[Agent] 显式: {providers[AGENT_PROVIDER]['name']}") or AGENT_PROVIDER
+        logger.info("显式 provider: %s", providers[AGENT_PROVIDER]["name"])
+        return AGENT_PROVIDER
     for key in providers:
         if os.environ.get(str(providers[key].get("env_key", ""))) or _has_api_key(key):
-            return print(f"[Agent] 自动: {providers[key]['name']} ({key})") or key
+            logger.info("自动检测 provider: %s (%s)", providers[key]["name"], key)
+            return key
     key = next(iter(providers))
-    return print(f"[Agent] 回退: {providers[key]['name']} ({key})") or key
+    logger.warning("回退 provider: %s (%s)", providers[key]["name"], key)
+    return key
 
 def _has_api_key(key: str) -> bool:
     if not os.path.exists(LLM_FILE): return False
@@ -178,10 +184,12 @@ def start_agent() -> str:
                     _save_remote_thread_id(agent.memory.thread_id)
                 # 主动修复可能残留的孤儿 tool_calls（上次中断可能遗留）
                 try:
-                    agent._repair_rejected_tool_calls(agent._invoke_config())
+                    loop.run_until_complete(
+                        agent._arepair_rejected_tool_calls(agent._invoke_config())
+                    )
                     agent._clear_pending_interrupt()
-                except Exception:
-                    pass
+                except Exception as error:
+                    logger.warning("修复孤儿 tool_call 失败: %s", error, exc_info=True)
                 result_container.append((agent, llm, agent.memory.thread_id))
             except Exception as e:
                 error_container.append(e)
@@ -244,10 +252,10 @@ def _auto_send_files(chat_id: str, text: str) -> int:
 def _clear_pending_interrupt(agent: Any) -> None:
     """清理未完成的中断，确保 checkpoint 干净。"""
     try:
-        agent._repair_rejected_tool_calls(agent._invoke_config())
+        asyncio.run(agent._arepair_rejected_tool_calls(agent._invoke_config()))
         agent._clear_pending_interrupt()
     except Exception as e:
-        print(f"[中断] 清理失败: {e}")
+        logger.warning("中断清理失败: %s", e, exc_info=True)
     _interrupt_cache.clear()
 
 def _handle_turn_result(chat_id: str, agent: Any, turn: Any, mode: str) -> None:
@@ -296,7 +304,7 @@ def _resume_interrupt(chat_id: str, content: str) -> None:
     else:
         payload = {"text": content}
     try:
-        _handle_turn_result(chat_id, agent, agent.resume_structured(payload),
+        _handle_turn_result(chat_id, agent, asyncio.run(agent.aresume_structured(payload)),
                             getattr(agent, "_pending_interrupt_mode", "chat"))
     except Exception as e:
         _send_text(chat_id, f"❌ 恢复失败: {e}")
@@ -364,7 +372,7 @@ def _handle_model_menu(chat_id: str, inp: str = "") -> None:
     agent = get_agent()
     if not agent: return _send_text(chat_id, "⚠️ 请先启动agent")
     if not inp:  # 列出菜单
-        from llm_client import load_providers
+        from agent.llm_client import load_providers
         try: providers = load_providers(LLM_FILE)
         except Exception as e: return _send_text(chat_id, f"❌ {e}")
         flat = [(k, m) for k, v in providers.items() for m in v.get("models", [])]
@@ -418,7 +426,7 @@ def _agent_task(chat_id: str, method: str, payload: str) -> None:
             agent = get_agent()
             if not agent: return _send_text(chat_id, "⚠️ 请先启动agent")
             _clear_pending_interrupt(agent)
-            turn = agent.run_structured(payload) if method == "run" else agent.chat_structured(payload)
+            turn = asyncio.run(agent.arun_structured(payload)) if method == "run" else asyncio.run(agent.achat_structured(payload))
             _handle_turn_result(chat_id, agent, turn, method)
         except Exception as e:
             _send_text(chat_id, f"❌ {e}")
@@ -436,7 +444,7 @@ def _on_message(data) -> None:
         if len(_seen_msg) > 500: _seen_msg.clear()
         raw = msg.content.strip()
         content = json.loads(raw).get("text", raw) if raw.startswith("{") else raw
-        print(f"[飞书] {data.event.sender.sender_id.open_id} | {content}")
+        logger.info("飞书消息: %s | %s", data.event.sender.sender_id.open_id, content)
         if data.event.sender.sender_id.open_id not in ALLOW_OPEN_ID:
             return _send_text(msg.chat_id, "⚠️ 权限不足")
         _dispatch(msg.chat_id, content)
@@ -510,11 +518,14 @@ def _dispatch(chat_id: str, content: str) -> None:
 # ===================== 入口 =====================
 
 def run_remote_bot() -> None:
+    from agent.logging_config import setup_logging
+    setup_logging()
+    # 启动 banner（保持 print，面向用户）
     print("=" * 45, "\n  LangChainAgent 飞书远程控制", "\n" + "=" * 45)
     print(f"  项目: {BASE_DIR}\n  配置: {REMOTE_CONFIG_FILE}\n")
-    print("[启动] " + start_agent() + "\n")
+    logger.info("Agent 启动: %s", start_agent())
     handler = EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(_on_message).build()
-    print("  WebSocket 连接中... 请在飞书发消息获取 open_id\n")
+    logger.info("WebSocket 连接中... 请在飞书发消息获取 open_id")
     LarkWSClient(app_id=APP_ID, app_secret=APP_SECRET, event_handler=handler, log_level=lark.LogLevel.ERROR).start()
 
 if __name__ == "__main__":

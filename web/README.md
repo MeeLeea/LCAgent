@@ -124,6 +124,25 @@ npm run preview
 
 内置 6 套主题（极夜黑、深空蓝、午夜紫、森野绿、护眼米、皓月白），通过 CSS 变量实现，选择持久化到 localStorage。
 
+### 工作流视图
+
+侧边栏左上角提供「对话 | 工作流」切换开关：
+
+- 切到「工作流」时，主内容区从聊天视图切换为工作流视图。
+- 视图头部提供工作流名称下拉框（`simple` / `pipline` 等，来源 `GET /api/workflows`），可随时切换并刷新展示对应工作流的节点与链路。
+- 工作流模式下侧边栏显示专属工作流会话列表，「新建会话」创建绑定当前工作流的专属会话（会话 ID 为 `{process_type}-workflow-{name}-{uuid}`，以工作流图标 + 徽标区分）。
+- 在专属工作流会话中直接输入消息即可，后端自动包装为 `/workflow:{name} <任务>` 命令执行。
+- 节点/边结构与状态通过 `GET /api/workflow?name=<name>` 获取，渲染为节点卡片 + mermaid 流程图；工作流结构带进程级缓存，仅点击刷新按钮强制重新拉取。
+- 哨兵节点（`__start__`/`__end__`）映射为 `START`/`END` 标签；节点初始状态为 `pending`。
+- **运行进度实时跟踪**：工作流执行期间，`POST /api/chat` 的 SSE 流会推送 `workflow_node`（节点 `running`/`done`）与 `workflow_status`（整体 `running`/`done`）事件，前端据此实时高亮节点卡片与流程图中的当前节点。
+
+#### 相关 API
+
+- `GET /api/workflows`：列出可用工作流名称。
+- `POST /api/threads`：`{"type": "workflow", "workflow_name": "simple"}` 创建专属工作流会话；缺省时创建普通会话。
+- `GET /api/threads`：会话摘要带 `type`（`chat`/`workflow`），工作流会话额外带 `workflow_name`。
+- `POST /api/chat`：在 `type=workflow` 的会话中发送不以 `/` 开头的消息时，自动包装为 `/workflow:{workflow_name} <消息>` 执行。
+
 ## Tauri 桌面应用
 
 本项目前端代码同时作为 Tauri 桌面应用的 UI，配置见项目根目录 `src-tauri/`。

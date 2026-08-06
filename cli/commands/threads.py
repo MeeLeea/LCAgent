@@ -6,7 +6,7 @@ import os
 
 from langchain_core.messages import HumanMessage
 
-from .types import CommandContext, CommandOutcome, HANDLED
+from .types import HANDLED, CommandContext, CommandOutcome
 
 
 def manage_threads(context: CommandContext) -> CommandOutcome:
@@ -82,21 +82,17 @@ def export_thread(context: CommandContext, user_input: str) -> CommandOutcome:
     return HANDLED
 
 
-def _thread_option(context: CommandContext, thread_id: str, current: str) -> tuple[str, str]:
+def _thread_option(
+    context: CommandContext,
+    thread_id: str,
+    current: str,
+) -> tuple[str, str]:
     try:
         # 直接读取目标会话消息，不再临时变异 thread_id
         messages = context.agent.memory.get_messages(thread_id=thread_id) or []
         message_count = len(messages)
-        # 标题缓存挂在 agent 实例上,同一次运行内不重复调 LLM
-        cache = getattr(context.agent, "_thread_title_cache", None)
-        if cache is None:
-            cache = {}
-            try:
-                setattr(context.agent, "_thread_title_cache", cache)
-            except AttributeError:
-                pass
-        # 对前5条 HumanMessage 调 LLM 生成标题
-        preview = _messages_preview(messages, context.llm, cache, thread_id, message_count)
+        # 用第一条用户消息作为会话标题,不调用 LLM,避免菜单渲染变慢
+        preview = _messages_preview(messages)
     except (AttributeError, OSError, RuntimeError):
         message_count = 0
         preview = ""
@@ -106,85 +102,42 @@ def _thread_option(context: CommandContext, thread_id: str, current: str) -> tup
     return f"{label_main}  [{message_count} 条消息]{mark}", thread_id
 
 
-def _messages_preview(
-    messages,
-    llm,
-    cache: dict,
-    thread_id: str,
-    message_count: int,
-    required: int = 3,
-    max_len: int = 15,
-) -> str:
-    """对前 N 条 HumanMessage 调用 LLM 生成标题,用于会话菜单显示。
+def _messages_preview(messages, max_len: int = 15) -> str:
+    """取第一条用户消息作为会话标题,超长截断。
 
-    策略:
-    - 只取 HumanMessage(用户消息最能体现会话主题)
-    - 不足 required 条时返回空(回退到 thread_id)
-    - 满 required 条时拼接内容,调用 LLM 生成 max_len 字以内的标题
-    - 结果按 thread_id + message_count 缓存,消息数变化时重新生成
-    - LLM 调用失败时回退到纯文本截断
+    无用户消息时返回空串,由调用方回退到 thread_id。
+
+    Args:
+        messages: 会话消息列表
+        max_len: 标题最大长度
+
+    Returns:
+        第一条用户消息的摘要;无用户消息返回空串
     """
-    # 命中缓存直接返回(消息数没变就用旧标题)
-    if thread_id in cache:
-        cached_title, cached_count = cache[thread_id]
-        if cached_count == message_count:
-            return cached_title
-
-    # 取前 required 条 HumanMessage
-    human_contents = []
     for msg in messages:
         if isinstance(msg, HumanMessage):
-            content = msg.content if isinstance(msg.content, str) else str(msg.content)
-            content = content.replace("\n", " ").replace("\r", " ").strip()
+            content = _message_text(msg.content)
+            content = content.replace("\r\n", " ").replace("\n", " ").replace("\r", " ").strip()
             if content:
-                human_contents.append(content)
-        if len(human_contents) >= required:
-            break
+                if len(content) > max_len:
+                    return content[:max_len] + "..."
+                return content
+    return ""
 
-    # 不足 required 条则跳过(返回空,让调用方回退到 thread_id)
-    if len(human_contents) < required:
-        return ""
 
-    # 调用 LLM 生成标题
-    dialog_text = "\n".join(
-        f"{i + 1}. {c}" for i, c in enumerate(human_contents[:required])
-    )
-    try:
-        title = llm.chat(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        f"你是标题生成器。用{max_len}字以内的中文概括对话主题,"
-                        "只输出标题文本,不要加引号、标点符号或任何解释。"
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"以下是用户的多轮提问,请生成一个{max_len}字以内的标题:\n\n"
-                        f"{dialog_text}"
-                    ),
-                },
-            ],
-            temperature=0.3,
-            max_tokens=30,
-        )
-        # 清理 LLM 输出(去引号、换行、首尾空白)
-        title = title.strip().strip("\"'""''").strip()
-        if title:
-            title = title[:max_len]
-            cache[thread_id] = (title, message_count)
-            return title
-    except Exception:
-        pass
-
-    # LLM 失败回退:纯文本截断
-    summary = " ".join(human_contents[:required])
-    summary = " ".join(summary.split())
-    if len(summary) > max_len:
-        summary = summary[:max_len] + "..."
-    return summary
+def _message_text(content: object) -> str:
+    """将消息内容归一化为纯文本,支持字符串与内容块列表。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+            elif isinstance(block, str):
+                parts.append(block)
+        return " ".join(part for part in parts if part)
+    return str(content)
 
 
 def _delete_thread(context: CommandContext, thread_id: str) -> None:

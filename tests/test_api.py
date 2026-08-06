@@ -43,10 +43,14 @@ def mock_agent():
     agent.memory = MagicMock()
     agent.memory.thread_id = "test-thread-123"
     agent.memory.new_thread = MagicMock(return_value="new-thread-456")
+    agent.memory.new_workflow_thread = MagicMock(return_value="server-workflow-simple-abc12345")
     agent.memory.list_threads = MagicMock(return_value=["thread-1", "thread-2"])
     agent.memory.delete_thread = MagicMock(return_value=True)
+    agent.memory.is_workflow_thread = MagicMock(return_value=False)
+    agent.memory.workflow_name_of = MagicMock(return_value=None)
     agent.get_available_tools = MagicMock(return_value=["calculator", "web_search", "ask_human"])
     agent.switch_llm = MagicMock()
+    agent.aswitch_llm = AsyncMock(side_effect=agent.switch_llm)
     
     # Mock astream_chat：普通对话返回 token + done 事件
     async def mock_astream_chat(message: str) -> AsyncIterator[Dict[str, Any]]:
@@ -89,7 +93,86 @@ def mock_agent():
         yield {"type": "done"}
     
     agent.astream_resume = mock_astream_resume
-    
+
+    # Mock metrics 收集器
+    agent.metrics = MagicMock()
+    agent.metrics.get_summary = MagicMock(return_value={
+        "session": {"duration_seconds": 12.5, "turn_count": 3},
+        "llm": {
+            "total_calls": 5,
+            "total_prompt_tokens": 1000,
+            "total_completion_tokens": 500,
+            "total_tokens": 1500,
+            "total_duration_ms": 3000.0,
+            "by_provider": {
+                "zhipu": {
+                    "count": 5,
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 500,
+                    "total_tokens": 1500,
+                    "avg_tokens": 300.0,
+                    "total_ms": 3000.0,
+                }
+            },
+        },
+        "tools": {
+            "total_calls": 2,
+            "total_duration_ms": 500.0,
+            "by_name": {
+                "calculator": {
+                    "count": 2,
+                    "total_ms": 500.0,
+                    "min_ms": 200.0,
+                    "max_ms": 300.0,
+                    "avg_ms": 250.0,
+                    "failures": 0,
+                    "timeouts": 0,
+                }
+            },
+        },
+        "compaction": {
+            "total_count": 1,
+            "total_messages_before": 60,
+            "total_messages_after": 22,
+            "total_duration_ms": 800.0,
+            "messages_saved": 38,
+        },
+    })
+    agent.metrics.reset = MagicMock()
+
+    # Mock manually_compact（异步）
+    agent.manually_compact = AsyncMock(return_value={
+        "summary": "用户讨论了 API 设计和测试策略",
+        "messages_before": 60,
+        "messages_after": 22,
+    })
+
+    # Mock 记忆相关方法
+    agent.get_memory_summary = MagicMock(return_value={
+        "thread_id": "test-thread-123",
+        "checkpoint_messages": 10,
+        "checkpoint_backend": "sqlite",
+        "checkpoint_file": "/tmp/test.sqlite",
+        "long_term_count": 5,
+        "total_threads": 3,
+    })
+    agent.compress_memory = MagicMock(return_value={
+        "success": True,
+        "original_count": 5,
+        "original_chars": 2000,
+        "compressed_chars": 500,
+        "summary": "压缩后的摘要内容",
+    })
+    agent.memory.clear_long_term = MagicMock()
+    agent.memory.clear_short_term = MagicMock()
+    agent.memory.export_thread = MagicMock(return_value="用户: 测试消息\n助手: 回复")
+
+    # Mock 技能列表
+    agent.list_skills = MagicMock(return_value=[
+        {"name": "pptx", "description": "PPT 生成技能"},
+        {"name": "pdf", "description": "PDF 处理技能"},
+    ])
+
     return agent
 
 
@@ -292,6 +375,205 @@ def test_get_tools(client, mock_agent):
 
 
 # --------------------------------------------------------------------------- #
+# 团队角色
+# --------------------------------------------------------------------------- #
+def test_get_roles(client, mock_agent):
+    """测试列出可用团队角色与当前角色名"""
+    mock_agent.name = "manager"
+    with patch(
+        "agent.role_sw.get_available_team_roles",
+        return_value=["manager", "terminator", "worker"],
+    ):
+        response = client.get("/api/roles")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["roles"] == ["manager", "terminator", "worker"]
+    assert data["current"] == "manager"
+
+
+def test_switch_role(client, mock_agent):
+    """测试切换团队角色：调用 arebuild_from_team_dir 并返回新角色"""
+    mock_agent.name = "worker"
+    mock_agent.arebuild_from_team_dir = AsyncMock()
+
+    response = client.post("/api/roles/switch", json={"role": "worker"})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["role"] == "worker"
+    assert data["current"] == "worker"
+    mock_agent.arebuild_from_team_dir.assert_awaited_once_with("worker", task="")
+
+
+def test_switch_role_with_task(client, mock_agent):
+    """测试切换角色时携带 task，task 透传给 arebuild_from_team_dir"""
+    mock_agent.name = "manager"
+    mock_agent.arebuild_from_team_dir = AsyncMock()
+
+    response = client.post(
+        "/api/roles/switch",
+        json={"role": "manager", "task": "分析项目结构"},
+    )
+
+    assert response.status_code == 200
+    mock_agent.arebuild_from_team_dir.assert_awaited_once_with(
+        "manager", task="分析项目结构"
+    )
+
+
+def test_switch_role_unknown(client, mock_agent):
+    """测试切换到未知角色返回 404"""
+    mock_agent.arebuild_from_team_dir = AsyncMock(
+        side_effect=KeyError("未找到 team 角色: ghost。可用角色: manager, worker")
+    )
+    with patch(
+        "agent.role_sw.get_available_team_roles",
+        return_value=["manager", "worker"],
+    ):
+        response = client.post("/api/roles/switch", json={"role": "ghost"})
+
+    assert response.status_code == 404
+    assert "ghost" in response.json()["detail"]
+
+
+def test_switch_role_empty_prompt(client, mock_agent):
+    """测试角色提示词文件为空返回 400"""
+    mock_agent.arebuild_from_team_dir = AsyncMock(
+        side_effect=FileNotFoundError("角色提示词文件为空或无法读取: team/broken/AGENT.md")
+    )
+    response = client.post("/api/roles/switch", json={"role": "broken"})
+
+    assert response.status_code == 400
+    assert "提示词" in response.json()["detail"]
+
+
+# --------------------------------------------------------------------------- #
+# 工作流
+# --------------------------------------------------------------------------- #
+class FakeGraphNode:
+    """模拟 graph.get_graph() 返回的节点"""
+
+    def __init__(self, node_id: str):
+        self.id = node_id
+
+
+class FakeGraphEdge:
+    """模拟 graph.get_graph() 返回的边"""
+
+    def __init__(self, source: str, target: str):
+        self.source = source
+        self.target = target
+
+
+class FakeGraphObj:
+    """模拟 graph.get_graph() 返回的图结构对象"""
+
+    def __init__(self):
+        self.nodes = {
+            "__start__": FakeGraphNode("__start__"),
+            "summarize": FakeGraphNode("summarize"),
+            "manager_plan": FakeGraphNode("manager_plan"),
+            "worker_exec": FakeGraphNode("worker_exec"),
+            "terminator_final": FakeGraphNode("terminator_final"),
+            "__end__": FakeGraphNode("__end__"),
+        }
+        self.edges = [
+            FakeGraphEdge("__start__", "summarize"),
+            FakeGraphEdge("summarize", "manager_plan"),
+            FakeGraphEdge("manager_plan", "worker_exec"),
+            FakeGraphEdge("worker_exec", "terminator_final"),
+            FakeGraphEdge("terminator_final", "__end__"),
+        ]
+
+
+class FakeCompiledGraph:
+    """模拟编译后的 LangGraph 图"""
+
+    def get_graph(self):
+        return FakeGraphObj()
+
+
+@pytest.fixture(autouse=True)
+def clear_workflow_cache():
+    """每个工作流测试前清空 lru_cache,避免用例间缓存干扰"""
+    from api.server import _workflow_snapshot
+
+    _workflow_snapshot.cache_clear()
+    yield
+    _workflow_snapshot.cache_clear()
+
+
+def test_get_workflow(client, mock_agent):
+    """测试获取工作流结构与节点状态"""
+    with patch("graph.registry.build_workflow", return_value=(FakeCompiledGraph(), {})):
+        response = client.get("/api/workflow")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["name"] == "simple"
+    assert data["workflow_status"] == "idle"
+
+    # 节点: 过滤掉 __start__/__end__ 哨兵
+    node_ids = [n["id"] for n in data["nodes"]]
+    assert node_ids == ["summarize", "manager_plan", "worker_exec", "terminator_final"]
+    for node in data["nodes"]:
+        assert node["status"] == "pending"
+        assert node["label"] == node["id"]
+
+    # 边: 哨兵节点映射为 START/END 标签,不再出现 __ 前缀
+    for edge in data["edges"]:
+        assert not edge["source"].startswith("__")
+        assert not edge["target"].startswith("__")
+    assert {"source": "START", "target": "summarize"} in data["edges"]
+    assert {"source": "terminator_final", "target": "END"} in data["edges"]
+    assert {"source": "summarize", "target": "manager_plan"} in data["edges"]
+
+
+def test_get_workflow_cached(client, mock_agent):
+    """测试工作流结构被缓存: 连续请求只构建一次"""
+    calls = []
+
+    def fake_build(name: str):
+        calls.append(name)
+        return FakeCompiledGraph(), {}
+
+    with patch("graph.registry.build_workflow", side_effect=fake_build):
+        r1 = client.get("/api/workflow")
+        r2 = client.get("/api/workflow")
+
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    # 缓存命中, build_workflow 只被调用一次
+    assert len(calls) == 1
+    assert calls[0] == "simple"
+
+
+def test_get_workflow_unknown_name(client, mock_agent):
+    """测试未知工作流名返回 404"""
+    def fake_build(name: str):
+        raise KeyError(f"未知工作流: {name}")
+
+    with patch("graph.registry.build_workflow", side_effect=fake_build):
+        response = client.get("/api/workflow?name=unknown_workflow")
+
+    assert response.status_code == 404
+    assert "未知工作流: unknown_workflow" in response.json()["detail"]
+
+
+def test_get_workflow_build_error(client, mock_agent):
+    """测试工作流构建异常返回 500"""
+    def fake_build(name: str):
+        raise RuntimeError("构建失败")
+
+    with patch("graph.registry.build_workflow", side_effect=fake_build):
+        response = client.get("/api/workflow")
+
+    assert response.status_code == 500
+    assert "工作流构建失败" in response.json()["detail"]
+
+
+# --------------------------------------------------------------------------- #
 # 会话管理
 # --------------------------------------------------------------------------- #
 def test_list_threads(client, mock_agent, temp_checkpoint_db):
@@ -309,6 +591,7 @@ def test_list_threads(client, mock_agent, temp_checkpoint_db):
         assert "thread_id" in thread
         assert "message_count" in thread
         assert "preview" in thread
+        assert "type" in thread
 
 
 def test_create_thread(client, mock_agent):
@@ -320,6 +603,39 @@ def test_create_thread(client, mock_agent):
     assert data["thread_id"] == "new-thread-456"
     
     mock_agent.memory.new_thread.assert_called_once()
+
+
+def test_create_workflow_thread(client, mock_agent):
+    """测试创建专属工作流会话"""
+    response = client.post(
+        "/api/threads",
+        json={"type": "workflow", "workflow_name": "simple"},
+    )
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["thread_id"] == "server-workflow-simple-abc12345"
+    mock_agent.memory.new_workflow_thread.assert_called_once_with("simple")
+
+
+def test_create_workflow_thread_default_name(client, mock_agent):
+    """测试未指定工作流名时回退到 simple"""
+    response = client.post(
+        "/api/threads",
+        json={"type": "workflow"},
+    )
+    assert response.status_code == 200
+    mock_agent.memory.new_workflow_thread.assert_called_once_with("simple")
+
+
+def test_list_workflows(client):
+    """测试列出可用工作流名称"""
+    with patch("graph.registry.WORKFLOWS", {"simple": None, "pipline": None}):
+        response = client.get("/api/workflows")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["workflows"] == ["simple", "pipline"]
 
 
 def test_delete_thread(client, mock_agent):
@@ -512,6 +828,168 @@ def test_chat_management_command(client, mock_agent):
         assert "命令" in content or "help" in content
 
 
+def test_chat_management_command_realtime_stream(client, mock_agent):
+    """测试管理型命令输出实时推送:多段 print 输出是独立 token 事件而非合并一次"""
+    with patch("api.server.dispatch_command") as mock_dispatch:
+        def side_effect(context, command):
+            context.print_fn("第一段输出")
+            context.print_fn("第二段输出")
+            return "success"
+
+        mock_dispatch.side_effect = side_effect
+
+        response = client.post(
+            "/api/chat",
+            json={"message": "/info", "thread_id": "test-thread-123"}
+        )
+
+        assert response.status_code == 200
+
+        events = []
+        for line in response.iter_lines():
+            if line.startswith("data: "):
+                events.append(json.loads(line[6:]))
+
+        # 两段输出是独立 token 事件(实时推送),且按顺序到达,最后以 done 收尾
+        token_events = [e for e in events if e["type"] == "token"]
+        assert len(token_events) == 2
+        assert token_events[0]["content"] == "第一段输出"
+        assert token_events[1]["content"] == "第二段输出"
+        assert events[-1]["type"] == "done"
+
+
+def test_is_execution_command_classification():
+    """测试执行型命令分类函数(_is_execution_command)"""
+    from api.server import _is_execution_command
+
+    # 执行型
+    assert _is_execution_command("json: 生成配置") is True
+    assert _is_execution_command("react: 帮我写代码") is True
+    assert _is_execution_command("cot: 推理一下") is True
+    assert _is_execution_command("skill:pptx 帮我做 PPT") is True
+
+    # 管理型(skill 无任务 / clear / 其他管理命令)
+    assert _is_execution_command("skill:pptx") is False      # 无任务文本
+    assert _is_execution_command("skill:clear") is False     # clear 是管理型
+    assert _is_execution_command("skill: 清空") is False
+    assert _is_execution_command("help") is False
+    assert _is_execution_command("info") is False
+    assert _is_execution_command("threads") is False
+    assert _is_execution_command("") is False
+
+
+def test_unsupported_runner_returns_clear_hint_instead_of_none():
+    """测试 Web 端 runner 兜底返回明确提示而非静默 None"""
+    from api.server import _unsupported_runner
+
+    result = _unsupported_runner(None, "任意任务")
+    assert isinstance(result, str)
+    assert result  # 非空
+    assert "json:" in result or "react:" in result  # 引导用户走流式/普通对话
+
+
+def test_chat_workflow_events_forwarded(client, mock_agent):
+    """测试工作流运行事件经 SSE 实时转发(workflow_node / workflow_status)"""
+    with patch("api.server.dispatch_command") as mock_dispatch:
+        def side_effect(context, command):
+            context.print_fn("构建工作流: simple")
+            # 模拟 run_workflow 内部经 workflow_event_cb 转发的事件
+            if context.workflow_event_cb:
+                context.workflow_event_cb({"type": "workflow_status", "status": "running"})
+                context.workflow_event_cb({"type": "workflow_node", "node": "manager_plan", "status": "running"})
+                context.workflow_event_cb({"type": "workflow_node", "node": "manager_plan", "status": "done"})
+                context.workflow_event_cb({"type": "workflow_status", "status": "done"})
+            context.print_fn("工作流执行完成")
+            return "success"
+
+        mock_dispatch.side_effect = side_effect
+
+        response = client.post(
+            "/api/chat",
+            json={"message": "/workflow:simple 测试任务", "thread_id": "test-thread-123"}
+        )
+
+        assert response.status_code == 200
+
+        events = []
+        for line in response.iter_lines():
+            if line.startswith("data: "):
+                events.append(json.loads(line[6:]))
+
+        types = [e["type"] for e in events]
+        # 顺序:token → workflow_status → workflow_node → workflow_node → workflow_status → token → done
+        assert types[0] == "token"
+        assert types[1] == "workflow_status"
+        assert events[1]["status"] == "running"
+        assert types[2] == "workflow_node"
+        assert events[2]["node"] == "manager_plan"
+        assert events[2]["status"] == "running"
+        assert types[3] == "workflow_node"
+        assert events[3]["status"] == "done"
+        assert types[4] == "workflow_status"
+        assert events[4]["status"] == "done"
+        assert types[-2] == "token"
+        assert types[-1] == "done"
+
+
+def test_chat_workflow_thread_auto_command(client, mock_agent):
+    """测试专属工作流会话自动包装为 /workflow:<name> 命令"""
+    mock_agent.memory.is_workflow_thread.return_value = True
+    mock_agent.memory.workflow_name_of.return_value = "simple"
+
+    with patch("api.server.dispatch_command") as mock_dispatch:
+        def side_effect(context, command):
+            context.print_fn(f"执行工作流命令: {command}")
+            return "success"
+
+        mock_dispatch.side_effect = side_effect
+
+        response = client.post(
+            "/api/chat",
+            json={"message": "帮我分析项目", "thread_id": "server-workflow-simple-abc12345"},
+        )
+
+        assert response.status_code == 200
+
+        events = []
+        for line in response.iter_lines():
+            if line.startswith("data: "):
+                events.append(json.loads(line[6:]))
+
+        token_content = "".join(e["content"] for e in events if e["type"] == "token")
+        assert "workflow:simple 帮我分析项目" in token_content
+        assert events[-1]["type"] == "done"
+
+
+def test_chat_workflow_thread_explicit_command_not_wrapped(client, mock_agent):
+    """测试工作流会话中显式以 / 开头的命令不被二次包装"""
+    mock_agent.memory.is_workflow_thread.return_value = True
+    mock_agent.memory.workflow_name_of.return_value = "simple"
+
+    with patch("api.server.dispatch_command") as mock_dispatch:
+        def side_effect(context, command):
+            context.print_fn(f"显式命令: {command}")
+            return "success"
+
+        mock_dispatch.side_effect = side_effect
+
+        response = client.post(
+            "/api/chat",
+            json={"message": "/help", "thread_id": "server-workflow-simple-abc12345"},
+        )
+
+        assert response.status_code == 200
+
+        events = []
+        for line in response.iter_lines():
+            if line.startswith("data: "):
+                events.append(json.loads(line[6:]))
+
+        token_content = "".join(e["content"] for e in events if e["type"] == "token")
+        assert "显式命令: help" in token_content
+        assert "workflow:simple" not in token_content
+
+
 # --------------------------------------------------------------------------- #
 # HITL 恢复
 # --------------------------------------------------------------------------- #
@@ -653,6 +1131,269 @@ def test_execute_command_with_exception(client, mock_agent):
 
 
 # --------------------------------------------------------------------------- #
+# 运行时指标
+# --------------------------------------------------------------------------- #
+def test_get_metrics(client, mock_agent):
+    """测试获取运行时指标"""
+    response = client.get("/api/metrics")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert "session" in data
+    assert data["session"]["turn_count"] == 3
+    assert "llm" in data
+    assert data["llm"]["total_calls"] == 5
+    assert data["llm"]["total_tokens"] == 1500
+    assert "zhipu" in data["llm"]["by_provider"]
+    assert "tools" in data
+    assert data["tools"]["total_calls"] == 2
+    assert "calculator" in data["tools"]["by_name"]
+    assert "compaction" in data
+    assert data["compaction"]["total_count"] == 1
+    assert data["compaction"]["messages_saved"] == 38
+
+
+def test_reset_metrics(client, mock_agent):
+    """测试重置运行时指标"""
+    response = client.post("/api/metrics/reset")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["reset"] is True
+    mock_agent.metrics.reset.assert_called_once()
+
+
+def test_get_metrics_no_agent(mock_llm):
+    """测试 Agent 未初始化时返回 503"""
+    with patch("api.server.agent", None), \
+         patch("api.server.llm", mock_llm):
+        from api.server import app
+        with TestClient(app) as c:
+            response = c.get("/api/metrics")
+            assert response.status_code == 503
+
+
+# --------------------------------------------------------------------------- #
+# 上下文压缩
+# --------------------------------------------------------------------------- #
+def test_compact_success(client, mock_agent):
+    """测试手动触发上下文压缩"""
+    response = client.post("/api/compact", json={"thread_id": "test-thread-123"})
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["compacted"] is True
+    assert data["thread_id"] == "test-thread-123"
+    assert data["messages_before"] == 60
+    assert data["messages_after"] == 22
+    assert "summary" in data
+
+
+def test_compact_no_need(client, mock_agent):
+    """测试消息数未超阈值时返回 compacted=False"""
+    mock_agent.manually_compact = AsyncMock(return_value=None)
+    response = client.post("/api/compact")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["compacted"] is False
+    assert "message" in data
+
+
+def test_compact_error(client, mock_agent):
+    """测试压缩异常返回 500"""
+    mock_agent.manually_compact = AsyncMock(side_effect=RuntimeError("压缩失败"))
+    response = client.post("/api/compact")
+    assert response.status_code == 500
+    assert "压缩失败" in response.json()["detail"]
+
+
+# --------------------------------------------------------------------------- #
+# 记忆管理
+# --------------------------------------------------------------------------- #
+def test_get_memory_summary(client, mock_agent):
+    """测试获取记忆摘要"""
+    response = client.get("/api/memory")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["thread_id"] == "test-thread-123"
+    assert data["checkpoint_messages"] == 10
+    assert data["long_term_count"] == 5
+    assert data["total_threads"] == 3
+
+
+def test_compress_memory(client, mock_agent):
+    """测试压缩长期记忆"""
+    response = client.post("/api/compress")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["success"] is True
+    assert data["original_count"] == 5
+    assert data["compressed_chars"] == 500
+    mock_agent.compress_memory.assert_called_once()
+
+
+def test_clear_memory_long(client, mock_agent):
+    """测试清空长期记忆"""
+    response = client.delete("/api/memory?scope=long")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["cleared"] is True
+    assert data["scope"] == "long"
+    mock_agent.memory.clear_long_term.assert_called_once()
+    mock_agent.memory.clear_short_term.assert_not_called()
+
+
+def test_clear_memory_short(client, mock_agent):
+    """测试清空短期记忆"""
+    response = client.delete("/api/memory?scope=short")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["scope"] == "short"
+    mock_agent.memory.clear_short_term.assert_called_once()
+    mock_agent.memory.clear_long_term.assert_not_called()
+
+
+def test_clear_memory_all(client, mock_agent):
+    """测试清空全部记忆"""
+    response = client.delete("/api/memory?scope=all")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["scope"] == "all"
+    mock_agent.memory.clear_long_term.assert_called_once()
+    mock_agent.memory.clear_short_term.assert_called_once()
+
+
+def test_clear_memory_invalid_scope(client, mock_agent):
+    """测试无效 scope 返回 400"""
+    response = client.delete("/api/memory?scope=invalid")
+    assert response.status_code == 400
+
+
+def test_clear_memory_default_scope(client, mock_agent):
+    """测试默认 scope 为 long"""
+    response = client.delete("/api/memory")
+    assert response.status_code == 200
+    assert response.json()["scope"] == "long"
+
+
+# --------------------------------------------------------------------------- #
+# 安全策略
+# --------------------------------------------------------------------------- #
+def test_get_safety(client):
+    """测试获取安全策略配置"""
+    with patch("api.server.safety_module") as mock_safety:
+        mock_safety.load_config.return_value = {
+            "mode": "blacklist",
+            "confirm_dangerous": True,
+            "blacklist": ["rm", "del"],
+        }
+        response = client.get("/api/safety")
+        assert response.status_code == 200
+
+        data = response.json()
+        assert data["mode"] == "blacklist"
+        assert data["confirm_dangerous"] is True
+
+
+def test_update_safety_mode(client):
+    """测试更新安全模式"""
+    with patch("api.server.safety_module") as mock_safety:
+        mock_safety.load_config.return_value = {
+            "mode": "blacklist",
+            "confirm_dangerous": True,
+        }
+        mock_safety.save_config.return_value = True
+        response = client.put("/api/safety", json={"mode": "whitelist"})
+        assert response.status_code == 200
+
+        data = response.json()
+        assert data["mode"] == "whitelist"
+        mock_safety.save_config.assert_called_once()
+
+
+def test_update_safety_confirm(client):
+    """测试更新危险确认开关"""
+    with patch("api.server.safety_module") as mock_safety:
+        mock_safety.load_config.return_value = {
+            "mode": "blacklist",
+            "confirm_dangerous": True,
+        }
+        mock_safety.save_config.return_value = True
+        response = client.put("/api/safety", json={"confirm_dangerous": False})
+        assert response.status_code == 200
+
+        data = response.json()
+        assert data["confirm_dangerous"] is False
+
+
+def test_update_safety_invalid_mode(client):
+    """测试无效模式返回 400"""
+    with patch("api.server.safety_module"):
+        response = client.put("/api/safety", json={"mode": "invalid"})
+        assert response.status_code == 400
+
+
+def test_update_safety_save_failed(client):
+    """测试保存失败返回 500"""
+    with patch("api.server.safety_module") as mock_safety:
+        mock_safety.load_config.return_value = {"mode": "blacklist", "confirm_dangerous": True}
+        mock_safety.save_config.return_value = False
+        response = client.put("/api/safety", json={"mode": "whitelist"})
+        assert response.status_code == 500
+
+
+# --------------------------------------------------------------------------- #
+# 技能列表
+# --------------------------------------------------------------------------- #
+def test_get_skills(client, mock_agent):
+    """测试获取技能列表"""
+    response = client.get("/api/skills")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert len(data["skills"]) == 2
+    assert data["skills"][0]["name"] == "pptx"
+    assert data["skills"][1]["name"] == "pdf"
+
+
+# --------------------------------------------------------------------------- #
+# 会话导出
+# --------------------------------------------------------------------------- #
+def test_export_thread(client, mock_agent):
+    """测试导出会话为文本"""
+    response = client.get("/api/threads/thread-1/export")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["thread_id"] == "thread-1"
+    assert data["format"] == "text"
+    assert "测试消息" in data["content"]
+    mock_agent.memory.export_thread.assert_called_once_with(thread_id="thread-1", fmt="text")
+
+
+def test_export_thread_markdown(client, mock_agent):
+    """测试导出会话为 Markdown"""
+    response = client.get("/api/threads/thread-1/export?fmt=markdown")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["format"] == "markdown"
+    mock_agent.memory.export_thread.assert_called_once_with(thread_id="thread-1", fmt="markdown")
+
+
+def test_export_thread_invalid_format(client, mock_agent):
+    """测试无效格式返回 400"""
+    response = client.get("/api/threads/thread-1/export?fmt=pdf")
+    assert response.status_code == 400
+
+
+# --------------------------------------------------------------------------- #
 # 辅助函数测试
 # --------------------------------------------------------------------------- #
 def test_format_help_as_table():
@@ -717,6 +1458,28 @@ def test_thread_summary(temp_checkpoint_db):
             assert summary["thread_id"] == "thread-1"
             assert summary["message_count"] == 5
             assert len(summary["preview"]) > 0
+    finally:
+        memory.close()
+
+
+def test_thread_summary_workflow_type(temp_checkpoint_db):
+    """测试工作流会话摘要带类型与工作流名，普通会话不带"""
+    from types import SimpleNamespace
+
+    from agent.memory import AgentMemory
+    from api.server import thread_summary
+
+    memory = AgentMemory(checkpoint_file=temp_checkpoint_db, process_type="server")
+    wf_tid = memory.new_workflow_thread("simple")
+    try:
+        with patch("api.server.agent", SimpleNamespace(memory=memory)):
+            summary = thread_summary(wf_tid)
+            assert summary["type"] == "workflow"
+            assert summary["workflow_name"] == "simple"
+
+            chat_summary = thread_summary("thread-1")
+            assert chat_summary["type"] == "chat"
+            assert "workflow_name" not in chat_summary
     finally:
         memory.close()
 

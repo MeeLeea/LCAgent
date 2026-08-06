@@ -172,9 +172,97 @@ button {
 /* ---------- 主布局 ---------- */
 .app {
   display: flex;
+  flex-direction: column;
   height: 100vh;
   width: 100vw;
   overflow: hidden;
+}
+
+.app-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ---------- 自定义窗口标题栏 ---------- */
+.titlebar {
+  height: 36px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 0 0 12px;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.titlebar-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 100%;
+}
+
+.titlebar-logo {
+  width: 20px;
+  height: 20px;
+  border-radius: 5px;
+  background: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.titlebar-logo-text {
+  font-size: 10px;
+  font-weight: 800;
+  color: #0d0d0d;
+  letter-spacing: -0.5px;
+}
+
+.titlebar-title {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.titlebar-controls {
+  display: flex;
+  align-items: center;
+  height: 100%;
+}
+
+.titlebar-btn {
+  width: 46px;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  transition: background 0.15s, color 0.15s;
+}
+
+.titlebar-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.titlebar-btn:active {
+  background: var(--border-soft);
+}
+
+.titlebar-close:hover {
+  background: #e02424;
+  color: #fff;
+}
+
+.titlebar-close:active {
+  background: #c01a1a;
 }
 
 /* ---------- 侧边栏 ---------- */
@@ -244,6 +332,43 @@ button {
 .logo-sub {
   font-size: 11px;
   color: var(--text-muted);
+}
+
+/* 对话/工作流切换开关 */
+.mode-switch {
+  display: flex;
+  gap: 4px;
+  margin: 10px 12px 4px;
+  padding: 3px;
+  background: var(--bg-hover);
+  border-radius: 10px;
+}
+
+.mode-switch-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 7px 0;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.mode-switch-btn:hover {
+  color: var(--text);
+}
+
+.mode-switch-btn.active {
+  background: var(--bg-input);
+  color: var(--accent);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
 }
 
 .new-thread-btn {
@@ -316,6 +441,21 @@ button {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 工作流会话类型标签 */
+.thread-badge {
+  flex-shrink: 0;
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 4px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
 }
 
 .thread-count {
@@ -377,6 +517,15 @@ button {
   background: var(--bg);
 }
 
+/* 主内容容器：workflow 模式下纵向承接「工作流面板 + 对话区」 */
+.main-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
 .topbar {
   height: 52px;
   flex-shrink: 0;
@@ -395,6 +544,36 @@ button {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* ---------- 连接状态圆点 ---------- */
+.connection-dot-wrap {
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 50%;
+  transition: background 0.12s;
+}
+
+.connection-dot-wrap:hover {
+  background: var(--bg-hover);
+}
+
+.connection-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  transition: background 0.3s;
+}
+
+.connection-dot.checking {
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.connection-dot.connected {
+  box-shadow: 0 0 6px color-mix(in srgb, var(--accent) 50%, transparent);
 }
 
 .model-selector {
@@ -435,6 +614,7 @@ button {
   flex: 1;
   overflow-y: auto;
   scroll-behavior: smooth;
+  position: relative;
 }
 
 .chat-inner {
@@ -686,6 +866,16 @@ tool-group,
   font-size: 11.5px;
 }
 
+.tool-card-result-label {
+  margin-top: 8px;
+}
+
+/* 滑动窗口：固定最大高度 + 垂直滚动，避免长输出撑爆卡片 */
+.tool-card-result {
+  max-height: 240px;
+  overflow-y: auto;
+}
+
 .tool-args-key {
   color: var(--accent);
 }
@@ -852,7 +1042,9 @@ tool-group,
 }
 
 .input-card {
-  max-width: 820px;
+  /* 随窗口宽度实时缩放：最小 320px → 按视口 60vw 增长 → 上限与聊天区一致 820px */
+  width: clamp(320px, 60vw, 820px);
+  max-width: calc(100vw - 48px);
   margin: 0 auto;
   background: var(--bg-input);
   border: 1px solid var(--border);
@@ -895,6 +1087,20 @@ tool-group,
   display: flex;
   align-items: center;
   gap: 4px;
+}
+
+.input-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.token-count {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+  white-space: nowrap;
 }
 
 .input-tool-btn {
@@ -1190,4 +1396,598 @@ tool-group,
 
 .theme-option.active .theme-check {
   display: flex;
+}
+
+/* ============================================================
+   工作流视图
+   ============================================================ */
+.workflow-view {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px;
+}
+
+/* workflow 模式下作为顶部可折叠面板，下方承接对话区 */
+.workflow-view.workflow-panel {
+  flex: none;
+  flex-shrink: 0;
+  /* 高度由 JS 动态控制（inline height），这里不再用 max-height 限制 */
+  padding: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid var(--border);
+}
+
+.workflow-view.workflow-panel.resizing {
+  transition: none;
+}
+
+.workflow-view.workflow-panel.collapsed {
+  height: auto !important;
+}
+
+.workflow-view.workflow-panel .workflow-head {
+  margin-bottom: 0;
+  border-radius: 0;
+  border-left: none;
+  border-right: none;
+  border-top: none;
+}
+
+.workflow-view.workflow-panel .workflow-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 20px 24px;
+}
+
+.workflow-view.workflow-panel.collapsed .workflow-body {
+  display: none;
+}
+
+/* 面板底边拖拽收缩手柄 */
+.workflow-resizer {
+  flex-shrink: 0;
+  height: 6px;
+  width: 100%;
+  cursor: row-resize;
+  background: transparent;
+  border-top: 1px solid var(--border-soft);
+  transition: background 0.15s;
+}
+
+.workflow-resizer:hover,
+.workflow-view.workflow-panel.resizing .workflow-resizer {
+  background: var(--accent);
+  opacity: 0.4;
+}
+
+/* 折叠态隐藏手柄 */
+.workflow-view.workflow-panel.collapsed .workflow-resizer {
+  display: none;
+}
+
+/* ============================================================
+   工具列表 popover（InputBar）
+   ============================================================ */
+.tool-popover {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  margin-bottom: 8px;
+  min-width: 200px;
+  max-width: 320px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  z-index: 100;
+  overflow: hidden;
+}
+
+.tool-popover-title {
+  padding: 8px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border-soft);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.tool-popover-list {
+  max-height: 280px;
+  overflow-y: auto;
+  padding: 4px;
+}
+
+.tool-popover-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  font-size: 12px;
+  color: var(--text);
+  border-radius: 6px;
+}
+
+.tool-popover-item:hover {
+  background: var(--bg-hover);
+}
+
+.tool-popover-item svg {
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.tool-popover-empty {
+  padding: 16px 12px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+/* ============================================================
+   角色选择 popover（InputBar）
+   ============================================================ */
+.role-popover {
+  min-width: 180px;
+}
+
+.role-popover-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--text);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.role-popover-item:hover {
+  background: var(--bg-hover);
+}
+
+.role-popover-item.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.role-popover-item svg {
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.role-popover-name {
+  flex: 1;
+}
+
+.role-check {
+  margin-left: auto;
+  color: var(--accent);
+}
+
+/* ============================================================
+   消息编辑框（Message）
+   ============================================================ */
+.msg-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.msg-edit-textarea {
+  width: 100%;
+  background: var(--bg-input);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  color: var(--text);
+  font-size: 14px;
+  font-family: inherit;
+  line-height: 1.5;
+  padding: 10px 12px;
+  resize: none;
+  outline: none;
+}
+
+.msg-edit-actions {
+  display: flex;
+  gap: 4px;
+}
+
+/* ============================================================
+   对话导出按钮（ChatView）
+   ============================================================ */
+.chat-export-bar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: -8px;
+}
+
+/* ============================================================
+   会话搜索框（Sidebar）
+   ============================================================ */
+.thread-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  margin: 0 8px 8px;
+  background: var(--bg-input);
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+}
+
+.thread-search svg {
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+
+.thread-search-input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-size: 12px;
+  outline: none;
+  font-family: inherit;
+}
+
+.thread-search-input::placeholder {
+  color: var(--text-faint);
+}
+
+.workflow-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 20px;
+  padding: 14px 16px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+}
+
+.workflow-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  font-size: 15px;
+}
+
+.workflow-select {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 5px 10px;
+  outline: none;
+  cursor: pointer;
+  font-family: inherit;
+  transition: border-color 0.12s;
+}
+
+.workflow-select:hover,
+.workflow-select:focus {
+  border-color: var(--accent);
+}
+
+.workflow-select option {
+  background: var(--bg-elevated);
+  color: var(--text);
+}
+
+.workflow-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.workflow-section {
+  margin-bottom: 24px;
+}
+
+.workflow-section-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.wf-node-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 10px;
+}
+
+.wf-node {
+  padding: 14px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+}
+
+.wf-node-label {
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 8px;
+  word-break: break-all;
+}
+
+.wf-node-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.wf-node-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+
+.wf-node-dot.pending {
+  background: var(--text-faint);
+}
+
+.wf-node-dot.running {
+  background: var(--accent);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.wf-node-dot.done {
+  background: var(--accent);
+}
+
+.wf-node-dot.idle {
+  background: var(--text-faint);
+}
+
+/* mermaid 工作流图容器 */
+.wf-graph-wrap {
+  padding: 16px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+}
+
+.wf-graph {
+  display: flex;
+  justify-content: center;
+  min-width: 320px;
+}
+
+/* mermaid 的 svg 自带 width=100% + max-width=<图宽> 内联样式，已自适应容器，无需覆盖尺寸 */
+
+/* 节点标签：htmlLabels 关闭后为 SVG <text>，由 mermaid 正确测量宽度 */
+.wf-graph .node text {
+  font-weight: 600;
+  fill: var(--text, #ececec) !important;
+}
+
+/* 确保节点内的 foreignObject 不裁切文本 */
+.wf-graph .node foreignObject {
+  overflow: visible;
+}
+
+/* mermaid 节点容器：圆角 */
+.wf-graph .node rect,
+.wf-graph .node polygon {
+  rx: 6;
+  ry: 6;
+}
+
+.wf-graph .edgeLabel {
+  font-size: 12px;
+}
+
+.wf-graph .edgePath .path {
+  stroke-width: 2px;
+}
+
+.wf-graph-fallback {
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.8;
+  word-break: break-all;
+}
+
+.workflow-loading,
+.workflow-empty,
+.workflow-error {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  height: 100%;
+  min-height: 200px;
+  color: var(--text-muted);
+  font-size: 14px;
+}
+
+.workflow-error {
+  flex-direction: column;
+  color: var(--danger);
+}
+
+.spin {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
+}
+
+/* ============================================================
+   消息时间戳（Message）
+   ============================================================ */
+.msg-time {
+  font-size: 10px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  padding: 0 2px;
+}
+
+/* ============================================================
+   对话工具栏：统计 + 导出 + 清空（ChatView）
+   ============================================================ */
+.chat-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 0;
+  margin-bottom: -4px;
+  border-bottom: 1px solid var(--border-soft);
+  padding-bottom: 8px;
+}
+
+.chat-stats {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.chat-stat-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.chat-stat-item svg {
+  opacity: 0.7;
+}
+
+.chat-toolbar-actions {
+  display: flex;
+  gap: 4px;
+}
+
+/* 危险按钮变体 */
+.msg-action-btn.danger {
+  color: var(--text-faint);
+}
+
+.msg-action-btn.danger:hover {
+  color: var(--danger);
+}
+
+.msg-action-btn.danger:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ============================================================
+   滚动到底部浮动按钮（ChatView）
+   ============================================================ */
+.scroll-bottom-btn {
+  position: absolute;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+  transition: color 0.15s, border-color 0.15s, transform 0.15s;
+  cursor: pointer;
+}
+
+.scroll-bottom-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  transform: translateX(-50%) translateY(-2px);
+}
+
+.scroll-bottom-pulse {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+/* ============================================================
+   快捷键列表项（InputBar）
+   ============================================================ */
+.shortcut-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 8px;
+  font-size: 12px;
+  color: var(--text);
+  border-radius: 6px;
+}
+
+.shortcut-item:hover {
+  background: var(--bg-hover);
+}
+
+.shortcut-desc {
+  color: var(--text-muted);
+}
+
+.shortcut-key {
+  font-family: 'JetBrains Mono', 'SF Mono', Consolas, monospace;
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  color: var(--text);
+  white-space: nowrap;
+}
+
+/* ============================================================
+   字符计数（InputBar）
+   ============================================================ */
+.char-count {
+  font-size: 10px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  padding: 0 4px;
+  user-select: none;
+}
+
+.char-count.warn {
+  color: var(--danger);
 }

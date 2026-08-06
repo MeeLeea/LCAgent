@@ -2,7 +2,20 @@
 
 from __future__ import annotations
 
-from . import core, execution, mcp, memory, provider, safety, skills, threads
+from . import (
+    core,
+    execution,
+    log_level,
+    mcp,
+    memory,
+    metrics,
+    provider,
+    role,
+    safety,
+    skills,
+    threads,
+    workflow,
+)
 from .types import BREAK, HANDLED, UNHANDLED, CommandContext, CommandOutcome
 
 
@@ -31,6 +44,8 @@ def dispatch_command(context: CommandContext, user_input: str) -> CommandOutcome
         return memory.clear_memory(context, user_input)
     if low in ("compress", "压缩"):
         return memory.compress_memory(context)
+    if low in ("compact", "压缩上下文"):
+        return memory.compact_context(context)
     if low.startswith("switch"):
         return provider.switch_provider(context, user_input)
     if low == "model" or low == "models":
@@ -39,8 +54,8 @@ def dispatch_command(context: CommandContext, user_input: str) -> CommandOutcome
         return provider.switch_model(context, user_input)
     if low == "mcp":
         return mcp.show_mcp(context)
-    if low == "mcp:reload":
-        return mcp.reload_mcp(context)
+    if low.startswith("mcp:reload"):
+        return mcp.reload_mcp(context, user_input)
     if low.startswith("mcp:add"):
         return mcp.add_mcp(context, user_input)
     if low.startswith("mcp:remove"):
@@ -51,10 +66,18 @@ def dispatch_command(context: CommandContext, user_input: str) -> CommandOutcome
         return skills.list_skills(context)
     if low.startswith("skill:"):
         return skills.skill_command(context, user_input)
+    if low == "role" or low == "roles" or low.startswith("role:"):
+        return role.role_command(context, user_input)
     if low == "safety":
         return safety.show_safety(context)
     if low.startswith("safety:"):
         return safety.safety_command(context, user_input)
+    if low == "workflow" or low.startswith("workflow:"):
+        return workflow.workflow_command(context, user_input)
+    if low == "metrics" or low.startswith("metrics:"):
+        return metrics.metrics_command(context, user_input)
+    if low == "log" or low.startswith("log:"):
+        return log_level.log_command(context, user_input)
     if low.startswith("json:"):
         return execution.json_mode(context, user_input)
     if low.startswith("react:"):
@@ -64,4 +87,4 @@ def dispatch_command(context: CommandContext, user_input: str) -> CommandOutcome
     return execution.chat_mode(context, user_input)
 
 
-__all__ = ["CommandContext", "CommandOutcome", "dispatch_command", "HANDLED"]
+__all__ = ["HANDLED", "CommandContext", "CommandOutcome", "dispatch_command"]

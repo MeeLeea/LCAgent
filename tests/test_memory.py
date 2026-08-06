@@ -102,6 +102,47 @@ def test_delete_thread_removes_checkpoints_and_writes_when_thread_exists(tmp_pat
     mem.close()
 
 
+def test_workflow_thread_management_server_mode(tmp_path):
+    """测试 server 模式下专属工作流会话的创建/识别/名称反解"""
+    db_path = str(tmp_path / "wf.sqlite")
+    mem = AgentMemory(checkpoint_file=db_path, use_sqlite=True, process_type="server")
+
+    tid = mem.new_workflow_thread("simple")
+    assert tid.startswith("server-workflow-simple-")
+    assert mem.is_workflow_thread(tid)
+    assert mem.workflow_name_of(tid) == "simple"
+    # 新工作流会话也会出现在会话列表中
+    assert tid in mem.list_threads()
+
+    # 普通会话不应被识别为工作流会话
+    chat_tid = mem.new_thread()
+    assert not mem.is_workflow_thread(chat_tid)
+    assert mem.workflow_name_of(chat_tid) is None
+
+    # 名称中的 - / 空格被清洗，反解结果一致
+    tid2 = mem.new_workflow_thread("my-workflow")
+    assert mem.workflow_name_of(tid2) == "my_workflow"
+
+    mem.close()
+
+
+def test_workflow_thread_cli_mode():
+    """测试无 process_type（CLI 模式）下工作流会话 id 与反解"""
+    mem = AgentMemory(use_sqlite=False)
+    try:
+        tid = mem.new_workflow_thread("pipline")
+        assert tid.startswith("workflow-")
+        assert mem.is_workflow_thread(tid)
+        assert mem.workflow_name_of(tid) == "pipline"
+
+        # 普通 CLI 会话 thread-xxxx 不是工作流会话
+        chat_tid = mem.new_thread()
+        assert not mem.is_workflow_thread(chat_tid)
+        assert mem.workflow_name_of(chat_tid) is None
+    finally:
+        mem.close()
+
+
 def test_switch_thread_returns_true_only_when_checkpoint_exists(tmp_path):
     # Given: 数据库中有一个 thread 有 checkpoint，另一个没有。
     db_path = str(tmp_path / "switch.sqlite")
@@ -151,6 +192,24 @@ def test_get_messages_with_thread_id_does_not_mutate_current_thread(monkeypatch)
     assert mem.thread_id == "t1"
     assert len(msgs) == 1
     assert msgs[0].content == "hello"
+
+
+def test_get_messages_returns_empty_list_and_logs_when_checkpoint_read_fails(monkeypatch, caplog):
+    # Given: checkpoint 读取会抛异常。
+    mem = AgentMemory(checkpoint_file=None, use_sqlite=False)
+
+    def fake_get_tuple(config):
+        raise RuntimeError("checkpoint 读取失败")
+
+    monkeypatch.setattr(mem._checkpointer, "get_tuple", fake_get_tuple)
+
+    # When: 读取消息。
+    with caplog.at_level("WARNING"):
+        msgs = mem.get_messages(thread_id="broken-thread")
+
+    # Then: 返回空列表并记录日志。
+    assert msgs == []
+    assert "读取 checkpoint 消息失败 [broken-thread]" in caplog.text
 
 
 def test_save_long_term_memory_is_atomic(tmp_path):

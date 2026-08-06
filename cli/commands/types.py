@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Callable, Protocol, TypeAlias
 
@@ -56,14 +57,10 @@ class AgentLike(Protocol):
     tools: list[ToolLike]
     auto_match_skills: bool
 
-    def switch_llm(self, llm: LlmLike) -> None: ...
     def get_memory_summary(self) -> dict[str, JsonValue]: ...
     def get_available_tools(self) -> list[str]: ...
     def compress_memory(self) -> dict[str, JsonValue]: ...
-    def reload_mcp_tools(self) -> int: ...
     def list_skills(self) -> list[dict[str, str]]: ...
-    def load_skill(self, name: str) -> bool: ...
-    def clear_skills(self) -> None: ...
     def cot(self, task: str) -> str: ...
 
 
@@ -93,6 +90,8 @@ SelectMenuFn: TypeAlias = Callable[..., str | tuple[str, str] | None]
 CreateLlmFn: TypeAlias = Callable[[str], LlmLike]
 ListProvidersFn: TypeAlias = Callable[[], dict[str, dict[str, JsonValue]]]
 RunnerFn: TypeAlias = Callable[[AgentLike, str], str]
+# 工作流运行跟踪事件回调:接收结构化事件字典(如 {"type": "workflow_node", "node": ..., "status": ...})
+WorkflowEventFn: TypeAlias = Callable[[dict[str, str]], None]
 
 
 @dataclass(slots=True)
@@ -104,11 +103,10 @@ class CommandOutcome:
 
 
 @dataclass(slots=True)
-class CommandContext:  # noqa: MUTABLE_OK - interactive session state updates the active LLM.
+class CommandContext:
     """Dependencies and mutable session state used by command handlers."""
 
     agent: AgentLike
-    llm: LlmLike
     base_dir: str
     config_file: str
     mcp_config_file: str
@@ -121,6 +119,8 @@ class CommandContext:  # noqa: MUTABLE_OK - interactive session state updates th
     chat_until_completion: RunnerFn
     safety_backend: SafetyBackend
     mcp_backend: McpBackend | None = None
+    # 工作流运行跟踪回调:推送节点/整体状态事件(SSE 等实时通道);None 时仅靠 print 输出
+    workflow_event_cb: WorkflowEventFn | None = None
 
     def print(self, value: str = "") -> None:
         self.print_fn(value)
@@ -129,9 +129,8 @@ class CommandContext:  # noqa: MUTABLE_OK - interactive session state updates th
         return self.input_fn(prompt)
 
     def replace_llm(self, llm: LlmLike) -> None:
-        # Agent 执行器和命令上下文必须指向同一客户端，避免切换后状态分叉。
-        self.agent.switch_llm(llm)
-        self.llm = llm
+        # Agent 执行器持有唯一 LLM 客户端，切换后命令层直接经 agent.llm 访问。
+        asyncio.run(self.agent.aswitch_llm(llm))
 
 
 HANDLED = CommandOutcome(handled=True)

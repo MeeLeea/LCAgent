@@ -1,0 +1,59 @@
+"""
+Team Agent 工厂函数 - 统一构建团队 Agent
+"""
+from __future__ import annotations
+
+import os
+
+from langchain_core.tools import BaseTool
+
+from agent.config import load_agent_config, resolve_path
+from team.base import TeamAgent
+
+
+def build_team_agent(
+    agent_class: type[TeamAgent],
+    config_file: str,
+    base_dir: str,
+    tools: list[BaseTool] | None = None,
+    **overrides
+) -> TeamAgent:
+    """
+    构建团队 Agent(Manager/Worker/Terminator)
+    
+    Args:
+        agent_class: Agent 类(ManagerAgent/WorkerAgent/TerminatorAgent)
+        config_file: agent_config.json 路径(相对项目根)
+        base_dir: 项目根目录
+        tools: 可选工具列表(Worker 需要,Manager/Terminator 不需要)
+        **overrides: 覆盖配置中的参数
+        
+    Returns:
+        初始化好的 Agent 实例
+    """
+    config_path = os.path.join(base_dir, config_file)
+    config = load_agent_config(config_path)
+    
+    # 应用覆盖参数
+    config.update(overrides)
+    
+    # 解析角色 AGENT.md 绝对路径,供工作流节点提示词模板加载
+    prompt_file = resolve_path(config.get("agent_prompt_file", "agent/AGENT.md"), base_dir)
+
+    content = TeamAgent._read_prompt_file(prompt_file) or ""
+    # 剥离 AGENT.md 中的 ## workflow:* 小节,避免模板混入系统提示词
+    system_prompt, _ = TeamAgent.parse_prompt_sections(content)
+    
+    # 构建轻量 TeamAgent
+    agent = agent_class(
+        name=config["name"],
+        system_prompt=system_prompt,
+        tools=tools,
+        max_iterations=config["max_iterations"],
+        verbose=config.get("verbose", False),
+        provider=config.get("provider", "zhipu"),
+        model=config.get("model"),
+        prompt_file=prompt_file,
+    )
+    
+    return agent

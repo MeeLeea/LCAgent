@@ -5,7 +5,9 @@ import { useStore } from './store'
 import { Sidebar } from './components/Sidebar'
 import { TopBar } from './components/TopBar'
 import { ChatView } from './components/ChatView'
+import { WorkflowView } from './components/WorkflowView'
 import { InputBar } from './components/InputBar'
+import { TitleBar } from './components/TitleBar'
 
 const DEFAULT_SIDEBAR_WIDTH = 264
 const MIN_SIDEBAR_WIDTH = 180
@@ -23,6 +25,7 @@ function loadSidebarWidth(): number {
 
 export default function App() {
   const init = useStore((s) => s.init)
+  const viewMode = useStore((s) => s.viewMode)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth)
   const [isResizing, setIsResizing] = useState(false)
@@ -62,17 +65,23 @@ export default function App() {
 
   return (
     <div className="app">
-      <aside
-        className={`sidebar${sidebarCollapsed ? ' collapsed' : ''}${isResizing ? ' resizing' : ''}`}
-        style={{ width: sidebarCollapsed ? 0 : sidebarWidth }}
-      >
-        <Sidebar onCollapse={() => setSidebarCollapsed(true)} />
-        <div className="sidebar-resizer" onPointerDown={onResizeStart} />
-      </aside>
-      <div className="main">
-        <TopBar onExpand={() => setSidebarCollapsed(false)} />
-        <ChatView />
-        <InputBar />
+      <TitleBar />
+      <div className="app-body">
+        <aside
+          className={`sidebar${sidebarCollapsed ? ' collapsed' : ''}${isResizing ? ' resizing' : ''}`}
+          style={{ width: sidebarCollapsed ? 0 : sidebarWidth }}
+        >
+          <Sidebar />
+          <div className="sidebar-resizer" onPointerDown={onResizeStart} />
+        </aside>
+        <div className="main">
+          <TopBar collapsed={sidebarCollapsed} onToggle={() => setSidebarCollapsed((v) => !v)} />
+          <div className="main-content">
+            {viewMode === 'workflow' && <WorkflowView />}
+            <ChatView />
+          </div>
+          <InputBar />
+        </div>
       </div>
     </div>
   )

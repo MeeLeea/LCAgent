@@ -1,0 +1,17 @@
+{
+    "name": "terminator",
+    "max_iterations": 200,
+    "skills_dir": ".agents/skills",
+    "auto_match_skills": true,
+    "enable_mcp": true,
+    "memory_size": 10,
+    "verbose": true,
+    "mcp_config_file": "config/mcp_servers.json",
+    "max_context_messages": 0,
+    "context_trim_keep": 12,
+    "max_execution_history": 100,
+    "tool_timeout": 120,
+    "agent_prompt_file": "team/terminator/AGENT.md",
+    "provider": "zhipu",
+    "model": null
+}

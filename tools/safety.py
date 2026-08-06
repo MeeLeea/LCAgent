@@ -54,10 +54,11 @@ BUILTIN_CONFIRM = [
     r"\bsudo\b", r"\bchmod\b", r"\bchown\b",
     r"\bmv\b", r"\bkill\b", r"\btaskkill\b", r"\bschtasks\b",
     # 解释器可隐藏任意副作用，脚本、内联代码和命令包装器统一要求人工确认
-    r"\b(?:python(?:3)?|py)(?:\.exe)?\b\s+(?:-[cmo]\b|[^\s;&|]+\.py\b)",
-    r"\b(?:powershell|pwsh)(?:\.exe)?\b[^\r\n]*\s-(?:command|file)\b",
-    r"\bcmd(?:\.exe)?\b\s+/(?:c|k)\b",
-    r"\b(?:bash|sh)\b\s+-c\b",
+    # ["']? 容忍带引号的完整路径（如 "C:\...\python.exe" -c "..."）
+    r'\b(?:python(?:3)?|py)(?:\.exe)?\b["\']?\s+(?:-[cmo]\b|[^\s;&|]+\.py\b)',
+    r'\b(?:powershell|pwsh)(?:\.exe)?\b["\']?[^\r\n]*\s-(?:command|file)\b',
+    r'\bcmd(?:\.exe)?\b["\']?\s+/(?:c|k)\b',
+    r'\b(?:bash|sh)\b["\']?\s+-c\b',
 ]
 
 # 默认配置
@@ -74,8 +75,7 @@ DEFAULT_CONFIG = {
             "{project_root}/agent", "{project_root}/api", "{project_root}/cli",
             "{project_root}/config", "{project_root}/memory", "{project_root}/scheduler",
             "{project_root}/web", "{project_root}/remote", "{project_root}/.agents",
-            "{project_root}/main.py", "{project_root}/llm_client.py",
-            "{project_root}/requirements.txt", "{project_root}/pyproject.toml",
+            "{project_root}/main.py", "{project_root}/requirements.txt", "{project_root}/pyproject.toml",
             "{project_root}/uv.lock", "{project_root}/skills-lock.json",
         ],
         "confirm_paths": [

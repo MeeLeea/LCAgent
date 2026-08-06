@@ -1,5 +1,5 @@
 """
-LangChain Agent 项目入口 - 支持多提供商(智谱/千问/DeepSeek/Kimi) + MCP工具
+LangChain Agent 项目入口 - 支持多提供商(智谱/千问/DeepSeek/Kimi) + MCP工具 + 多Agent工作流
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ except ImportError:
 
 from agent import AgentCore
 from agent.config import load_agent_config, resolve_path
-from llm_client import load_providers as list_providers
+from agent.logging_config import setup_logging
 from tools import safety as safety_module
 from cli.cli_menu import select_menu
 from cli.commands import CommandContext, dispatch_command
@@ -24,7 +24,7 @@ from cli.human_input import chat_until_completion, run_structured_until_completi
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LLM_FILE = os.path.join(BASE_DIR, "config", "llm_config.json")
 MCP_CONFIG_FILE = os.path.join(BASE_DIR, "config", "mcp_servers.json")
-AGENT_CONFIG_FILE = os.path.join(BASE_DIR, "config", "agent_config.json")
+AGENT_CONFIG_FILE = os.path.join(BASE_DIR, "agent", "agent_config.json")
 MEMORY_FILE = os.path.join(BASE_DIR, "memory", "memory.json")
 CHECKPOINT_FILE = os.path.join(BASE_DIR, "memory", "checkpoints.sqlite")
 
@@ -43,16 +43,20 @@ def build_agent(provider: str, process_type: str = None) -> tuple[AgentCore, obj
         process_type: 进程类型标识(feishu/None)，用于多进程隔离。
                       CLI 模式传 None(单进程不需要隔离)
     """
+    from agent.llm_client import load_providers as list_providers
+    
     print(f"\n初始化 {list_providers(LLM_FILE)[provider]['name']} 客户端...")
     llm = create_llm(provider, LLM_FILE)
     print("加载运行时配置...")
     config = load_agent_config(AGENT_CONFIG_FILE)
+    agent_prompt_file = config.get("agent_prompt_file")
     # 配置中的相对路径统一锚定项目根，避免调用方工作目录影响资源加载。
     skills_dir = resolve_path(config["skills_dir"], BASE_DIR)
     mcp_config_file = resolve_path(config["mcp_config_file"], BASE_DIR)
     print("初始化Agent(含MCP工具加载 + Checkpoint 持久化)...")
     agent = AgentCore(
         llm_client=llm,
+        name=config["name"],
         memory_size=config["memory_size"],
         long_term_memory_file=MEMORY_FILE,
         checkpoint_file=CHECKPOINT_FILE,
@@ -64,17 +68,21 @@ def build_agent(provider: str, process_type: str = None) -> tuple[AgentCore, obj
         auto_match_skills=config["auto_match_skills"],
         max_context_messages=config["max_context_messages"],
         context_trim_keep=config["context_trim_keep"],
-        process_type=process_type
+        process_type=process_type,
+        agent_prompt_file=agent_prompt_file,
+        max_execution_history=config.get("max_execution_history", 100),
+        tool_timeout=config.get("tool_timeout", 120),
     )
     return agent, llm
 
 
-def make_context(agent: AgentCore, llm: object) -> CommandContext:
+def make_context(agent: AgentCore) -> CommandContext:
     """组装命令分发器所需的运行时依赖。"""
+    from agent.llm_client import load_providers as list_providers
+    
     # 命令模块只依赖该上下文，便于在测试中替换输入、菜单、LLM 和安全后端。
     return CommandContext(
         agent=agent,
-        llm=llm,
         base_dir=BASE_DIR,
         config_file=LLM_FILE,
         mcp_config_file=MCP_CONFIG_FILE,
@@ -91,12 +99,14 @@ def make_context(agent: AgentCore, llm: object) -> CommandContext:
 
 def main() -> None:
     """运行交互式命令行主循环。"""
+    setup_logging()
+    # 启动 banner（保持 print，面向用户）
     print("=" * 50)
-    print("  LangChain Agent (基于LangChain框架)")
+    print("  LC Agent (基于LangChain框架)")
     print("=" * 50)
     provider = select_provider(LLM_FILE, select_menu)
-    agent, llm = build_agent(provider)
-    context = make_context(agent, llm)
+    agent, _ = build_agent(provider)
+    context = make_context(agent)
     show_ready(context)
 
     while True:
