@@ -1,6 +1,6 @@
+import asyncio
 import importlib
 import os
-import asyncio  # noqa: ANYIO_OK
 import sys
 from types import SimpleNamespace
 from typing import TypedDict
@@ -10,7 +10,6 @@ from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, Interrupt
-
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -195,12 +194,12 @@ def test_cli_helper_renders_and_resumes_until_completion():
         return {"choice_id": interrupt.id}
 
     # When: the CLI helper drives the turn.
-    output = human_input.run_human_input_loop(
+    output = asyncio.run(human_input.run_human_input_loop(
         agent=FakeAgent(),
         message="start",
         render_interrupt=render_interrupt,
         read_resume=read_resume,
-    )
+    ))
 
     # Then: it renders every interrupt and resumes until the final output.
     assert output == "done"
@@ -478,12 +477,12 @@ def test_cli_helper_collects_simultaneous_interrupts_before_one_resume():
         return {"choice_id": f"answer-{interrupt.id}"}
 
     # When: the CLI helper handles the turn.
-    output = human_input.run_human_input_loop(
+    output = asyncio.run(human_input.run_human_input_loop(
         agent=FakeAgent(),
         message="start",
         render_interrupt=render_interrupt,
         read_resume=read_resume,
-    )
+    ))
 
     # Then: all answers are collected and resumed with one interrupt-id keyed payload.
     assert output == "done"

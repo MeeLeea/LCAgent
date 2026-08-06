@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
-
-from .types import CommandContext, CommandOutcome, HANDLED
+from .types import HANDLED, CommandContext, CommandOutcome
 
 
 def show_mcp(context: CommandContext) -> CommandOutcome:
@@ -48,7 +46,7 @@ def show_mcp(context: CommandContext) -> CommandOutcome:
     return HANDLED
 
 
-def reload_mcp(context: CommandContext, user_input: str = "") -> CommandOutcome:
+async def reload_mcp(context: CommandContext, user_input: str = "") -> CommandOutcome:
     """重新加载 MCP 工具
 
     用法:
@@ -60,19 +58,19 @@ def reload_mcp(context: CommandContext, user_input: str = "") -> CommandOutcome:
 
     if server_name:
         context.print(f"\n重连 MCP Server: {server_name}...")
-        success = asyncio.run(context.agent.areload_mcp_server(server_name))
+        success = await context.agent.areload_mcp_server(server_name)
         if success:
             context.print(f"完成: {server_name} 已重连")
         else:
             context.print(f"失败: {server_name} 重连失败或已移除")
     else:
         context.print("\n重新加载所有 MCP 工具...")
-        count = asyncio.run(context.agent.areload_mcp_tools())
+        count = await context.agent.areload_mcp_tools()
         context.print(f"完成: 已加载 {count} 个 MCP 工具")
     return HANDLED
 
 
-def add_mcp(context: CommandContext, user_input: str) -> CommandOutcome:
+async def add_mcp(context: CommandContext, user_input: str) -> CommandOutcome:
     backend = _backend(context)
     if backend is None:
         return HANDLED
@@ -111,7 +109,7 @@ def add_mcp(context: CommandContext, user_input: str) -> CommandOutcome:
             )
             context.print(f"\n已添加 stdio MCP Server: {name}")
         # 只重连新添加的 server，不影响其他
-        success = asyncio.run(context.agent.areload_mcp_server(name))
+        success = await context.agent.areload_mcp_server(name)
         if success:
             context.print(f"已连接: {name}")
         else:
@@ -121,7 +119,7 @@ def add_mcp(context: CommandContext, user_input: str) -> CommandOutcome:
     return HANDLED
 
 
-def remove_mcp(context: CommandContext, user_input: str) -> CommandOutcome:
+async def remove_mcp(context: CommandContext, user_input: str) -> CommandOutcome:
     backend = _backend(context)
     if backend is None:
         return HANDLED
@@ -133,14 +131,14 @@ def remove_mcp(context: CommandContext, user_input: str) -> CommandOutcome:
     if backend.remove_server(name, context.mcp_config_file):
         context.print(f"\n已删除 MCP Server: {name}")
         # 重连以移除该 server 的工具（其他 server 不受影响）
-        asyncio.run(context.agent.areload_mcp_server(name))
+        await context.agent.areload_mcp_server(name)
         context.print(f"已移除 {name} 的工具")
     else:
         context.print(f"\n未找到: {name}")
     return HANDLED
 
 
-def toggle_mcp(context: CommandContext, user_input: str) -> CommandOutcome:
+async def toggle_mcp(context: CommandContext, user_input: str) -> CommandOutcome:
     backend = _backend(context)
     if backend is None:
         return HANDLED
@@ -154,7 +152,7 @@ def toggle_mcp(context: CommandContext, user_input: str) -> CommandOutcome:
         state = "启用" if enabled else "禁用"
         context.print(f"\n已{state} MCP Server: {name}")
         # 重连该 server（禁用时移除其工具，启用时加载其工具）
-        asyncio.run(context.agent.areload_mcp_server(name))
+        await context.agent.areload_mcp_server(name)
         context.print(f"已更新 {name} 的工具")
     else:
         context.print(f"\n未找到: {name}")

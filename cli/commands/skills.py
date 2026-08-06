@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
-
-from .types import CommandContext, CommandOutcome, HANDLED
+from .types import HANDLED, CommandContext, CommandOutcome
 
 
 def list_skills(context: CommandContext) -> CommandOutcome:
@@ -26,13 +24,13 @@ def list_skills(context: CommandContext) -> CommandOutcome:
     return HANDLED
 
 
-def skill_command(context: CommandContext, user_input: str) -> CommandOutcome:
+async def skill_command(context: CommandContext, user_input: str) -> CommandOutcome:
     rest = user_input[6:].strip()
     parts = rest.split(None, 1)
     sub = parts[0].strip().lower() if parts else ""
     task_text = parts[1].strip() if len(parts) > 1 else ""
     if sub in ("clear", "清空", "reset"):
-        asyncio.run(context.agent.aclear_skills())
+        await context.agent.aclear_skills()
         context.print("\n已清空手动加载的技能")
         return HANDLED
     if not sub:
@@ -44,12 +42,12 @@ def skill_command(context: CommandContext, user_input: str) -> CommandOutcome:
         context.print(f"\n未找到技能: {sub}")
         context.print(f"可用: {', '.join(available) or '(无)'}")
         return HANDLED
-    if asyncio.run(context.agent.aload_skill(matched)):
+    if await context.agent.aload_skill(matched):
         context.print(f"\n已加载技能: {matched} (将注入后续对话的 system prompt)")
         if not context.agent.auto_match_skills:
             context.print("提示: 自动匹配已关闭,本技能仅手动加载生效")
         if task_text:
-            result = context.run_structured_until_completion(context.agent, task_text)
+            result = await context.run_structured_until_completion(context.agent, task_text)
             context.print(f"\n助手: {result}")
     else:
         context.print(f"\n加载失败: {matched}")
