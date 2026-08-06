@@ -148,6 +148,15 @@ export const api = {
 
   getTools: () => jsonFetch<{ tools: string[] }>(`${BASE}/tools`),
 
+  // ── 团队角色 ──
+  getRoles: () => jsonFetch<{ roles: string[]; current: string | null }>(`${BASE}/roles`),
+  switchRole: (role: string, task?: string) =>
+    jsonFetch<{ role: string; current: string | null }>(`${BASE}/roles/switch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role, task }),
+    }),
+
   getWorkflows: () => jsonFetch<{ workflows: string[] }>(`${BASE}/workflows`),
 
   getWorkflow: (name = 'simple') =>

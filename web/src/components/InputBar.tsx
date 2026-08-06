@@ -1,15 +1,18 @@
 // 输入栏：自适应文本框 + 发送/停止按钮 + 工具列表 + 字符计数 + 上下文 Token 估算 + 快捷键
 import { useRef, useState, useEffect, useMemo } from 'react'
-import { ArrowUp, Square, Wrench, Keyboard } from 'lucide-react'
+import { ArrowUp, Square, Wrench, Keyboard, Users, Check, Loader2 } from 'lucide-react'
 import { useStore, isWorkflowThread } from '../store'
 
 export function InputBar() {
   const [text, setText] = useState('')
   const [toolPopoverOpen, setToolPopoverOpen] = useState(false)
   const [shortcutOpen, setShortcutOpen] = useState(false)
+  const [rolePopoverOpen, setRolePopoverOpen] = useState(false)
+  const [switchingRole, setSwitchingRole] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const toolWrapRef = useRef<HTMLDivElement>(null)
   const shortcutWrapRef = useRef<HTMLDivElement>(null)
+  const roleWrapRef = useRef<HTMLDivElement>(null)
   const isStreaming = useStore((s) => s.isStreaming)
   const sendMessage = useStore((s) => s.sendMessage)
   const stopStreaming = useStore((s) => s.stopStreaming)
@@ -17,6 +20,9 @@ export function InputBar() {
   const messages = useStore((s) => s.messages)
   const threads = useStore((s) => s.threads)
   const currentThreadId = useStore((s) => s.currentThreadId)
+  const roles = useStore((s) => s.roles)
+  const currentRole = useStore((s) => s.currentRole)
+  const switchRole = useStore((s) => s.switchRole)
 
   const currentThread = threads.find((t) => t.thread_id === currentThreadId)
   const isWorkflow = currentThread
@@ -45,7 +51,7 @@ export function InputBar() {
 
   // 点击外部关闭弹窗
   useEffect(() => {
-    if (!toolPopoverOpen && !shortcutOpen) return
+    if (!toolPopoverOpen && !shortcutOpen && !rolePopoverOpen) return
     const handler = (e: MouseEvent) => {
       if (toolPopoverOpen && toolWrapRef.current && !toolWrapRef.current.contains(e.target as Node)) {
         setToolPopoverOpen(false)
@@ -53,10 +59,25 @@ export function InputBar() {
       if (shortcutOpen && shortcutWrapRef.current && !shortcutWrapRef.current.contains(e.target as Node)) {
         setShortcutOpen(false)
       }
+      if (rolePopoverOpen && roleWrapRef.current && !roleWrapRef.current.contains(e.target as Node)) {
+        setRolePopoverOpen(false)
+      }
     }
     document.addEventListener('mousedown', handler)
     return () => document.removeEventListener('mousedown', handler)
-  }, [toolPopoverOpen, shortcutOpen])
+  }, [toolPopoverOpen, shortcutOpen, rolePopoverOpen])
+
+  const handleSwitchRole = async (role: string) => {
+    if (switchingRole) return
+    if (role === currentRole) {
+      setRolePopoverOpen(false)
+      return
+    }
+    setRolePopoverOpen(false)
+    setSwitchingRole(true)
+    await switchRole(role)
+    setSwitchingRole(false)
+  }
 
   const handleSend = () => {
     if (isStreaming) return
@@ -121,6 +142,45 @@ export function InputBar() {
         />
         <div className="input-toolbar">
           <div className="input-tools">
+            {/* 角色选择 */}
+            <div ref={roleWrapRef} style={{ position: 'relative' }}>
+              <button
+                className="input-tool-btn"
+                onClick={() => setRolePopoverOpen((v) => !v)}
+                disabled={switchingRole}
+                title={`当前角色：${currentRole ?? '未设置'}（点击切换）`}
+              >
+                {switchingRole ? (
+                  <Loader2 size={13} className="spin" />
+                ) : (
+                  <Users size={13} />
+                )}
+                角色：{switchingRole ? '切换中…' : (currentRole ?? '—')}
+              </button>
+              {rolePopoverOpen && (
+                <div className="tool-popover role-popover">
+                  <div className="tool-popover-title">团队角色（{roles.length}）</div>
+                  <div className="tool-popover-list">
+                    {roles.length === 0 ? (
+                      <div className="tool-popover-empty">暂无可用角色</div>
+                    ) : (
+                      roles.map((r) => (
+                        <div
+                          key={r}
+                          className={`role-popover-item${r === currentRole ? ' active' : ''}`}
+                          onClick={() => handleSwitchRole(r)}
+                        >
+                          <Users size={11} />
+                          <span className="role-popover-name">{r}</span>
+                          {r === currentRole && <Check size={12} className="role-check" />}
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+
             {/* 工具列表 */}
             <div ref={toolWrapRef} style={{ position: 'relative' }}>
               <button

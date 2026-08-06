@@ -112,7 +112,9 @@ def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
         max_context_messages=cfg["max_context_messages"],
         context_trim_keep=cfg["context_trim_keep"],
         process_type="server",
-        agent_core_prompt=cfg["agent_core_prompt"]
+        agent_prompt_file=cfg.get("agent_prompt_file"),
+        max_execution_history=cfg.get("max_execution_history", 100),
+        tool_timeout=cfg.get("tool_timeout", 120),
     )
     return new_agent, new_llm
 

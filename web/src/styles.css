@@ -1529,6 +1529,48 @@ tool-group,
 }
 
 /* ============================================================
+   角色选择 popover（InputBar）
+   ============================================================ */
+.role-popover {
+  min-width: 180px;
+}
+
+.role-popover-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--text);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.role-popover-item:hover {
+  background: var(--bg-hover);
+}
+
+.role-popover-item.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.role-popover-item svg {
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.role-popover-name {
+  flex: 1;
+}
+
+.role-check {
+  margin-left: auto;
+  color: var(--accent);
+}
+
+/* ============================================================
    消息编辑框（Message）
    ============================================================ */
 .msg-edit {
