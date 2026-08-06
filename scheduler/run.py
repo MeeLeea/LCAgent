@@ -98,8 +98,8 @@ def make_agent_factory(provider: str):
     llm = LLMClient(provider=provider, config_file=LLM_CONFIG_FILE)
     logger.info("LLM 已就绪: %s / %s", llm.get_info()["provider_name"], llm.model)
 
-    def factory() -> AgentCore:
-        return AgentCore(
+    async def factory() -> AgentCore:
+        return await AgentCore.acreate(
             llm_client=llm,
             name=agent_config["name"],
             memory_size=agent_config["memory_size"],

@@ -14,6 +14,7 @@
 """
 from typing import Any, Callable, Dict, Tuple
 import asyncio
+import inspect
 import logging
 
 logger = logging.getLogger(__name__)
@@ -104,9 +105,53 @@ def _execute_workflow_task(task_id: Any, task_text: str) -> Tuple[bool, str]:
         return False, f"工作流执行异常: {exc}"
 
 
-def execute_task(task: Dict[str, Any], agent_factory: AgentFactory) -> Tuple[bool, str]:
+class _AgentCreateError(Exception):
+    """Agent 创建阶段失败的标记异常（与执行异常区分，返回不同错误提示）。"""
+
+
+async def _run_agent_task(task_text: str, agent_factory: AgentFactory) -> str:
+    """在单个事件循环内创建 Agent、执行任务并释放资源。
+
+    关键约束：AsyncSqliteSaver 绑定创建它的事件循环，跨 loop 使用会挂起。
+    因此 factory 构造（await 若返回协程）、arun 执行、aclose 关闭必须在
+    同一个 loop 内完成。本函数由 execute_task 用 asyncio.run 包裹执行。
+
+    Args:
+        task_text: 任务描述文本
+        agent_factory: 返回 Agent 实例的可调用对象；返回协程时自动 await
+
+    Returns:
+        执行结果字符串（可能为空）
+
+    Raises:
+        _AgentCreateError: factory 构造失败（含 async factory 抛异常）
     """
-    执行单条定时任务。
+    try:
+        agent = agent_factory()
+        if inspect.isawaitable(agent):
+            agent = await agent
+    except Exception as exc:
+        raise _AgentCreateError(str(exc)) from exc
+
+    try:
+        result = agent.arun(task_text)
+        if inspect.isawaitable(result):
+            result = await result
+        return str(result) if result else ""
+    finally:
+        # 释放异步 SQLite 连接等资源；关闭失败不掩盖执行结果
+        aclose = getattr(agent, "aclose", None)
+        if callable(aclose):
+            try:
+                close_result = aclose()
+                if inspect.isawaitable(close_result):
+                    await close_result
+            except Exception as exc:
+                logger.warning("Agent 关闭失败: %s", exc, exc_info=True)
+
+
+def execute_task(task: Dict[str, Any], agent_factory: AgentFactory) -> Tuple[bool, str]:
+    """执行单条定时任务。
 
     根据 task_text 自动判断执行路径：
     - 以 "workflow:" 开头 → 多 Agent 工作流执行
@@ -136,15 +181,11 @@ def execute_task(task: Dict[str, Any], agent_factory: AgentFactory) -> Tuple[boo
 
     # 普通 Agent 任务
     try:
-        agent = agent_factory()
-    except Exception as exc:
-        return False, f"创建 Agent 实例失败: {exc}"
-
-    try:
-        # AgentCore.run() 返回执行结果字符串
-        result = asyncio.run(agent.arun(task_text))
+        result = asyncio.run(_run_agent_task(task_text, agent_factory))
         output = str(result) if result else "(Agent 未返回内容)"
         logger.info("任务 #%d 执行完成", task_id)
         return True, output
+    except _AgentCreateError as exc:
+        return False, f"创建 Agent 实例失败: {exc}"
     except Exception as exc:
         return False, f"Agent 执行异常: {exc}"
