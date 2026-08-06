@@ -1,6 +1,10 @@
 """
 记忆模块 - 基于 LangGraph Checkpoint
 
+兼容说明:
+- 旧同步路径: 继续使用 sqlite3 + SqliteSaver, 供现有调用方与测试使用
+- 新异步路径: 通过 `acreate()` 构建 aiosqlite + AsyncSqliteSaver, 供 LangGraph 异步热路径使用
+
 替代原 deque + memory.json 方案:
 - 短期记忆 → checkpoint 自动管理(SQLite 持久化,自动恢复)
 - 长期记忆 → memory.json 手动标记(用于 compress 摘要)
@@ -12,6 +16,7 @@
 4. 多会话隔离: 不同 thread_id 独立
 5. 工具调用中间状态: 完整保存(tool_calls、tool_outputs)
 """
+import aiosqlite
 import os
 import json
 import logging
@@ -31,6 +36,7 @@ from langchain_core.messages import (
 )
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.checkpoint.memory import MemorySaver
 
 logger = logging.getLogger(__name__)
@@ -96,6 +102,8 @@ class AgentMemory:
         self.thread_id = thread_id or self._generate_thread_id()
         self.short_term_size = short_term_size
         self.use_sqlite = use_sqlite and checkpoint_file is not None
+        self._async_mode = False
+        self._async_conn: aiosqlite.Connection | None = None
 
         # 长期记忆(独立于 checkpoint,用于 compress)
         self.long_term_memory: List[Dict[str, Any]] = []
@@ -106,6 +114,46 @@ class AgentMemory:
         # 加载长期记忆
         if long_term_file and os.path.exists(long_term_file):
             self._load_long_term_memory()
+
+    @classmethod
+    async def acreate(
+        cls,
+        checkpoint_file: Optional[str] = None,
+        long_term_file: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        short_term_size: int = 10,
+        use_sqlite: bool = True,
+        process_type: Optional[str] = None,
+    ) -> "AgentMemory":
+        """在运行中的事件循环内创建异步记忆实例。"""
+        choice = cls.__new__(cls)
+        choice.checkpoint_file = checkpoint_file
+        choice.long_term_file = long_term_file
+        choice.process_type = process_type
+        choice.thread_id = thread_id or choice._generate_thread_id()
+        choice.short_term_size = short_term_size
+        choice.use_sqlite = use_sqlite and checkpoint_file is not None
+        choice._async_mode = True
+        choice._async_conn = None
+        choice.long_term_memory = []
+
+        if choice.use_sqlite:
+            assert checkpoint_file is not None
+            parent = os.path.dirname(os.path.abspath(checkpoint_file))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            conn = await aiosqlite.connect(checkpoint_file)
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute("PRAGMA busy_timeout=10000")
+            choice._checkpointer = AsyncSqliteSaver(conn)
+            choice._async_conn = conn
+        else:
+            choice._checkpointer = MemorySaver()
+
+        if long_term_file and os.path.exists(long_term_file):
+            choice._load_long_term_memory()
+
+        return choice
 
     def _generate_thread_id(self) -> str:
         """生成新的 thread_id，自动加上 process_type 前缀（如有）"""
@@ -211,12 +259,36 @@ class AgentMemory:
         conn.execute("PRAGMA busy_timeout=10000")
         return conn
 
+    async def _async_stored_thread_ids(self, all_types: bool = False) -> List[str]:
+        """异步读取数据库中真实存在的 thread_id。"""
+        if not self.use_sqlite or self._async_conn is None:
+            return []
+        try:
+            cursor = await self._async_conn.execute(
+                "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
+            )
+            try:
+                rows = await cursor.fetchall()
+            finally:
+                await cursor.close()
+        except sqlite3.OperationalError as error:
+            if "no such table" in str(error).lower():
+                return []
+            raise
+
+        stored = [row[0] for row in rows]
+        if all_types:
+            return stored
+        return [thread_id for thread_id in stored if self._matches_process_type(thread_id)]
+
     def close(self) -> None:
         """关闭 checkpointer 持有的 SQLite 连接。
 
         sqlite3 的 connection 上下文管理器只提交事务、不关闭连接,
         因此长驻连接必须显式关闭,否则 WAL 无法回收、Windows 上文件也删不掉。
         """
+        if self._async_mode:
+            return
         conn = getattr(self._checkpointer, "conn", None)
         if conn is None:
             return
@@ -298,6 +370,16 @@ class AgentMemory:
             return stored
         return sorted(stored + [self.thread_id])
 
+    async def alist_threads(self, all_types: bool = False) -> List[str]:
+        """异步列出所有可见 thread_id(数据库存量 ∪ 当前会话)。"""
+        if self.use_sqlite and self._async_conn is not None:
+            stored = await self._async_stored_thread_ids(all_types=all_types)
+        else:
+            stored = self._stored_thread_ids(all_types=all_types)
+        if self.thread_id in stored:
+            return stored
+        return sorted(stored + [self.thread_id])
+
     def delete_thread(self, thread_id: str) -> bool:
         """
         删除指定会话(从 SQLite checkpoint 表移除)
@@ -352,6 +434,57 @@ class AgentMemory:
             self.thread_id = remaining[0] if remaining else self.new_thread()
         return True
 
+    async def adelete_thread(self, thread_id: str) -> bool:
+        """异步删除指定会话(从 SQLite checkpoint 表移除)。"""
+        if not self.use_sqlite:
+            return False
+
+        deleted = False
+        delete_fn = getattr(self._checkpointer, "adelete_thread", None)
+        if callable(delete_fn):
+            before_changes = self._async_conn.total_changes if self._async_conn is not None else 0
+            try:
+                await delete_fn(thread_id)
+            except (aiosqlite.Error, sqlite3.Error, AttributeError, TypeError) as error:
+                logger.error("删除会话失败(通过异步 Saver 契约): %s", error)
+            else:
+                if self._async_conn is not None:
+                    deleted = self._async_conn.total_changes > before_changes
+                else:
+                    deleted = True
+
+        if not deleted and self._async_conn is not None:
+            try:
+                before_changes = self._async_conn.total_changes
+                await self._async_conn.execute(
+                    "DELETE FROM checkpoints WHERE thread_id = ?", (thread_id,)
+                )
+                try:
+                    await self._async_conn.execute(
+                        "DELETE FROM writes WHERE thread_id = ?", (thread_id,)
+                    )
+                except sqlite3.OperationalError as error:
+                    if "no such table" not in str(error).lower():
+                        raise
+                await self._async_conn.commit()
+                deleted = self._async_conn.total_changes > before_changes
+            except sqlite3.OperationalError as error:
+                if "no such table" in str(error).lower():
+                    return False
+                logger.error("删除会话失败(异步兜底路径): %s", error)
+                return False
+            except (aiosqlite.Error, AttributeError, TypeError) as error:
+                logger.error("删除会话失败(异步兜底路径): %s", error)
+                return False
+
+        if not deleted:
+            return False
+
+        if thread_id == self.thread_id:
+            remaining = await self._async_stored_thread_ids()
+            self.thread_id = remaining[0] if remaining else self.new_thread()
+        return True
+
     # ============ 消息获取 ============
 
     def get_messages(self, thread_id: Optional[str] = None) -> List[BaseMessage]:
@@ -374,6 +507,27 @@ class AgentMemory:
                     return list(channel_values["messages"])
         except Exception as error:
             logger.warning("读取 checkpoint 消息失败 [%s]: %s", target, error, exc_info=True)
+        return []
+
+    async def aget_messages(self, thread_id: Optional[str] = None) -> List[BaseMessage]:
+        """从异步 checkpoint 获取指定会话(默认当前会话)的所有消息。"""
+        target = thread_id if thread_id is not None else self.thread_id
+        config = {"configurable": {"thread_id": target}}
+        try:
+            getter = getattr(self._checkpointer, "aget_tuple", None)
+            if callable(getter):
+                tup = await getter(config)
+            else:
+                sync_getter = getattr(self._checkpointer, "get_tuple", None)
+                if not callable(sync_getter):
+                    return []
+                tup = sync_getter(config)
+            if tup and tup.checkpoint:
+                channel_values = tup.checkpoint.get("channel_values", {})
+                if "messages" in channel_values:
+                    return list(channel_values["messages"])
+        except (aiosqlite.Error, sqlite3.Error, AttributeError, TypeError) as error:
+            logger.warning("读取异步 checkpoint 消息失败 [%s]: %s", target, error, exc_info=True)
         return []
 
     def export_thread(self, thread_id: Optional[str] = None, fmt: str = "text") -> str:
@@ -432,6 +586,22 @@ class AgentMemory:
             result.append({"role": role, "content": content})
         return result
 
+    async def aget_short_term(self, limit: Optional[int] = None) -> List[Dict[str, str]]:
+        """异步兼容旧 API:从 checkpoint 取消息转为 dict 格式。"""
+        msgs = await self.aget_messages()
+        if limit:
+            msgs = msgs[-limit:]
+        elif self.short_term_size:
+            msgs = msgs[-self.short_term_size:]
+        result: List[Dict[str, str]] = []
+        for m in msgs:
+            role = _message_role(m)
+            content = _message_text(m)
+            if isinstance(m, ToolMessage):
+                content = TOOL_RESULT_PREFIX + content
+            result.append({"role": role, "content": content})
+        return result
+
     # ============ 长期记忆(用于 compress) ============
 
     def add(self, role: str, content: str, metadata: Optional[Dict[str, Any]] = None):
@@ -469,6 +639,18 @@ class AgentMemory:
         self.long_term_memory.clear()
         if self.long_term_file and os.path.exists(self.long_term_file):
             os.remove(self.long_term_file)
+
+    async def aclose(self) -> None:
+        """关闭异步 checkpointer 持有的 SQLite 连接。"""
+        conn = self._async_conn
+        if conn is None:
+            return
+        try:
+            await conn.close()
+        except (aiosqlite.Error, sqlite3.Error, AttributeError, RuntimeError, ValueError) as error:
+            logger.warning("关闭异步 checkpoint 连接失败: %s", error)
+        finally:
+            self._async_conn = None
 
     def _save_long_term_memory(self):
         """保存长期记忆到文件(原子写,崩溃时不产生坏 JSON)"""
