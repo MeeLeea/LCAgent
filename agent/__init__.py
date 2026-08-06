@@ -8,6 +8,7 @@ from .message_utils import (
     build_interrupt_event,
     StreamHandler,
 )
+from .logging_config import setup_logging, TraceContext
 
 __all__ = [
     'LLMClient',
@@ -18,4 +19,6 @@ __all__ = [
     'stringify_content',
     'build_interrupt_event',
     'StreamHandler',
+    'setup_logging',
+    'TraceContext',
 ]

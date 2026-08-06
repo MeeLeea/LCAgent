@@ -1,5 +1,5 @@
-// 工具调用卡片：展示工具名、参数、执行结果（可折叠）
-import { useEffect, useState } from 'react'
+// 工具调用卡片：展示工具名、参数、执行结果（默认收起，点击展开）
+import { useState } from 'react'
 import { ChevronDown, ChevronRight, Terminal, Check, Loader2, AlertTriangle } from 'lucide-react'
 import type { ToolCall, ToolResult } from '../types'
 
@@ -16,16 +16,61 @@ function isErrorContent(content: string): boolean {
   return /Traceback|Error[:：]|错误|失败|Exception|❌|执行出错/i.test(content)
 }
 
-export function ToolCallCard({ call, result }: { call: ToolCall; result?: ToolResult }) {
-  // 默认折叠：正常情况下只显示一行摘要，突出 AI 文本回复
-  const [open, setOpen] = useState(false)
-  const done = !!result
-  const isError = !!(result && isErrorContent(result.content))
+/**
+ * 从完整输出中提取异常摘要：
+ * - Python Traceback：取最后几行（实际的异常类型 + 消息）
+ * - 其他错误：取包含错误关键词的行
+ * - 兜底：取最后 3 行
+ */
+function extractErrorSummary(content: string): string {
+  const lines = content.split('\n').filter((l) => l.trim())
+  if (lines.length === 0) return content
 
-  // 出现异常时自动展开，便于排查
-  useEffect(() => {
-    if (isError) setOpen(true)
-  }, [isError])
+  // Python Traceback：最后的异常行（跳过 "During handling..." 等嵌套信息）
+  if (/Traceback/i.test(content)) {
+    const tail: string[] = []
+    for (let i = lines.length - 1; i >= 0 && tail.length < 3; i--) {
+      tail.unshift(lines[i])
+      // 遇到 Traceback 行就停（它本身不是错误信息）
+      if (/Traceback/i.test(lines[i])) break
+    }
+    return tail.join('\n')
+  }
+
+  // 非 Traceback：取包含错误关键词的行
+  const errorLines = lines.filter((l) =>
+    /Error[:：]|错误|失败|Exception|❌|执行出错/i.test(l),
+  )
+  if (errorLines.length > 0) {
+    return errorLines.slice(0, 3).join('\n')
+  }
+
+  // 兜底：最后 3 行
+  return lines.slice(-3).join('\n')
+}
+
+/**
+ * 截断极长的结果内容，防止 DOM 膨胀影响性能。
+ * 滑动窗口负责视觉上的滚动，这里只做硬上限保护。
+ */
+function truncate(text: string, max = 20000): string {
+  if (text.length <= max) return text
+  return text.slice(0, max) + `\n... (已截断，共 ${text.length} 字符)`
+}
+
+export function ToolCallCard({ call, result }: { call: ToolCall; result?: ToolResult }) {
+  // 卡片整体默认收起
+  const [open, setOpen] = useState(false)
+
+  const done = !!result
+  const isError = !!(result && result.content && isErrorContent(result.content))
+
+  // 异常时只取错误摘要；正常时保留完整内容（由滑动窗口滚动查看）
+  const displayContent = result?.content
+    ? isError
+      ? extractErrorSummary(result.content)
+      : truncate(result.content)
+    : ''
 
   return (
     <div className={`tool-card${isError ? ' tool-card-error' : ''}`}>
@@ -55,6 +100,14 @@ export function ToolCallCard({ call, result }: { call: ToolCall; result?: ToolRe
         <div className="tool-card-body">
           <div>参数：</div>
           <pre>{formatArgs(call.args)}</pre>
+          {displayContent && (
+            <>
+              <div className="tool-card-result-label">
+                {isError ? '异常信息：' : '执行结果：'}
+              </div>
+              <pre className="tool-card-result">{displayContent}</pre>
+            </>
+          )}
         </div>
       )}
     </div>

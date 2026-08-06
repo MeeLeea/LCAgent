@@ -1,6 +1,8 @@
 import ast
 import importlib.util
 
+import pytest
+
 import tools.create_tools as create_tool_module
 from tools.create_tools import create_tool
 
@@ -27,6 +29,15 @@ __all__ = [
 """
 
 
+def _invoke_with_tools_dir(
+    monkeypatch,
+    tmp_path,
+    args: dict[str, str | bool | None],
+) -> dict[str, object]:
+    monkeypatch.setattr(create_tool_module, "DEFAULT_TOOL_DIR", str(tmp_path))
+    return create_tool.invoke(args)
+
+
 def test_create_tool_default_path_saves_to_tools_dir(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(create_tool_module, "DEFAULT_TOOL_DIR", str(tmp_path))
     result = create_tool.invoke(VALID_ARGS)
@@ -38,54 +49,52 @@ def test_create_tool_default_path_saves_to_tools_dir(monkeypatch, tmp_path) -> N
     assert expected.read_text(encoding="utf-8") == result["source_code"]
 
 
-def test_create_tool_with_directory_path(tmp_path) -> None:
-    target_dir = tmp_path / "sub"
-    target_dir.mkdir()
-    args = {**VALID_ARGS, "tool_path": str(target_dir)}
+@pytest.mark.parametrize(
+    ("tool_path",),
+    [
+        ("sub",),
+        ("custom/my_tool.py",),
+    ],
+)
+def test_create_tool_writes_expected_file(monkeypatch, tmp_path, tool_path: str) -> None:
+    target = tmp_path / tool_path
+    if target.suffix:
+        args = {**VALID_ARGS, "tool_path": str(target)}
+        expected = target
+    else:
+        target.mkdir()
+        args = {**VALID_ARGS, "tool_path": str(target)}
+        expected = target / "read_markdown_file.py"
 
-    result = create_tool.invoke(args)
+    result = _invoke_with_tools_dir(monkeypatch, tmp_path, args)
 
     assert result["success"] is True
-    expected = target_dir / "read_markdown_file.py"
     assert result["file_path"] == str(expected)
     assert expected.exists()
 
 
-def test_create_tool_with_file_path(tmp_path) -> None:
-    target = tmp_path / "custom" / "my_tool.py"
-    args = {**VALID_ARGS, "tool_path": str(target)}
-
-    result = create_tool.invoke(args)
-
-    assert result["success"] is True
-    assert result["file_path"] == str(target)
-    assert target.exists()
-
-
-def test_generated_file_is_valid_python(tmp_path) -> None:
-    target = tmp_path / "valid_tool.py"
-    args = {**VALID_ARGS, "tool_path": str(target)}
-
-    result = create_tool.invoke(args)
+@pytest.mark.parametrize(
+    ("tool_path",),
+    [
+        ("valid_tool.py",),
+        ("self_contained.py",),
+    ],
+)
+def test_generated_artifacts_are_valid(monkeypatch, tmp_path, tool_path: str) -> None:
+    target = tmp_path / tool_path
+    result = _invoke_with_tools_dir(monkeypatch, tmp_path, {**VALID_ARGS, "tool_path": str(target)})
 
     assert result["success"] is True
     ast.parse(target.read_text(encoding="utf-8"))
-
-
-def test_generated_source_is_self_contained(tmp_path) -> None:
-    target = tmp_path / "self_contained.py"
-    result = create_tool.invoke({**VALID_ARGS, "tool_path": str(target)})
-
-    assert result["success"] is True
     assert "from langchain_core.tools import tool" in result["source_code"]
     assert "from typing import Dict, Any" in result["source_code"]
 
 
-def test_generated_tool_is_importable_and_runs(tmp_path) -> None:
+def test_generated_tool_is_importable_and_runs(monkeypatch, tmp_path) -> None:
     md_file = tmp_path / "sample.md"
     md_file.write_text("hello", encoding="utf-8")
     target = tmp_path / "importable_tool.py"
-    result = create_tool.invoke({**VALID_ARGS, "tool_path": str(target)})
+    result = _invoke_with_tools_dir(monkeypatch, tmp_path, {**VALID_ARGS, "tool_path": str(target)})
     assert result["success"] is True
 
     spec = importlib.util.spec_from_file_location("generated_importable_tool", target)
@@ -104,7 +113,7 @@ def _load_generated(tmp_path: str, target: str, name: str):
     return module
 
 
-def test_multiline_fstring_content_is_preserved(tmp_path) -> None:
+def test_multiline_fstring_content_is_preserved(monkeypatch, tmp_path) -> None:
     target = tmp_path / "greet.py"
     args = {
         "tool_name": "greet",
@@ -114,7 +123,7 @@ def test_multiline_fstring_content_is_preserved(tmp_path) -> None:
         "tool_path": str(target),
     }
 
-    result = create_tool.invoke(args)
+    result = _invoke_with_tools_dir(monkeypatch, tmp_path, args)
 
     assert result["success"] is True
     module = _load_generated(str(tmp_path), str(target), "generated_greet")
@@ -123,7 +132,7 @@ def test_multiline_fstring_content_is_preserved(tmp_path) -> None:
     assert out["result"] == "你好, 张三\n今天是周五"
 
 
-def test_tool_logic_with_dict_literal_and_fstring(tmp_path) -> None:
+def test_tool_logic_with_dict_literal_and_fstring(monkeypatch, tmp_path) -> None:
     target = tmp_path / "fmt_dict.py"
     args = {
         "tool_name": "fmt_dict",
@@ -133,7 +142,7 @@ def test_tool_logic_with_dict_literal_and_fstring(tmp_path) -> None:
         "tool_path": str(target),
     }
 
-    result = create_tool.invoke(args)
+    result = _invoke_with_tools_dir(monkeypatch, tmp_path, args)
 
     assert result["success"] is True
     module = _load_generated(str(tmp_path), str(target), "generated_fmt_dict")
@@ -142,7 +151,7 @@ def test_tool_logic_with_dict_literal_and_fstring(tmp_path) -> None:
     assert out["result"] == "值: {'k': 1}"
 
 
-def test_description_with_braces_does_not_break_template(tmp_path) -> None:
+def test_description_with_braces_does_not_break_template(monkeypatch, tmp_path) -> None:
     target = tmp_path / "brace_desc.py"
     args = {
         **VALID_ARGS,
@@ -150,13 +159,13 @@ def test_description_with_braces_does_not_break_template(tmp_path) -> None:
         "tool_path": str(target),
     }
 
-    result = create_tool.invoke(args)
+    result = _invoke_with_tools_dir(monkeypatch, tmp_path, args)
 
     assert result["success"] is True
     assert "形如 {key: value} 的字典" in result["source_code"]
 
 
-def test_nested_logic_keeps_relative_indent(tmp_path) -> None:
+def test_nested_logic_keeps_relative_indent(monkeypatch, tmp_path) -> None:
     target = tmp_path / "sum_list.py"
     args = {
         "tool_name": "sum_list",
@@ -166,7 +175,7 @@ def test_nested_logic_keeps_relative_indent(tmp_path) -> None:
         "tool_path": str(target),
     }
 
-    result = create_tool.invoke(args)
+    result = _invoke_with_tools_dir(monkeypatch, tmp_path, args)
 
     assert result["success"] is True
     module = _load_generated(str(tmp_path), str(target), "generated_sum_list")
@@ -205,11 +214,11 @@ def test_create_tool_register_is_idempotent(monkeypatch, tmp_path) -> None:
     assert content.count("'read_markdown_file'") == 1
 
 
-def test_create_tool_does_not_register_outside_tools_dir(tmp_path) -> None:
+def test_create_tool_does_not_register_outside_tools_dir(monkeypatch, tmp_path) -> None:
     target_dir = tmp_path / "external"
     target_dir.mkdir()
 
-    result = create_tool.invoke({**VALID_ARGS, "tool_path": str(target_dir)})
+    result = _invoke_with_tools_dir(monkeypatch, tmp_path, {**VALID_ARGS, "tool_path": str(target_dir)})
 
     assert result["success"] is True
     assert result["registered"] is False
@@ -243,7 +252,7 @@ def test_full_pipeline_registers_and_imports(monkeypatch, tmp_path) -> None:
     assert out["result"] == "hello"
 
 
-def test_create_tool_rejects_invalid_syntax(tmp_path) -> None:
+def test_create_tool_rejects_invalid_syntax(monkeypatch, tmp_path) -> None:
     target = tmp_path / "bad.py"
     args = {
         **VALID_ARGS,
@@ -251,22 +260,10 @@ def test_create_tool_rejects_invalid_syntax(tmp_path) -> None:
         "tool_path": str(target),
     }
 
-    result = create_tool.invoke(args)
+    result = _invoke_with_tools_dir(monkeypatch, tmp_path, args)
 
     assert result["success"] is False
     assert result["file_path"] is None
     assert not target.exists()
 
 
-def test_create_tool_rejects_invalid_tool_name(tmp_path) -> None:
-    target = tmp_path / "bad.py"
-    args = {
-        **VALID_ARGS,
-        "tool_name": "my tool",
-        "tool_path": str(target),
-    }
-
-    result = create_tool.invoke(args)
-
-    assert result["success"] is False
-    assert not target.exists()

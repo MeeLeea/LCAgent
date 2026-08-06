@@ -194,6 +194,24 @@ def test_get_messages_with_thread_id_does_not_mutate_current_thread(monkeypatch)
     assert msgs[0].content == "hello"
 
 
+def test_get_messages_returns_empty_list_and_logs_when_checkpoint_read_fails(monkeypatch, caplog):
+    # Given: checkpoint 读取会抛异常。
+    mem = AgentMemory(checkpoint_file=None, use_sqlite=False)
+
+    def fake_get_tuple(config):
+        raise RuntimeError("checkpoint 读取失败")
+
+    monkeypatch.setattr(mem._checkpointer, "get_tuple", fake_get_tuple)
+
+    # When: 读取消息。
+    with caplog.at_level("WARNING"):
+        msgs = mem.get_messages(thread_id="broken-thread")
+
+    # Then: 返回空列表并记录日志。
+    assert msgs == []
+    assert "读取 checkpoint 消息失败 [broken-thread]" in caplog.text
+
+
 def test_save_long_term_memory_is_atomic(tmp_path):
     # Given: 一个长期记忆文件路径。
     ltm_file = str(tmp_path / "ltm.json")

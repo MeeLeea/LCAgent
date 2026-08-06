@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Callable, Protocol, TypeAlias
 
@@ -56,14 +57,10 @@ class AgentLike(Protocol):
     tools: list[ToolLike]
     auto_match_skills: bool
 
-    def switch_llm(self, llm: LlmLike) -> None: ...
     def get_memory_summary(self) -> dict[str, JsonValue]: ...
     def get_available_tools(self) -> list[str]: ...
     def compress_memory(self) -> dict[str, JsonValue]: ...
-    def reload_mcp_tools(self) -> int: ...
     def list_skills(self) -> list[dict[str, str]]: ...
-    def load_skill(self, name: str) -> bool: ...
-    def clear_skills(self) -> None: ...
     def cot(self, task: str) -> str: ...
 
 
@@ -133,7 +130,7 @@ class CommandContext:
 
     def replace_llm(self, llm: LlmLike) -> None:
         # Agent 执行器持有唯一 LLM 客户端，切换后命令层直接经 agent.llm 访问。
-        self.agent.switch_llm(llm)
+        asyncio.run(self.agent.aswitch_llm(llm))
 
 
 HANDLED = CommandOutcome(handled=True)

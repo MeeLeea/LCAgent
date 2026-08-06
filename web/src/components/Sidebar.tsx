@@ -1,10 +1,10 @@
 // 侧边栏：会话列表管理（内容渲染到外层 aside 容器中）
 import { useState } from 'react'
-import { MessageSquarePlus, MessagesSquare, Trash2, PanelLeftClose, GitBranch, Search } from 'lucide-react'
+import { MessageSquarePlus, MessagesSquare, Trash2, GitBranch, Search } from 'lucide-react'
 import { useStore, THEMES, isWorkflowThread, stripWorkflowPrefix } from '../store'
 import { ThemePicker } from './ThemePicker'
 
-export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
+export function Sidebar() {
   const threads = useStore((s) => s.threads)
   const currentThreadId = useStore((s) => s.currentThreadId)
   const isStreaming = useStore((s) => s.isStreaming)
@@ -136,12 +136,7 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
 
       <div className="sidebar-footer">
         <span style={{ fontSize: 11 }}>{currentTheme?.name ?? '主题'}</span>
-        <div style={{ display: 'flex', gap: 4 }}>
-          <ThemePicker />
-          <button className="icon-btn" onClick={onCollapse} title="收起侧栏">
-            <PanelLeftClose size={15} />
-          </button>
-        </div>
+        <ThemePicker />
       </div>
     </>
   )

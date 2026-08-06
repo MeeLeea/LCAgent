@@ -68,6 +68,13 @@ interface AppState {
   currentModel: string | null
   tools: string[]
 
+  // 团队角色
+  roles: string[]
+  currentRole: string | null
+
+  // LLM 累计 token 用量（输入栏右下角展示）
+  totalTokens: number
+
   // 工作流
   workflows: string[]
   workflow: WorkflowInfo | null
@@ -109,6 +116,10 @@ interface AppState {
   // 提供商/模型
   switchProvider: (key: string) => Promise<void>
   switchModel: (model: string) => Promise<void>
+
+  // 团队角色
+  fetchRoles: () => Promise<void>
+  switchRole: (role: string) => Promise<void>
 }
 
 let abortFn: (() => void) | null = null
@@ -214,6 +225,9 @@ export const useStore = create<AppState>((set, get) => ({
   currentProvider: null,
   currentModel: null,
   tools: [],
+  roles: [],
+  currentRole: null,
+  totalTokens: 0,
   viewMode: 'chat',
   workflows: [],
   workflow: null,
@@ -281,6 +295,10 @@ export const useStore = create<AppState>((set, get) => ({
     void get().checkConnection()
     await Promise.all([get().refreshProviders(), get().fetchThreads(), get().fetchWorkflows()])
     api.getTools().then((r) => set({ tools: r.tools })).catch(() => {})
+    // 拉取初始 token 用量
+    api.getMetrics().then((m) => set({ totalTokens: m.llm.total_tokens })).catch(() => {})
+    // 拉取团队角色列表与当前角色
+    void get().fetchRoles()
   },
 
   refreshProviders: async () => {
@@ -424,12 +442,12 @@ export const useStore = create<AppState>((set, get) => ({
           set({ messages: msgs })
           break
         case 'tool_result':
-          // 接收 tool_result 标记完成状态，但不保存内容
+          // 保存执行结果内容，供卡片展开时查看（默认收起）
           msgs[lastIndex] = {
             ...last,
             toolResults: [
               ...(last.toolResults ?? []),
-              { id: ev.id, name: ev.name, content: '' }, // 内容置空
+              { id: ev.id, name: ev.name, content: ev.content },
             ],
           }
           set({ messages: msgs })
@@ -481,7 +499,7 @@ export const useStore = create<AppState>((set, get) => ({
         }
         case 'done':
           msgs[lastIndex] = { ...last, streaming: false }
-          set({ messages: msgs })
+          set({ messages: msgs, totalTokens: ev.total_tokens ?? get().totalTokens })
           finish()
           get().fetchThreads()
           break
@@ -563,12 +581,12 @@ export const useStore = create<AppState>((set, get) => ({
           set({ messages: msgs })
           break
         case 'tool_result':
-          // 接收 tool_result 标记完成状态，但不保存内容
+          // 保存执行结果内容，供卡片展开时查看（默认收起）
           msgs[lastIndex] = {
             ...last,
             toolResults: [
               ...(last.toolResults ?? []),
-              { id: ev.id, name: ev.name, content: '' }, // 内容置空
+              { id: ev.id, name: ev.name, content: ev.content },
             ],
           }
           set({ messages: msgs })
@@ -618,7 +636,7 @@ export const useStore = create<AppState>((set, get) => ({
         }
         case 'done':
           msgs[lastIndex] = { ...last, streaming: false }
-          set({ messages: msgs })
+          set({ messages: msgs, totalTokens: ev.total_tokens ?? get().totalTokens })
           finish()
           get().fetchThreads()
           break
@@ -669,6 +687,26 @@ export const useStore = create<AppState>((set, get) => ({
       console.log('[前端] 模型切换完成')
     } catch (e) {
       console.error('[前端] 切换模型失败:', e)
+    }
+  },
+
+  fetchRoles: async () => {
+    try {
+      const r = await api.getRoles()
+      set({ roles: r.roles, currentRole: r.current })
+    } catch {
+      /* ignore */
+    }
+  },
+
+  switchRole: async (role) => {
+    console.log('[前端] 切换角色:', role)
+    try {
+      await api.switchRole(role)
+      await get().fetchRoles()
+      console.log('[前端] 角色切换完成')
+    } catch (e) {
+      console.error('[前端] 切换角色失败:', e)
     }
   },
 }))
