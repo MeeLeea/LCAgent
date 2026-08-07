@@ -39,6 +39,12 @@ from .exceptions import AgentStateError
 from .llm_client import LLMClient
 from .logging_config import TraceContext, generate_trace_id
 from .memory import AgentMemory
+from .memory_lock_pool import ThreadMemoryLockPool
+from .memory_middleware import (
+    ThreadMemoryReadMiddleware,
+    ThreadMemoryWriteMiddleware,
+)
+from .memory_store import ThreadMemoryStore
 from .message_utils import StreamHandler
 from .metrics import MetricsCollector
 from .session import SessionRegistry, SessionStore
@@ -155,6 +161,11 @@ class AgentCore:
         self._session_store: SessionStore | None = SessionStore(
             max_history=max_execution_history
         )
+
+        # 长期记忆 Store + per-thread 并发锁池 + 写中间件（在 _init_session_registry 中初始化）
+        self._thread_memory_store: ThreadMemoryStore | None = None
+        self._thread_memory_lock_pool: ThreadMemoryLockPool | None = None
+        self._memory_write_middleware: ThreadMemoryWriteMiddleware | None = None
 
         # 执行历史 max 条数（传递给 SessionStore 做裁剪；实例不再持有 deque）
         self._max_execution_history = max_execution_history
@@ -308,6 +319,9 @@ class AgentCore:
         SessionRegistry 与 AgentMemory 共享同一 checkpointer 和 SQLite 连接，
         负责会话生命周期管理（new/switch/list/delete）+ 消息读取 + 瞬态状态隔离。
         AgentMemory 退化为仅负责长期记忆（memory.json）。
+
+        同时初始化 ThreadMemoryStore（长期记忆 Store 封装）和
+        ThreadMemoryLockPool（per-thread 并发锁池），供后续中间件使用。
         """
         self._session_registry = SessionRegistry(
             checkpointer=self.memory.get_checkpointer(),
@@ -318,6 +332,21 @@ class AgentCore:
         )
         # 同步当前会话指针
         self._session_registry.current_session_id = self.memory.thread_id
+
+        # 初始化长期记忆 Store（复用 AgentMemory 的 Store backend）
+        self._thread_memory_store = ThreadMemoryStore(
+            backend=self.memory.get_long_term_store(),
+        )
+        # 初始化 per-thread 并发锁池
+        self._thread_memory_lock_pool = ThreadMemoryLockPool()
+
+        # 初始化长期记忆写中间件（事件接收 + 防抖 + Fact 抽取流水线）
+        # llm_getter 延迟求值，支持 LLM 热切换（aswitch_llm 后立即生效）
+        self._memory_write_middleware = ThreadMemoryWriteMiddleware(
+            memory_store=self._thread_memory_store,
+            lock_pool=self._thread_memory_lock_pool,
+            llm_getter=lambda: self.llm,
+        )
 
     @property
     def session(self) -> SessionRegistry:
@@ -345,6 +374,43 @@ class AgentCore:
             store = SessionStore()
             self._session_store = store
         return store
+
+    @property
+    def long_term_memory(self) -> ThreadMemoryStore:
+        """长期记忆 Store（per-thread facts 隔离）。
+
+        通过此属性访问长期记忆 API：
+        - ``agent.long_term_memory.query_facts(sid)``
+        - ``agent.long_term_memory.save_fact(sid, item)``
+        - ``agent.long_term_memory.clear_thread_memory(sid)``
+        - ``agent.long_term_memory.prune_facts(sid)``
+        """
+        if self._thread_memory_store is None:
+            # 兼容测试中通过 object.__new__ 创建的实例
+            if self._session_registry is None:
+                self._init_session_registry()
+        return self._thread_memory_store  # type: ignore[return-value]
+
+    @property
+    def memory_lock_pool(self) -> ThreadMemoryLockPool:
+        """per-thread 并发锁池（保护同一 thread 的记忆写入）。"""
+        if self._thread_memory_lock_pool is None:
+            if self._session_registry is None:
+                self._init_session_registry()
+        return self._thread_memory_lock_pool  # type: ignore[return-value]
+
+    @property
+    def memory_write(self) -> ThreadMemoryWriteMiddleware:
+        """长期记忆写中间件（事件接收 + 防抖 + Fact 抽取流水线）。
+
+        通过此属性提交记忆事件：
+        - ``await agent.memory_write.submit_event(thread_id, role, content)``
+        - ``await agent.memory_write.submit_event(thread_id, role, content, important=True)``
+        """
+        if self._memory_write_middleware is None:
+            if self._session_registry is None:
+                self._init_session_registry()
+        return self._memory_write_middleware  # type: ignore[return-value]
 
     def set_current_session(self, session_id: str) -> None:
         """设置当前会话 ID，同步 session 注册表与 memory。
@@ -465,6 +531,11 @@ class AgentCore:
         )
         self._skill_middleware = skill_middleware
 
+        # 长期记忆读取中间件：awrap_model_call 时从 Store 读取 thread facts 注入 SystemMessage
+        memory_read_middleware = ThreadMemoryReadMiddleware(
+            memory_store=self.long_term_memory,
+        )
+
         # create_agent 直接返回可调用的agent
         wrapped_tools = wrap_tools_with_timeout(self.tools, self.tool_timeout)
         agent = create_agent(
@@ -472,8 +543,9 @@ class AgentCore:
             tools=wrapped_tools,
             system_prompt=system_prompt,
             checkpointer=self.memory.get_checkpointer(),
+            store=self.memory.get_long_term_store(),
             state_schema=LCAgentState,
-            middleware=[compaction_middleware, skill_middleware],
+            middleware=[compaction_middleware, skill_middleware, memory_read_middleware],
         )
         # 保存中间件引用，供手动压缩使用
         self._compaction_middleware = compaction_middleware
@@ -496,6 +568,37 @@ class AgentCore:
         避免在 areload_mcp_tools 内部调用时死锁）。
         """
         self.agent_executor = self._create_agent_executor()
+
+    async def _submit_memory_event(
+        self,
+        config: dict[str, Any] | None,
+        role: str,
+        content: str,
+        important: bool = False,
+    ) -> None:
+        """提交记忆事件到写中间件（非阻塞，防抖处理）。
+
+        从 config 提取 thread_id；config 为 None 时使用当前会话。
+        替代旧的 ``self.memory.aadd()``，长期记忆写入由 Store 接管。
+        记忆提交是副作用，失败仅记日志、不影响主流程。
+
+        Args:
+            config: LangGraph 配置（含 thread_id），为 None 时用当前会话
+            role: 消息角色 (user / assistant)
+            content: 消息文本内容
+            important: 是否用户显式标记为重要
+        """
+        try:
+            thread_id = (
+                self._thread_id_from_config(config)
+                if config
+                else getattr(self.session, "current_session_id", None)
+            )
+            if not thread_id:
+                return
+            await self.memory_write.submit_event(thread_id, role, content, important)
+        except Exception as error:
+            logger.debug("记忆事件提交失败: %s", error)
 
     async def _ahandle_turn_completion(
         self,
@@ -524,10 +627,11 @@ class AgentCore:
             # 只清理当前线程的中断状态，避免清掉其他会话的挂起中断
             await self._aclear_pending_interrupt(self._thread_id_from_config(config))
             if user_message:
-                await self.memory.aadd("user", user_message)
+                await self._submit_memory_event(config, "user", user_message)
             if save_assistant and turn.output:
-                metadata = {"important": True} if important else {}
-                await self.memory.aadd("assistant", turn.output, metadata)
+                await self._submit_memory_event(
+                    config, "assistant", turn.output, important=important
+                )
 
     def _get_system_prompt(self) -> str:
         """获取系统提示词。
@@ -861,7 +965,9 @@ class AgentCore:
         elif turn.is_completed:
             await self._aclear_pending_interrupt(tid)
             if mode == "run" and turn.output:
-                await self.memory.aadd("assistant", turn.output, {"important": True})
+                await self._submit_memory_event(
+                    config, "assistant", turn.output, important=True
+                )
 
         return turn
 
@@ -953,13 +1059,13 @@ class AgentCore:
     async def _afallback_chat(self, message: str) -> str:
         """Agent 执行失败时降级为纯 LLM 对话（异步版本）"""
         history = await self.session.aget_short_term()
-        await self.memory.aadd("user", message)
+        await self._submit_memory_event(None, "user", message)
         response = self.llm.chat_with_history(
             user_input=message,
             history=history,
             system_prompt="你是一个有帮助的AI助手，请用中文回答。"
         )
-        await self.memory.aadd("assistant", response)
+        await self._submit_memory_event(None, "assistant", response)
         return response
 
     async def acot(self, task: str) -> str:
@@ -980,8 +1086,11 @@ class AgentCore:
             "请用中文回答。"
         )
 
-        # CoT 模式不调用工具,直接用 LLM + checkpoint 历史
-        context = await self.session.aget_short_term() + self.memory.get_long_term(3)
+        # CoT 模式不调用工具,直接用 LLM + checkpoint 历史 + 长期记忆 facts
+        short_term = await self.session.aget_short_term()
+        facts = await self.long_term_memory.query_facts(self.session.current_session_id)
+        long_term = [{"role": "system", "content": f"[长期记忆] {f.content}"} for f in facts[:3]]
+        context = short_term + long_term
         response = self.llm.chat_with_history(
             user_input=task,
             history=context,
@@ -992,8 +1101,8 @@ class AgentCore:
         logger.info("最终答案: %s", response)
 
         # 存入记忆
-        await self.memory.aadd("user", task)
-        await self.memory.aadd("assistant", response, {"important": True})
+        await self._submit_memory_event(None, "user", task)
+        await self._submit_memory_event(None, "assistant", response, important=True)
 
         return response
 
@@ -1213,19 +1322,27 @@ class AgentCore:
             return
         self._closed = True
 
-        # 1. 关闭 MCP 连接池
+        # 1. 刷新长期记忆写中间件 buffer（处理未提交的防抖事件），然后关闭
+        try:
+            if self._memory_write_middleware is not None:
+                await self._memory_write_middleware.flush_all()
+                await self._memory_write_middleware.shutdown()
+        except Exception as e:
+            logger.warning("长期记忆写中间件关闭异常: %s", e, exc_info=True)
+
+        # 2. 关闭 MCP 连接池
         try:
             await self._mcp_pool.close()
         except Exception as e:
             logger.warning("MCP 连接池关闭异常: %s", e, exc_info=True)
 
-        # 2. 关闭 Checkpoint DB 连接
+        # 3. 关闭 Checkpoint DB 连接
         try:
             await self.memory.aclose()
         except Exception as e:
             logger.warning("Checkpoint DB 关闭异常: %s", e, exc_info=True)
 
-        # 3. SessionStore 中的 per-session 状态（history / interrupts）随 Store GC 自动回收
+        # 4. SessionStore 中的 per-session 状态（history / interrupts）随 Store GC 自动回收
         #    无需显式清理实例级可变状态（已迁移至 SessionStore）
 
         logger.info("AgentCore 资源已释放")

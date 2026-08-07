@@ -26,6 +26,9 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.store.base import BaseStore
+from langgraph.store.memory import InMemoryStore
+from langgraph.store.sqlite.aio import AsyncSqliteStore
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +85,10 @@ class AgentMemory:
         # 初始化 checkpointer
         self._checkpointer = self._init_checkpointer()
 
+        # 长期记忆 Store（同步模式用 InMemoryStore；异步模式在 acreate 中用 AsyncSqliteStore）
+        self._long_term_store: BaseStore = InMemoryStore()
+        self._long_term_store_conn: aiosqlite.Connection | None = None
+
         # 加载长期记忆
         if long_term_file and os.path.exists(long_term_file):
             self._load_long_term_memory()
@@ -118,8 +125,19 @@ class AgentMemory:
             await conn.execute("PRAGMA busy_timeout=10000")
             choice._checkpointer = AsyncSqliteSaver(conn)
             choice._async_conn = conn
+
+            # 长期记忆 Store：AsyncSqliteStore，复用同一 SQLite 文件，独立连接
+            store_conn = await aiosqlite.connect(checkpoint_file)
+            await store_conn.execute("PRAGMA journal_mode=WAL")
+            await store_conn.execute("PRAGMA busy_timeout=10000")
+            choice._long_term_store = AsyncSqliteStore(store_conn)
+            await choice._long_term_store.setup()
+            await store_conn.commit()  # 确保 setup 建表事务已提交
+            choice._long_term_store_conn = store_conn
         else:
             choice._checkpointer = MemorySaver()
+            choice._long_term_store = InMemoryStore()
+            choice._long_term_store_conn = None
 
         if long_term_file and await asyncio.to_thread(os.path.exists, long_term_file):
             await choice._a_load_long_term_memory()
@@ -152,6 +170,14 @@ class AgentMemory:
     def get_checkpointer(self) -> BaseCheckpointSaver:
         """获取 checkpointer 实例(传给 create_agent)"""
         return self._checkpointer
+
+    def get_long_term_store(self) -> BaseStore:
+        """获取长期记忆 Store 实例（供 ThreadMemoryStore 使用）。
+
+        - 异步模式: ``AsyncSqliteStore``（持久化到 SQLite，与 checkpoint 复用同一文件）
+        - 同步模式: ``InMemoryStore``（仅内存，用于测试）
+        """
+        return self._long_term_store
 
     def close(self) -> None:
         """关闭 checkpointer 持有的 SQLite 连接。
@@ -261,16 +287,25 @@ class AgentMemory:
             await asyncio.to_thread(os.remove, self.long_term_file)
 
     async def aclose(self) -> None:
-        """关闭异步 checkpointer 持有的 SQLite 连接。"""
+        """关闭异步 checkpointer 和长期记忆 Store 持有的 SQLite 连接。"""
         conn = self._async_conn
-        if conn is None:
-            return
-        try:
-            await conn.close()
-        except (aiosqlite.Error, sqlite3.Error, AttributeError, RuntimeError, ValueError) as error:
-            logger.warning("关闭异步 checkpoint 连接失败: %s", error)
-        finally:
-            self._async_conn = None
+        if conn is not None:
+            try:
+                await conn.close()
+            except (aiosqlite.Error, sqlite3.Error, AttributeError, RuntimeError, ValueError) as error:
+                logger.warning("关闭异步 checkpoint 连接失败: %s", error)
+            finally:
+                self._async_conn = None
+
+        # 关闭长期记忆 Store 连接（与 checkpoint 独立的连接）
+        store_conn = self._long_term_store_conn
+        if store_conn is not None:
+            try:
+                await store_conn.close()
+            except (aiosqlite.Error, sqlite3.Error, AttributeError, RuntimeError, ValueError) as error:
+                logger.warning("关闭长期记忆 Store 连接失败: %s", error)
+            finally:
+                self._long_term_store_conn = None
 
     def _save_long_term_memory(self):
         """保存长期记忆到文件(原子写,崩溃时不产生坏 JSON)"""

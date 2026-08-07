@@ -551,17 +551,15 @@ def test_interrupted_run_records_final_important_assistant_memory_after_resume()
     # Given: an interrupted AgentCore run later completes by resume.
     from agent.agent_core import AgentCore
 
-    recorded_memory = []
+    recorded_events = []
+
+    class FakeWriteMiddleware:
+        async def submit_event(self, thread_id, role, content, important=False):
+            recorded_events.append((thread_id, role, content, important))
 
     class FakeMemory:
         def get_config(self):
             return {"configurable": {"thread_id": "thread-memory"}}
-
-        def add(self, role, content, metadata=None):
-            recorded_memory.append((role, content, metadata))
-
-        async def aadd(self, role, content, metadata=None):
-            self.add(role, content, metadata)
 
     class FakeExecutor:
         def __init__(self):
@@ -586,6 +584,7 @@ def test_interrupted_run_records_final_important_assistant_memory_after_resume()
     core.verbose = False
     core.agent_core_prompt = "test prompt"
     core._state_lock = asyncio.Lock()
+    core._memory_write_middleware = FakeWriteMiddleware()
 
     # When: run interrupts and then completes after resume.
     interrupted = asyncio.run(core.arun_structured("needs approval"))
@@ -594,7 +593,7 @@ def test_interrupted_run_records_final_important_assistant_memory_after_resume()
     # Then: the final assistant output is saved as important memory after completion.
     assert interrupted.status == "interrupted"
     assert completed.status == "completed"
-    assert ("assistant", "approved result", {"important": True}) in recorded_memory
+    assert ("thread-memory", "assistant", "approved result", True) in recorded_events
 
 
 def test_legacy_run_and_chat_raise_on_interrupt_instead_of_empty_string():
