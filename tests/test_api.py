@@ -70,6 +70,7 @@ def mock_agent():
 
     # execute_command 端点用 set_current_session 切换当前会话
     agent.set_current_session = MagicMock()
+    agent.aclear_long_term_memory = AsyncMock(return_value=2)
     agent.get_available_tools = MagicMock(return_value=["calculator", "web_search", "ask_human"])
     agent.switch_llm = MagicMock()
     agent.aswitch_llm = AsyncMock(side_effect=agent.switch_llm)
@@ -1265,7 +1266,7 @@ def test_clear_memory_long(client, mock_agent):
     data = response.json()
     assert data["cleared"] is True
     assert data["scope"] == "long"
-    mock_agent.memory.aclear_long_term.assert_awaited_once()
+    mock_agent.aclear_long_term_memory.assert_awaited_once()
     mock_agent.session.new_session.assert_not_called()
 
 
@@ -1277,7 +1278,7 @@ def test_clear_memory_short(client, mock_agent):
     data = response.json()
     assert data["scope"] == "short"
     mock_agent.session.new_session.assert_called_once()
-    mock_agent.memory.aclear_long_term.assert_not_called()
+    mock_agent.aclear_long_term_memory.assert_not_called()
 
 
 def test_clear_memory_all(client, mock_agent):
@@ -1287,7 +1288,7 @@ def test_clear_memory_all(client, mock_agent):
 
     data = response.json()
     assert data["scope"] == "all"
-    mock_agent.memory.aclear_long_term.assert_awaited_once()
+    mock_agent.aclear_long_term_memory.assert_awaited_once()
     mock_agent.session.new_session.assert_called_once()
 
 

@@ -40,7 +40,7 @@ async def manage_threads(context: CommandContext) -> CommandOutcome:
             context.print(f"\n已在当前会话: {current}")
             break
         await context.agent.session.aswitch_session(str(selected))
-        context.agent.memory.thread_id = str(selected)  # 同步 memory 指针
+        context.agent.set_current_session(str(selected))
         messages = await context.agent.session.aget_messages()
         context.print(f"\n已切换到会话: {selected} (恢复 {len(messages or [])} 条历史消息)")
         break
@@ -50,7 +50,7 @@ async def manage_threads(context: CommandContext) -> CommandOutcome:
 def new_thread(context: CommandContext) -> CommandOutcome:
     old = context.agent.session.current_session_id
     new = context.agent.session.new_session()
-    context.agent.memory.thread_id = new  # 同步 memory 指针
+    context.agent.set_current_session(new)
     context.print(f"\n已开启新会话: {new}")
     context.print(f"原会话 {old} 已保留,可用 'thread' 切回")
     return HANDLED

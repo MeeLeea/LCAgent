@@ -143,7 +143,7 @@ def test_resume_structured_invokes_command_resume_with_same_thread_config():
 
     core = object.__new__(AgentCore)
     core.agent_executor = FakeExecutor()
-    core.memory = SimpleNamespace(get_config=lambda: {"configurable": {"thread_id": "thread-123"}})
+    core.memory = SimpleNamespace(thread_id="thread-123", get_config=lambda: {"configurable": {"thread_id": "thread-123"}})
     core.max_iterations = 25
     core._state_lock = asyncio.Lock()
     core._acompact_if_needed = no_compact
@@ -558,6 +558,8 @@ def test_interrupted_run_records_final_important_assistant_memory_after_resume()
             recorded_events.append((thread_id, role, content, important))
 
     class FakeMemory:
+        thread_id = "thread-memory"
+
         def get_config(self):
             return {"configurable": {"thread_id": "thread-memory"}}
 

@@ -195,7 +195,7 @@ def start_agent() -> str:
             tid = _load_remote_thread_id()
             if tid:
                 await agent.session.aswitch_session(tid)
-                agent.memory.thread_id = tid  # 同步 memory 指针
+                agent.set_current_session(tid)
             else:
                 _save_remote_thread_id(agent.session.current_session_id)
             # 主动修复可能残留的孤儿 tool_calls（上次中断可能遗留）

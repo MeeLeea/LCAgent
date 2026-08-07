@@ -1,6 +1,6 @@
 """长期记忆 Store 业务读写封装 — 基于 LangGraph BaseStore 的 per-thread 隔离。
 
-与 :class:`agent.session.store.SessionStore` 平行设计，但负责长期记忆（facts），
+与 :class:`session.store.SessionStore` 平行设计，但负责长期记忆（facts），
 而非瞬态会话状态（execution_history / interrupts）。
 
 隔离方式：

@@ -549,6 +549,22 @@ def test_run_simple_workflow_with_memory():
     assert result["final_answer"] == "最终答案: 完成"
 
 
+class FakeFact:
+    """模拟 ThreadFactItem"""
+    def __init__(self, content, category="important"):
+        self.content = content
+        self.category = category
+
+
+class FakeLongTermMemory:
+    """模拟 ThreadMemoryStore 的 query_facts 接口"""
+    def __init__(self, facts=None):
+        self._facts = facts or []
+
+    async def query_facts(self, thread_id):
+        return self._facts
+
+
 class FakeMemory:
     """模拟 AgentMemory 的记忆读取接口"""
     def __init__(self, short_term=None, long_term=None):
@@ -568,6 +584,8 @@ def test_build_memory_context():
     from cli.commands.workflow import abuild_memory_context
 
     class FakeSession:
+        current_session_id = "t1"
+
         async def aget_short_term(self, session_id=None):
             return [
                 {"role": "user", "content": "你好"},
@@ -577,14 +595,16 @@ def test_build_memory_context():
     class FakeAgent:
         def __init__(self):
             self.session = FakeSession()
-            self.memory = FakeMemory(long_term=[{"role": "system", "content": "用户偏好中文"}])
+            self.long_term_memory = FakeLongTermMemory(
+                facts=[FakeFact("用户偏好中文", "important")]
+            )
 
     text = asyncio.run(abuild_memory_context(FakeAgent()))
     assert "【当前会话】" in text
     assert "user: 你好" in text
     assert "assistant: 你好!" in text
     assert "【长期记忆】" in text
-    assert "system: 用户偏好中文" in text
+    assert "用户偏好中文" in text
 
 
 def test_build_memory_context_empty():
@@ -593,13 +613,15 @@ def test_build_memory_context_empty():
     from cli.commands.workflow import abuild_memory_context
 
     class FakeSession:
+        current_session_id = "t1"
+
         async def aget_short_term(self, session_id=None):
             return []
 
     class FakeAgent:
         def __init__(self):
             self.session = FakeSession()
-            self.memory = FakeMemory()
+            self.long_term_memory = FakeLongTermMemory()
 
     assert asyncio.run(abuild_memory_context(FakeAgent())) == ""
 
@@ -612,13 +634,15 @@ def test_build_memory_context_truncation(monkeypatch):
     monkeypatch.setattr(wf_module, "MAX_RAW_CONTEXT_CHARS", 20)
 
     class FakeSession:
+        current_session_id = "t1"
+
         async def aget_short_term(self, session_id=None):
             return [{"role": "user", "content": "这是一段很长很长的内容" * 10}]
 
     class FakeAgent:
         def __init__(self):
             self.session = FakeSession()
-            self.memory = FakeMemory()
+            self.long_term_memory = FakeLongTermMemory()
 
     text = asyncio.run(abuild_memory_context(FakeAgent()))
     assert "已截断" in text
@@ -635,6 +659,8 @@ class FakeExecutor:
 
 class FakeSession:
     """模拟 SessionRegistry 的短期记忆接口"""
+    current_session_id = "t1"
+
     async def aget_short_term(self, session_id=None):
         return []
 
@@ -645,6 +671,7 @@ class FakeAgentCore:
         self.agent_executor = FakeExecutor()
         self.memory = FakeMemory()
         self.session = FakeSession()
+        self.long_term_memory = FakeLongTermMemory()
 
     def _invoke_config(self, thread_id=None):
         return {"configurable": {"thread_id": "t1"}}
@@ -721,6 +748,8 @@ def test_run_workflow_injects_memory(monkeypatch):
     core.memory = Mem()
 
     class FakeSessionWithMemory:
+        current_session_id = "t1"
+
         async def aget_short_term(self, session_id=None):
             return [{"role": "user", "content": "之前聊过X"}]
     core.session = FakeSessionWithMemory()

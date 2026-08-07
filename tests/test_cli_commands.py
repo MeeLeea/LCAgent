@@ -90,6 +90,11 @@ class FakeAgent:
             "summary": "压缩摘要",
         }
 
+    async def aclear_long_term_memory(self, session_id: str | None = None) -> int:
+        self.calls.append(("aclear_long_term_memory", session_id))
+        await self.memory.aclear_long_term()
+        return 2
+
     def reload_mcp_tools(self) -> int:
         self.calls.append(("reload_mcp_tools", None))
         return 4

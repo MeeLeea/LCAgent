@@ -175,7 +175,7 @@ def test_record_tool_steps_deduplicates_full_history_and_maps_observations():
         ToolMessage(content="new result", tool_call_id="call-new"),
     ]
 
-    from agent.session.store import SessionStore
+    from session.store import SessionStore
 
     core = object.__new__(AgentCore)
     core.verbose = False
@@ -208,7 +208,7 @@ def test_clear_history_resets_tool_call_dedupe_state():
         AIMessage(content="", tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "call-1"}]),
         ToolMessage(content="result", tool_call_id="call-1"),
     ]
-    from agent.session.store import SessionStore
+    from session.store import SessionStore
 
     core = object.__new__(AgentCore)
     core.verbose = False
@@ -234,6 +234,8 @@ def test_arun_stops_after_user_rejects_command(monkeypatch):
     from agent.agent_core import AgentCore
 
     class FakeMemory:
+        thread_id = "thread-rejected"
+
         def get_config(self):
             return {"configurable": {"thread_id": "thread-rejected"}}
 
@@ -288,6 +290,8 @@ def test_aresume_stops_after_user_rejects_command():
     from agent.agent_core import AgentCore
 
     class FakeMemory:
+        thread_id = "thread-resume-rejected"
+
         def get_config(self):
             return {"configurable": {"thread_id": "thread-resume-rejected"}}
 
@@ -311,7 +315,7 @@ def test_aresume_stops_after_user_rejects_command():
             return SimpleNamespace(values={"messages": []})
 
     executor = RejectingExecutor()
-    from agent.session.store import SessionStore
+    from session.store import SessionStore
 
     core = object.__new__(AgentCore)
     core.memory = FakeMemory()
@@ -347,6 +351,8 @@ def test_arun_repairs_checkpoint_after_user_rejects_command():
     updates = []
 
     class FakeMemory:
+        thread_id = "thread-rejected"
+
         def get_config(self):
             return {"configurable": {"thread_id": "thread-rejected"}}
 

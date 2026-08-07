@@ -9,18 +9,18 @@ async def clear_memory(context: CommandContext, user_input: str) -> CommandOutco
     parts = user_input.split(None, 1)
     target = parts[1].strip().lower() if len(parts) > 1 else "long"
     if target in ("long", "长期"):
-        await context.agent.memory.aclear_long_term()
-        context.print("\n已清空长期记忆(并删除 memory.json)")
+        cleared = await context.agent.aclear_long_term_memory()
+        context.print(f"\n已清空长期记忆 ({cleared} 条 facts)")
     elif target in ("short", "短期"):
         # 短期记忆 = 当前会话 checkpoint；开启新会话替代删除
         tid = context.agent.session.new_session()
-        context.agent.memory.thread_id = tid
+        context.agent.set_current_session(tid)
         context.print(f"\n已清空短期记忆（新会话: {tid}）")
     elif target in ("all", "全部"):
-        await context.agent.memory.aclear_long_term()
+        cleared = await context.agent.aclear_long_term_memory()
         tid = context.agent.session.new_session()
-        context.agent.memory.thread_id = tid
-        context.print(f"\n已清空全部记忆(长期+短期，新会话: {tid})")
+        context.agent.set_current_session(tid)
+        context.print(f"\n已清空全部记忆 (长期 {cleared} 条 facts + 短期，新会话: {tid})")
     else:
         context.print("\n用法: clear [long|short|all]  (默认 long)")
     return HANDLED
@@ -42,7 +42,7 @@ async def compress_memory(context: CommandContext) -> CommandOutcome:
         context.print(f"  压缩率:       {ratio:.1f}%")
         context.print("\n--- 摘要内容 ---")
         context.print(str(result["summary"]))
-        context.print("--- 已保存到 memory.json ---")
+        context.print("--- 已保存到长期记忆 Store ---")
     else:
         context.print(f"\n压缩失败: {result.get('error', '未知错误')}")
     return HANDLED

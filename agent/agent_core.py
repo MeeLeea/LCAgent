@@ -47,7 +47,7 @@ from .memory_middleware import (
 from .memory_store import ThreadMemoryStore
 from .message_utils import StreamHandler
 from .metrics import MetricsCollector
-from .session import SessionRegistry, SessionStore
+from session import SessionRegistry, SessionStore
 from .skill_middleware import SkillInjectionMiddleware
 
 logger = logging.getLogger(__name__)
@@ -358,10 +358,10 @@ class AgentCore:
         - ``agent.session.aget_messages(sid)``
         - ``agent.session.current_session_id``  (getter/setter)
         """
-        if self._session_registry is None:
+        if getattr(self, "_session_registry", None) is None:
             # 兼容测试中通过 object.__new__ 创建的实例
             self._init_session_registry()
-        return self._session_registry
+        return self._session_registry  # type: ignore[return-value]
 
     def _get_store(self) -> SessionStore:
         """获取 SessionStore（惰性创建，兼容 object.__new__ 创建的测试实例）。
@@ -375,6 +375,22 @@ class AgentCore:
             self._session_store = store
         return store
 
+    def _current_sid(self, thread_id: str | None = None) -> str:
+        """获取当前会话 ID（兼容测试中通过 object.__new__ 创建的无 _session_registry 实例）。
+
+        优先使用显式 thread_id；否则从 SessionRegistry 读取；
+        若 _session_registry 不存在或无 current_session_id 属性则回退到 memory.thread_id，
+        最终回退到 "default"。
+        """
+        if thread_id is not None:
+            return thread_id
+        reg = getattr(self, "_session_registry", None)
+        if reg is not None:
+            sid = getattr(reg, "current_session_id", None)
+            if sid is not None:
+                return sid
+        return getattr(getattr(self, "memory", None), "thread_id", "default")
+
     @property
     def long_term_memory(self) -> ThreadMemoryStore:
         """长期记忆 Store（per-thread facts 隔离）。
@@ -385,17 +401,17 @@ class AgentCore:
         - ``agent.long_term_memory.clear_thread_memory(sid)``
         - ``agent.long_term_memory.prune_facts(sid)``
         """
-        if self._thread_memory_store is None:
+        if getattr(self, "_thread_memory_store", None) is None:
             # 兼容测试中通过 object.__new__ 创建的实例
-            if self._session_registry is None:
+            if getattr(self, "_session_registry", None) is None:
                 self._init_session_registry()
         return self._thread_memory_store  # type: ignore[return-value]
 
     @property
     def memory_lock_pool(self) -> ThreadMemoryLockPool:
         """per-thread 并发锁池（保护同一 thread 的记忆写入）。"""
-        if self._thread_memory_lock_pool is None:
-            if self._session_registry is None:
+        if getattr(self, "_thread_memory_lock_pool", None) is None:
+            if getattr(self, "_session_registry", None) is None:
                 self._init_session_registry()
         return self._thread_memory_lock_pool  # type: ignore[return-value]
 
@@ -407,8 +423,8 @@ class AgentCore:
         - ``await agent.memory_write.submit_event(thread_id, role, content)``
         - ``await agent.memory_write.submit_event(thread_id, role, content, important=True)``
         """
-        if self._memory_write_middleware is None:
-            if self._session_registry is None:
+        if getattr(self, "_memory_write_middleware", None) is None:
+            if getattr(self, "_session_registry", None) is None:
                 self._init_session_registry()
         return self._memory_write_middleware  # type: ignore[return-value]
 
@@ -592,7 +608,7 @@ class AgentCore:
             thread_id = (
                 self._thread_id_from_config(config)
                 if config
-                else getattr(self.session, "current_session_id", None)
+                else self._current_sid()
             )
             if not thread_id:
                 return
@@ -656,14 +672,14 @@ class AgentCore:
         """
         reg = getattr(self, "_session_registry", None)
         if reg is not None:
-            sid = thread_id or reg.current_session_id
+            sid = self._current_sid(thread_id)
             return reg.get_context(sid).config
         # Fallback：测试中通过 object.__new__ 创建的实例无 session_registry
-        if thread_id is None:
-            cfg = self.memory.get_config()
-        else:
-            cfg = self.memory.get_config(thread_id=thread_id)
-        return {**cfg, "recursion_limit": self.max_iterations}
+        sid = self._current_sid(thread_id)
+        return {
+            "configurable": {"thread_id": sid},
+            "recursion_limit": getattr(self, "max_iterations", 25),
+        }
 
     def _thread_id_from_config(self, config: dict[str, Any]) -> str | None:
         configurable = config.get("configurable")
@@ -708,7 +724,7 @@ class AgentCore:
         Args:
             thread_id: 指定会话线程 ID。为 None 时清除当前会话的中断。
         """
-        sid = thread_id or self.session.current_session_id
+        sid = self._current_sid(thread_id)
         await self._get_store().aclear_interrupt(sid)
 
     async def _arecord_tool_steps(
@@ -885,7 +901,7 @@ class AgentCore:
             thread_id: 目标会话线程 ID（为 None 时使用当前会话）
         """
         self._ensure_not_closed()
-        tid = thread_id or getattr(self.memory, "thread_id", "-")
+        tid = self._current_sid(thread_id)
         with TraceContext(trace_id=generate_trace_id(), thread_id=tid):
             logger.info("arun_structured: %s", task[:100])
             config = self._invoke_config(thread_id)
@@ -914,7 +930,7 @@ class AgentCore:
             thread_id: 目标会话线程 ID（为 None 时使用当前会话）
         """
         self._ensure_not_closed()
-        tid = thread_id or getattr(self.memory, "thread_id", "-")
+        tid = self._current_sid(thread_id)
         with TraceContext(trace_id=generate_trace_id(), thread_id=tid):
             logger.info("achat_structured: %s", message[:100])
             config = self._invoke_config(thread_id)
@@ -1088,7 +1104,7 @@ class AgentCore:
 
         # CoT 模式不调用工具,直接用 LLM + checkpoint 历史 + 长期记忆 facts
         short_term = await self.session.aget_short_term()
-        facts = await self.long_term_memory.query_facts(self.session.current_session_id)
+        facts = await self.long_term_memory.query_facts(self._current_sid())
         long_term = [{"role": "system", "content": f"[长期记忆] {f.content}"} for f in facts[:3]]
         context = short_term + long_term
         response = self.llm.chat_with_history(
@@ -1267,7 +1283,7 @@ class AgentCore:
         Args:
             session_id: 目标会话 ID。为 None 时使用当前会话。
         """
-        sid = session_id or self.session.current_session_id
+        sid = self._current_sid(session_id)
         return await self._get_store().aget_history(sid)
 
     async def aclear_history(self, session_id: str | None = None) -> None:
@@ -1276,26 +1292,51 @@ class AgentCore:
         Args:
             session_id: 目标会话 ID。为 None 时使用当前会话。
         """
-        sid = session_id or self.session.current_session_id
+        sid = self._current_sid(session_id)
         await self._get_store().aclear_history(sid)
 
     async def aget_memory_summary(self) -> dict[str, Any]:
-        """异步获取记忆摘要统计（当前会话消息数、长期记忆条数、checkpoint 信息）"""
+        """异步获取记忆摘要统计（当前会话消息数、长期记忆 facts 条数、checkpoint 信息）"""
         session_info = await self.session.asummarize()
+        sid = self._current_sid()
         return {
-            "thread_id": self.session.current_session_id,
+            "thread_id": sid,
             "checkpoint_messages": session_info["checkpoint_messages"],
             "checkpoint_backend": "sqlite" if self.memory.use_sqlite else "memory",
             "checkpoint_file": self.memory.checkpoint_file or "(内存)",
-            "long_term_count": len(self.memory.long_term_memory),
+            "long_term_count": await self.long_term_memory.count_facts(sid),
             "total_threads": session_info["total_sessions"],
         }
 
     async def acompress_memory(self) -> dict[str, Any]:
-        """异步压缩长期记忆: 委托给 memory.acompress_memory,用 LLM 生成摘要。
+        """异步压缩长期记忆：从 ThreadMemoryStore 读取全部 facts，用 LLM 生成摘要后替换。
 
-        LLMClient 无异步 chat 接口,阻塞的 LLM 调用放入线程池执行,避免阻塞事件循环。
+        LLMClient 无异步 chat 接口，阻塞的 LLM 调用放入线程池执行，避免阻塞事件循环。
         """
+        sid = self._current_sid()
+        facts = await self.long_term_memory.query_facts(sid)
+        if not facts:
+            return {"success": False, "error": "没有长期记忆可压缩"}
+
+        # 1. 拼接所有 facts 为文本
+        history_lines = []
+        original_chars = 0
+        for idx, fact in enumerate(facts, 1):
+            line = f"[{idx}] ({fact.create_time}) [{fact.category}] {fact.content}"
+            history_lines.append(line)
+            original_chars += len(fact.content)
+        history_text = "\n\n".join(history_lines)
+
+        # 2. 调用 LLM 生成摘要
+        system_prompt = (
+            "你是一个记忆压缩助手。请将以下历史对话记录压缩成一份简洁的摘要，要求：\n"
+            "1. 保留所有关键信息、用户意图、重要决策和事实\n"
+            "2. 去除重复和冗余内容\n"
+            "3. 按主题分条目组织，使用 '- ' 开头\n"
+            "4. 保持事实准确，不要添加推测内容\n"
+            "5. 用中文输出"
+        )
+
         async def _asummarize_text(text: str, prompt: str) -> str:
             def _sync_call() -> str:
                 try:
@@ -1308,7 +1349,41 @@ class AgentCore:
 
             return await asyncio.to_thread(_sync_call)
 
-        return await self.memory.acompress_memory(_asummarize_text)
+        summary = await _asummarize_text(
+            f"以下是历史对话记录，请压缩成摘要:\n\n{history_text}",
+            system_prompt,
+        )
+        if not summary:
+            return {"success": False, "error": "LLM 调用失败或返回空摘要"}
+
+        # 3. 用摘要替换全部 facts
+        result = await self.long_term_memory.replace_with_summary(sid, summary)
+        compressed_chars = len(summary)
+
+        return {
+            "success": result["success"],
+            "original_count": result["original_count"],
+            "original_chars": original_chars,
+            "compressed_chars": compressed_chars,
+            "summary": summary,
+        }
+
+    async def aclear_long_term_memory(self, session_id: str | None = None) -> int:
+        """清空当前会话的长期记忆 facts（ThreadMemoryStore）。
+
+        同时清空旧 JSON 长期记忆（memory.json）以保持向后兼容。
+
+        Args:
+            session_id: 目标会话 ID。为 None 时使用当前会话。
+
+        Returns:
+            被清除的 fact 数量
+        """
+        sid = self._current_sid(session_id)
+        cleared = await self.long_term_memory.clear_thread_memory(sid)
+        # 同步清空旧 JSON 长期记忆（向后兼容）
+        await self.memory.aclear_long_term()
+        return cleared
 
     # ============ 生命周期管理 ============
 

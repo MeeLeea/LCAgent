@@ -50,12 +50,8 @@ def test_get_config_thread_id_isolation():
 def test_invoke_config_respects_thread_id():
     from agent.agent_core import AgentCore
 
-    calls = []
-
     class FakeMemory:
-        def get_config(self, thread_id: str | None = None):
-            calls.append(thread_id)
-            return {"configurable": {"thread_id": thread_id or "fallback"}}
+        thread_id = "fallback"
 
     core = object.__new__(AgentCore)
     core.memory = FakeMemory()
@@ -69,7 +65,6 @@ def test_invoke_config_respects_thread_id():
         "configurable": {"thread_id": "thread-x"},
         "recursion_limit": 25,
     }
-    assert calls == [None, "thread-x"]
 
 
 # --------------------------------------------------------------------------- #
@@ -105,7 +100,7 @@ def test_no_mutable_system_message():
 def test_pending_interrupt_capture_and_clear_per_thread():
     """_acapture / _aclear 通过 SessionStore 实现 per-session 中断隔离。"""
     from agent.agent_core import AgentCore
-    from agent.session.store import SessionStore
+    from session.store import SessionStore
 
     core = object.__new__(AgentCore)
     core._session_store = SessionStore()

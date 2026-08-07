@@ -2,7 +2,7 @@
 记忆模块 - 长期记忆管理（基于 JSON 持久化）
 
 会话管理（checkpointer thread 级的 new/switch/list/delete/get_messages 等）
-已迁移至 agent.session.SessionRegistry。本模块仅负责：
+已迁移至 session.SessionRegistry。本模块仅负责：
 - 初始化 checkpointer（供 SessionRegistry 和 create_agent 共享）
 - 长期记忆（memory.json）的增删查改与压缩
 """

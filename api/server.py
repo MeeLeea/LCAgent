@@ -482,10 +482,10 @@ async def create_thread(req: CreateThreadRequest | None = None):
         if req and req.type == "workflow":
             workflow_name = req.workflow_name or "simple"
             tid = agent.session.new_workflow_session(workflow_name)
-            agent.memory.thread_id = tid  # 同步 memory 指针
+            agent.set_current_session(tid)
         else:
             tid = agent.session.new_session()
-            agent.memory.thread_id = tid  # 同步 memory 指针
+            agent.set_current_session(tid)
     logger.info("创建会话: %s", tid)
     return {"thread_id": tid}
 
@@ -614,7 +614,7 @@ async def chat(req: ChatRequest):
         # 确定会话 ID（new_thread 在事件循环内原子执行，无需加锁）
         is_new_thread = req.thread_id is None
         tid = req.thread_id if req.thread_id else agent.session.new_session()
-        agent.memory.thread_id = tid  # 同步 memory 指针
+        agent.set_current_session(tid)
 
         message = req.message.strip()
 
@@ -953,18 +953,18 @@ async def clear_memory(scope: str = "long"):
     """
     async with chat_lock:
         if scope in ("long", "长期"):
-            await agent.memory.aclear_long_term()
-            logger.info("已清空长期记忆")
+            cleared = await agent.aclear_long_term_memory()
+            logger.info("已清空长期记忆 (%d 条 facts)", cleared)
         elif scope in ("short", "短期"):
             # 短期记忆 = 当前会话 checkpoint；开启新会话替代删除
             tid = agent.session.new_session()
-            agent.memory.thread_id = tid
+            agent.set_current_session(tid)
             logger.info("已清空短期记忆（新会话: %s）", tid)
         elif scope in ("all", "全部"):
-            await agent.memory.aclear_long_term()
+            cleared = await agent.aclear_long_term_memory()
             tid = agent.session.new_session()
-            agent.memory.thread_id = tid
-            logger.info("已清空全部记忆（新会话: %s）", tid)
+            agent.set_current_session(tid)
+            logger.info("已清空全部记忆 (长期 %d 条 facts + 短期，新会话: %s)", cleared, tid)
         else:
             raise HTTPException(status_code=400, detail="scope 必须为 long|short|all")
         return {"cleared": True, "scope": scope}
