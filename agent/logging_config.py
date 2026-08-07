@@ -23,7 +23,7 @@ import contextvars
 import logging
 import sys
 import uuid
-from typing import Self
+from typing_extensions import Self
 
 # ── 上下文变量（asyncio 安全） ──────────────────────────────────
 

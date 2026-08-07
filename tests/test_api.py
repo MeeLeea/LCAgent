@@ -23,7 +23,7 @@ import sqlite3
 import sys
 import tempfile
 from collections.abc import AsyncIterator
-from datetime import UTC
+from datetime import timezone
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -45,15 +45,31 @@ def mock_agent():
     agent.memory = MagicMock()
     agent.memory.thread_id = "test-thread-123"
     agent.memory._async_mode = False
-    agent.memory.new_thread = MagicMock(return_value="new-thread-456")
-    agent.memory.new_workflow_thread = MagicMock(return_value="server-workflow-simple-abc12345")
-    agent.memory.list_threads = MagicMock(return_value=["thread-1", "thread-2"])
-    agent.memory.delete_thread = MagicMock(return_value=True)
-    agent.memory.alist_threads = AsyncMock(return_value=["thread-1", "thread-2"])
-    agent.memory.adelete_thread = AsyncMock(return_value=True)
-    agent.memory.aget_messages = AsyncMock(return_value=[])
-    agent.memory.is_workflow_thread = MagicMock(return_value=False)
-    agent.memory.workflow_name_of = MagicMock(return_value=None)
+    agent.memory.aclear_long_term = AsyncMock()
+
+    # 会话管理已迁移到 agent.session
+    agent.session = MagicMock()
+    agent.session.current_session_id = "test-thread-123"
+    agent.session.new_session = MagicMock(return_value="new-thread-456")
+    agent.session.new_workflow_session = MagicMock(return_value="server-workflow-simple-abc12345")
+    agent.session.alist_sessions = AsyncMock(return_value=["thread-1", "thread-2"])
+    agent.session.adelete_session = AsyncMock(return_value=True)
+    agent.session.aget_messages = AsyncMock(return_value=[])
+    agent.session.is_workflow_session = MagicMock(return_value=False)
+    agent.session.workflow_name_of = MagicMock(return_value=None)
+    agent.session.aswitch_session = AsyncMock()
+    agent.session.aexport_session = AsyncMock()
+    agent.aget_memory_summary = AsyncMock(return_value={
+        "thread_id": "test-thread-123",
+        "checkpoint_messages": 10,
+        "checkpoint_backend": "sqlite",
+        "checkpoint_file": "memory/checkpoints.sqlite",
+        "long_term_count": 5,
+        "total_threads": 3,
+    })
+
+    # execute_command 端点用 set_current_session 切换当前会话
+    agent.set_current_session = MagicMock()
     agent.get_available_tools = MagicMock(return_value=["calculator", "web_search", "ask_human"])
     agent.switch_llm = MagicMock()
     agent.aswitch_llm = AsyncMock(side_effect=agent.switch_llm)
@@ -154,28 +170,14 @@ def mock_agent():
         "messages_after": 22,
     })
 
-    # Mock 记忆相关方法
-    agent.get_memory_summary = MagicMock(return_value={
-        "thread_id": "test-thread-123",
-        "checkpoint_messages": 10,
-        "checkpoint_backend": "sqlite",
-        "checkpoint_file": "/tmp/test.sqlite",
-        "long_term_count": 5,
-        "total_threads": 3,
-    })
-    agent.compress_memory = MagicMock(return_value={
+    # Mock 记忆压缩（异步接口）
+    agent.acompress_memory = AsyncMock(return_value={
         "success": True,
         "original_count": 5,
         "original_chars": 2000,
         "compressed_chars": 500,
         "summary": "压缩后的摘要内容",
     })
-    agent.acompress_memory = AsyncMock(return_value=agent.compress_memory.return_value)
-    agent.memory.clear_long_term = MagicMock()
-    agent.memory.aclear_long_term = AsyncMock()
-    agent.memory.clear_short_term = MagicMock()
-    agent.memory.export_thread = MagicMock(return_value="用户: 测试消息\n助手: 回复")
-
     # Mock 技能列表
     agent.list_skills = MagicMock(return_value=[
         {"name": "pptx", "description": "PPT 生成技能"},
@@ -233,7 +235,7 @@ def temp_checkpoint_db():
         {"configurable": {"thread_id": "thread-1", "checkpoint_ns": ""}},
         {
             "id": checkpoint_id,
-            "ts": datetime.now(UTC).isoformat(),
+            "ts": datetime.now(timezone.utc).isoformat(),
             "channel_values": {"messages": test_messages},
         },
         {},
@@ -613,8 +615,8 @@ def test_create_thread(client, mock_agent):
     
     data = response.json()
     assert data["thread_id"] == "new-thread-456"
-    
-    mock_agent.memory.new_thread.assert_called_once()
+
+    mock_agent.session.new_session.assert_called_once()
 
 
 def test_create_workflow_thread(client, mock_agent):
@@ -627,7 +629,7 @@ def test_create_workflow_thread(client, mock_agent):
 
     data = response.json()
     assert data["thread_id"] == "server-workflow-simple-abc12345"
-    mock_agent.memory.new_workflow_thread.assert_called_once_with("simple")
+    mock_agent.session.new_workflow_session.assert_called_once_with("simple")
 
 
 def test_create_workflow_thread_default_name(client, mock_agent):
@@ -637,7 +639,7 @@ def test_create_workflow_thread_default_name(client, mock_agent):
         json={"type": "workflow"},
     )
     assert response.status_code == 200
-    mock_agent.memory.new_workflow_thread.assert_called_once_with("simple")
+    mock_agent.session.new_workflow_session.assert_called_once_with("simple")
 
 
 def test_list_workflows(client):
@@ -659,12 +661,12 @@ def test_delete_thread(client, mock_agent):
     assert data["deleted"] is True
     assert data["thread_id"] == "thread-1"
     
-    mock_agent.memory.adelete_thread.assert_awaited_once_with("thread-1")
+    mock_agent.session.adelete_session.assert_awaited_once_with("thread-1")
 
 
 def test_delete_thread_not_found(client, mock_agent):
     """测试删除不存在的会话"""
-    mock_agent.memory.adelete_thread.return_value = False
+    mock_agent.session.adelete_session.return_value = False
     
     response = client.delete("/api/threads/nonexistent")
     assert response.status_code == 404
@@ -672,7 +674,7 @@ def test_delete_thread_not_found(client, mock_agent):
 
 def test_get_thread_messages(client, mock_agent, temp_checkpoint_db):
     """测试读取会话消息"""
-    mock_agent.memory.aget_messages.return_value = [
+    mock_agent.session.aget_messages.return_value = [
         HumanMessage(content="测试消息1"),
         AIMessage(content="回复1"),
         HumanMessage(content="测试消息2"),
@@ -951,8 +953,8 @@ def test_chat_workflow_events_forwarded(client, mock_agent):
 
 def test_chat_workflow_thread_auto_command(client, mock_agent):
     """测试专属工作流会话自动包装为 /workflow:<name> 命令"""
-    mock_agent.memory.is_workflow_thread.return_value = True
-    mock_agent.memory.workflow_name_of.return_value = "simple"
+    mock_agent.session.is_workflow_session.return_value = True
+    mock_agent.session.workflow_name_of.return_value = "simple"
 
     with patch("api.server.dispatch_command", new_callable=AsyncMock) as mock_dispatch:
         async def side_effect(context, command):
@@ -980,8 +982,8 @@ def test_chat_workflow_thread_auto_command(client, mock_agent):
 
 def test_chat_workflow_thread_explicit_command_not_wrapped(client, mock_agent):
     """测试工作流会话中显式以 / 开头的命令不被二次包装"""
-    mock_agent.memory.is_workflow_thread.return_value = True
-    mock_agent.memory.workflow_name_of.return_value = "simple"
+    mock_agent.session.is_workflow_session.return_value = True
+    mock_agent.session.workflow_name_of.return_value = "simple"
 
     with patch("api.server.dispatch_command", new_callable=AsyncMock) as mock_dispatch:
         async def side_effect(context, command):
@@ -1264,7 +1266,7 @@ def test_clear_memory_long(client, mock_agent):
     assert data["cleared"] is True
     assert data["scope"] == "long"
     mock_agent.memory.aclear_long_term.assert_awaited_once()
-    mock_agent.memory.clear_short_term.assert_not_called()
+    mock_agent.session.new_session.assert_not_called()
 
 
 def test_clear_memory_short(client, mock_agent):
@@ -1274,8 +1276,8 @@ def test_clear_memory_short(client, mock_agent):
 
     data = response.json()
     assert data["scope"] == "short"
-    mock_agent.memory.clear_short_term.assert_called_once()
-    mock_agent.memory.clear_long_term.assert_not_called()
+    mock_agent.session.new_session.assert_called_once()
+    mock_agent.memory.aclear_long_term.assert_not_called()
 
 
 def test_clear_memory_all(client, mock_agent):
@@ -1286,7 +1288,7 @@ def test_clear_memory_all(client, mock_agent):
     data = response.json()
     assert data["scope"] == "all"
     mock_agent.memory.aclear_long_term.assert_awaited_once()
-    mock_agent.memory.clear_short_term.assert_called_once()
+    mock_agent.session.new_session.assert_called_once()
 
 
 def test_clear_memory_invalid_scope(client, mock_agent):
@@ -1387,7 +1389,7 @@ def test_get_skills(client, mock_agent):
 # --------------------------------------------------------------------------- #
 def test_export_thread(client, mock_agent, temp_checkpoint_db):
     """测试导出会话为文本"""
-    mock_agent.memory.aget_messages.return_value = [
+    mock_agent.session.aget_messages.return_value = [
         HumanMessage(content="测试消息1"),
         AIMessage(content="回复1"),
     ]
@@ -1398,12 +1400,12 @@ def test_export_thread(client, mock_agent, temp_checkpoint_db):
     assert data["thread_id"] == "thread-1"
     assert data["format"] == "text"
     assert "测试消息" in data["content"]
-    mock_agent.memory.aget_messages.assert_awaited_once_with(thread_id="thread-1")
+    mock_agent.session.aget_messages.assert_awaited_once_with(session_id="thread-1")
 
 
 def test_export_thread_markdown(client, mock_agent, temp_checkpoint_db):
     """测试导出会话为 Markdown"""
-    mock_agent.memory.aget_messages.return_value = [
+    mock_agent.session.aget_messages.return_value = [
         HumanMessage(content="测试消息1"),
         AIMessage(content="回复1"),
     ]
@@ -1412,7 +1414,7 @@ def test_export_thread_markdown(client, mock_agent, temp_checkpoint_db):
 
     data = response.json()
     assert data["format"] == "markdown"
-    mock_agent.memory.aget_messages.assert_awaited_once_with(thread_id="thread-1")
+    mock_agent.session.aget_messages.assert_awaited_once_with(session_id="thread-1")
 
 
 def test_export_thread_invalid_format(client, mock_agent):
@@ -1477,16 +1479,16 @@ def test_thread_summary(temp_checkpoint_db):
 
     from api.server import thread_summary
 
-    memory = MagicMock()
-    memory.aget_messages = AsyncMock(return_value=[
+    session = MagicMock()
+    session.aget_messages = AsyncMock(return_value=[
         HumanMessage(content="测试消息1"),
         AIMessage(content="回复1"),
         HumanMessage(content="测试消息2"),
         AIMessage(content="回复2"),
     ])
-    memory.is_workflow_thread = MagicMock(return_value=False)
-    memory.workflow_name_of = MagicMock(return_value=None)
-    with patch("api.server.agent", SimpleNamespace(memory=memory)):
+    session.is_workflow_session = MagicMock(return_value=False)
+    session.workflow_name_of = MagicMock(return_value=None)
+    with patch("api.server.agent", SimpleNamespace(session=session)):
         summary = asyncio.run(thread_summary("thread-1"))
 
         assert summary["thread_id"] == "thread-1"
@@ -1500,12 +1502,12 @@ def test_thread_summary_workflow_type(temp_checkpoint_db):
 
     from api.server import thread_summary
 
-    memory = MagicMock()
-    memory.aget_messages = AsyncMock(return_value=[])
-    memory.is_workflow_thread = MagicMock(side_effect=lambda thread_id: thread_id.startswith("server-workflow-"))
-    memory.workflow_name_of = MagicMock(side_effect=lambda thread_id: "simple" if thread_id.startswith("server-workflow-") else None)
+    session = MagicMock()
+    session.aget_messages = AsyncMock(return_value=[])
+    session.is_workflow_session = MagicMock(side_effect=lambda thread_id: thread_id.startswith("server-workflow-"))
+    session.workflow_name_of = MagicMock(side_effect=lambda thread_id: "simple" if thread_id.startswith("server-workflow-") else None)
     wf_tid = "server-workflow-simple-2571eacc"
-    with patch("api.server.agent", SimpleNamespace(memory=memory)):
+    with patch("api.server.agent", SimpleNamespace(session=session)):
         summary = asyncio.run(thread_summary(wf_tid))
         assert summary["type"] == "workflow"
         assert summary["workflow_name"] == "simple"

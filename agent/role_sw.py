@@ -91,8 +91,8 @@ async def arebuild_agent_from_team_dir(
     扫描 team/ 定位目标角色目录,读取其 agent_config.json 与 AGENT.md,
     复用现有构建链把主 AgentCore 切换为该角色的提示词/LLM:
 
-    - 仅提示词变化 → 走 _update_system_prompt(),不重建 Graph(约快 100x)
-    - provider/model 变化 → 重建 LLMClient 并走 _arebuild_agent_executor()
+    - 仅提示词变化 → 重建 executor（system_prompt 已改为静态字符串）
+    - provider/model 变化 → 重建 LLMClient 并重建 executor
 
     整个过程就地修改传入的 AgentCore 实例,不返回新对象。
 
@@ -157,10 +157,10 @@ async def arebuild_agent_from_team_dir(
                 temperature=agent.llm.temperature,
                 max_tokens=agent.llm.max_tokens,
             )
-            await agent._arebuild_agent_executor(task)
+            await agent._arebuild_agent_executor()
         else:
-            # 仅提示词变化:更新系统提示词,不重建 Graph
-            agent._update_system_prompt(task)
+            # 仅提示词变化:重建 executor 以使用新的 system_prompt
+            await agent._arebuild_agent_executor()
 
     if agent.verbose:
         logger.info(

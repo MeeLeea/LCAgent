@@ -4,7 +4,7 @@
 
 - 配置驱动的多 LLM 提供商（见 `config/llm_config.json`），运行时可切换提供商/模型
 - 本地工具调用（搜索、文件读写、计算、终端命令、文件打开、技能读取）
-- **MCP Server 工具动态加载**（已预置 workspace 文件夹管理服务，可扩展任意 MCP 服务）
+- **MCP Server 工具动态加载**（可扩展任意 MCP 服务）
 - **LangGraph Checkpoint 持久化**（服务器异步运行时使用 `memory/checkpoints_async.sqlite`，程序重启可恢复对话）
 - **LangGraph Human-in-the-loop**（`ask_human` 暂停图执行，CLI 结构化选择后 `Command(resume)` 继续）
 - 长期记忆管理（compress 压缩摘要）与长上下文自动裁剪
@@ -61,7 +61,6 @@
     - [1. 本地工具（Local Tools）](#1-本地工具local-tools)
     - [2. MCP 工具（MCP Server Tools）](#2-mcp-工具mcp-server-tools)
       - [已注册的 MCP Server](#已注册的-mcp-server)
-      - [workspace MCP Server 提供的工具](#workspace-mcp-server-提供的工具)
       - [MCP 配置文件](#mcp-配置文件)
       - [MCP 管理命令](#mcp-管理命令)
     - [3. 技能阅读（Skills）](#3-技能阅读skills)
@@ -274,7 +273,6 @@ LangChainAgent/
 │   ├── mcp_loader.py        # MCP 配置管理与工具加载器
 │   ├── mcp_pool.py          # MCP 连接池（per-server 隔离 + 健康探测 + 自动重连）
 │   ├── tool_wrapper.py      # 工具超时包装器（统一超时保护，超时返回 JSON 错误）
-│   ├── workspace_tool.py    # 工作目录管理 MCP Server
 │   └── scheduler_tool.py    # 定时任务工具（schedule_task/list/cancel/delete/cleanup）
 ├── cli/
 │   ├── __init__.py
@@ -320,7 +318,6 @@ LangChainAgent/
 │   ├── test_logging_config.py
 │   ├── test_exceptions_and_close.py
 │   ├── test_provider_models.py        # 在线连通性测试(需 API Key)
-│   └── test_workspace_tool_path_protection.py
 └── exports/                 # 对话导出目录(运行 export 命令时生成)
 ```
 
@@ -448,8 +445,8 @@ LLM 回复 → 写回 checkpoint
 #### `cot:` → checkpoint + memory.json
 
 ```python
-# cot()
-context = self.memory.get_short_term() + self.memory.get_long_term(3)
+# cot()（异步）
+context = await self.session.aget_short_term() + self.memory.get_long_term(3)
 response = self.llm.chat_with_history(
     user_input=task,
     history=context,   # ← 短期(checkpoint) + 长期(memory.json)
@@ -457,8 +454,8 @@ response = self.llm.chat_with_history(
 )
 ```
 
-- `get_short_term()` → 从 **checkpoint** 取当前 thread 的消息（转 dict）
-- `get_long_term(3)` → 从 **memory.json** 取最近 3 条长期记忆
+- `session.aget_short_term()` → 从 **SessionRegistry**（封装 checkpointer）取当前会话的消息（转 dict）
+- `memory.get_long_term(3)` → 从 **memory.json** 取最近 3 条长期记忆
 - 两者拼接后作为 history 传给 LLM
 
 #### 技能指引与长上下文摘要的注入
@@ -735,7 +732,6 @@ LLM 生成摘要
 --- 摘要内容 ---
 - 用户要求创建 LangChainAgent 项目
 - 已通过 config/llm_config.json 配置多个 LLM 提供商
-- 添加了 MCP workspace 工具（6 个文件夹管理工具）
 - 修复了 StructuredTool 同步调用问题
 - ...
 --- 已保存到 memory.json ---
@@ -785,23 +781,31 @@ LLM 生成摘要
 
 > ⚠️ **隔离规则**：异步实例（`acreate`）上调用同步方法会直接抛 `RuntimeError`（`_check_not_async` 守卫），防止事件循环内阻塞与跨线程混跑。请在异步环境统一使用带 `a` 前缀的异步版本；`close()` / `__enter__` 在异步模式同样被禁用，改用 `aclose()` / `async with`。
 
-| 同步（已废弃，仅同步实例可用）        | 异步（推荐）                             | 说明                                                   |
+> ℹ️ **会话管理已迁移**：`new/switch/list/delete/get_messages/get_short_term/export/summarize` 等会话级方法已迁移至 `agent.session`（`SessionRegistry`），`AgentMemory` 仅保留 checkpointer 初始化与长期记忆管理。
+
+| 同步（仅同步实例可用）               | 异步（推荐）                             | 说明                                                   |
 | ------------------------------------ | ---------------------------------------- | ------------------------------------------------------ |
 | `get_checkpointer()`                 | -                                        | 获取 checkpointer 实例(传给 create_react_agent)        |
 | `get_config()`                       | -                                        | 返回`{"configurable": {"thread_id": ...}}`(传给 invoke) |
-| `get_messages()`                     | `aget_messages()`                        | 从 checkpoint 获取指定 thread 的所有消息               |
-| `get_short_term(limit)`              | `aget_short_term(limit)`                 | 从 checkpoint 取消息转为 dict 格式                     |
 | `get_long_term(limit)`               | `get_long_term(limit)`（纯内存，共用）   | 获取最近 N 条长期记忆                                  |
 | `add(role, content, metadata)`       | `aadd(role, content, metadata)`          | 添加记忆，`important=True` 触发写 memory.json          |
-| `new_thread()`                       | `new_thread()`（纯内存，共用）           | 开启新会话                                             |
-| `switch_thread(thread_id)`           | `aswitch_thread(thread_id)`              | 切换到指定会话                                         |
-| `delete_thread(thread_id)`           | `adelete_thread(thread_id)`              | 删除指定会话(删当前会话时自动切换到其他会话)           |
-| `list_threads()`                     | `alist_threads()`                        | 列出所有会话 ID                                        |
-| `export_thread(thread_id, fmt)`      | `aexport_thread(thread_id, fmt)`         | 导出指定会话为可读文本/Markdown                        |
-| `clear_short_term()`                 | `clear_short_term()`（纯内存，共用）     | 开启新会话(替代删除)                                   |
 | `clear_long_term()`                  | `aclear_long_term()`                     | 清空长期记忆并删除文件                                 |
-| `summarize()`                        | `asummarize()`                           | 返回记忆统计信息(含 thread_id、消息数、会话数)         |
 | `compress_memory(cb)`                | `acompress_memory(cb)`                   | 压缩长期记忆（LLM 摘要后替换原内容）                   |
+
+会话管理（`SessionRegistry`，通过 `agent.session` 访问）：
+
+| 方法                                  | 说明                                                   |
+| ------------------------------------- | ------------------------------------------------------ |
+| `new_session()`                       | 开启新会话，返回 session_id                            |
+| `new_workflow_session(workflow_name)` | 开启工作流会话                                         |
+| `aswitch_session(session_id)`         | 切换到指定会话                                         |
+| `adelete_session(session_id)`         | 删除指定会话(删当前会话时自动切换到其他会话)           |
+| `alist_sessions()`                    | 列出所有会话 ID                                        |
+| `aget_messages(session_id)`           | 从 checkpoint 获取指定会话的所有消息                   |
+| `aget_short_term(session_id, limit)`  | 从 checkpoint 取消息转为 dict 格式                     |
+| `aexport_session(session_id, fmt)`    | 导出指定会话为可读文本/Markdown                        |
+| `asummarize(session_id)`              | 返回会话统计信息(含 session_id、消息数、会话数)        |
+| `is_workflow_session(session_id)`     | 判断是否为工作流会话                                   |
 
 `AgentCore` 侧对应新增：`aget_memory_summary()` 与 `acompress_memory()`（后者内部把阻塞的 LLM 调用放入 `asyncio.to_thread`，避免阻塞事件循环）。
 
@@ -855,22 +859,8 @@ Agent 的工具分为两类：
 
 | Server 名称    | 工具数 | 传输方式 | 说明                                                |
 | -------------- | ------ | -------- | --------------------------------------------------- |
-| `workspace`  | 6      | stdio    | 文件夹创建/删除/移动/复制/列举（Python 实现）       |
 | `filesystem` | -      | stdio    | 可选官方文件系统服务（需手动添加/启用，需 Node.js） |
 | `fetch`      | -      | stdio    | 可选官方网页抓取服务（需手动添加/启用，需 Node.js） |
-
-#### workspace MCP Server 提供的工具
-
-由 [tools/workspace_tool.py](tools/workspace_tool.py) 实现，基于 `FastMCP`：
-
-| 工具                      | 功能              | 参数                            |
-| ------------------------- | ----------------- | ------------------------------- |
-| `create_workspace`      | 创建文件夹        | `folder_name`, `parent_dir` |
-| `get_current_workspace` | 获取当前工作目录  | 无                              |
-| `list_directory`        | 列出目录内容      | `path`                        |
-| `delete_workspace`      | 删除文件夹        | `folder_path`, `recursive`  |
-| `move_workspace`        | 移动/重命名文件夹 | `src_path`, `dest_path`     |
-| `copy_workspace`        | 复制文件夹        | `src_path`, `dest_path`     |
 
 #### MCP 配置文件
 
@@ -878,14 +868,7 @@ Agent 的工具分为两类：
 
 ```json
 {
-    "servers": {
-        "workspace": {
-            "transport": "stdio",
-            "command": "python",
-            "args": ["tools/workspace_tool.py"],
-            "enabled": true
-        }
-    }
+    "servers": {}
 }
 ```
 
@@ -1138,7 +1121,7 @@ LLM 决定是否调用工具
 3. 你确实拥有这些工具的能力，工具会在用户本地执行
 4. 创建文件、脚本、文件夹默认位置是 ./tests/
 5. 如果用户要保存内容到文件，直接调用 write_file 工具
-6. 如果用户要创建目录，直接调用 create_workspace 工具
+6. 如果用户要创建目录，直接调用终端工具
 7. 测试/运行脚本时直接调用终端工具
 8. 危险命令会被安全策略拦截或要求确认
 9. 专业任务应优先用 read_skill 读取相关技能指引
@@ -1968,18 +1951,14 @@ CLI 会自动识别新工作流：`workflow:my_flow <任务>`。
         kimi       (Kimi (Moonshot))
 ----------------------------------------
 
-[MCP] workspace: 加载了 6 个工具
-[MCP] 已加载 6 个工具: create_workspace, get_current_workspace, ...
+[MCP] 已加载 0 个工具
 
 Agent 已就绪！
 当前提供商: DeepSeek
 当前模型:   deepseek-chat
 
 本地工具: search, read_file, write_file, calculate, run_shell, ...
-MCP工具:  create_workspace, get_current_workspace, ...
-
-你: 在 D:\work 下创建一个叫 my_project 的文件夹
-助手: 已为你创建文件夹 my_project，路径：D:\work\my_project
+MCP工具:
 ```
 
 ### 2. 三种执行模式
@@ -2083,7 +2062,7 @@ Agent 调用 `ask_human` 暂停图执行，等待人工选择后继续：
 已导出会话 thread-b1dc3b2a 到 我的导出/backup.md
 ```
 
-由 [agent/memory.py](agent/memory.py) 的 `AgentMemory.export_thread()` 实现，将 checkpoint 中的对话渲染为可读 Markdown。
+由 [agent/session/registry.py](agent/session/registry.py) 的 `SessionRegistry.aexport_session()` 实现，将 checkpoint 中的对话渲染为可读 Markdown。
 
 ### 7. JSON 模式
 
@@ -2110,10 +2089,10 @@ Agent 按要求**只输出一个合法 JSON 对象**（不含 ``` 标记与解�
 你: mcp
 MCP Servers:
 ------------------------------------------------------------
-  [✓启用] workspace (stdio)
-           python tools/workspace_tool.py
+  [✓启用] fetch (stdio)
+           npx -y @modelcontextprotocol/server-fetch
 ------------------------------------------------------------
-已加载 MCP 工具数: 6
+已加载 MCP 工具数: 0
 ```
 
 ### 9. 退出
@@ -2189,17 +2168,16 @@ async def main() -> None:
     print(llm.list_models())           # 查看当前提供商的可用模型
     await agent.aswitch_llm(llm)       # 重建 Agent 以使用新模型
 
-    # 会话管理（异步接口，acreate 实例上同步方法会抛 RuntimeError）
-    agent.memory.new_thread()                          # 开启新会话（纯内存接口，两模式共用）
-    await agent.memory.aswitch_thread("thread-abc123") # 切换到已有会话
-    await agent.memory.adelete_thread("thread-xxx")    # 删除指定会话
-    print(await agent.memory.alist_threads())          # 列出所有会话
-    print(await agent.memory.aexport_thread(fmt="markdown"))  # 导出当前会话为 Markdown 文本
+    # 会话管理（已迁移至 agent.session，异步接口）
+    agent.session.new_session()                            # 开启新会话
+    await agent.session.aswitch_session("thread-abc123")   # 切换到已有会话
+    await agent.session.adelete_session("thread-xxx")      # 删除指定会话
+    print(await agent.session.alist_sessions())            # 列出所有会话
+    print(await agent.session.aexport_session(fmt="markdown"))  # 导出当前会话为 Markdown 文本
 
-    # 记忆管理（异步接口）
-    await agent.memory.aclear_long_term()  # 清空长期记忆
-    agent.memory.clear_short_term()        # 开启新会话(替代删除，纯内存接口)
-    print(await agent.memory.asummarize()) # 查看记忆统计(含 thread_id、消息数)
+    # 记忆管理（长期记忆仍在 agent.memory，异步接口）
+    await agent.memory.aclear_long_term()      # 清空长期记忆
+    print(await agent.session.asummarize())    # 查看会话统计(含 session_id、消息数)
 
     # 压缩长期记忆
     result = await agent.acompress_memory()
@@ -2308,14 +2286,7 @@ Agent 的核心系统提示词（行为规则）已从 `agent_config.json` 中�
 
 ```json
 {
-  "servers": {
-    "workspace": {
-      "transport": "stdio",
-      "command": "python",
-      "args": ["tools/workspace_tool.py"],
-      "enabled": true
-    }
-  }
+  "servers": {}
 }
 ```
 
@@ -2451,7 +2422,6 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 | `tests/test_memory.py`                      | `AgentMemory`：长期记忆、会话管理(SQLite)                      |
 | `tests/test_agent_core_regressions.py`      | Agent 核心回归：HITL 恢复、会话隔离、技能匹配、长上下文裁剪等    |
 | `tests/test_scheduler.py`                   | 定时任务调度：TaskStore CRUD、原子抢占、重试逻辑                 |
-| `tests/test_workspace_tool_path_protection.py` | 工作目录工具：路径保护、越界检测                             |
 | `tests/test_api.py`                         | API Server：端点路由、流式聊天、命令执行（FastAPI TestClient）   |
 | `tests/test_message_utils.py`               | LLM 异常信息提取：429/5xx/鉴权/未知错误的中文提示                |
 | `tests/test_llm_client.py`                  | 瞬时错误自动重试：should_retry 判定与重试行为                    |
@@ -2569,7 +2539,7 @@ uv run ruff check .
 - LangGraph 1.x（`create_react_agent`、自定义 `AgentMiddleware` 压缩中间件）
 - LangGraph Checkpoint（`langgraph-checkpoint-sqlite`，同步/异步 SQLite 持久化）
 - langchain-mcp-adapters 0.3+（MCP 工具适配）
-- mcp 1.9+ / fastmcp 2.x（FastMCP Server）
+- mcp 1.9+
 - tenacity 9.x（LLM 瞬时错误自动重试）
 - OpenAI SDK（用于 OpenAI 兼容接口）
 - Tavily Python SDK（联网搜索）

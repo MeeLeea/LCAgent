@@ -18,8 +18,8 @@ def _write_export_file(path: str, text: str) -> None:
 
 async def manage_threads(context: CommandContext) -> CommandOutcome:
     while True:
-        threads = await context.agent.memory.alist_threads()
-        current = context.agent.memory.thread_id
+        threads = await context.agent.session.alist_sessions()
+        current = context.agent.session.current_session_id
         if not threads:
             context.print("\n暂无会话记录")
             break
@@ -39,16 +39,18 @@ async def manage_threads(context: CommandContext) -> CommandOutcome:
         if selected == current:
             context.print(f"\n已在当前会话: {current}")
             break
-        await context.agent.memory.aswitch_thread(str(selected))
-        messages = await context.agent.memory.aget_messages()
+        await context.agent.session.aswitch_session(str(selected))
+        context.agent.memory.thread_id = str(selected)  # 同步 memory 指针
+        messages = await context.agent.session.aget_messages()
         context.print(f"\n已切换到会话: {selected} (恢复 {len(messages or [])} 条历史消息)")
         break
     return HANDLED
 
 
 def new_thread(context: CommandContext) -> CommandOutcome:
-    old = context.agent.memory.thread_id
-    new = context.agent.memory.new_thread()
+    old = context.agent.session.current_session_id
+    new = context.agent.session.new_session()
+    context.agent.memory.thread_id = new  # 同步 memory 指针
     context.print(f"\n已开启新会话: {new}")
     context.print(f"原会话 {old} 已保留,可用 'thread' 切回")
     return HANDLED
@@ -68,15 +70,14 @@ async def export_thread(context: CommandContext, user_input: str) -> CommandOutc
     rest = user_input[7:].strip() if low.startswith("export:") else user_input[6:].strip()
     parts = rest.split(None, 1)
     thread_id = parts[0] if parts else None
-    path = parts[1] if len(parts) > 1 else None
-    text = await context.agent.memory.aexport_thread(thread_id)
+    text = await context.agent.session.aexport_session(thread_id)
     if not text.strip():
         context.print("\n该会话没有可导出的消息")
         return HANDLED
     if not path:
         exports_dir = os.path.join(context.base_dir, "exports")
         os.makedirs(exports_dir, exist_ok=True)
-        safe_thread_id = thread_id or context.agent.memory.thread_id
+        safe_thread_id = thread_id or context.agent.session.current_session_id
         path = os.path.join(exports_dir, f"{safe_thread_id}.md")
     try:
         await asyncio.to_thread(_write_export_file, path, text)
@@ -95,7 +96,7 @@ async def _athread_option(
 ) -> tuple[str, str]:
     try:
         # 直接读取目标会话消息，不再临时变异 thread_id
-        messages = await context.agent.memory.aget_messages(thread_id=thread_id) or []
+        messages = await context.agent.session.aget_messages(session_id=thread_id) or []
         message_count = len(messages)
         # 用第一条用户消息作为会话标题,不调用 LLM,避免菜单渲染变慢
         preview = _messages_preview(messages)
@@ -152,10 +153,10 @@ async def _adelete_thread(context: CommandContext, thread_id: str) -> None:
     if confirm not in ("y", "yes"):
         context.print("已取消")
         return
-    was_current = thread_id == context.agent.memory.thread_id
-    if await context.agent.memory.adelete_thread(thread_id):
+    was_current = thread_id == context.agent.session.current_session_id
+    if await context.agent.session.adelete_session(thread_id):
         context.print(f"\n已删除会话: {thread_id}")
         if was_current:
-            context.print(f"当前会话已被删除,自动切换到: {context.agent.memory.thread_id}")
+            context.print(f"当前会话已被删除,自动切换到: {context.agent.session.current_session_id}")
         return
     context.print(f"\n删除失败:会话 '{thread_id}' 不存在或数据库错误")

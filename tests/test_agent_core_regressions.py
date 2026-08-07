@@ -54,7 +54,7 @@ def test_compaction_retains_recent_messages_in_new_thread_state():
     core.verbose = False
     core.agent_executor = FakeExecutor()
     core._state_lock = asyncio.Lock()
-    core._invoke_config = lambda: {"configurable": {"thread_id": "thread-test"}}
+    core._invoke_config = lambda thread_id=None: {"configurable": {"thread_id": "thread-test"}}
 
     # Set up compaction middleware
     class FakeModel:
@@ -64,6 +64,12 @@ def test_compaction_retains_recent_messages_in_new_thread_state():
     core._compaction_middleware = LCAgentCompactionMiddleware(
         FakeModel(), CompactionConfig(max_messages=5, keep_recent=2)
     )
+
+    # 提供 fake session（manually_compact 通过 self.session.aget_messages 读取消息）
+    class _FakeSession:
+        async def aget_messages(self, session_id=None):
+            return messages
+    core._session_registry = _FakeSession()
 
     # When: manually_compact runs.
     result = asyncio.run(core.manually_compact())
@@ -119,7 +125,7 @@ def test_compaction_does_not_change_thread_when_summary_fails():
     core.verbose = False
     core.agent_executor = FakeExecutor()
     core._state_lock = asyncio.Lock()
-    core._invoke_config = lambda: {"configurable": {"thread_id": "thread-before"}}
+    core._invoke_config = lambda thread_id=None: {"configurable": {"thread_id": "thread-before"}}
 
     class FailingModel:
         async def ainvoke(self, prompt):
@@ -128,6 +134,12 @@ def test_compaction_does_not_change_thread_when_summary_fails():
     core._compaction_middleware = LCAgentCompactionMiddleware(
         FailingModel(), CompactionConfig(max_messages=5, keep_recent=2)
     )
+
+    # 提供 fake session（manually_compact 通过 self.session.aget_messages 读取消息）
+    class _FakeSession:
+        async def aget_messages(self, session_id=None):
+            return messages
+    core._session_registry = _FakeSession()
 
     # When: manually_compact runs with failing LLM.
     result = asyncio.run(core.manually_compact())
@@ -163,16 +175,22 @@ def test_record_tool_steps_deduplicates_full_history_and_maps_observations():
         ToolMessage(content="new result", tool_call_id="call-new"),
     ]
 
+    from agent.session.store import SessionStore
+
     core = object.__new__(AgentCore)
     core.verbose = False
-    core.execution_history = []
+    core._session_store = SessionStore()
 
     # When: two full histories are recorded.
-    core._record_tool_steps(first_history, first_input)
-    core._record_tool_steps(second_history, second_input)
+    session_id = "thread-test"
+    async def _run():
+        await core._arecord_tool_steps(first_history, first_input, session_id)
+        await core._arecord_tool_steps(second_history, second_input, session_id)
+        return await core.aget_execution_history(session_id)
+    history = asyncio.run(_run())
 
     # Then: every tool_call id appears once and observations attach to the matching call.
-    assert core.execution_history == [
+    assert history == [
         {"step": 1, "tool": "search", "input": {"q": "old"}, "observation": "old result"},
         {"step": 2, "tool": "read", "input": {"path": "a"}, "observation": "read result"},
         {"step": 3, "tool": "write", "input": {"path": "b"}, "observation": "write result"},
@@ -190,17 +208,23 @@ def test_clear_history_resets_tool_call_dedupe_state():
         AIMessage(content="", tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "call-1"}]),
         ToolMessage(content="result", tool_call_id="call-1"),
     ]
+    from agent.session.store import SessionStore
+
     core = object.__new__(AgentCore)
     core.verbose = False
-    core.execution_history = []
+    core._session_store = SessionStore()
 
     # When: history is cleared and the same call id is observed again later.
-    core._record_tool_steps(history, input_msg)
-    core.clear_history()
-    core._record_tool_steps(history, input_msg)
+    session_id = "thread-test"
+    async def _run():
+        await core._arecord_tool_steps(history, input_msg, session_id)
+        await core.aclear_history(session_id)
+        await core._arecord_tool_steps(history, input_msg, session_id)
+        return await core.aget_execution_history(session_id)
+    result_history = asyncio.run(_run())
 
     # Then: clear_history also clears dedupe state, so the call can be recorded again.
-    assert core.execution_history == [
+    assert result_history == [
         {"step": 1, "tool": "search", "input": {"q": "x"}, "observation": "result"}
     ]
 
@@ -246,10 +270,8 @@ def test_arun_stops_after_user_rejects_command(monkeypatch):
     core.memory = FakeMemory()
     core.max_iterations = 25
     core.verbose = False
-    core.execution_history = []
     core._state_lock = asyncio.Lock()
     core.agent_core_prompt = "test prompt"
-    core._compute_skill_block = lambda task: ""
     core.agent_executor = executor
 
     # When: 当前任务尝试执行被拒绝的命令。
@@ -289,14 +311,16 @@ def test_aresume_stops_after_user_rejects_command():
             return SimpleNamespace(values={"messages": []})
 
     executor = RejectingExecutor()
+    from agent.session.store import SessionStore
+
     core = object.__new__(AgentCore)
     core.memory = FakeMemory()
     core.max_iterations = 25
     core.verbose = False
-    core.execution_history = []
     core._state_lock = asyncio.Lock()
     core.agent_executor = executor
-    core._pending_interrupts = {"thread-resume-rejected": "chat"}
+    core._session_store = SessionStore()
+    asyncio.run(core._get_store().aset_interrupt_mode("thread-resume-rejected", "chat"))
 
     # When: 用户以 deny 恢复中断。
     turn = asyncio.run(core.aresume_structured({"choice_id": "deny"}))
@@ -304,7 +328,7 @@ def test_aresume_stops_after_user_rejects_command():
     # Then: 本轮取消并清理中断状态，而不是抛异常给调用方。
     assert turn.status == "cancelled"
     assert turn.output == "用户已拒绝执行危险命令，当前任务已取消。"
-    assert core._pending_interrupts == {}
+    assert asyncio.run(core._get_store().aget_interrupt_mode("thread-resume-rejected")) is None
 
 
 def test_arun_repairs_checkpoint_after_user_rejects_command():
@@ -356,10 +380,8 @@ def test_arun_repairs_checkpoint_after_user_rejects_command():
     core.memory = FakeMemory()
     core.max_iterations = 25
     core.verbose = False
-    core.execution_history = []
     core._state_lock = asyncio.Lock()
     core.agent_core_prompt = "test prompt"
-    core._compute_skill_block = lambda task: ""
     core.agent_executor = executor
 
     # When: 拒绝信号终止当前 turn。
@@ -378,21 +400,7 @@ def test_arun_repairs_checkpoint_after_user_rejects_command():
     assert rejected[0].status == "error"
 
 
-# ============ _check_and_raise_if_interrupted ============
-
-
-def test_check_and_raise_if_interrupted_raises_only_for_interrupted_status():
-    # Given: 三种 turn 状态分别对应中断/正常完成/取消。
-    from agent.agent_core import AgentCore, AgentTurnResult
-
-    core = object.__new__(AgentCore)
-
-    # When/Then: 只有 interrupted 状态触发异常，且异常信息包含 resume 指引。
-    with pytest.raises(RuntimeError, match="resume" + "_structured"):
-        core._check_and_raise_if_interrupted(AgentTurnResult.interrupted([]))
-
-    assert core._check_and_raise_if_interrupted(AgentTurnResult.completed("ok")) is None
-    assert core._check_and_raise_if_interrupted(AgentTurnResult.cancelled("no")) is None
+# ============ arun() / achat() 中断处理 ============
 
 
 def test_arun_and_achat_share_the_same_interrupt_error(monkeypatch, capsys):
@@ -410,7 +418,7 @@ def test_arun_and_achat_share_the_same_interrupt_error(monkeypatch, capsys):
 
     core.arun_structured = _return_interrupted_task
     core.achat_structured = _return_interrupted_message
-    core._fallback_chat = lambda message: pytest.fail("中断不应降级到 fallback")
+    core._afallback_chat = lambda message: pytest.fail("中断不应降级到 fallback")
 
     # When: 两个公开入口分别执行。
     with pytest.raises(RuntimeError) as run_error:
@@ -418,9 +426,9 @@ def test_arun_and_achat_share_the_same_interrupt_error(monkeypatch, capsys):
     with pytest.raises(RuntimeError) as chat_error:
         asyncio.run(core.achat("hello"))
 
-    # Then: 统一的检查方法让两条路径抛出完全相同的错误信息。
+    # Then: 两条路径抛出完全相同的错误信息，包含 aresume 指引。
     assert str(run_error.value) == str(chat_error.value)
-    assert "resume with " + "resume" + "_structured()" in str(run_error.value)
+    assert "aresume()" in str(run_error.value)
     capsys.readouterr()
 
 
@@ -452,24 +460,6 @@ def test_arun_returns_error_message_for_runtime_and_generic_failures(caplog):
     assert any("任务执行失败: boom" in r.message for r in caplog.records)
 
 
-def test_arun_reraises_runtime_error_mentioning_interrupt(capsys):
-    # Given: 异步运行入口抛出内部包含 interrupt 字样的 RuntimeError。
-    from agent.agent_core import AgentCore
-
-    core = object.__new__(AgentCore)
-    core._state_lock = asyncio.Lock()
-
-    async def _raise_interrupt(task):
-        raise RuntimeError("Agent turn interrupted; resume with " + "resume" + "_structured().")
-
-    core.arun_structured = _raise_interrupt
-
-    # When/Then: 中断异常必须原样抛出，不能被降级成错误字符串。
-    with pytest.raises(RuntimeError, match="interrupted"):
-        asyncio.run(core.arun("task"))
-    capsys.readouterr()
-
-
 def test_achat_falls_back_for_non_interrupt_failures():
     # Given: 异步对话入口抛出非中断的 RuntimeError 与普通 Exception。
     from agent.agent_core import AgentCore
@@ -492,6 +482,12 @@ def test_achat_falls_back_for_non_interrupt_failures():
     core._state_lock = asyncio.Lock()
     core.memory = FakeMemory()
     core.llm = FakeLLM()
+
+    # 提供 fake session（_afallback_chat 通过 self.session.aget_short_term 读取历史）
+    class _FakeSession:
+        async def aget_short_term(self, session_id=None):
+            return []
+    core._session_registry = _FakeSession()
 
     def _raise(exc):
         async def _raise_exc(message):
@@ -518,7 +514,7 @@ def test_achat_reraises_langgraph_interrupt_exceptions():
 
     core = object.__new__(AgentCore)
     core._state_lock = asyncio.Lock()
-    core._fallback_chat = lambda message: pytest.fail("中断不应降级到 fallback")
+    core._afallback_chat = lambda message: pytest.fail("中断不应降级到 fallback")
 
     async def _raise_graph_interrupt(message):
         raise GraphInterrupt("paused")

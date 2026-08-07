@@ -12,12 +12,15 @@ async def clear_memory(context: CommandContext, user_input: str) -> CommandOutco
         await context.agent.memory.aclear_long_term()
         context.print("\n已清空长期记忆(并删除 memory.json)")
     elif target in ("short", "短期"):
-        context.agent.memory.clear_short_term()
-        context.print("\n已清空短期记忆")
+        # 短期记忆 = 当前会话 checkpoint；开启新会话替代删除
+        tid = context.agent.session.new_session()
+        context.agent.memory.thread_id = tid
+        context.print(f"\n已清空短期记忆（新会话: {tid}）")
     elif target in ("all", "全部"):
         await context.agent.memory.aclear_long_term()
-        context.agent.memory.clear_short_term()
-        context.print("\n已清空全部记忆(长期+短期)")
+        tid = context.agent.session.new_session()
+        context.agent.memory.thread_id = tid
+        context.print(f"\n已清空全部记忆(长期+短期，新会话: {tid})")
     else:
         context.print("\n用法: clear [long|short|all]  (默认 long)")
     return HANDLED

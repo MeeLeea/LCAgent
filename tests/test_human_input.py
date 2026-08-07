@@ -495,7 +495,7 @@ def test_cli_helper_collects_simultaneous_interrupts_before_one_resume():
     ]
 
 
-def test_resume_after_switching_thread_is_rejected():
+def test_resume_after_switching_thread_proceeds_in_default_chat_mode():
     # Given: AgentCore has an interrupted turn for one thread.
     from agent.agent_core import AgentCore
 
@@ -533,19 +533,18 @@ def test_resume_after_switching_thread_is_rejected():
     core.agent_executor = FakeExecutor()
     core.max_iterations = 25
     core.verbose = False
-    core.execution_history = []
     core.agent_core_prompt = "test prompt"
-    core._compute_skill_block = lambda task: ""
     core._state_lock = asyncio.Lock()
 
     # When: the run interrupts and the current thread is switched before resume.
     turn = asyncio.run(core.arun_structured("needs approval"))
     core.memory.thread_id = "thread-after"
 
-    # Then: resume is rejected instead of resuming against the wrong thread.
+    # Then: resume defaults to chat mode (no interrupt tracked for the new
+    # thread) and proceeds via LangGraph instead of being rejected.
     assert turn.status == "interrupted"
-    with pytest.raises(ValueError, match="thread"):
-        asyncio.run(core.aresume_structured({"choice_id": "approve"}))
+    resumed = asyncio.run(core.aresume_structured({"choice_id": "approve"}))
+    assert resumed.status == "completed"
 
 
 def test_interrupted_run_records_final_important_assistant_memory_after_resume():
@@ -585,9 +584,7 @@ def test_interrupted_run_records_final_important_assistant_memory_after_resume()
     core.agent_executor = FakeExecutor()
     core.max_iterations = 25
     core.verbose = False
-    core.execution_history = []
     core.agent_core_prompt = "test prompt"
-    core._compute_skill_block = lambda task: ""
     core._state_lock = asyncio.Lock()
 
     # When: run interrupts and then completes after resume.
@@ -602,9 +599,9 @@ def test_interrupted_run_records_final_important_assistant_memory_after_resume()
 
 def test_legacy_run_and_chat_raise_on_interrupt_instead_of_empty_string():
     # Given: legacy wrappers receive an interrupted structured turn.
-    from agent.agent_core import AgentCore
+    from agent.agent_core import AgentCore, AgentTurnResult
 
-    interrupted = SimpleNamespace(status="interrupted", output=None, interrupts=[Interrupt(value={}, id="i-1")])
+    interrupted = AgentTurnResult.interrupted([Interrupt(value={}, id="i-1")])
     core = object.__new__(AgentCore)
     async def arun_structured(task):
         return interrupted

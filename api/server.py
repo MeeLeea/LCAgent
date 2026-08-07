@@ -214,7 +214,7 @@ def serialize_messages(messages: list[Any]) -> list[dict[str, Any]]:
 
 async def thread_summary(thread_id: str) -> dict[str, Any]:
     """单个会话的摘要信息（消息数 + 预览 + 会话类型）。"""
-    msgs = await agent.memory.aget_messages(thread_id=thread_id) if agent else []
+    msgs = await agent.session.aget_messages(session_id=thread_id) if agent else []
     preview = ""
     for m in msgs:
         if isinstance(m, HumanMessage):
@@ -229,9 +229,9 @@ async def thread_summary(thread_id: str) -> dict[str, Any]:
         "type": "chat",
     }
     # 专属工作流会话：标注类型并带上绑定的工作流名，前端据此区分展示
-    if agent and agent.memory.is_workflow_thread(thread_id):
+    if agent and agent.session.is_workflow_session(thread_id):
         summary["type"] = "workflow"
-        summary["workflow_name"] = agent.memory.workflow_name_of(thread_id)
+        summary["workflow_name"] = agent.session.workflow_name_of(thread_id)
     return summary
 
 
@@ -296,7 +296,7 @@ async def health():
         "status": "ok",
         "provider": info.get("provider"),
         "model": info.get("model"),
-        "thread_id": agent.memory.thread_id if agent else None,
+        "thread_id": agent.session.current_session_id if agent else None,
     }
 
 
@@ -469,10 +469,10 @@ async def list_workflows():
 @app.get("/api/threads")
 async def list_threads():
     """列出所有会话（按消息数倒序，便于最近活跃的靠前）。"""
-    ids = await agent.memory.alist_threads() if agent else []
+    ids = await agent.session.alist_sessions() if agent else []
     summaries = [await thread_summary(tid) for tid in ids]
     summaries.sort(key=lambda x: x["message_count"], reverse=True)
-    return {"threads": summaries, "current": agent.memory.thread_id if agent else None}
+    return {"threads": summaries, "current": agent.session.current_session_id if agent else None}
 
 
 @app.post("/api/threads")
@@ -481,9 +481,11 @@ async def create_thread(req: CreateThreadRequest | None = None):
     async with chat_lock:
         if req and req.type == "workflow":
             workflow_name = req.workflow_name or "simple"
-            tid = agent.memory.new_workflow_thread(workflow_name)
+            tid = agent.session.new_workflow_session(workflow_name)
+            agent.memory.thread_id = tid  # 同步 memory 指针
         else:
-            tid = agent.memory.new_thread()
+            tid = agent.session.new_session()
+            agent.memory.thread_id = tid  # 同步 memory 指针
     logger.info("创建会话: %s", tid)
     return {"thread_id": tid}
 
@@ -491,7 +493,7 @@ async def create_thread(req: CreateThreadRequest | None = None):
 @app.delete("/api/threads/{thread_id}")
 async def delete_thread(thread_id: str):
     logger.info("删除会话: %s", thread_id)
-    ok = await agent.memory.adelete_thread(thread_id)
+    ok = await agent.session.adelete_session(thread_id)
     if not ok:
         logger.warning("删除失败: %s", thread_id)
         raise HTTPException(status_code=404, detail="会话不存在或删除失败")
@@ -500,7 +502,7 @@ async def delete_thread(thread_id: str):
 
 @app.get("/api/threads/{thread_id}/messages")
 async def get_thread_messages(thread_id: str):
-    msgs = await agent.memory.aget_messages(thread_id=thread_id) if agent else []
+    msgs = await agent.session.aget_messages(session_id=thread_id) if agent else []
     return {"thread_id": thread_id, "messages": serialize_messages(msgs)}
 
 
@@ -611,13 +613,14 @@ async def chat(req: ChatRequest):
     async def event_stream():
         # 确定会话 ID（new_thread 在事件循环内原子执行，无需加锁）
         is_new_thread = req.thread_id is None
-        tid = req.thread_id if req.thread_id else agent.memory.new_thread()
+        tid = req.thread_id if req.thread_id else agent.session.new_session()
+        agent.memory.thread_id = tid  # 同步 memory 指针
 
         message = req.message.strip()
 
         # 专属工作流会话：未显式以 / 开头时，自动包装为 /workflow:<name> 命令执行
-        if agent.memory.is_workflow_thread(tid):
-            workflow_name = agent.memory.workflow_name_of(tid)
+        if agent.session.is_workflow_session(tid):
+            workflow_name = agent.session.workflow_name_of(tid)
             if workflow_name and not message.startswith('/'):
                 message = f"/workflow:{workflow_name} {message}"
                 logger.info("工作流会话 [%s] 自动包装命令: %s", tid, message)
@@ -758,7 +761,7 @@ async def chat_resume(req: ResumeRequest):
 
     async def event_stream():
         # 恢复必须带 thread_id（前端在会话被中断时已知线程）；缺失时回退当前会话
-        tid = req.thread_id or agent.memory.thread_id
+        tid = req.thread_id or agent.session.current_session_id
         logger.info("恢复会话 [%s]", tid)
         async with _thread_lock(tid):
             try:
@@ -781,8 +784,8 @@ async def execute_command(req: CommandRequest):
     """执行 CLI 命令（如 /help, /info, /threads 等）。"""
     async with chat_lock:
         if req.thread_id:
-            agent.memory.thread_id = req.thread_id
-        tid = req.thread_id or agent.memory.thread_id
+            agent.set_current_session(req.thread_id)
+        tid = req.thread_id or agent.session.current_session_id
         
         # 去掉前导 / 符号（CLI 命令不需要 /）
         command = req.command.lstrip('/')
@@ -898,7 +901,7 @@ async def compact_context(thread_id: str | None = None):
 
     与 before_model 中间件使用相同的压缩逻辑，适用于对话过长时主动释放 token。
     """
-    tid = thread_id or agent.memory.thread_id
+    tid = thread_id or agent.session.current_session_id
     logger.info("手动压缩上下文 [%s]", tid)
     async with _thread_lock(tid):
         try:
@@ -920,17 +923,7 @@ async def get_memory_summary():
     """获取记忆摘要统计（当前会话消息数、长期记忆条数、checkpoint 信息）"""
     if not agent:
         raise HTTPException(status_code=503, detail="Agent 未初始化")
-    memory = agent.memory
-    if not getattr(memory, "_async_mode", False):
-        return agent.get_memory_summary()
-    return {
-        "thread_id": memory.thread_id,
-        "checkpoint_messages": len(await memory.aget_messages()),
-        "checkpoint_backend": "sqlite" if memory.use_sqlite else "memory",
-        "checkpoint_file": memory.checkpoint_file or "(内存)",
-        "long_term_count": len(memory.long_term_memory),
-        "total_threads": len(await memory.alist_threads()),
-    }
+    return await agent.aget_memory_summary()
 
 
 @app.post("/api/compress")
@@ -963,12 +956,15 @@ async def clear_memory(scope: str = "long"):
             await agent.memory.aclear_long_term()
             logger.info("已清空长期记忆")
         elif scope in ("short", "短期"):
-            agent.memory.clear_short_term()
-            logger.info("已清空短期记忆")
+            # 短期记忆 = 当前会话 checkpoint；开启新会话替代删除
+            tid = agent.session.new_session()
+            agent.memory.thread_id = tid
+            logger.info("已清空短期记忆（新会话: %s）", tid)
         elif scope in ("all", "全部"):
             await agent.memory.aclear_long_term()
-            agent.memory.clear_short_term()
-            logger.info("已清空全部记忆")
+            tid = agent.session.new_session()
+            agent.memory.thread_id = tid
+            logger.info("已清空全部记忆（新会话: %s）", tid)
         else:
             raise HTTPException(status_code=400, detail="scope 必须为 long|short|all")
         return {"cleared": True, "scope": scope}
@@ -1023,7 +1019,7 @@ async def export_thread(thread_id: str, fmt: str = "text"):
         raise HTTPException(status_code=503, detail="Agent 未初始化")
     if fmt not in ("text", "markdown"):
         raise HTTPException(status_code=400, detail="fmt 必须为 text|markdown")
-    msgs = await agent.memory.aget_messages(thread_id=thread_id)
+    msgs = await agent.session.aget_messages(session_id=thread_id)
     blocks = []
     for m in msgs:
         if isinstance(m, HumanMessage):

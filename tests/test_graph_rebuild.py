@@ -1,8 +1,9 @@
 """测试 Graph 重建消除：技能变化不触发 Graph 重建，工具变化才重建。
 
-核心机制：create_agent 接收可变 SystemMessage 对象作为 system_prompt，
-model_node 闭包捕获该对象引用。修改 .content 即可动态更新提示词，
-无需重新编译 LangGraph。
+核心机制：AgentCore 无状态化——system_prompt 为静态字符串，
+技能注入由 SkillInjectionMiddleware 在 model 调用时从 LCAgentState.active_skills
+读取（随 checkpoint per-thread 隔离）。技能变化只写入 state，不重建 Graph；
+仅工具列表/LLM 变化时才调用 _arebuild_agent_executor 重新编译 LangGraph。
 """
 import asyncio
 from types import SimpleNamespace
@@ -22,13 +23,9 @@ def _make_minimal_core():
     core.verbose = False
     core.max_iterations = 25
     core.agent_core_prompt = "base prompt"
-    core.active_skills = set()
     core.auto_match_skills = False
-    core.execution_history = []
-    core._recorded_tool_call_ids = set()
     core._state_lock = asyncio.Lock()
     core.compaction_config = CompactionConfig(max_messages=999, keep_recent=10)
-    core._system_message = SystemMessage(content="base prompt")
     return core
 
 
@@ -43,24 +40,50 @@ class FakeModel:
 
 
 class FakeExecutor:
-    """记录 invoke 调用的假 executor"""
+    """记录调用并模拟 LangGraph executor 的 invoke / state API"""
 
     def __init__(self):
         self.invoke_calls = 0
+        self.get_state_calls = 0
+        self.update_state_calls = 0
+        self._state_values = {"active_skills": [], "messages": [], "summary": ""}
 
     def invoke(self, value, config):
         self.invoke_calls += 1
-        return {"messages": [AIMessage(content="done")]} 
+        return {"messages": [AIMessage(content="done")]}
 
     async def ainvoke(self, value, config):
         self.invoke_calls += 1
-        return {"messages": [AIMessage(content="done")]} 
+        return {"messages": [AIMessage(content="done")]}
 
     def get_state(self, config):
-        return SimpleNamespace(values={"messages": [], "summary": ""})
+        self.get_state_calls += 1
+        return SimpleNamespace(values=dict(self._state_values))
+
+    async def aget_state(self, config):
+        self.get_state_calls += 1
+        return SimpleNamespace(values=dict(self._state_values))
 
     async def aupdate_state(self, config, values):
+        self.update_state_calls += 1
+        self._state_values.update(values)
+
+
+class FakeMemory:
+    """假记忆：提供 get_config / aadd，模拟 AgentMemory 的最小接口"""
+
+    def __init__(self, thread_id="thread-1"):
+        self.thread_id = thread_id
+
+    def get_config(self, thread_id=None):
+        tid = thread_id or self.thread_id
+        return {"configurable": {"thread_id": tid}}
+
+    def add(self, role, content, metadata=None):
         pass
+
+    async def aadd(self, role, content, metadata=None):
+        self.add(role, content, metadata)
 
 
 class FakeSkillManager:
@@ -94,55 +117,7 @@ class FakeToolObj:
         self.name = name
 
 
-# ============ 测试：_update_system_prompt 不触发 Graph 重建 ============
-
-
-def test_update_system_prompt_does_not_call_create_agent_executor():
-    # Given: 一个已初始化的 AgentCore
-    core = _make_minimal_core()
-    core.agent_executor = FakeExecutor()
-    core._compute_skill_block = lambda task: ""
-    create_calls = 0
-
-    def counting_create(skill_block=""):
-        nonlocal create_calls
-        create_calls += 1
-        return FakeExecutor()
-
-    core._create_agent_executor = counting_create
-
-    # When: 调用 _update_system_prompt
-    core._update_system_prompt("some task")
-
-    # Then: _create_agent_executor 没有被调用（没有 Graph 重建）
-    assert create_calls == 0
-    # 但系统提示词内容确实更新了
-    assert core._system_message.content == "base prompt"
-
-
-def test_update_system_prompt_with_skill_block():
-    # Given: 带技能管理器的 AgentCore
-    core = _make_minimal_core()
-    core.agent_executor = FakeExecutor()
-    core.skill_manager = FakeSkillManager()
-    core.active_skills = {"git-commit"}
-
-    def compute_skill_block(task):
-        names = set(core.active_skills)
-        if core.auto_match_skills and task:
-            names.update(core.skill_manager.match_skills(task))
-        if not names:
-            return ""
-        return core.skill_manager.render_block(sorted(names))
-
-    core._compute_skill_block = compute_skill_block
-
-    # When: 更新系统提示词
-    core._update_system_prompt("commit my changes")
-
-    # Then: 提示词包含技能内容
-    assert "Git Commit Skill" in core._system_message.content
-    assert "base prompt" in core._system_message.content
+# ============ 测试：技能变化不触发 Graph 重建 ============
 
 
 def test_arun_structured_uses_update_not_rebuild():
@@ -151,30 +126,8 @@ def test_arun_structured_uses_update_not_rebuild():
     executor = FakeExecutor()
     core.agent_executor = executor
     core.skill_manager = FakeSkillManager()
-    core.active_skills = set()
-    core.auto_match_skills = True
-
-    class FakeMemory:
-        def get_config(self):
-            return {"configurable": {"thread_id": "thread-1"}}
-
-        def add(self, role, content, metadata=None):
-            pass
-
-        async def aadd(self, role, content, metadata=None):
-            self.add(role, content, metadata)
-
     core.memory = FakeMemory()
-
-    def real_compute(task):
-        names = set(core.active_skills)
-        if core.auto_match_skills and task:
-            names.update(core.skill_manager.match_skills(task))
-        if not names:
-            return ""
-        return core.skill_manager.render_block(sorted(names))
-
-    core._compute_skill_block = real_compute
+    core.auto_match_skills = True
 
     rebuild_count = 0
 
@@ -184,22 +137,21 @@ def test_arun_structured_uses_update_not_rebuild():
 
     core._arebuild_agent_executor = counting_rebuild
 
-    # When: 执行任务（"git" 关键词匹配 git-commit 技能）
+    # When: 执行任务（技能注入由 SkillInjectionMiddleware 自动完成，无需重建 Graph）
     asyncio.run(core.arun_structured("git commit my code"))
 
-    # Then: Graph 没有被重建
+    # Then: Graph 没有被重建，但 executor 被调用了一次
     assert rebuild_count == 0
-    # 但系统提示词包含了匹配到的技能
-    assert "Git Commit Skill" in core._system_message.content
-    # 执行器被调用了一次
     assert executor.invoke_calls == 1
 
 
 def test_aload_skill_does_not_rebuild_graph():
-    # Given: AgentCore 带技能管理器
+    # Given: AgentCore 带 mock executor（提供 aget_state / aupdate_state）与 memory
     core = _make_minimal_core()
-    core.agent_executor = FakeExecutor()
+    executor = FakeExecutor()
+    core.agent_executor = executor
     core.skill_manager = FakeSkillManager()
+    core.memory = FakeMemory()
     core.auto_match_skills = False
 
     rebuild_count = 0
@@ -213,20 +165,21 @@ def test_aload_skill_does_not_rebuild_graph():
     # When: 加载技能
     result = asyncio.run(core.aload_skill("git-commit"))
 
-    # Then: 技能加载成功，但没有重建 Graph
+    # Then: 技能加载成功，但没有重建 Graph；技能通过 aupdate_state 写入 state
     assert result is True
     assert rebuild_count == 0
-    assert "git-commit" in core.active_skills
-    # 系统提示词更新了
-    assert "Git Commit Skill" in core._system_message.content
+    assert executor.update_state_calls == 1
+    assert "git-commit" in executor._state_values["active_skills"]
 
 
 def test_aclear_skills_does_not_rebuild_graph():
-    # Given: AgentCore 已加载技能
+    # Given: AgentCore 已在 state 中加载技能
     core = _make_minimal_core()
-    core.agent_executor = FakeExecutor()
+    executor = FakeExecutor()
+    executor._state_values["active_skills"] = ["git-commit", "code-review"]
+    core.agent_executor = executor
     core.skill_manager = FakeSkillManager()
-    core.active_skills = {"git-commit", "code-review"}
+    core.memory = FakeMemory()
     core.auto_match_skills = False
 
     rebuild_count = 0
@@ -240,11 +193,35 @@ def test_aclear_skills_does_not_rebuild_graph():
     # When: 清空技能
     asyncio.run(core.aclear_skills())
 
-    # Then: 技能被清空，但没有重建 Graph
+    # Then: 没有重建 Graph；技能通过 aupdate_state 清空为空列表
     assert rebuild_count == 0
-    assert len(core.active_skills) == 0
-    # 系统提示词恢复为基础提示词
-    assert core._system_message.content == "base prompt"
+    assert executor.update_state_calls == 1
+    assert executor._state_values["active_skills"] == []
+
+
+def test_achat_structured_updates_prompt_without_rebuild():
+    # Given: AgentCore 带技能管理器
+    core = _make_minimal_core()
+    executor = FakeExecutor()
+    core.agent_executor = executor
+    core.skill_manager = FakeSkillManager()
+    core.memory = FakeMemory()
+    core.auto_match_skills = True
+
+    rebuild_count = 0
+
+    async def counting_rebuild(task=""):
+        nonlocal rebuild_count
+        rebuild_count += 1
+
+    core._arebuild_agent_executor = counting_rebuild
+
+    # When: 对话（技能注入由 SkillInjectionMiddleware 自动完成，无需重建 Graph）
+    asyncio.run(core.achat_structured("review my code"))
+
+    # Then: Graph 没有被重建，但 executor 被调用了一次
+    assert rebuild_count == 0
+    assert executor.invoke_calls == 1
 
 
 # ============ 测试：工具列表变化才触发 Graph 重建 ============
@@ -318,7 +295,7 @@ def test_areload_mcp_tools_skips_rebuild_when_tools_unchanged():
     assert count == 0
 
 
-# ============ 测试：_system_message 可变性 ============
+# ============ 测试：SystemMessage 可变性 ============
 
 
 def test_system_message_content_is_mutable_after_compilation():
@@ -330,51 +307,3 @@ def test_system_message_content_is_mutable_after_compilation():
 
     # Then: 同一对象的 content 已更新
     assert sys_msg.content == "updated prompt with skills"
-
-
-def test_achat_structured_updates_prompt_without_rebuild():
-    # Given: AgentCore 带技能管理器
-    core = _make_minimal_core()
-    executor = FakeExecutor()
-    core.agent_executor = executor
-    core.skill_manager = FakeSkillManager()
-    core.active_skills = set()
-    core.auto_match_skills = True
-
-    class FakeMemory:
-        def get_config(self):
-            return {"configurable": {"thread_id": "thread-chat-1"}}
-
-        def add(self, role, content, metadata=None):
-            pass
-
-        async def aadd(self, role, content, metadata=None):
-            self.add(role, content, metadata)
-
-    core.memory = FakeMemory()
-
-    def real_compute(task):
-        names = set(core.active_skills)
-        if core.auto_match_skills and task:
-            names.update(core.skill_manager.match_skills(task))
-        if not names:
-            return ""
-        return core.skill_manager.render_block(sorted(names))
-
-    core._compute_skill_block = real_compute
-
-    rebuild_count = 0
-
-    async def counting_rebuild(task=""):
-        nonlocal rebuild_count
-        rebuild_count += 1
-
-    core._arebuild_agent_executor = counting_rebuild
-
-    # When: 对话（"code" 关键词匹配 code-review 技能）
-    asyncio.run(core.achat_structured("review my code"))
-
-    # Then: Graph 没有被重建，但提示词更新了
-    assert rebuild_count == 0
-    assert "Code Review Skill" in core._system_message.content
-    assert executor.invoke_calls == 1

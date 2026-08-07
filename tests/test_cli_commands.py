@@ -33,12 +33,34 @@ class FakeMemory:
 
 
 @dataclass
+class FakeSession:
+    """模拟 SessionRegistry 的会话管理接口"""
+    current_session_id: str = "thread-1"
+    calls: list[tuple[str, Any]] = field(default_factory=list)
+
+    def new_session(self) -> str:
+        self.calls.append(("new_session", None))
+        self.current_session_id = "thread-2"
+        return self.current_session_id
+
+    def new_workflow_session(self, name: str) -> str:
+        self.calls.append(("new_workflow_session", name))
+        self.current_session_id = f"workflow-{name}-thread-xxx"
+        return self.current_session_id
+
+
+@dataclass
 class FakeAgent:
     memory: FakeMemory = field(default_factory=FakeMemory)
+    session: FakeSession = field(default_factory=FakeSession)
     calls: list[tuple[str, Any]] = field(default_factory=list)
     llm: Any = None
     mcp_tools: list[Any] = field(default_factory=list)
     auto_match_skills: bool = True
+
+    def set_current_session(self, session_id: str) -> None:
+        self.session.current_session_id = session_id
+        self.memory.thread_id = session_id
 
     def switch_llm(self, llm: Any) -> None:
         self.calls.append(("switch_llm", llm))
@@ -47,8 +69,8 @@ class FakeAgent:
     async def aswitch_llm(self, llm: Any) -> None:
         self.switch_llm(llm)
 
-    def get_memory_summary(self) -> dict[str, Any]:
-        self.calls.append(("get_memory_summary", None))
+    async def aget_memory_summary(self) -> dict[str, Any]:
+        self.calls.append(("aget_memory_summary", None))
         return {
             "thread_id": self.memory.thread_id,
             "checkpoint_backend": "sqlite",
@@ -57,9 +79,6 @@ class FakeAgent:
             "long_term_count": 2,
             "total_threads": 1,
         }
-
-    async def aget_memory_summary(self) -> dict[str, Any]:
-        return self.get_memory_summary()
 
     async def acompress_memory(self) -> dict[str, Any]:
         self.calls.append(("acompress_memory", None))
@@ -236,7 +255,7 @@ def test_dispatch_handles_info_without_running_agent(harness: Harness) -> None:
     result = dispatch(harness, "info")
     # Then: info is handled locally and no LLM run is started.
     assert result.handled is True
-    assert ("get_memory_summary", None) in harness.agent.calls
+    assert ("aget_memory_summary", None) in harness.agent.calls
     assert harness.runners.calls == []
 
 
@@ -267,12 +286,14 @@ def test_dispatch_thread_new_and_clear_mutate_memory(harness: Harness) -> None:
     # When: thread:new and clear all are dispatched.
     thread_result = dispatch(harness, "thread:new")
     clear_result = dispatch(harness, "clear all")
-    # Then: both commands are local and call the memory API directly.
+    # Then: both commands are local and call the session/memory API directly.
     assert thread_result.handled is True
     assert clear_result.handled is True
-    assert ("new_thread", None) in harness.agent.memory.calls
+    # thread:new → session.new_session()
+    assert ("new_session", None) in harness.agent.session.calls
+    # clear all → memory.aclear_long_term() + session.new_session()
     assert ("aclear_long_term", None) in harness.agent.memory.calls
-    assert ("clear_short_term", None) in harness.agent.memory.calls
+    assert ("new_session", None) in harness.agent.session.calls
 
 
 def test_dispatch_mcp_reload_skill_task_and_safety_mode(harness: Harness) -> None:

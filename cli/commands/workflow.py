@@ -15,54 +15,25 @@ logger = logging.getLogger(__name__)
 MAX_RAW_CONTEXT_CHARS = 6000
 
 
-async def abuild_memory_context(memory) -> str:
-    """
-    从 AgentMemory 提取当前会话短期记忆与长期记忆,拼装为文本并截断 - 异步版本
-    
+async def abuild_memory_context(agent) -> str:
+    """从 Agent 提取当前会话短期记忆与长期记忆，拼装为文本并截断。
+
+    短期记忆从 SessionRegistry 读取（checkpoint 消息），长期记忆从 AgentMemory 读取。
+
     Args:
-        memory: AgentMemory 实例
-        
+        agent: AgentCore 实例（需有 session 和 memory 属性）
+
     Returns:
         记忆文本;无记忆时返回空串
     """
     blocks = []
 
-    short_term = await memory.aget_short_term() or []
+    short_term = await agent.session.aget_short_term() or []
     if short_term:
         lines = [f"{item.get('role', 'user')}: {item.get('content', '')}" for item in short_term]
         blocks.append("【当前会话】\n" + "\n".join(lines))
 
-    long_term = memory.get_long_term() or []
-    if long_term:
-        lines = [f"{item.get('role', 'user')}: {item.get('content', '')}" for item in long_term]
-        blocks.append("【长期记忆】\n" + "\n".join(lines))
-
-    text = "\n\n".join(blocks).strip()
-    if len(text) > MAX_RAW_CONTEXT_CHARS:
-        text = text[:MAX_RAW_CONTEXT_CHARS] + "\n...(记忆文本过长,已截断)"
-    return text
-
-
-def build_memory_context(memory) -> str:
-    """
-    从 AgentMemory 提取当前会话短期记忆与长期记忆,拼装为文本并截断 - 同步版本（已废弃）
-    
-    @deprecated: 请使用 abuild_memory_context() 异步版本
-    
-    Args:
-        memory: AgentMemory 实例
-        
-    Returns:
-        记忆文本;无记忆时返回空串
-    """
-    blocks = []
-
-    short_term = memory.get_short_term() or []
-    if short_term:
-        lines = [f"{item.get('role', 'user')}: {item.get('content', '')}" for item in short_term]
-        blocks.append("【当前会话】\n" + "\n".join(lines))
-
-    long_term = memory.get_long_term() or []
+    long_term = agent.memory.get_long_term() or []
     if long_term:
         lines = [f"{item.get('role', 'user')}: {item.get('content', '')}" for item in long_term]
         blocks.append("【长期记忆】\n" + "\n".join(lines))
@@ -83,7 +54,7 @@ def _record_workflow_result(context: CommandContext, name: str, task: str, resul
         return
     try:
         executor.update_state(
-            context.agent.memory.get_config(),
+            context.agent._invoke_config(),
             {"messages": [
                 HumanMessage(content=f"workflow:{name} {task}"),
                 AIMessage(content=final_answer),
@@ -141,7 +112,7 @@ async def run_workflow(context: CommandContext, name: str, task: str) -> dict:
         result = runner(
             graph,
             task,
-            raw_context=await abuild_memory_context(context.agent.memory),
+            raw_context=await abuild_memory_context(context.agent),
             on_node_start=_on_node_start,
             on_node_end=_on_node_end,
         )

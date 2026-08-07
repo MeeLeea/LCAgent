@@ -194,16 +194,17 @@ def start_agent() -> str:
             _safety.set_confirm_backend(_safety.interrupt_confirm)
             tid = _load_remote_thread_id()
             if tid:
-                await agent.memory.aswitch_thread(tid)
+                await agent.session.aswitch_session(tid)
+                agent.memory.thread_id = tid  # 同步 memory 指针
             else:
-                _save_remote_thread_id(agent.memory.thread_id)
+                _save_remote_thread_id(agent.session.current_session_id)
             # 主动修复可能残留的孤儿 tool_calls（上次中断可能遗留）
             try:
                 await agent._arepair_rejected_tool_calls(agent._invoke_config())
-                agent._clear_pending_interrupt()
+                await agent._aclear_pending_interrupt()
             except Exception as error:
                 logger.warning("修复孤儿 tool_call 失败: %s", error, exc_info=True)
-            return agent, llm, agent.memory.thread_id
+            return agent, llm, agent.session.current_session_id
 
         agent, llm, tid = _run_on_agent_loop(_astart_agent, timeout=30)
         with _agent_lock:
@@ -251,9 +252,11 @@ def _auto_send_files(chat_id: str, text: str) -> int:
 
 def _clear_pending_interrupt(agent: Any) -> None:
     """清理未完成的中断，确保 checkpoint 干净。"""
+    async def _cleanup():
+        await agent._arepair_rejected_tool_calls(agent._invoke_config())
+        await agent._aclear_pending_interrupt()
     try:
-        _run_on_agent_loop(lambda: agent._arepair_rejected_tool_calls(agent._invoke_config()), timeout=60)
-        agent._clear_pending_interrupt()
+        _run_on_agent_loop(_cleanup, timeout=60)
     except Exception as e:
         logger.warning("中断清理失败: %s", e, exc_info=True)
     _interrupt_cache.clear()
@@ -304,8 +307,12 @@ def _resume_interrupt(chat_id: str, content: str) -> None:
     else:
         payload = {"text": content}
     try:
-        _handle_turn_result(chat_id, agent, _run_on_agent_loop(lambda: agent.aresume_structured(payload)),
-                            getattr(agent, "_pending_interrupt_mode", "chat"))
+        async def _resume_with_mode():
+            mode = await agent._get_store().aget_interrupt_mode(agent.session.current_session_id)
+            turn = await agent.aresume_structured(payload)
+            return turn, mode or "chat"
+        turn, interrupt_mode = _run_on_agent_loop(_resume_with_mode)
+        _handle_turn_result(chat_id, agent, turn, interrupt_mode)
     except Exception as e:
         _send_text(chat_id, f"❌ 恢复失败: {e}")
         _clear_pending_interrupt(agent)
@@ -324,28 +331,28 @@ HELP_TEXT = (
 def _handle_threads(chat_id: str, arg: str = "") -> None:
     agent = get_agent()
     if not agent: return _send_text(chat_id, "⚠️ 请先启动agent")
-    mem = agent.memory
+    sess = agent.session
 
     if not arg or arg == "列表":
-        threads = _run_on_agent_loop(lambda: mem.alist_threads())
-        cur = mem.thread_id
+        threads = _run_on_agent_loop(lambda: sess.alist_sessions())
+        cur = sess.current_session_id
         if not threads:
             return _send_text(chat_id, "没有已保存的会话")
         lines = [f"📋 {len(threads)} 个会话：", ""]
         for t in threads:
-            _ = len(_run_on_agent_loop(mem.aget_messages)) if t == cur else 0  # 只统计当前线程
+            _ = len(_run_on_agent_loop(sess.aget_messages)) if t == cur else 0  # 只统计当前线程
             lines.append(f"  • {t}{' ← 当前' if t == cur else ''}")
         _send_text(chat_id, "\n".join(lines))
     elif arg.startswith("切换 "):
         tid = arg.split(maxsplit=1)[1].strip()
-        if _run_on_agent_loop(lambda: mem.aswitch_thread(tid)):
+        if _run_on_agent_loop(lambda: sess.aswitch_session(tid)):
             _save_remote_thread_id(tid)
             _send_text(chat_id, f"✅ 已切换到 {tid}")
         else:
             _send_text(chat_id, f"⚠️ 会话不存在: {tid}，发送「会话列表」查看")
     else:
-        lines = [f"📋 当前: {mem.thread_id}", f"  总会话数: {len(_run_on_agent_loop(lambda: mem.alist_threads()))}"]
-        info = _run_on_agent_loop(mem.asummarize)
+        lines = [f"📋 当前: {sess.current_session_id}", f"  总会话数: {len(_run_on_agent_loop(lambda: sess.alist_sessions()))}"]
+        info = _run_on_agent_loop(sess.asummarize)
         lines.append(f"  当前消息数: {info.get('checkpoint_messages', 0)}")
         _send_text(chat_id, "\n".join(lines))
 
@@ -354,10 +361,14 @@ def _handle_status(chat_id: str) -> None:
     if not info: return _send_text(chat_id, "Agent 未启动")
     if info["status"] == "error": return _send_text(chat_id, f"❌ {info.get('error')}")
     agent = get_agent()
-    _send_text(chat_id, (
-        f"📊 {info['status']} | {info.get('provider')} / {info.get('model')}"
-        + (f" | 工具:{len(agent.tools)} 步骤:{len(agent.execution_history)}" if agent else "")
-    ))
+    extra = ""
+    if agent:
+        try:
+            history = _run_on_agent_loop(lambda: agent.aget_execution_history(), timeout=5)
+            extra = f" | 工具:{len(agent.tools)} 步骤:{len(history)}"
+        except Exception:
+            extra = f" | 工具:{len(agent.tools)}"
+    _send_text(chat_id, f"📊 {info['status']} | {info.get('provider')} / {info.get('model')}{extra}")
 
 def _handle_stop(chat_id: str) -> None:
     if chat_id in _interrupt_cache:

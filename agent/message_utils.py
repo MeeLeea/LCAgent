@@ -153,7 +153,7 @@ class StreamHandler:
     """流式事件处理器，通过组合方式注入 AgentCore。
 
     构造时接收 agent 引用，通过 agent 访问其 agent_executor、verbose
-    以及 _invoke_config、_update_system_prompt 等业务方法。
+    以及 _invoke_config 等业务方法。
     提供 astream_chat / astream_resume 两个流式接口。
     """
 
@@ -164,16 +164,14 @@ class StreamHandler:
         self,
         input_or_command: Any,
         config: dict[str, Any],
-        executor: Any | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """直接消费 LangGraph 的异步事件流并映射为前端事件。
 
         Args:
             input_or_command: 输入消息或恢复命令
             config: LangGraph 配置对象
-            executor: 目标线程的编译图。为 None 时使用 agent.agent_executor。
         """
-        graph = executor if executor is not None else self.agent.agent_executor
+        graph = self.agent.agent_executor
         recorded_msg_ids: set[str] = set()
         for attempt in range(RETRY_ATTEMPTS):
             emitted = False
@@ -231,8 +229,8 @@ class StreamHandler:
                                 )
                 return
             except UserRejectedCommandError:
-                await self.agent._arepair_rejected_tool_calls(config, executor)
-                self.agent._clear_pending_interrupt(self._thread_id_of(config))
+                await self.agent._arepair_rejected_tool_calls(config)
+                await self.agent._aclear_pending_interrupt(self._thread_id_of(config))
                 yield {"type": "cancelled", "content": "用户已拒绝执行危险命令，当前任务已取消。"}
                 return
             except Exception as error:
@@ -253,10 +251,9 @@ class StreamHandler:
     async def _check_interrupt(
         self,
         config: dict[str, Any],
-        executor: Any | None = None,
     ) -> dict[str, Any] | None:
         """流结束后异步检查是否被 ask_human 中断，返回中断事件或 None。"""
-        graph = executor if executor is not None else self.agent.agent_executor
+        graph = self.agent.agent_executor
         try:
             state = await graph.aget_state(config)
             if state is not None:
@@ -288,18 +285,13 @@ class StreamHandler:
             message: 用户消息
             thread_id: 目标会话线程 ID（为 None 时使用当前会话）
         """
-        config = self.agent._config_for(thread_id)
-        executor = await self.agent._executor_for(thread_id)
-        # 动态更新系统提示词（技能匹配），不重建 Graph
-        # 加锁防止与 areload_mcp_tools / aload_skill 并发修改共享状态
-        async with self.agent._state_lock:
-            self.agent._update_system_prompt(message, thread_id)
+        config = self.agent._invoke_config(thread_id)
         input_msg = HumanMessage(content=message)
         original_verbose = self.agent.verbose
         self.agent.verbose = False
         had_terminal = False
         try:
-            async for ev in self._astream_events({"messages": [input_msg]}, config, executor):
+            async for ev in self._astream_events({"messages": [input_msg]}, config):
                 if ev.get("type") in ("error", "cancelled"):
                     had_terminal = True
                 yield ev
@@ -308,11 +300,11 @@ class StreamHandler:
 
         if had_terminal:
             return
-        interrupt = await self._check_interrupt(config, executor)
+        interrupt = await self._check_interrupt(config)
         if interrupt is not None:
             yield interrupt
             return
-        self.agent._clear_pending_interrupt(self._thread_id_of(config))
+        await self.agent._aclear_pending_interrupt(self._thread_id_of(config))
         yield {"type": "done"}
 
     async def astream_resume(self, payload: dict[str, Any], thread_id: str | None = None):
@@ -322,13 +314,12 @@ class StreamHandler:
             payload: 恢复数据
             thread_id: 目标会话线程 ID（为 None 时使用当前会话）
         """
-        config = self.agent._config_for(thread_id)
-        executor = await self.agent._executor_for(thread_id)
+        config = self.agent._invoke_config(thread_id)
         original_verbose = self.agent.verbose
         self.agent.verbose = False
         had_terminal = False
         try:
-            async for ev in self._astream_events(Command(resume=payload), config, executor):
+            async for ev in self._astream_events(Command(resume=payload), config):
                 if ev.get("type") in ("error", "cancelled"):
                     had_terminal = True
                 yield ev
@@ -337,11 +328,11 @@ class StreamHandler:
 
         if had_terminal:
             return
-        interrupt = await self._check_interrupt(config, executor)
+        interrupt = await self._check_interrupt(config)
         if interrupt is not None:
             yield interrupt
             return
-        self.agent._clear_pending_interrupt(self._thread_id_of(config))
+        await self.agent._aclear_pending_interrupt(self._thread_id_of(config))
         yield {"type": "done"}
 
 

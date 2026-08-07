@@ -19,9 +19,10 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Annotated, Any
 
 from langchain.agents.middleware import AgentMiddleware, AgentState
+from langchain.agents.middleware.types import OmitFromInput
 from langchain_core.messages import (
     AnyMessage,
     SystemMessage,
@@ -30,19 +31,24 @@ from langchain_core.messages import (
 from langchain_core.messages.utils import get_buffer_string
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.runtime import Runtime
+from typing_extensions import NotRequired
 
 logger = logging.getLogger(__name__)
 
 
 class LCAgentState(AgentState):
-    """扩展 AgentState，添加增量摘要字段（随 checkpoint 持久化）。
+    """扩展 AgentState，添加增量摘要 + 活跃技能字段（随 checkpoint 持久化）。
 
-    summary 字段存储当前 thread 的历史对话摘要，
-    由 CompactionMiddleware 在 before_model 时增量更新。
+    - ``summary``: 当前 thread 的历史对话摘要，由 CompactionMiddleware 增量更新。
+    - ``active_skills``: 当前 thread 手动加载的技能名列表，由
+      ``SkillInjectionMiddleware`` 在 model 调用时读取并注入提示词。
+      使用 ``OmitFromInput`` 防止用户输入覆盖此字段。
+
     每个 thread 拥有独立的 state，天然隔离。
     """
 
     summary: str
+    active_skills: Annotated[NotRequired[list[str]], OmitFromInput]
 
 
 @dataclass(frozen=True, slots=True)

@@ -108,6 +108,7 @@ def _make_minimal_core():
     """创建一个最小化的 AgentCore，不连接真实 MCP/LLM
 
     通过 object.__new__ 跳过 __init__，手动设置必要属性。
+    execution_history / pending_interrupts 已迁移至 SessionStore（惰性创建）。
     """
     from agent.agent_core import AgentCore
 
@@ -123,11 +124,6 @@ def _make_minimal_core():
     # Mock memory
     core.memory = MagicMock()
     core.memory.aclose = AsyncMock()
-
-    # Execution history
-    from collections import deque
-    core.execution_history = deque(maxlen=10)
-    core.execution_history.append({"step": 1})
 
     return core
 
@@ -153,13 +149,16 @@ class TestAgentCoreClose:
 
         core.memory.aclose.assert_awaited_once()
 
-    def test_close_clears_execution_history(self):
+    def test_close_does_not_crash_without_instance_state(self):
+        """aclose() 不再清理实例级 execution_history / pending_interrupts
+        （已迁移至 SessionStore，随 Store GC 自动回收）。
+        此测试验证 aclose 在无实例级状态时不崩溃。
+        """
         core = _make_minimal_core()
-        assert len(core.execution_history) == 1
 
         asyncio.run(core.aclose())
 
-        assert len(core.execution_history) == 0
+        assert core._closed is True
 
     def test_close_is_idempotent(self):
         # Given: 已关闭的 core

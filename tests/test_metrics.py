@@ -515,14 +515,9 @@ class FakeAgentWithMetrics:
     auto_match_skills: bool = True
     metrics: MetricsCollector = field(default_factory=MetricsCollector)
 
-    def get_memory_summary(self) -> dict[str, Any]:
-        return {"thread_id": "t-1"}
-
     def get_available_tools(self) -> list[str]:
         return []
 
-    def compress_memory(self) -> dict[str, Any]:
-        return {}
     def list_skills(self) -> list[dict[str, str]]:
         return []
     def cot(self, task: str) -> str:
@@ -539,12 +534,8 @@ class FakeAgentNoMetrics:
     tools: list = field(default_factory=list)
     auto_match_skills: bool = True
 
-    def get_memory_summary(self) -> dict[str, Any]:
-        return {"thread_id": "t-1"}
     def get_available_tools(self) -> list[str]:
         return []
-    def compress_memory(self) -> dict[str, Any]:
-        return {}
     def list_skills(self) -> list[dict[str, str]]:
         return []
     def cot(self, task: str) -> str:
