@@ -26,17 +26,17 @@ from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ContextT, ModelRequest
-from langchain_core.messages import BaseMessage, SystemMessage
+from langchain_core.messages import SystemMessage
 
-from .memory_lock_pool import ThreadMemoryLockPool
-from .memory_models import (
-    AgentEvent,
+from .lock_pool import ThreadMemoryLockPool
+from .models import (
     MemoryCategory,
+    MemoryInputEvent,
     ThreadFactItem,
     _naive_now,
     judge_long_term_memory,
 )
-from .memory_store import ThreadMemoryStore
+from .store import ThreadMemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,8 @@ class ThreadMemoryWriteMiddleware:
         memory_store: ThreadMemoryStore 实例（Store 业务封装）
         lock_pool: ThreadMemoryLockPool 实例（per-thread 并发锁）
         llm_getter: 返回当前 LLMClient 的 callable（支持 LLM 热切换）
+        buffer_delay_seconds: 防抖缓冲窗口（秒），默认 MEMORY_BUFFER_DELAY_SECONDS
+        max_buffer_messages: 单 thread 缓冲区上限，默认 MAX_BUFFER_MESSAGE_COUNT
     """
 
     def __init__(
@@ -69,10 +71,14 @@ class ThreadMemoryWriteMiddleware:
         memory_store: ThreadMemoryStore,
         lock_pool: ThreadMemoryLockPool,
         llm_getter: Callable[[], Any],
+        buffer_delay_seconds: int | None = None,
+        max_buffer_messages: int | None = None,
     ) -> None:
         self._store = memory_store
         self._lock_pool = lock_pool
         self._llm_getter = llm_getter
+        self._buffer_delay_seconds = buffer_delay_seconds if buffer_delay_seconds is not None else MEMORY_BUFFER_DELAY_SECONDS
+        self._max_buffer_messages = max_buffer_messages if max_buffer_messages is not None else MAX_BUFFER_MESSAGE_COUNT
 
         # 防抖 buffer: thread_id → [(role, content, important), ...]
         self._buffer: dict[str, list[tuple[str, str, bool]]] = {}
@@ -109,8 +115,8 @@ class ThreadMemoryWriteMiddleware:
             buf.append((role, content, important))
 
             # 限制单 thread 缓存条数
-            if len(buf) > MAX_BUFFER_MESSAGE_COUNT:
-                self._buffer[thread_id] = buf[-MAX_BUFFER_MESSAGE_COUNT:]
+            if len(buf) > self._max_buffer_messages:
+                self._buffer[thread_id] = buf[-self._max_buffer_messages:]
 
             # 重置防抖计时器
             old_timer = self._timers.get(thread_id)
@@ -121,29 +127,13 @@ class ThreadMemoryWriteMiddleware:
                 self._a_delayed_flush(thread_id)
             )
 
-    async def submit_event_batch(
-        self,
-        thread_id: str,
-        messages: list[tuple[str, str, bool]],
-    ) -> None:
-        """批量投递多条事件。
-
-        Args:
-            thread_id: 会话线程 ID
-            messages: [(role, content, important), ...] 列表
-        """
-        if not messages:
-            return
-        for role, content, important in messages:
-            await self.submit_event(thread_id, role, content, important)
-
     async def _a_delayed_flush(self, thread_id: str) -> None:
         """防抖延迟后执行 flush。
 
         被 cancel 时不执行（防抖语义：新消息到达时取消旧计时）。
         """
         try:
-            await asyncio.sleep(MEMORY_BUFFER_DELAY_SECONDS)
+            await asyncio.sleep(self._buffer_delay_seconds)
         except asyncio.CancelledError:
             return
         await self._aflush_thread(thread_id)
@@ -181,10 +171,10 @@ class ThreadMemoryWriteMiddleware:
     ) -> None:
         """执行完整 Fact 处理流水线。"""
 
-        # ① 构造 AgentEvent 并分类
-        events: list[tuple[AgentEvent, MemoryCategory]] = []
+        # ① 构造 MemoryInputEvent 并分类
+        events: list[tuple[MemoryInputEvent, MemoryCategory]] = []
         for role, content, important in messages:
-            event = AgentEvent(
+            event = MemoryInputEvent(
                 event_type="message",
                 content=content,
                 is_user_explicit_remember=important,

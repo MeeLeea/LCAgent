@@ -163,43 +163,6 @@ class TestMCPServerConnection:
         assert conn.status == ServerStatus.CONNECTED
         assert conn.tool_names == ["new_tool"]
 
-    def test_health_check_connected_with_tools(self, fake_mcp):
-        # Given: 已连接且有工具的 server
-        fake_mcp._tools_map["srv"] = [FakeToolObj(name="t1")]
-        conn = MCPServerConnection("srv", {"transport": "stdio", "command": "echo"})
-
-        async def setup_and_check():
-            await conn.connect()
-            return await conn.health_check()
-
-        result = asyncio.run(setup_and_check())
-
-        # Then: 返回 True
-        assert result is True
-
-    def test_health_check_disconnected_returns_false(self, fake_mcp):
-        # Given: 未连接的 server
-        conn = MCPServerConnection("srv", {"transport": "stdio", "command": "echo"})
-
-        result = asyncio.run(conn.health_check())
-
-        # Then: 返回 False
-        assert result is False
-
-    def test_health_check_connected_no_tools_returns_false(self, fake_mcp):
-        # Given: 已连接但工具列表为空（异常状态）
-        fake_mcp._tools_map["srv"] = []
-        conn = MCPServerConnection("srv", {"transport": "stdio", "command": "echo"})
-
-        async def setup_and_check():
-            await conn.connect()
-            return await conn.health_check()
-
-        result = asyncio.run(setup_and_check())
-
-        # Then: 返回 False（工具为空视为不健康）
-        assert result is False
-
     def test_get_info_stdio(self):
         # Given: stdio 类型的 server
         conn = MCPServerConnection("srv", {
@@ -434,23 +397,6 @@ class TestMCPPool:
         assert infos["fail-srv"].status == ServerStatus.ERROR
         assert "fake error" in infos["fail-srv"].last_error
 
-    def test_get_server_info_single(self, fake_mcp, tmp_path: Path):
-        fake_mcp._tools_map["srv"] = [FakeToolObj(name="t1")]
-        cfg_file = tmp_path / "mcp.json"
-        _write_config(cfg_file, {
-            "srv": {"transport": "stdio", "command": "echo", "enabled": True},
-        })
-        pool = MCPPool(str(cfg_file))
-
-        asyncio.run(pool.initialize())
-
-        info = pool.get_server_info("srv")
-        missing = pool.get_server_info("nonexistent")
-
-        assert info is not None
-        assert info.name == "srv"
-        assert missing is None
-
     def test_close_disconnects_all(self, fake_mcp, tmp_path: Path):
         fake_mcp._tools_map["srv-a"] = [FakeToolObj(name="a1")]
         fake_mcp._tools_map["srv-b"] = [FakeToolObj(name="b1")]
@@ -469,7 +415,6 @@ class TestMCPPool:
         asyncio.run(init_and_close())
 
         assert pool.get_all_tools() == []
-        assert pool.connections == {}
 
     def test_initialize_removes_stale_connections(self, fake_mcp, tmp_path: Path):
         fake_mcp._tools_map["srv-a"] = [FakeToolObj(name="a1")]
@@ -483,7 +428,7 @@ class TestMCPPool:
 
         async def init_twice():
             await pool.initialize()
-            assert len(pool.connections) == 2
+            assert len(pool.get_server_infos()) == 2
             # 删除 srv-b
             _write_config(cfg_file, {
                 "srv-a": {"transport": "stdio", "command": "echo", "enabled": True},
@@ -492,24 +437,6 @@ class TestMCPPool:
 
         asyncio.run(init_twice())
 
-        assert "srv-a" in pool.connections
-        assert "srv-b" not in pool.connections
-
-    def test_reload_all_reconnects_everything(self, fake_mcp, tmp_path: Path):
-        fake_mcp._tools_map["srv"] = [FakeToolObj(name="old")]
-        cfg_file = tmp_path / "mcp.json"
-        _write_config(cfg_file, {
-            "srv": {"transport": "stdio", "command": "echo", "enabled": True},
-        })
-        pool = MCPPool(str(cfg_file))
-
-        async def init_and_reload_all():
-            await pool.initialize()
-            fake_mcp._tools_map["srv"] = [FakeToolObj(name="new1"), FakeToolObj(name="new2")]
-            return await pool.reload_all()
-
-        count = asyncio.run(init_and_reload_all())
-
-        assert count == 2
-        names = {t.name for t in pool.get_all_tools()}
-        assert names == {"new1", "new2"}
+        names = {i.name for i in pool.get_server_infos()}
+        assert "srv-a" in names
+        assert "srv-b" not in names

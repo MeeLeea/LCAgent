@@ -21,7 +21,6 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from agent.metrics import (
     MetricsCollector,
-    estimate_tokens,
 )
 
 # ════════════════════════════════════════════════════════════════════════
@@ -41,7 +40,7 @@ class TestLLMMetrics:
             completion_tokens=50,
             duration_ms=500.0,
         )
-        assert collector.llm_call_count == 1
+        assert collector.get_summary()["llm"]["total_calls"] == 1
         summary = collector.get_summary()
         assert summary["llm"]["total_calls"] == 1
         assert summary["llm"]["total_prompt_tokens"] == 100
@@ -183,7 +182,7 @@ class TestToolMetrics:
     def test_record_single_tool_call(self):
         collector = MetricsCollector()
         collector.record_tool_call(name="run_shell", duration_ms=320.5, success=True)
-        assert collector.tool_call_count == 1
+        assert collector.get_summary()["tools"]["total_calls"] == 1
         summary = collector.get_summary()
         assert summary["tools"]["total_calls"] == 1
         assert summary["tools"]["by_name"]["run_shell"]["count"] == 1
@@ -240,7 +239,7 @@ class TestCompactionMetrics:
             summary_length=500,
             duration_ms=1500.0,
         )
-        assert collector.compaction_count == 1
+        assert collector.get_summary()["compaction"]["total_count"] == 1
         summary = collector.get_summary()
         assert summary["compaction"]["total_count"] == 1
         assert summary["compaction"]["total_messages_before"] == 60
@@ -327,7 +326,7 @@ class TestThreadSafety:
         for t in threads:
             t.join()
 
-        assert collector.llm_call_count == 1000
+        assert collector.get_summary()["llm"]["total_calls"] == 1000
         summary = collector.get_summary()
         assert summary["llm"]["total_calls"] == 1000
 
@@ -361,27 +360,6 @@ class TestThreadSafety:
         assert summary["llm"]["total_calls"] == 50
         assert summary["tools"]["total_calls"] == 50
         assert summary["compaction"]["total_count"] == 10
-
-
-# ════════════════════════════════════════════════════════════════════════
-#  estimate_tokens 测试
-# ════════════════════════════════════════════════════════════════════════
-
-
-class TestEstimateTokens:
-    """token 估算测试"""
-
-    def test_empty_string(self):
-        assert estimate_tokens("") == 0
-
-    def test_short_string(self):
-        assert estimate_tokens("abc") == 1
-
-    def test_long_string(self):
-        assert estimate_tokens("a" * 40) == 10
-
-    def test_none_returns_zero(self):
-        assert estimate_tokens(None) == 0
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -623,8 +601,8 @@ class TestCLIMetricsCommand:
         result = metrics_command(ctx, "metrics:reset")
 
         assert result.handled is True
-        assert agent.metrics.llm_call_count == 0
         summary = agent.metrics.get_summary()
+        assert summary["llm"]["total_calls"] == 0
         assert summary["session"]["turn_count"] == 0
         assert any("重置" in line for line in printed)
 
@@ -675,4 +653,4 @@ class TestCLIMetricsCommand:
 
         result = asyncio.run(dispatch_command(ctx, "metrics:reset"))
         assert result.handled is True
-        assert agent.metrics.llm_call_count == 0
+        assert agent.metrics.get_summary()["llm"]["total_calls"] == 0

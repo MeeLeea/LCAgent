@@ -9,6 +9,7 @@ import asyncio
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from collections.abc import AsyncIterator
 from typing import Any, Literal
 
 from typing_extensions import Self
@@ -18,7 +19,6 @@ from langchain_core.messages import (
     AIMessage,
     BaseMessage,
     HumanMessage,
-    SystemMessage,
     ToolMessage,
 )
 from langchain_core.tools import BaseTool
@@ -38,16 +38,8 @@ from .compaction import (
 from .exceptions import AgentStateError
 from .llm_client import LLMClient
 from .logging_config import TraceContext, generate_trace_id
-from .memory import AgentMemory
-from .memory_lock_pool import ThreadMemoryLockPool
-from .memory_middleware import (
-    ThreadMemoryReadMiddleware,
-    ThreadMemoryWriteMiddleware,
-)
-from .memory_store import ThreadMemoryStore
-from .message_utils import StreamHandler
 from .metrics import MetricsCollector
-from session import SessionRegistry, SessionStore
+from session import SessionManager, SessionRegistry, SessionStore
 from .skill_middleware import SkillInjectionMiddleware
 
 logger = logging.getLogger(__name__)
@@ -100,6 +92,11 @@ class AgentCore:
         agent_prompt_file: str | None,
         max_execution_history: int,
         tool_timeout: float,
+        checkpointer: Any | None = None,
+        store: Any | None = None,
+        extra_middleware: list | None = None,
+        initial_thread_id: str | None = None,
+        async_conn: Any | None = None,
     ) -> None:
         self.name = name
         self.llm = llm_client
@@ -156,16 +153,21 @@ class AgentCore:
         self.agent_executor = None
 
         # 会话注册表（管理 checkpointer + Store 的会话状态）
-        # 在 __init__/acreate 中创建 AgentMemory 后初始化
+        # 在 __init__/acreate 中调用 _init_session_registry 后初始化
         self._session_registry: SessionRegistry | None = None
+        self._session_manager: SessionManager | None = None
+        self._memory_manager: Any = None
         self._session_store: SessionStore | None = SessionStore(
             max_history=max_execution_history
         )
 
-        # 长期记忆 Store + per-thread 并发锁池 + 写中间件（在 _init_session_registry 中初始化）
-        self._thread_memory_store: ThreadMemoryStore | None = None
-        self._thread_memory_lock_pool: ThreadMemoryLockPool | None = None
-        self._memory_write_middleware: ThreadMemoryWriteMiddleware | None = None
+        # LangGraph 原语（由入口程序 / MemoryContext 注入）
+        self._checkpointer = checkpointer
+        self._store = store
+        self._extra_middleware = extra_middleware or []
+        self._process_type = process_type
+        self._initial_thread_id = initial_thread_id
+        self._async_conn = async_conn
 
         # 执行历史 max 条数（传递给 SessionStore 做裁剪；实例不再持有 deque）
         self._max_execution_history = max_execution_history
@@ -173,17 +175,10 @@ class AgentCore:
         self._compaction_middleware = None
         self._tools_signature = frozenset()
 
-        # 流式事件处理器（组合模式）
-        self.stream = StreamHandler(self)
-
     def __init__(
         self,
         llm_client: LLMClient,
         name: str = "LCAgent",
-        memory_size: int = 10,
-        long_term_memory_file: str | None = None,
-        checkpoint_file: str | None = None,
-        thread_id: str | None = None,
         max_iterations: int = 25,
         verbose: bool = True,
         mcp_config_file: str | None = None,
@@ -196,26 +191,34 @@ class AgentCore:
         agent_prompt_file: str | None = None,
         max_execution_history: int = 100,
         tool_timeout: float = 60.0,
+        checkpointer: Any | None = None,
+        store: Any | None = None,
+        extra_middleware: list | None = None,
+        initial_thread_id: str | None = None,
+        async_conn: Any | None = None,
     ):
         """
         初始化Agent核心
 
         Args:
             llm_client: LLM客户端实例
-            memory_size: 仅兼容旧 API(checkpoint 不限容量)
-            long_term_memory_file: 长期记忆 JSON 文件(用于 compress)
-            checkpoint_file: SQLite checkpoint 文件路径(为 None 时用内存)
-            thread_id: 会话线程 ID(为 None 时自动生成)
             max_iterations: Agent最大迭代次数(langgraph recursion_limit)
             verbose: 是否打印详细执行过程
             mcp_config_file: MCP servers 配置文件路径
             enable_mcp: 是否启用 MCP 工具加载
+            skills_dir: 技能目录路径
+            auto_match_skills: 任务开始时是否自动匹配注入技能
             max_context_messages: 长上下文裁剪阈值(0=关闭);超过则自动摘要并开新会话
             context_trim_keep: 裁剪时保留的最近消息条数
             process_type: 进程类型标识(server/scheduler/feishu)，用于多进程隔离
             agent_prompt_file: Agent核心提示词文件路径(为 None 时使用配置默认值)
             max_execution_history: 执行历史最大条数(防止内存泄漏)
             tool_timeout: 工具执行默认超时秒数(0=禁用超时)
+            checkpointer: LangGraph checkpointer 原语（由入口程序 / MemoryContext 注入）
+            store: LangGraph store 原语（长期记忆 Store）
+            extra_middleware: 额外中间件列表（如记忆读写中间件）
+            initial_thread_id: 初始会话线程 ID
+            async_conn: 异步数据库连接（供 SessionRegistry 使用）
         """
         self._init_common(
             llm_client=llm_client,
@@ -232,14 +235,11 @@ class AgentCore:
             agent_prompt_file=agent_prompt_file,
             max_execution_history=max_execution_history,
             tool_timeout=tool_timeout,
-        )
-        self.memory = AgentMemory(
-            checkpoint_file=checkpoint_file,
-            long_term_file=long_term_memory_file,
-            thread_id=thread_id,
-            short_term_size=memory_size,
-            use_sqlite=checkpoint_file is not None,
-            process_type=process_type,
+            checkpointer=checkpointer,
+            store=store,
+            extra_middleware=extra_middleware,
+            initial_thread_id=initial_thread_id,
+            async_conn=async_conn,
         )
         self._init_session_registry()
 
@@ -253,10 +253,6 @@ class AgentCore:
         cls,
         llm_client: LLMClient,
         name: str = "LCAgent",
-        memory_size: int = 10,
-        long_term_memory_file: str | None = None,
-        checkpoint_file: str | None = None,
-        thread_id: str | None = None,
         max_iterations: int = 25,
         verbose: bool = True,
         mcp_config_file: str | None = None,
@@ -269,6 +265,11 @@ class AgentCore:
         agent_prompt_file: str | None = None,
         max_execution_history: int = 100,
         tool_timeout: float = 60.0,
+        checkpointer: Any | None = None,
+        store: Any | None = None,
+        extra_middleware: list | None = None,
+        initial_thread_id: str | None = None,
+        async_conn: Any | None = None,
     ) -> AgentCore:
         """在运行中的事件循环内创建 AgentCore。"""
         self = cls.__new__(cls)
@@ -287,14 +288,11 @@ class AgentCore:
             agent_prompt_file=agent_prompt_file,
             max_execution_history=max_execution_history,
             tool_timeout=tool_timeout,
-        )
-        self.memory = await AgentMemory.acreate(
-            checkpoint_file=checkpoint_file,
-            long_term_file=long_term_memory_file,
-            thread_id=thread_id,
-            short_term_size=memory_size,
-            use_sqlite=checkpoint_file is not None,
-            process_type=process_type,
+            checkpointer=checkpointer,
+            store=store,
+            extra_middleware=extra_middleware,
+            initial_thread_id=initial_thread_id,
+            async_conn=async_conn,
         )
         self._init_session_registry()
 
@@ -314,39 +312,21 @@ class AgentCore:
         return mc
 
     def _init_session_registry(self) -> None:
-        """从 AgentMemory 的 checkpointer 构建 SessionRegistry。
+        """从传入的 LangGraph 原语构建 SessionRegistry。
 
-        SessionRegistry 与 AgentMemory 共享同一 checkpointer 和 SQLite 连接，
-        负责会话生命周期管理（new/switch/list/delete）+ 消息读取 + 瞬态状态隔离。
-        AgentMemory 退化为仅负责长期记忆（memory.json）。
-
-        同时初始化 ThreadMemoryStore（长期记忆 Store 封装）和
-        ThreadMemoryLockPool（per-thread 并发锁池），供后续中间件使用。
+        SessionRegistry 负责会话生命周期管理（new/switch/list/delete）+
+        消息读取 + 瞬态状态隔离。
+        checkpointer / store / async_conn 由入口程序 / MemoryContext 注入。
         """
         self._session_registry = SessionRegistry(
-            checkpointer=self.memory.get_checkpointer(),
+            checkpointer=self._checkpointer,
             store=self._session_store or SessionStore(),
-            process_type=self.memory.process_type,
+            process_type=self._process_type,
             recursion_limit=self.max_iterations,
-            async_conn=getattr(self.memory, "_async_conn", None),
+            async_conn=self._async_conn,
         )
         # 同步当前会话指针
-        self._session_registry.current_session_id = self.memory.thread_id
-
-        # 初始化长期记忆 Store（复用 AgentMemory 的 Store backend）
-        self._thread_memory_store = ThreadMemoryStore(
-            backend=self.memory.get_long_term_store(),
-        )
-        # 初始化 per-thread 并发锁池
-        self._thread_memory_lock_pool = ThreadMemoryLockPool()
-
-        # 初始化长期记忆写中间件（事件接收 + 防抖 + Fact 抽取流水线）
-        # llm_getter 延迟求值，支持 LLM 热切换（aswitch_llm 后立即生效）
-        self._memory_write_middleware = ThreadMemoryWriteMiddleware(
-            memory_store=self._thread_memory_store,
-            lock_pool=self._thread_memory_lock_pool,
-            llm_getter=lambda: self.llm,
-        )
+        self._session_registry.current_session_id = self._initial_thread_id or self._session_registry.current_session_id
 
     @property
     def session(self) -> SessionRegistry:
@@ -362,6 +342,42 @@ class AgentCore:
             # 兼容测试中通过 object.__new__ 创建的实例
             self._init_session_registry()
         return self._session_registry  # type: ignore[return-value]
+
+    @property
+    def session_manager(self) -> SessionManager:
+        """SessionManager 实例（三层架构 Session 层门面）。
+
+        懒初始化：首次访问时构建。如果 ``_memory_manager`` 已由入口程序
+        通过 ``set_memory_manager()`` 注入，则传递给 SessionManager。
+        所有上层流量（流式/非流式/会话管理/记忆管理）应通过此入口。
+
+        通过此属性访问对外接口：
+        - ``await agent.session_manager.achat_stream(message)``
+        - ``await agent.session_manager.achat(message)``
+        - ``await agent.session_manager.aresume_stream(payload)``
+        - ``agent.session_manager.new_session()``
+        """
+        if getattr(self, "_session_manager", None) is None:
+            from session import SessionManager
+            mm = getattr(self, "_memory_manager", None)
+            self._session_manager = SessionManager(self, memory=mm)
+        return self._session_manager
+
+    def set_memory_manager(self, memory_manager: Any) -> None:
+        """注入 MemoryManager（由入口程序在创建 MemoryContext 后调用）。
+
+        必须在首次访问 ``session_manager`` 属性之前调用，
+        否则 SessionManager 将在没有记忆功能的情况下初始化。
+
+        Args:
+            memory_manager: MemoryManager 实例
+        """
+        if getattr(self, "_session_manager", None) is not None:
+            raise RuntimeError(
+                "SessionManager 已初始化，无法再注入 MemoryManager。"
+                "请在访问 session_manager 之前调用 set_memory_manager()。"
+            )
+        self._memory_manager = memory_manager
 
     def _get_store(self) -> SessionStore:
         """获取 SessionStore（惰性创建，兼容 object.__new__ 创建的测试实例）。
@@ -379,7 +395,7 @@ class AgentCore:
         """获取当前会话 ID（兼容测试中通过 object.__new__ 创建的无 _session_registry 实例）。
 
         优先使用显式 thread_id；否则从 SessionRegistry 读取；
-        若 _session_registry 不存在或无 current_session_id 属性则回退到 memory.thread_id，
+        若 _session_registry 不存在或无 current_session_id 属性则回退到 _initial_thread_id，
         最终回退到 "default"。
         """
         if thread_id is not None:
@@ -389,53 +405,26 @@ class AgentCore:
             sid = getattr(reg, "current_session_id", None)
             if sid is not None:
                 return sid
-        return getattr(getattr(self, "memory", None), "thread_id", "default")
+        return getattr(self, "_initial_thread_id", None) or "default"
 
     @property
-    def long_term_memory(self) -> ThreadMemoryStore:
-        """长期记忆 Store（per-thread facts 隔离）。
-
-        通过此属性访问长期记忆 API：
-        - ``agent.long_term_memory.query_facts(sid)``
-        - ``agent.long_term_memory.save_fact(sid, item)``
-        - ``agent.long_term_memory.clear_thread_memory(sid)``
-        - ``agent.long_term_memory.prune_facts(sid)``
-        """
-        if getattr(self, "_thread_memory_store", None) is None:
-            # 兼容测试中通过 object.__new__ 创建的实例
-            if getattr(self, "_session_registry", None) is None:
-                self._init_session_registry()
-        return self._thread_memory_store  # type: ignore[return-value]
-
-    @property
-    def memory_lock_pool(self) -> ThreadMemoryLockPool:
-        """per-thread 并发锁池（保护同一 thread 的记忆写入）。"""
-        if getattr(self, "_thread_memory_lock_pool", None) is None:
-            if getattr(self, "_session_registry", None) is None:
-                self._init_session_registry()
-        return self._thread_memory_lock_pool  # type: ignore[return-value]
-
-    @property
-    def memory_write(self) -> ThreadMemoryWriteMiddleware:
-        """长期记忆写中间件（事件接收 + 防抖 + Fact 抽取流水线）。
-
-        通过此属性提交记忆事件：
-        - ``await agent.memory_write.submit_event(thread_id, role, content)``
-        - ``await agent.memory_write.submit_event(thread_id, role, content, important=True)``
-        """
-        if getattr(self, "_memory_write_middleware", None) is None:
-            if getattr(self, "_session_registry", None) is None:
-                self._init_session_registry()
-        return self._memory_write_middleware  # type: ignore[return-value]
+    def checkpoint_info(self) -> dict[str, Any]:
+        """checkpoint 后端元信息（backend 类型 + 文件路径）。"""
+        if self._checkpointer is not None:
+            cls_name = type(self._checkpointer).__name__
+            return {
+                "checkpoint_backend": "sqlite" if "Sqlite" in cls_name else "memory",
+                "checkpoint_file": getattr(self._checkpointer, "checkpoint_file", "(内存)") if hasattr(self._checkpointer, "checkpoint_file") else "(内存)",
+            }
+        return {"checkpoint_backend": "memory", "checkpoint_file": "(内存)"}
 
     def set_current_session(self, session_id: str) -> None:
-        """设置当前会话 ID，同步 session 注册表与 memory。
+        """设置当前会话 ID。
 
         Args:
             session_id: 目标会话 ID
         """
         self.session.current_session_id = session_id
-        self.memory.thread_id = session_id
 
     async def areload_mcp_tools(self) -> int:
         """
@@ -547,21 +536,16 @@ class AgentCore:
         )
         self._skill_middleware = skill_middleware
 
-        # 长期记忆读取中间件：awrap_model_call 时从 Store 读取 thread facts 注入 SystemMessage
-        memory_read_middleware = ThreadMemoryReadMiddleware(
-            memory_store=self.long_term_memory,
-        )
-
         # create_agent 直接返回可调用的agent
         wrapped_tools = wrap_tools_with_timeout(self.tools, self.tool_timeout)
         agent = create_agent(
             model=chat_model,
             tools=wrapped_tools,
             system_prompt=system_prompt,
-            checkpointer=self.memory.get_checkpointer(),
-            store=self.memory.get_long_term_store(),
+            checkpointer=self._checkpointer,
+            store=self._store,
             state_schema=LCAgentState,
-            middleware=[compaction_middleware, skill_middleware, memory_read_middleware],
+            middleware=[compaction_middleware, skill_middleware, *self._extra_middleware],
         )
         # 保存中间件引用，供手动压缩使用
         self._compaction_middleware = compaction_middleware
@@ -585,69 +569,25 @@ class AgentCore:
         """
         self.agent_executor = self._create_agent_executor()
 
-    async def _submit_memory_event(
-        self,
-        config: dict[str, Any] | None,
-        role: str,
-        content: str,
-        important: bool = False,
-    ) -> None:
-        """提交记忆事件到写中间件（非阻塞，防抖处理）。
-
-        从 config 提取 thread_id；config 为 None 时使用当前会话。
-        替代旧的 ``self.memory.aadd()``，长期记忆写入由 Store 接管。
-        记忆提交是副作用，失败仅记日志、不影响主流程。
-
-        Args:
-            config: LangGraph 配置（含 thread_id），为 None 时用当前会话
-            role: 消息角色 (user / assistant)
-            content: 消息文本内容
-            important: 是否用户显式标记为重要
-        """
-        try:
-            thread_id = (
-                self._thread_id_from_config(config)
-                if config
-                else self._current_sid()
-            )
-            if not thread_id:
-                return
-            await self.memory_write.submit_event(thread_id, role, content, important)
-        except Exception as error:
-            logger.debug("记忆事件提交失败: %s", error)
-
     async def _ahandle_turn_completion(
         self,
         turn: AgentTurnResult,
         config: dict[str, Any],
         mode: str,
-        user_message: str | None = None,
-        save_assistant: bool = True,
-        important: bool = False
     ) -> None:
-        """统一处理 turn 完成后的状态更新和记忆存储
+        """统一处理 turn 完成后的 interrupt 状态管理
 
-        根据 turn 状态更新 interrupt 状态，并选择性地保存消息到记忆。
+        根据 turn 状态更新 interrupt 状态。
 
         Args:
             turn: Agent 执行结果
             config: LangGraph 配置对象
             mode: 执行模式 ('run', 'chat', 等)
-            user_message: 用户消息（如需保存到记忆）
-            save_assistant: 是否保存 assistant 消息到记忆
-            important: assistant 消息是否标记为重要
         """
         if turn.is_interrupted:
             await self._acapture_pending_interrupt(config, mode)
         elif turn.is_completed:
-            # 只清理当前线程的中断状态，避免清掉其他会话的挂起中断
             await self._aclear_pending_interrupt(self._thread_id_from_config(config))
-            if user_message:
-                await self._submit_memory_event(config, "user", user_message)
-            if save_assistant and turn.output:
-                await self._submit_memory_event(
-                    config, "assistant", turn.output, important=important
-                )
 
     def _get_system_prompt(self) -> str:
         """获取系统提示词。
@@ -914,7 +854,7 @@ class AgentCore:
 
             await self._arecord_tool_steps(result.get("messages", []), input_msg, tid)
             turn = self._parse_turn_result(result)
-            await self._ahandle_turn_completion(turn, config, "run", task, important=True)
+            await self._ahandle_turn_completion(turn, config, "run")
             self.metrics.increment_turn()
 
         return turn
@@ -945,7 +885,7 @@ class AgentCore:
                     return await self._ahandle_rejected_command(config)
 
             turn = self._parse_turn_result(result)
-            await self._ahandle_turn_completion(turn, config, "chat", message)
+            await self._ahandle_turn_completion(turn, config, "chat")
             self.metrics.increment_turn()
 
             return turn
@@ -980,109 +920,297 @@ class AgentCore:
             await self._acapture_pending_interrupt(config, mode)
         elif turn.is_completed:
             await self._aclear_pending_interrupt(tid)
-            if mode == "run" and turn.output:
-                await self._submit_memory_event(
-                    config, "assistant", turn.output, important=True
-                )
 
         return turn
 
-# ============ 流式接口（委托给 StreamHandler） ============
+# ============ 纯执行接口（yield AgentEvent，不处理记忆/会话/并发） ============
 
-    async def astream_chat(self, message: str, thread_id: str | None = None):
-        """流式对话，委托给 self.stream。事件格式见 StreamHandler.astream_chat。
+    async def _arun_graph_events(
+        self,
+        input_or_command: Any,
+        config: dict[str, Any],
+        thread_id: str,
+        trace_id: str,
+        collected_output: list[str] | None = None,
+    ) -> AsyncIterator[AgentEvent]:
+        """内部方法：直接消费 LangGraph astream_events，映射为 AgentEvent。
+
+        处理重试、UserRejectedCommandError、LLM 异常映射。
+        不处理：interrupt 检查、记忆提交、工具步骤记录。
+
+        Args:
+            input_or_command: 输入消息 dict 或 Command(resume=...)
+            config: LangGraph 配置
+            thread_id: 会话线程 ID（写入事件）
+            trace_id: 追踪 ID
+            collected_output: 可选列表，收集 TOKEN 文本用于最终 DONE 事件
+        """
+        from .events import AgentEvent, EventType
+        from .message_utils import extract_llm_error, stringify_content
+        from .llm_client import RETRY_ATTEMPTS, RETRY_MAX_DELAY, should_retry
+        from langchain_core.messages import AIMessage, AIMessageChunk
+        from tools.terminal_tools import UserRejectedCommandError
+
+        graph = self.agent_executor
+        recorded_msg_ids: set[str] = set()
+
+        for attempt in range(RETRY_ATTEMPTS):
+            emitted = False
+            try:
+                async for ev in graph.astream_events(
+                    input_or_command,
+                    config=config,
+                    version="v2",
+                ):
+                    event_name = ev.get("event", "") if isinstance(ev, dict) else ""
+                    metadata = ev.get("metadata") if isinstance(ev, dict) else None
+                    data = ev.get("data") if isinstance(ev, dict) else None
+                    metadata_dict = metadata if isinstance(metadata, dict) else {}
+                    data_dict = data if isinstance(data, dict) else {}
+
+                    if event_name == "on_chat_model_stream":
+                        node = metadata_dict.get("langgraph_node", "")
+                        chunk = data_dict.get("chunk")
+                        if isinstance(chunk, AIMessageChunk) and node in ("agent", "model"):
+                            text = stringify_content(chunk.content)
+                            if text:
+                                emitted = True
+                                if collected_output is not None:
+                                    collected_output.append(text)
+                                yield AgentEvent.token(
+                                    text, thread_id=thread_id, trace_id=trace_id
+                                )
+                    elif event_name == "on_tool_start":
+                        name = data_dict.get("name")
+                        tool_input = data_dict.get("input")
+                        emitted = True
+                        yield AgentEvent.tool_call(
+                            tool_call_id=data_dict.get("tool_call_id") or name or "",
+                            name=name or "",
+                            args=tool_input,
+                            thread_id=thread_id,
+                            trace_id=trace_id,
+                        )
+                    elif event_name == "on_tool_end":
+                        output = data_dict.get("output")
+                        content = (
+                            getattr(output, "content", None)
+                            if output is not None
+                            else data_dict.get("output")
+                        )
+                        emitted = True
+                        yield AgentEvent.tool_result(
+                            tool_call_id=(
+                                data_dict.get("tool_call_id")
+                                or getattr(output, "tool_call_id", None)
+                                or data_dict.get("name", "")
+                            ),
+                            name=data_dict.get("name", "") or "",
+                            content=stringify_content(content),
+                            thread_id=thread_id,
+                            trace_id=trace_id,
+                        )
+                    elif event_name == "on_chat_model_end":
+                        output = data_dict.get("output")
+                        if isinstance(output, AIMessage):
+                            msg_id = getattr(output, "id", None) or str(id(output))
+                            if msg_id not in recorded_msg_ids:
+                                recorded_msg_ids.add(msg_id)
+                                llm = getattr(self, "llm", None)
+                                self.metrics.extract_and_record_llm_usage(
+                                    output,
+                                    provider=getattr(llm, "provider", ""),
+                                    model=getattr(llm, "model", "") or "",
+                                )
+                return
+            except UserRejectedCommandError:
+                await self._arepair_rejected_tool_calls(config)
+                await self._aclear_pending_interrupt(thread_id)
+                yield AgentEvent.cancelled(
+                    "用户已拒绝执行危险命令，当前任务已取消。",
+                    thread_id=thread_id,
+                    trace_id=trace_id,
+                )
+                return
+            except Exception as error:
+                if emitted or not should_retry(error) or attempt == RETRY_ATTEMPTS - 1:
+                    yield AgentEvent.error(
+                        extract_llm_error(error),
+                        thread_id=thread_id,
+                        trace_id=trace_id,
+                    )
+                    return
+                await asyncio.sleep(min(RETRY_MAX_DELAY, 2**attempt))
+
+    async def _acheck_interrupt_event(
+        self,
+        config: dict[str, Any],
+        thread_id: str,
+        trace_id: str,
+    ) -> AgentEvent | None:
+        """流结束后检查是否被 ask_human 中断，返回 INTERRUPT 事件或 None。"""
+        from .events import AgentEvent
+        from .message_utils import build_interrupt_event
+
+        graph = self.agent_executor
+        try:
+            state = await graph.aget_state(config)
+            if state is not None:
+                for task in getattr(state, "tasks", []) or []:
+                    for intr in getattr(task, "interrupts", []) or []:
+                        ev_dict = build_interrupt_event(getattr(intr, "value", None))
+                        return AgentEvent.interrupt(
+                            prompt=ev_dict.get("prompt", ""),
+                            choices=ev_dict.get("choices"),
+                            thread_id=thread_id,
+                            trace_id=trace_id,
+                        )
+        except Exception as error:
+            logger.warning("检查 interrupt 失败: %s", error, exc_info=True)
+        return None
+
+    async def arun_events(
+        self,
+        message: str,
+        *,
+        thread_id: str | None = None,
+        is_run_mode: bool = False,
+    ) -> AsyncIterator[AgentEvent]:
+        """纯执行接口：运行 graph，yield AgentEvent 事件流。
+
+        这是三层架构中 Agent 层的核心接口。SessionManager 调用此方法获取
+        事件流，负责并发锁、checkpoint、记忆沉淀等全部会话级职责。
+
+        Agent 只做执行：
+        - 组装 prompt（系统提示 + 会话上下文 + 召回记忆）
+        - 执行 LangGraph 流程、LLM 推理、工具调用
+        - 监听 graph 内部 astream_events
+        - 统一输出标准化 AgentEvent 事件流
+
+        不做：
+        - 不读写存储（checkpoint 由 graph 自动管理）
+        - 不管理会话（new/switch/list/delete）
+        - 不处理记忆（recall/submit/compress）
+        - 不处理锁、并发
+
+        事件流顺序：
+        TOKEN* → (TOOL_CALL → TOOL_RESULT)* → INTERRUPT | CANCELLED | ERROR | DONE
 
         Args:
             message: 用户消息
             thread_id: 目标会话线程 ID（为 None 时使用当前会话）
+            is_run_mode: True=执行模式（DONE 事件标记 is_important），
+                         False=对话模式
         """
-        async for ev in self.stream.astream_chat(message, thread_id=thread_id):
-            yield ev
+        from .events import AgentEvent
 
-    async def astream_resume(self, payload: dict[str, Any], thread_id: str | None = None):
-        """流式恢复中断会话，委托给 self.stream。
+        self._ensure_not_closed()
+        tid = self._current_sid(thread_id)
+        trace_id = generate_trace_id()
+
+        with TraceContext(trace_id=trace_id, thread_id=tid):
+            logger.info("arun_events: %s", message[:100])
+            config = self._invoke_config(thread_id)
+            input_msg = HumanMessage(content=message)
+            collected_output: list[str] = []
+
+            with self._temp_verbose(False):
+                async for ev in self._arun_graph_events(
+                    {"messages": [input_msg]},
+                    config,
+                    tid,
+                    trace_id,
+                    collected_output,
+                ):
+                    if ev.is_terminal:
+                        # ERROR / CANCELLED → 记录 interrupt 状态后返回
+                        if ev.event_type.value == "cancelled":
+                            await self._acapture_pending_interrupt(config, "chat")
+                        yield ev
+                        return
+                    yield ev
+
+            # 流正常结束：检查是否被中断
+            interrupt_ev = await self._acheck_interrupt_event(config, tid, trace_id)
+            if interrupt_ev is not None:
+                await self._acapture_pending_interrupt(config, "chat" if not is_run_mode else "run")
+                yield interrupt_ev
+                return
+
+            # 正常完成：清理中断状态，yield DONE
+            await self._aclear_pending_interrupt(tid)
+            final_output = "".join(collected_output)
+            self.metrics.increment_turn()
+            yield AgentEvent.done(
+                content=final_output,
+                thread_id=tid,
+                role="assistant",
+                is_important=is_run_mode,
+                trace_id=trace_id,
+            )
+
+    async def aresume_events(
+        self,
+        payload: dict[str, Any],
+        *,
+        thread_id: str | None = None,
+    ) -> AsyncIterator[AgentEvent]:
+        """纯执行接口：恢复中断会话，yield AgentEvent 事件流。
 
         Args:
             payload: 恢复数据
             thread_id: 目标会话线程 ID（为 None 时使用当前会话）
         """
-        async for ev in self.stream.astream_resume(payload, thread_id=thread_id):
-            yield ev
+        from .events import AgentEvent
 
-    async def arun(self, task: str) -> str:
-        """异步执行任务（推荐使用）
+        self._ensure_not_closed()
+        tid = self._current_sid(thread_id)
+        trace_id = generate_trace_id()
 
-        使用 arun_structured 异步执行，支持事件循环内调用。
+        with TraceContext(trace_id=trace_id, thread_id=tid):
+            logger.info("aresume_events: thread=%s", tid)
+            config = self._invoke_config(thread_id)
 
-        Args:
-            task: 任务描述
+            # 从 SessionStore 读取 per-session 中断模式
+            mode = await self._get_store().aget_interrupt_mode(tid)
+            if mode is None:
+                mode = "chat"
 
-        Returns:
-            执行结果
-        """
-        logger.info("开始执行任务: %s", task)
+            collected_output: list[str] = []
 
-        try:
-            turn = await self.arun_structured(task)
-        except Exception as e:
-            error_msg = f"任务执行失败: {e!s}"
-            logger.exception("%s", error_msg)
-            return error_msg
+            with self._temp_verbose(False):
+                async for ev in self._arun_graph_events(
+                    Command(resume=payload),
+                    config,
+                    tid,
+                    trace_id,
+                    collected_output,
+                ):
+                    if ev.is_terminal:
+                        if ev.event_type.value == "cancelled":
+                            await self._acapture_pending_interrupt(config, mode)
+                        yield ev
+                        return
+                    yield ev
 
-        if turn.is_interrupted:
-            raise RuntimeError("Agent turn interrupted; resume with aresume().")
+            # 流正常结束：检查是否再次被中断
+            interrupt_ev = await self._acheck_interrupt_event(config, tid, trace_id)
+            if interrupt_ev is not None:
+                await self._acapture_pending_interrupt(config, mode)
+                yield interrupt_ev
+                return
 
-        output = turn.output or ""
-        logger.info("最终答案: %s", output)
-        return output
-
-    async def achat(self, message: str) -> str:
-        """异步对话模式（推荐使用）
-
-        Args:
-            message: 用户消息
-
-        Returns:
-            助手回复
-        """
-        try:
-            turn = await self.achat_structured(message)
-        except Exception as e:
-            if e.__class__.__name__ in {"GraphInterrupt", "NodeInterrupt"}:
-                raise
-            logger.warning("achat 降级到 fallback: %s", e, exc_info=True)
-            return await self._afallback_chat(message)
-
-        if turn.is_interrupted:
-            raise RuntimeError("Agent turn interrupted; resume with aresume().")
-
-        return turn.output or ""
-
-    async def aresume(self, payload: dict[str, Any]) -> str:
-        """异步恢复中断会话（推荐使用）
-
-        Args:
-            payload: 恢复数据
-
-        Returns:
-            助手回复
-        """
-        turn = await self.aresume_structured(payload)
-        if turn.is_interrupted:
-            raise RuntimeError("Agent turn interrupted; resume with aresume().")
-        return turn.output or ""
-
-    async def _afallback_chat(self, message: str) -> str:
-        """Agent 执行失败时降级为纯 LLM 对话（异步版本）"""
-        history = await self.session.aget_short_term()
-        await self._submit_memory_event(None, "user", message)
-        response = self.llm.chat_with_history(
-            user_input=message,
-            history=history,
-            system_prompt="你是一个有帮助的AI助手，请用中文回答。"
-        )
-        await self._submit_memory_event(None, "assistant", response)
-        return response
+            # 正常完成
+            await self._aclear_pending_interrupt(tid)
+            final_output = "".join(collected_output)
+            self.metrics.increment_turn()
+            yield AgentEvent.done(
+                content=final_output,
+                thread_id=tid,
+                role="assistant",
+                is_important=(mode == "run"),
+                trace_id=trace_id,
+            )
 
     async def acot(self, task: str) -> str:
         """
@@ -1102,24 +1230,15 @@ class AgentCore:
             "请用中文回答。"
         )
 
-        # CoT 模式不调用工具,直接用 LLM + checkpoint 历史 + 长期记忆 facts
         short_term = await self.session.aget_short_term()
-        facts = await self.long_term_memory.query_facts(self._current_sid())
-        long_term = [{"role": "system", "content": f"[长期记忆] {f.content}"} for f in facts[:3]]
-        context = short_term + long_term
         response = self.llm.chat_with_history(
             user_input=task,
-            history=context,
+            history=short_term,
             system_prompt=system_prompt,
             temperature=0.7
         )
 
         logger.info("最终答案: %s", response)
-
-        # 存入记忆
-        await self._submit_memory_event(None, "user", task)
-        await self._submit_memory_event(None, "assistant", response, important=True)
-
         return response
 
     async def aswitch_llm(self, llm_client: LLMClient):
@@ -1196,12 +1315,6 @@ class AgentCore:
         """
         config = self._invoke_config(thread_id)
         await self.agent_executor.aupdate_state(config, {"active_skills": []})
-
-    def set_auto_match(self, enabled: bool):
-        """开关任务自动匹配技能（更新中间件标志）"""
-        self.auto_match_skills = enabled
-        if self._skill_middleware is not None:
-            self._skill_middleware.auto_match = enabled
 
     # ============ 长上下文裁剪 ============
 
@@ -1295,130 +1408,25 @@ class AgentCore:
         sid = self._current_sid(session_id)
         await self._get_store().aclear_history(sid)
 
-    async def aget_memory_summary(self) -> dict[str, Any]:
-        """异步获取记忆摘要统计（当前会话消息数、长期记忆 facts 条数、checkpoint 信息）"""
-        session_info = await self.session.asummarize()
-        sid = self._current_sid()
-        return {
-            "thread_id": sid,
-            "checkpoint_messages": session_info["checkpoint_messages"],
-            "checkpoint_backend": "sqlite" if self.memory.use_sqlite else "memory",
-            "checkpoint_file": self.memory.checkpoint_file or "(内存)",
-            "long_term_count": await self.long_term_memory.count_facts(sid),
-            "total_threads": session_info["total_sessions"],
-        }
-
-    async def acompress_memory(self) -> dict[str, Any]:
-        """异步压缩长期记忆：从 ThreadMemoryStore 读取全部 facts，用 LLM 生成摘要后替换。
-
-        LLMClient 无异步 chat 接口，阻塞的 LLM 调用放入线程池执行，避免阻塞事件循环。
-        """
-        sid = self._current_sid()
-        facts = await self.long_term_memory.query_facts(sid)
-        if not facts:
-            return {"success": False, "error": "没有长期记忆可压缩"}
-
-        # 1. 拼接所有 facts 为文本
-        history_lines = []
-        original_chars = 0
-        for idx, fact in enumerate(facts, 1):
-            line = f"[{idx}] ({fact.create_time}) [{fact.category}] {fact.content}"
-            history_lines.append(line)
-            original_chars += len(fact.content)
-        history_text = "\n\n".join(history_lines)
-
-        # 2. 调用 LLM 生成摘要
-        system_prompt = (
-            "你是一个记忆压缩助手。请将以下历史对话记录压缩成一份简洁的摘要，要求：\n"
-            "1. 保留所有关键信息、用户意图、重要决策和事实\n"
-            "2. 去除重复和冗余内容\n"
-            "3. 按主题分条目组织，使用 '- ' 开头\n"
-            "4. 保持事实准确，不要添加推测内容\n"
-            "5. 用中文输出"
-        )
-
-        async def _asummarize_text(text: str, prompt: str) -> str:
-            def _sync_call() -> str:
-                try:
-                    return self.llm.chat([
-                        {"role": "system", "content": prompt},
-                        {"role": "user", "content": text},
-                    ]).strip()
-                except Exception:
-                    return ""
-
-            return await asyncio.to_thread(_sync_call)
-
-        summary = await _asummarize_text(
-            f"以下是历史对话记录，请压缩成摘要:\n\n{history_text}",
-            system_prompt,
-        )
-        if not summary:
-            return {"success": False, "error": "LLM 调用失败或返回空摘要"}
-
-        # 3. 用摘要替换全部 facts
-        result = await self.long_term_memory.replace_with_summary(sid, summary)
-        compressed_chars = len(summary)
-
-        return {
-            "success": result["success"],
-            "original_count": result["original_count"],
-            "original_chars": original_chars,
-            "compressed_chars": compressed_chars,
-            "summary": summary,
-        }
-
-    async def aclear_long_term_memory(self, session_id: str | None = None) -> int:
-        """清空当前会话的长期记忆 facts（ThreadMemoryStore）。
-
-        同时清空旧 JSON 长期记忆（memory.json）以保持向后兼容。
-
-        Args:
-            session_id: 目标会话 ID。为 None 时使用当前会话。
-
-        Returns:
-            被清除的 fact 数量
-        """
-        sid = self._current_sid(session_id)
-        cleared = await self.long_term_memory.clear_thread_memory(sid)
-        # 同步清空旧 JSON 长期记忆（向后兼容）
-        await self.memory.aclear_long_term()
-        return cleared
-
     # ============ 生命周期管理 ============
 
     async def aclose(self) -> None:
-        """优雅关闭：释放 MCP 连接池、Checkpoint DB 等资源
+        """优雅关闭：释放 MCP 连接池等资源
 
         关闭后 AgentCore 不再可用，调用任何方法会抛 AgentStateError。
         可安全重复调用（幂等）。
+
+        注意：checkpoint DB 和长期记忆资源的关闭由入口程序通过 MemoryContext.aclose() 负责。
         """
         if self._closed:
             return
         self._closed = True
 
-        # 1. 刷新长期记忆写中间件 buffer（处理未提交的防抖事件），然后关闭
-        try:
-            if self._memory_write_middleware is not None:
-                await self._memory_write_middleware.flush_all()
-                await self._memory_write_middleware.shutdown()
-        except Exception as e:
-            logger.warning("长期记忆写中间件关闭异常: %s", e, exc_info=True)
-
-        # 2. 关闭 MCP 连接池
+        # 关闭 MCP 连接池
         try:
             await self._mcp_pool.close()
         except Exception as e:
             logger.warning("MCP 连接池关闭异常: %s", e, exc_info=True)
-
-        # 3. 关闭 Checkpoint DB 连接
-        try:
-            await self.memory.aclose()
-        except Exception as e:
-            logger.warning("Checkpoint DB 关闭异常: %s", e, exc_info=True)
-
-        # 4. SessionStore 中的 per-session 状态（history / interrupts）随 Store GC 自动回收
-        #    无需显式清理实例级可变状态（已迁移至 SessionStore）
 
         logger.info("AgentCore 资源已释放")
 

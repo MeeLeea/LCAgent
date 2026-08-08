@@ -2,7 +2,7 @@
 
 验证:
 1. 异常继承关系正确，可被 LCAgentError 统一 catch
-2. 各异常携带正确的属性（server_name, tool_name, timeout 等）
+2. AgentStateError 携带正确的 detail 属性
 3. AgentCore.aclose() 释放资源、幂等、关闭后抛 AgentStateError
 """
 from __future__ import annotations
@@ -14,11 +14,7 @@ import pytest
 
 from agent.exceptions import (
     AgentStateError,
-    CompressError,
-    InterruptTimeoutError,
     LCAgentError,
-    MCPConnectionError,
-    ToolTimeoutError,
 )
 
 # ════════════════════════════════════════════════════════════════════════
@@ -31,10 +27,6 @@ class TestExceptionHierarchy:
 
     def test_all_inherit_from_lcagent_error(self):
         for exc_class in [
-            MCPConnectionError,
-            ToolTimeoutError,
-            CompressError,
-            InterruptTimeoutError,
             AgentStateError,
         ]:
             assert issubclass(exc_class, LCAgentError)
@@ -42,10 +34,6 @@ class TestExceptionHierarchy:
     def test_all_inherit_from_exception(self):
         for exc_class in [
             LCAgentError,
-            MCPConnectionError,
-            ToolTimeoutError,
-            CompressError,
-            InterruptTimeoutError,
             AgentStateError,
         ]:
             assert issubclass(exc_class, Exception)
@@ -53,10 +41,6 @@ class TestExceptionHierarchy:
     def test_catch_all_with_lcagent_error(self):
         # Given: 各种子异常
         errors = [
-            MCPConnectionError("srv"),
-            ToolTimeoutError("tool", 60),
-            CompressError("summarize"),
-            InterruptTimeoutError("thread-1"),
             AgentStateError("closed"),
         ]
 
@@ -66,33 +50,6 @@ class TestExceptionHierarchy:
                 raise err
             except LCAgentError as caught:
                 assert caught is err
-
-    def test_mcp_connection_error_attributes(self):
-        err = MCPConnectionError("my-server", "connection refused")
-        assert err.server_name == "my-server"
-        assert "connection refused" in str(err)
-        assert err.detail == "connection refused"
-
-    def test_mcp_connection_error_default_message(self):
-        err = MCPConnectionError("my-server")
-        assert "my-server" in str(err)
-
-    def test_tool_timeout_error_attributes(self):
-        err = ToolTimeoutError("calc", 30.0)
-        assert err.tool_name == "calc"
-        assert err.timeout == 30.0
-        assert "calc" in str(err)
-        assert "30" in str(err)
-
-    def test_compress_error_attributes(self):
-        err = CompressError("prune", "disk full")
-        assert err.stage == "prune"
-        assert err.detail == "disk full"
-
-    def test_interrupt_timeout_error_attributes(self):
-        err = InterruptTimeoutError("thread-abc")
-        assert err.thread_id == "thread-abc"
-        assert "thread-abc" in str(err)
 
     def test_agent_state_error_detail(self):
         err = AgentStateError("already closed", detail="called from arun")
@@ -121,9 +78,7 @@ def _make_minimal_core():
     core._mcp_pool = MagicMock()
     core._mcp_pool.close = AsyncMock()
 
-    # Mock memory
-    core.memory = MagicMock()
-    core.memory.aclose = AsyncMock()
+    # memory 已剥离至 MemoryContext / SessionManager，AgentCore.aclose 不再关闭 memory
 
     return core
 
@@ -147,7 +102,8 @@ class TestAgentCoreClose:
 
         asyncio.run(core.aclose())
 
-        core.memory.aclose.assert_awaited_once()
+        # memory 关闭已迁移至 MemoryContext/SessionManager，AgentCore.aclose 只关 MCP pool
+        core._mcp_pool.close.assert_awaited_once()
 
     def test_close_does_not_crash_without_instance_state(self):
         """aclose() 不再清理实例级 execution_history / pending_interrupts
@@ -171,7 +127,6 @@ class TestAgentCoreClose:
 
         # Then: 不重复调用 close（幂等）
         core._mcp_pool.close.assert_awaited_once()
-        core.memory.aclose.assert_awaited_once()
 
     def test_arun_structured_raises_after_close(self):
         core = _make_minimal_core()
@@ -213,9 +168,8 @@ class TestAgentCoreClose:
 
         asyncio.run(use_and_exit())
 
-        # MCP pool 和 memory 都被关闭
+        # MCP pool 被关闭（memory 由 MemoryContext/SessionManager 管理）
         core._mcp_pool.close.assert_awaited_once()
-        core.memory.aclose.assert_awaited_once()
 
     def test_close_handles_mcp_error_gracefully(self):
         # Given: MCP close 抛异常
@@ -225,14 +179,14 @@ class TestAgentCoreClose:
         # When: 关闭（不抛异常）
         asyncio.run(core.aclose())
 
-        # Then: 仍然继续关闭 memory
-        core.memory.aclose.assert_awaited_once()
+        # Then: 仍然继续关闭（memory 由 MemoryContext/SessionManager 管理）
+        core._mcp_pool.close.assert_awaited_once()
         assert core._closed is True
 
     def test_close_handles_memory_error_gracefully(self):
-        # Given: memory close 抛异常
+        # memory 关闭已迁移至 MemoryContext/SessionManager，AgentCore.aclose 只关 MCP pool。
+        # 此测试验证 aclose 在无 memory 依赖时仍正常工作。
         core = _make_minimal_core()
-        core.memory.aclose = AsyncMock(side_effect=RuntimeError("DB boom"))
 
         # When: 关闭
         asyncio.run(core.aclose())

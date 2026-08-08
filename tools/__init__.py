@@ -12,7 +12,6 @@ from .open_file import open_file, open_sqlite
 from .scheduler_tool import (
     cancel_scheduled_task,
     cleanup_finished_tasks,
-    configure,
     delete_scheduled_task,
     list_scheduled_tasks,
     schedule_task,
@@ -49,7 +48,6 @@ __all__ = [
     'calculate',
     'cancel_scheduled_task',
     'cleanup_finished_tasks',
-    'configure',
     'create_tool',
     'delete_scheduled_task',
     'get_local_time',

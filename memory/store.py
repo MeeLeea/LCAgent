@@ -20,7 +20,7 @@ from typing import Any
 from langgraph.store.base import BaseStore
 from langgraph.store.memory import InMemoryStore
 
-from .memory_models import MemoryCategory, ThreadFactItem
+from .models import MemoryCategory, ThreadFactItem
 
 logger = logging.getLogger(__name__)
 
@@ -82,21 +82,6 @@ class ThreadMemoryStore:
         facts.sort(key=lambda f: f.create_time)
         return facts
 
-    async def query_facts_by_category(
-        self, thread_id: str, category: MemoryCategory
-    ) -> list[ThreadFactItem]:
-        """按分类筛选 facts。
-
-        Args:
-            thread_id: 会话线程 ID
-            category: 记忆分类
-
-        Returns:
-            匹配分类的 facts 列表
-        """
-        facts = await self.query_facts(thread_id)
-        return [f for f in facts if f.category == category.value]
-
     async def count_facts(self, thread_id: str) -> int:
         """统计 thread 的 fact 数量。"""
         return len(await self.query_facts(thread_id))
@@ -135,15 +120,6 @@ class ThreadMemoryStore:
         for item in items:
             item.thread_id = thread_id
             await self._store.aput(ns, key=item.fact_id, value=item.to_dict())
-
-    async def delete_fact(self, thread_id: str, fact_id: str) -> None:
-        """删除单条 fact。
-
-        Args:
-            thread_id: 会话线程 ID
-            fact_id: 记忆条目 ID
-        """
-        await self._store.adelete(_facts_namespace(thread_id), key=fact_id)
 
     # ============ LRU 淘汰 ============
 
@@ -186,7 +162,7 @@ class ThreadMemoryStore:
             thread_id: 会话线程 ID
             fact_id: 记忆条目 ID
         """
-        from .memory_models import _naive_now
+        from .models import _naive_now
 
         item = await self._store.aget(_facts_namespace(thread_id), key=fact_id)
         if item is None:

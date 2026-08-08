@@ -18,10 +18,11 @@ MAX_RAW_CONTEXT_CHARS = 6000
 async def abuild_memory_context(agent) -> str:
     """从 Agent 提取当前会话短期记忆与长期记忆，拼装为文本并截断。
 
-    短期记忆从 SessionRegistry 读取（checkpoint 消息），长期记忆从 ThreadMemoryStore 读取。
+    短期记忆从 SessionRegistry 读取（checkpoint 消息），
+    长期记忆通过 SessionManager → MemoryManager.recall_text() 召回。
 
     Args:
-        agent: AgentCore 实例（需有 session 和 long_term_memory 属性）
+        agent: AgentCore 实例（需有 session 和 _session_manager 属性）
 
     Returns:
         记忆文本;无记忆时返回空串
@@ -33,10 +34,14 @@ async def abuild_memory_context(agent) -> str:
         lines = [f"{item.get('role', 'user')}: {item.get('content', '')}" for item in short_term]
         blocks.append("【当前会话】\n" + "\n".join(lines))
 
-    facts = await agent.long_term_memory.query_facts(agent.session.current_session_id)
-    if facts:
-        lines = [f"[{f.category}] {f.content}" for f in facts]
-        blocks.append("【长期记忆】\n" + "\n".join(lines))
+    # 通过 SessionManager → MemoryManager 召回长期记忆
+    sm = getattr(agent, "_session_manager", None)
+    if sm is not None:
+        memory = getattr(sm, "memory", None)
+        if memory is not None:
+            long_term_text = await memory.recall_text(agent.session.current_session_id)
+            if long_term_text:
+                blocks.append(long_term_text.strip())
 
     text = "\n\n".join(blocks).strip()
     if len(text) > MAX_RAW_CONTEXT_CHARS:

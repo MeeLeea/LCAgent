@@ -279,33 +279,6 @@ class LLMClient:
         """获取统一聊天模型实例（供Agent使用）"""
         return self.client
 
-    def switch_provider(
-        self,
-        provider: str,
-        api_key: str | None = None,
-        model: str | None = None
-    ):
-        """运行时切换提供商"""
-        provider = provider.lower()
-        providers = load_providers(self.config_file)
-        if provider not in providers:
-            raise ValueError(f"不支持的提供商: {provider}")
-
-        self.provider = provider
-        self.provider_config = providers[provider]
-
-        new_key = (
-            api_key
-            or self.provider_config.get("api_key")
-            or os.environ.get(self.provider_config.get("env_key", ""))
-        )
-        if not new_key:
-            raise ValueError(f"请提供 {self.provider_config['name']} 的API密钥")
-
-        self.api_key = new_key
-        self.model = model or self.provider_config.get("model")
-        self.client = self._create_chat_model()
-
     def switch_model(self, model: str):
         """
         运行时切换模型(仅限当前提供商支持的模型)

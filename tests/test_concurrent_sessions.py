@@ -3,12 +3,10 @@
 ==================
 
 覆盖特征点：
-  - memory.get_config 显式 thread_id 隔离
   - agent_core._invoke_config 的 thread_id 处理
   - 所有会话共享同一编译图（无 per-thread 缓存）
   - _pending_interrupts 的 per-thread 中断状态隔离
   - manually_compact(thread_id=) 针对指定线程压缩
-  - StreamHandler 流式对话的 thread_id 透传
   - server._thread_lock 的 per-thread 锁隔离
 
 运行：
@@ -22,39 +20,13 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 
 # --------------------------------------------------------------------------- #
-# memory.get_config thread_id 隔离
-# --------------------------------------------------------------------------- #
-class FakeMemoryBase:
-    def __init__(self):
-        self.thread_id = "current-default"
-
-
-def test_get_config_thread_id_isolation():
-    from agent.memory import AgentMemory
-
-    memory = object.__new__(AgentMemory)
-    memory.thread_id = "current-default"
-
-    assert memory.get_config() == {"configurable": {"thread_id": "current-default"}}
-    assert memory.get_config(thread_id="thread-a") == {
-        "configurable": {"thread_id": "thread-a"}
-    }
-    assert memory.get_config(thread_id="thread-b") == {
-        "configurable": {"thread_id": "thread-b"}
-    }
-
-
-# --------------------------------------------------------------------------- #
 # agent_core._invoke_config
 # --------------------------------------------------------------------------- #
 def test_invoke_config_respects_thread_id():
     from agent.agent_core import AgentCore
 
-    class FakeMemory:
-        thread_id = "fallback"
-
     core = object.__new__(AgentCore)
-    core.memory = FakeMemory()
+    core._initial_thread_id = "fallback"
     core.max_iterations = 25
 
     assert core._invoke_config() == {
@@ -215,99 +187,6 @@ def test_manually_compact_uses_target_thread():
     assert result["summary"] == "sum"
     assert len(state_updates) == 1
     assert state_updates[0][0]["configurable"]["thread_id"] == thread_id
-
-
-# --------------------------------------------------------------------------- #
-# StreamHandler thread_id 透传
-# --------------------------------------------------------------------------- #
-class _FakeMetrics:
-    def extract_and_record_llm_usage(self, output, provider="", model=""):
-        pass
-
-
-class _FakeStreamExecutor:
-    """模拟共享编译图。"""
-
-    def __init__(self):
-        self.used: list[str | None] = []
-
-    async def astream_events(self, *args: Any, **kwargs: Any):
-        config = kwargs.get("config") or {}
-        tid = config.get("configurable", {}).get("thread_id")
-        self.used.append(tid)
-        yield {
-            "event": "on_chat_model_end",
-            "metadata": {},
-            "data": {"output": AIMessage(content="你好", id="msg-1")},
-        }
-
-    async def aget_state(self, config):
-        return None
-
-
-class _FakeStreamAgent:
-    """模拟 StreamHandler 依赖的 agent 接口（无状态模式）。"""
-
-    def __init__(self):
-        self.verbose = False
-        self.metrics = _FakeMetrics()
-        self._state_lock = asyncio.Lock()
-        self.cleared_threads: list[str | None] = []
-        self.agent_executor = _FakeStreamExecutor()
-
-    def _invoke_config(self, thread_id: str | None = None):
-        tid = thread_id or "default"
-        return {"configurable": {"thread_id": tid, "recursion_limit": 25}}
-
-    def _thread_id_from_config(self, config: dict[str, Any]) -> str | None:
-        configurable = config.get("configurable")
-        if isinstance(configurable, dict):
-            tid = configurable.get("thread_id")
-            if isinstance(tid, str):
-                return tid
-        return None
-
-    async def _aclear_pending_interrupt(self, thread_id: str | None = None) -> None:
-        self.cleared_threads.append(thread_id)
-
-    async def _arepair_rejected_tool_calls(self, config):
-        pass
-
-
-def test_stream_handler_thread_id_plumbing():
-    from agent.message_utils import StreamHandler
-
-    agent = _FakeStreamAgent()
-    handler = StreamHandler(agent)
-
-    async def collect():
-        return [ev async for ev in handler.astream_chat("你好", thread_id="t-sse")]
-
-    events = asyncio.run(collect())
-
-    # 共享 executor 被用于事件流，config 中携带 thread_id
-    assert agent.agent_executor.used == ["t-sse"]
-    # 中断清理带 thread_id
-    assert agent.cleared_threads == ["t-sse"]
-    # 无中断，正常完成
-    assert events[-1] == {"type": "done"}
-
-
-def test_stream_handler_default_thread_when_none():
-    from agent.message_utils import StreamHandler
-
-    agent = _FakeStreamAgent()
-    handler = StreamHandler(agent)
-
-    async def collect():
-        return [ev async for ev in handler.astream_chat("你好")]
-
-    events = asyncio.run(collect())
-
-    # config 解析后的默认线程 id（_invoke_config(None) → "default"）
-    assert agent.agent_executor.used == ["default"]
-    assert agent.cleared_threads == ["default"]
-    assert events[-1] == {"type": "done"}
 
 
 # --------------------------------------------------------------------------- #

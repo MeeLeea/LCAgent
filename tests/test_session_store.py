@@ -11,7 +11,6 @@ from session import (
     SessionContext,
     SessionRegistry,
     SessionStore,
-    create_checkpointer,
 )
 
 
@@ -57,10 +56,10 @@ def test_recorded_call_ids_dedup():
     store = SessionStore()
 
     async def run():
-        await store.aadd_recorded_call_id("s1", "call-a")
-        await store.aadd_recorded_call_id("s1", "call-a")  # 重复
-        await store.aadd_recorded_call_id("s1", "call-b")
-        await store.aadd_recorded_call_id("s2", "call-c")
+        await store.aadd_recorded_call_ids("s1", {"call-a"})
+        await store.aadd_recorded_call_ids("s1", {"call-a"})  # 重复
+        await store.aadd_recorded_call_ids("s1", {"call-b"})
+        await store.aadd_recorded_call_ids("s2", {"call-c"})
         ids1 = await store.aget_recorded_call_ids("s1")
         ids2 = await store.aget_recorded_call_ids("s2")
         return ids1, ids2
@@ -97,7 +96,7 @@ def test_delete_session_clears_all_state():
 
     async def run():
         await store.aappend_history("s1", {"step": 1})
-        await store.aadd_recorded_call_id("s1", "call-x")
+        await store.aadd_recorded_call_ids("s1", {"call-x"})
         await store.aset_interrupt_mode("s1", "run")
         await store.adelete_session("s1")
         h = await store.aget_history("s1")
@@ -190,16 +189,6 @@ def test_registry_process_type_filter():
 
     reg2 = SessionRegistry(cp, store, process_type=None)
     assert reg2._matches_process_type("anything")
-
-
-# --------------------------------------------------------------------------- #
-# checkpointer 工厂
-# --------------------------------------------------------------------------- #
-def test_create_checkpointer_memory_mode():
-    cp = create_checkpointer(checkpoint_file=None, use_sqlite=False)
-    from langgraph.checkpoint.memory import MemorySaver as MS
-
-    assert isinstance(cp, MS)
 
 
 def test_registry_alist_sessions_includes_current_for_memory():

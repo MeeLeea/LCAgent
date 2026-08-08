@@ -53,32 +53,6 @@ class StructuredFormatter(logging.Formatter):
 
 # ── 公开 API ───────────────────────────────────────────────────
 
-def set_trace_context(
-    trace_id: str | None = None,
-    thread_id: str | None = None,
-) -> None:
-    """设置当前上下文的 trace_id 和 thread_id
-
-    Args:
-        trace_id: 请求追踪 ID（None=不修改）
-        thread_id: 会话线程 ID（None=不修改）
-    """
-    if trace_id is not None:
-        _trace_id.set(trace_id)
-    if thread_id is not None:
-        _thread_id.set(thread_id)
-
-
-def get_trace_id() -> str:
-    """获取当前上下文的 trace_id"""
-    return _trace_id.get()
-
-
-def get_thread_id() -> str:
-    """获取当前上下文的 thread_id"""
-    return _thread_id.get()
-
-
 def generate_trace_id() -> str:
     """生成新的 trace_id（8 位 hex）"""
     return uuid.uuid4().hex[:8]
@@ -126,11 +100,6 @@ def set_log_level(level: str | int) -> int:
 
     logging.getLogger().setLevel(resolved)
     return resolved
-
-
-def get_log_level() -> int:
-    """获取当前 root logger 的整型日志级别"""
-    return logging.getLogger().level
 
 
 def get_log_level_name() -> str:
@@ -235,11 +204,7 @@ __all__ = [
     "StructuredFormatter",
     "TraceContext",
     "generate_trace_id",
-    "get_log_level",
     "get_log_level_name",
-    "get_thread_id",
-    "get_trace_id",
     "set_log_level",
-    "set_trace_context",
     "setup_logging",
 ]

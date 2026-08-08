@@ -14,7 +14,6 @@ from __future__ import annotations
 import logging
 import sqlite3
 import uuid
-from contextlib import closing
 from datetime import datetime
 from typing import Any
 

@@ -205,18 +205,18 @@ class TestTaskExecutor:
 
     def test_success(self):
         mock_agent = MagicMock()
-        mock_agent.arun = AsyncMock(return_value="任务执行完成")
+        mock_agent.session_manager.arun = AsyncMock(return_value="任务执行完成")
         factory = lambda: mock_agent
 
         task = {"id": 1, "task_type": "one_time", "task_text": "生成报告"}
         success, output = execute_task(task, factory)
         assert success is True
         assert output == "任务执行完成"
-        mock_agent.arun.assert_called_once_with("生成报告")
+        mock_agent.session_manager.arun.assert_called_once_with("生成报告")
 
     def test_agent_raises(self):
         mock_agent = MagicMock()
-        mock_agent.arun = AsyncMock(side_effect=RuntimeError("Agent 崩溃"))
+        mock_agent.session_manager.arun = AsyncMock(side_effect=RuntimeError("Agent 崩溃"))
         factory = lambda: mock_agent
 
         task = {"id": 2, "task_type": "one_time", "task_text": "test"}
@@ -244,7 +244,7 @@ class TestSchedulerEngine:
 
     def test_register_periodic_task(self, store):
         mock_agent = MagicMock()
-        mock_agent.arun = AsyncMock(return_value="ok")
+        mock_agent.session_manager.arun = AsyncMock(return_value="ok")
         engine = SchedulerEngine(
             task_store=store,
             agent_factory=lambda: mock_agent,
@@ -277,7 +277,7 @@ class TestSchedulerEngine:
 
     def test_sync_periodic_tasks(self, store):
         mock_agent = MagicMock()
-        mock_agent.arun = AsyncMock(return_value="ok")
+        mock_agent.session_manager.arun = AsyncMock(return_value="ok")
         # 先入库两条周期任务（引擎未启动）
         store.create_task("periodic", "日报", cron_expr="0 9 * * *")
         store.create_task("periodic", "周报", cron_expr="0 9 * * 1")
@@ -293,7 +293,7 @@ class TestSchedulerEngine:
 
     def test_poll_and_execute_due_task(self, store):
         mock_agent = MagicMock()
-        mock_agent.arun = AsyncMock(return_value="报告已生成")
+        mock_agent.session_manager.arun = AsyncMock(return_value="报告已生成")
         engine = SchedulerEngine(
             task_store=store,
             agent_factory=lambda: mock_agent,
@@ -327,7 +327,7 @@ class TestSchedulerEngine:
 
         store.create_task("one_time", "未来任务", execute_time="2099-12-31T23:59:59")
         engine._poll_and_execute()
-        mock_agent.arun.assert_not_called()
+        mock_agent.session_manager.arun.assert_not_called()
 
         engine.stop()
 
@@ -383,7 +383,7 @@ class TestSchedulerEngine:
             return f"done: {task_text}"
 
         mock_agent = MagicMock()
-        mock_agent.arun = AsyncMock(side_effect=slow_agent_run)
+        mock_agent.session_manager.arun = AsyncMock(side_effect=slow_agent_run)
 
         engine = SchedulerEngine(
             task_store=store,
@@ -431,7 +431,7 @@ class TestSchedulerEngine:
             return f"done: {task_text}"
 
         mock_agent = MagicMock()
-        mock_agent.arun = AsyncMock(side_effect=serial_agent_run)
+        mock_agent.session_manager.arun = AsyncMock(side_effect=serial_agent_run)
 
         engine = SchedulerEngine(
             task_store=store,

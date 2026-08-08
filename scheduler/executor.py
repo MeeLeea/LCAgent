@@ -1,13 +1,13 @@
 """
-任务执行桥接 - 接收数据库任务，调用 AgentCore.run() 或工作流执行
+任务执行桥接 - 接收数据库任务，调用 SessionManager.arun() 或工作流执行
 
 职责（逻辑 B 的执行端）：
-    scheduler 拿到到期任务 → executor 判断任务类型 → 调用 Agent 或工作流 → 返回结果
+    scheduler 拿到到期任务 → executor 判断任务类型 → 调用 Session 或工作流 → 返回结果
 
 设计要点：
     - 通过 agent_factory（Callable[[], AgentCore]）解耦 Agent 的创建方式，
       调度器不需要知道 LLM / MCP / 技能等初始化细节
-    - 执行是同步阻塞的（AgentCore.run 本身是同步的），调度器在线程池中调用
+    - 执行通过 SessionManager.arun()（异步），调度器用 asyncio.run 在线程池中调用
     - 捕获所有异常，返回 (success, output/error) 元组，绝不向调度器抛异常
     - 支持 workflow: 前缀: task_text 以 "workflow:" 开头时路由到多 Agent 工作流
 """
@@ -110,11 +110,11 @@ class _AgentCreateError(Exception):
 
 
 async def _run_agent_task(task_text: str, agent_factory: AgentFactory) -> str:
-    """在单个事件循环内创建 Agent、执行任务并释放资源。
+    """在单个事件循环内创建 Agent、通过 SessionManager 执行任务并释放资源。
 
     关键约束：AsyncSqliteSaver 绑定创建它的事件循环，跨 loop 使用会挂起。
-    因此 factory 构造（await 若返回协程）、arun 执行、aclose 关闭必须在
-    同一个 loop 内完成。本函数由 execute_task 用 asyncio.run 包裹执行。
+    因此 factory 构造（await 若返回协程）、session_manager.arun 执行、
+    aclose 关闭必须在同一个 loop 内完成。本函数由 execute_task 用 asyncio.run 包裹执行。
 
     Args:
         task_text: 任务描述文本
@@ -134,20 +134,37 @@ async def _run_agent_task(task_text: str, agent_factory: AgentFactory) -> str:
         raise _AgentCreateError(str(exc)) from exc
 
     try:
-        result = agent.arun(task_text)
-        if inspect.isawaitable(result):
-            result = await result
+        result = await agent.session_manager.arun(task_text)
         return str(result) if result else ""
     finally:
-        # 释放异步 SQLite 连接等资源；关闭失败不掩盖执行结果
-        aclose = getattr(agent, "aclose", None)
-        if callable(aclose):
+        # 优先通过 SessionManager 关闭（刷新记忆 buffer + 释放 Agent 资源），
+        # 回退到 agent.aclose（兼容未初始化 SessionManager 的场景）
+        sm = getattr(agent, "_session_manager", None)
+        if sm is not None:
             try:
-                close_result = aclose()
-                if inspect.isawaitable(close_result):
-                    await close_result
+                aclose = getattr(sm, "aclose", None)
+                if callable(aclose):
+                    close_result = aclose()
+                    if inspect.isawaitable(close_result):
+                        await close_result
             except Exception as exc:
-                logger.warning("Agent 关闭失败: %s", exc, exc_info=True)
+                logger.warning("SessionManager 关闭失败: %s", exc, exc_info=True)
+        else:
+            aclose = getattr(agent, "aclose", None)
+            if callable(aclose):
+                try:
+                    close_result = aclose()
+                    if inspect.isawaitable(close_result):
+                        await close_result
+                except Exception as exc:
+                    logger.warning("Agent 关闭失败: %s", exc, exc_info=True)
+        # 关闭 MemoryContext（释放 SQLite 连接等底层资源）
+        mem_ctx = getattr(agent, "_memory_context", None)
+        if mem_ctx is not None:
+            try:
+                await mem_ctx.aclose()
+            except Exception as exc:
+                logger.warning("MemoryContext 关闭失败: %s", exc, exc_info=True)
 
 
 def execute_task(task: dict[str, Any], agent_factory: AgentFactory) -> tuple[bool, str]:
@@ -155,7 +172,7 @@ def execute_task(task: dict[str, Any], agent_factory: AgentFactory) -> tuple[boo
 
     根据 task_text 自动判断执行路径：
     - 以 "workflow:" 开头 → 多 Agent 工作流执行
-    - 其他 → AgentCore.run() 执行
+    - 其他 → SessionManager.arun() 执行
 
     Args:
         task:          TaskStore 返回的任务字典（含 task_text 等字段）

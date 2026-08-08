@@ -102,22 +102,10 @@ class SessionStore:
             return set()
         return set(item.value.get("ids", []))
 
-    async def aadd_recorded_call_id(self, session_id: str, call_id: str) -> None:
-        """追加单个 tool_call_id 到去重集合。"""
-        ids = await self.aget_recorded_call_ids(session_id)
-        if call_id in ids:
-            return
-        ids.add(call_id)
-        await self._store.aput(
-            _ns(session_id, "history"),
-            key="call_ids",
-            value={"ids": sorted(ids)},
-        )
-
     async def aadd_recorded_call_ids(self, session_id: str, new_ids: set[str]) -> None:
         """批量追加多个 tool_call_id 到去重集合。
 
-        比 ``aadd_recorded_call_id`` 更高效：一次读改写即可追加多个 ID，
+        比 ``aappend_history`` 更高效：一次读改写即可追加多个 ID，
         适用于 ``_arecord_tool_steps`` 一次 turn 内记录多个工具调用。
         """
         if not new_ids:

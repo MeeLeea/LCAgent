@@ -61,13 +61,6 @@ class ThreadMemoryLockPool:
             if removed is not None:
                 logger.debug("清理 thread %s 的记忆锁", thread_id)
 
-    async def cleanup_all(self) -> None:
-        """清空所有锁缓存（用于 Agent 关闭时）。"""
-        async with self._dict_lock:
-            count = len(self._locks)
-            self._locks.clear()
-            if count:
-                logger.debug("清空全部记忆锁 (%d 个)", count)
 
 
 __all__ = ["ThreadMemoryLockPool"]

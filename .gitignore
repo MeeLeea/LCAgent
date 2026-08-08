@@ -55,7 +55,7 @@ calibrate_*.png
 .omo/
 drafts/
 node_modules/
-memory/
+data/
 .agents/
 config/*
 !config/*.json.example

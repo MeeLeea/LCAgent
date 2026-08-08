@@ -13,23 +13,35 @@ from cli.commands.types import CommandContext
 
 
 @dataclass
-class FakeMemory:
-    thread_id: str = "thread-1"
+class FakeSessionManager:
+    """模拟 SessionManager 的记忆管理接口"""
     calls: list[tuple[str, Any]] = field(default_factory=list)
+    _thread_id: str = "thread-1"
 
-    def new_thread(self) -> str:
-        self.calls.append(("new_thread", None))
-        self.thread_id = "thread-2"
-        return self.thread_id
+    async def aget_memory_summary(self) -> dict[str, Any]:
+        self.calls.append(("aget_memory_summary", None))
+        return {
+            "thread_id": self._thread_id,
+            "checkpoint_backend": "sqlite",
+            "checkpoint_file": "checkpoints.sqlite",
+            "checkpoint_messages": 3,
+            "long_term_count": 2,
+            "total_threads": 1,
+        }
 
-    def clear_long_term(self) -> None:
-        self.calls.append(("clear_long_term", None))
+    async def acompress_memory(self) -> dict[str, Any]:
+        self.calls.append(("acompress_memory", None))
+        return {
+            "success": True,
+            "original_count": 2,
+            "original_chars": 100,
+            "compressed_chars": 10,
+            "summary": "压缩摘要",
+        }
 
-    async def aclear_long_term(self) -> None:
-        self.calls.append(("aclear_long_term", None))
-
-    def clear_short_term(self) -> None:
-        self.calls.append(("clear_short_term", None))
+    async def aclear_long_term_memory(self, session_id: str | None = None) -> int:
+        self.calls.append(("aclear_long_term_memory", session_id))
+        return 2
 
 
 @dataclass
@@ -51,16 +63,18 @@ class FakeSession:
 
 @dataclass
 class FakeAgent:
-    memory: FakeMemory = field(default_factory=FakeMemory)
+    session_manager: FakeSessionManager = field(default_factory=FakeSessionManager)
     session: FakeSession = field(default_factory=FakeSession)
     calls: list[tuple[str, Any]] = field(default_factory=list)
     llm: Any = None
+    local_tools: list[Any] = field(default_factory=list)
     mcp_tools: list[Any] = field(default_factory=list)
+    tools: list[Any] = field(default_factory=list)
     auto_match_skills: bool = True
 
     def set_current_session(self, session_id: str) -> None:
         self.session.current_session_id = session_id
-        self.memory.thread_id = session_id
+        self.session_manager._thread_id = session_id
 
     def switch_llm(self, llm: Any) -> None:
         self.calls.append(("switch_llm", llm))
@@ -68,32 +82,6 @@ class FakeAgent:
 
     async def aswitch_llm(self, llm: Any) -> None:
         self.switch_llm(llm)
-
-    async def aget_memory_summary(self) -> dict[str, Any]:
-        self.calls.append(("aget_memory_summary", None))
-        return {
-            "thread_id": self.memory.thread_id,
-            "checkpoint_backend": "sqlite",
-            "checkpoint_file": "checkpoints.sqlite",
-            "checkpoint_messages": 3,
-            "long_term_count": 2,
-            "total_threads": 1,
-        }
-
-    async def acompress_memory(self) -> dict[str, Any]:
-        self.calls.append(("acompress_memory", None))
-        return {
-            "success": True,
-            "original_count": 2,
-            "original_chars": 100,
-            "compressed_chars": 10,
-            "summary": "压缩摘要",
-        }
-
-    async def aclear_long_term_memory(self, session_id: str | None = None) -> int:
-        self.calls.append(("aclear_long_term_memory", session_id))
-        await self.memory.aclear_long_term()
-        return 2
 
     def reload_mcp_tools(self) -> int:
         self.calls.append(("reload_mcp_tools", None))
@@ -260,7 +248,7 @@ def test_dispatch_handles_info_without_running_agent(harness: Harness) -> None:
     result = dispatch(harness, "info")
     # Then: info is handled locally and no LLM run is started.
     assert result.handled is True
-    assert ("aget_memory_summary", None) in harness.agent.calls
+    assert ("aget_memory_summary", None) in harness.agent.session_manager.calls
     assert harness.runners.calls == []
 
 
@@ -296,8 +284,8 @@ def test_dispatch_thread_new_and_clear_mutate_memory(harness: Harness) -> None:
     assert clear_result.handled is True
     # thread:new → session.new_session()
     assert ("new_session", None) in harness.agent.session.calls
-    # clear all → memory.aclear_long_term() + session.new_session()
-    assert ("aclear_long_term", None) in harness.agent.memory.calls
+    # clear all → session_manager.aclear_long_term_memory() + session.new_session()
+    assert ("aclear_long_term_memory", None) in harness.agent.session_manager.calls
     assert ("new_session", None) in harness.agent.session.calls
 
 

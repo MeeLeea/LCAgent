@@ -5,7 +5,7 @@
 - 配置驱动的多 LLM 提供商（见 `config/llm_config.json`），运行时可切换提供商/模型
 - 本地工具调用（搜索、文件读写、计算、终端命令、文件打开、技能读取）
 - **MCP Server 工具动态加载**（可扩展任意 MCP 服务）
-- **LangGraph Checkpoint 持久化**（服务器异步运行时使用 `memory/checkpoints_async.sqlite`，程序重启可恢复对话）
+- **LangGraph Checkpoint 持久化**（服务器异步运行时使用 `data/checkpoints_async.sqlite`，程序重启可恢复对话）
 - **LangGraph Human-in-the-loop**（`ask_human` 暂停图执行，CLI 结构化选择后 `Command(resume)` 继续）
 - 长期记忆管理（compress 压缩摘要）与长上下文自动裁剪
 - **长上下文压缩中间件**（增量摘要 + 工具输出 Prune，摘要随 checkpoint 持久化、per-thread 隔离；`before_model` 自动触发或 `compact` 命令手动触发）
@@ -224,7 +224,7 @@ LangChainAgent/
 │   ├── executor.py          # AgentCore 异步执行桥接(acreate/arun/aclose 单 loop)
 │   ├── engine.py            # APScheduler 引擎
 │   └── run.py               # 独立进程入口
-├── memory/                  # 运行时数据库目录（自动生成）
+├── data/                  # 运行时数据库目录（自动生成）
 │   ├── checkpoints_async.sqlite # Checkpoint 持久化数据库（异步 saver）
 │   ├── memory.json          # 长期记忆文件（用于 compress 摘要）
 │   └── scheduled_tasks.sqlite# 定时任务数据库
@@ -490,8 +490,8 @@ self.agent_executor = self._create_agent_executor(
 
 | 类型                 | 存储方式                               | 触发时机                   | 保存内容                           | 持久化  | 用途                              |
 | -------------------- | -------------------------------------- | -------------------------- | ---------------------------------- | ------- | --------------------------------- |
-| **Checkpoint** | `memory/checkpoints_async.sqlite` (SQLite) | Agent 每步执行后自动       | 完整状态(消息+工具调用链+中间变量) | ✅ 永久 | 程序重启恢复对话、多会话隔离      |
-| **长期记忆**   | `memory/memory.json` (JSON)          | 手动标记`important=True` | 仅 react/cot 的最终结果            | ✅ 永久 | 跨会话保留关键决策、用于 compress |
+| **Checkpoint** | `data/checkpoints_async.sqlite` (SQLite) | Agent 每步执行后自动       | 完整状态(消息+工具调用链+中间变量) | ✅ 永久 | 程序重启恢复对话、多会话隔离      |
+| **长期记忆**   | `data/memory.json` (JSON)          | 手动标记`important=True` | 仅 react/cot 的最终结果            | ✅ 永久 | 跨会话保留关键决策、用于 compress |
 
 ### 三种模式的记忆行为
 
@@ -581,8 +581,8 @@ MEMORY_FILE = os.path.join(BASE_DIR, "memory", "memory.json")            # 长�
 
 | 文件                          | 格式      | 内容                                |
 | ----------------------------- | --------- | ----------------------------------- |
-| `memory/checkpoints_async.sqlite` | SQLite    | Agent 执行状态(按 thread_id 隔离)   |
-| `memory/memory.json`        | JSON 数组 | react/cot 的最终结果(用于 compress) |
+| `data/checkpoints_async.sqlite` | SQLite    | Agent 执行状态(按 thread_id 隔离)   |
+| `data/memory.json`        | JSON 数组 | react/cot 的最终结果(用于 compress) |
 
 > 全异步迁移后 CLI / API / 飞书均使用 `AsyncSqliteSaver`，checkpoint 数据库为
 > `checkpoints_async.sqlite`。旧版同步运行的 `checkpoints.sqlite` 不再写入，可手动删除。
@@ -606,7 +606,7 @@ MEMORY_FILE = os.path.join(BASE_DIR, "memory", "memory.json")            # 长�
 ]
 ```
 
-> 两个文件都会**自动创建父目录**，无需手动建 `memory/` 文件夹。
+> 两个文件都会**自动创建父目录**，无需手动建 `data/` 文件夹。
 >
 > **查看 checkpoints_async.sqlite**：可用 [DB Browser for SQLite](https://sqlitebrowser.org/dl/) 打开，或让 Agent 调用 `open_sqlite` 工具自动打开。
 
@@ -1415,7 +1415,7 @@ Agent 在对话中通过以下 `@tool` 函数与调度系统交互：
 ```python
 from tools.scheduler_tool import configure
 
-configure(db_path="memory/scheduled_tasks.sqlite")
+configure(db_path="data/scheduled_tasks.sqlite")
 ```
 
 **2. 启动后台调度器**（独立进程，与主对话进程分离）
@@ -2120,8 +2120,8 @@ async def main() -> None:
         llm_client=llm,
         name="LCAgent",                                    # Agent 名称（默认 LCAgent）
         memory_size=10,
-        long_term_memory_file="memory/memory.json",        # 长期记忆(用于 compress)
-        checkpoint_file="memory/checkpoints_async.sqlite", # Checkpoint 持久化（异步 saver）
+        long_term_memory_file="data/memory.json",        # 长期记忆(用于 compress)
+        checkpoint_file="data/checkpoints_async.sqlite", # Checkpoint 持久化（异步 saver）
         max_iterations=15,
         mcp_config_file="config/mcp_servers.json",
         enable_mcp=True,
@@ -2380,7 +2380,7 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 
 ```json
 {
-  "db_path": "memory/scheduled_tasks.sqlite",
+  "db_path": "data/scheduled_tasks.sqlite",
   "poll_interval": 30,
   "timezone": "Asia/Shanghai",
   "max_retries": 3,
@@ -2392,7 +2392,7 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 
 | 键                | 类型         | 默认值                            | 说明                                               |
 | ----------------- | ------------ | --------------------------------- | -------------------------------------------------- |
-| `db_path`       | string       | `memory/scheduled_tasks.sqlite` | 任务数据库路径（相对项目根）                       |
+| `db_path`       | string       | `data/scheduled_tasks.sqlite` | 任务数据库路径（相对项目根）                       |
 | `poll_interval` | int          | 30                                | 轮询间隔（秒），调度器每隔此时间检查是否有到期任务 |
 | `timezone`      | string       | `Asia/Shanghai`                 | 任务时区，影响 cron 表达式解析                     |
 | `max_retries`   | int          | 3                                 | 任务执行失败最大重试次数                           |

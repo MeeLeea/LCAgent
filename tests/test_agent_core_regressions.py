@@ -233,18 +233,6 @@ def test_arun_stops_after_user_rejects_command(monkeypatch):
     # Given: 图执行期间终端工具收到用户拒绝信号。
     from agent.agent_core import AgentCore
 
-    class FakeMemory:
-        thread_id = "thread-rejected"
-
-        def get_config(self):
-            return {"configurable": {"thread_id": "thread-rejected"}}
-
-        def add(self, role, content, metadata=None):
-            raise AssertionError("取消的任务不应写入长期记忆")
-
-        async def aadd(self, role, content, metadata=None):
-            self.add(role, content, metadata)
-
     from tools.terminal_tools import run_shell
 
     monkeypatch.setattr("tools.terminal_tools.confirm", lambda prompt: False)
@@ -269,7 +257,7 @@ def test_arun_stops_after_user_rejects_command(monkeypatch):
 
     executor = RejectingExecutor()
     core = object.__new__(AgentCore)
-    core.memory = FakeMemory()
+    core._initial_thread_id = "thread-rejected"
     core.max_iterations = 25
     core.verbose = False
     core._state_lock = asyncio.Lock()
@@ -289,18 +277,6 @@ def test_aresume_stops_after_user_rejects_command():
     # Given: 中断恢复期间（如飞书 deny 选择）用户拒绝危险命令。
     from agent.agent_core import AgentCore
 
-    class FakeMemory:
-        thread_id = "thread-resume-rejected"
-
-        def get_config(self):
-            return {"configurable": {"thread_id": "thread-resume-rejected"}}
-
-        def add(self, role, content, metadata=None):
-            raise AssertionError("取消的任务不应写入长期记忆")
-
-        async def aadd(self, role, content, metadata=None):
-            self.add(role, content, metadata)
-
     class RejectingExecutor:
         def invoke(self, value, config):
             raise UserRejectedCommandError("python cleanup.py")
@@ -318,7 +294,7 @@ def test_aresume_stops_after_user_rejects_command():
     from session.store import SessionStore
 
     core = object.__new__(AgentCore)
-    core.memory = FakeMemory()
+    core._initial_thread_id = "thread-resume-rejected"
     core.max_iterations = 25
     core.verbose = False
     core._state_lock = asyncio.Lock()
@@ -350,18 +326,6 @@ def test_arun_repairs_checkpoint_after_user_rejects_command():
     state = SimpleNamespace(values={"messages": [pending, finished]})
     updates = []
 
-    class FakeMemory:
-        thread_id = "thread-rejected"
-
-        def get_config(self):
-            return {"configurable": {"thread_id": "thread-rejected"}}
-
-        def add(self, role, content, metadata=None):
-            raise AssertionError("取消的任务不应写入长期记忆")
-
-        async def aadd(self, role, content, metadata=None):
-            self.add(role, content, metadata)
-
     class RejectingExecutor:
         def invoke(self, value, config):
             raise UserRejectedCommandError("python cleanup.py")
@@ -383,7 +347,7 @@ def test_arun_repairs_checkpoint_after_user_rejects_command():
 
     executor = RejectingExecutor()
     core = object.__new__(AgentCore)
-    core.memory = FakeMemory()
+    core._initial_thread_id = "thread-rejected"
     core.max_iterations = 25
     core.verbose = False
     core._state_lock = asyncio.Lock()
@@ -404,132 +368,6 @@ def test_arun_repairs_checkpoint_after_user_rejects_command():
     rejected = [message for message in repaired if message.tool_call_id == "call-rejected"]
     assert len(rejected) == 1
     assert rejected[0].status == "error"
-
-
-# ============ arun() / achat() 中断处理 ============
-
-
-def test_arun_and_achat_share_the_same_interrupt_error(monkeypatch, capsys):
-    # Given: 异步运行与异步对话都返回 interrupted turn。
-    from agent.agent_core import AgentCore, AgentTurnResult
-
-    interrupted = AgentTurnResult.interrupted([])
-    core = object.__new__(AgentCore)
-    core._state_lock = asyncio.Lock()
-    async def _return_interrupted_task(task):
-        return interrupted
-
-    async def _return_interrupted_message(message):
-        return interrupted
-
-    core.arun_structured = _return_interrupted_task
-    core.achat_structured = _return_interrupted_message
-    core._afallback_chat = lambda message: pytest.fail("中断不应降级到 fallback")
-
-    # When: 两个公开入口分别执行。
-    with pytest.raises(RuntimeError) as run_error:
-        asyncio.run(core.arun("task"))
-    with pytest.raises(RuntimeError) as chat_error:
-        asyncio.run(core.achat("hello"))
-
-    # Then: 两条路径抛出完全相同的错误信息，包含 aresume 指引。
-    assert str(run_error.value) == str(chat_error.value)
-    assert "aresume()" in str(run_error.value)
-    capsys.readouterr()
-
-
-    # ============ arun() / achat() 异常处理 ============
-
-
-def test_arun_returns_error_message_for_runtime_and_generic_failures(caplog):
-    # Given: 异步运行入口分别抛出非中断 RuntimeError 和普通 Exception。
-    from agent.agent_core import AgentCore
-
-    core = object.__new__(AgentCore)
-    core._state_lock = asyncio.Lock()
-
-    def _raise(exc):
-        async def _raise_exc(task):
-            raise exc
-
-        core.arun_structured = _raise_exc
-        return asyncio.run(core.arun("task"))
-
-    # When: 两类异常先后发生。
-    with caplog.at_level(logging.ERROR, logger="agent.agent_core"):
-        runtime_result = _raise(RuntimeError("boom"))
-        generic_result = _raise(ValueError("bad value"))
-
-    # Then: 两类异常都被转换成同一格式的错误文本而不是向外抛出。
-    assert runtime_result == "任务执行失败: boom"
-    assert generic_result == "任务执行失败: bad value"
-    assert any("任务执行失败: boom" in r.message for r in caplog.records)
-
-
-def test_achat_falls_back_for_non_interrupt_failures():
-    # Given: 异步对话入口抛出非中断的 RuntimeError 与普通 Exception。
-    from agent.agent_core import AgentCore
-
-    class FakeMemory:
-        async def aget_short_term(self):
-            return []
-        
-        def add(self, role, content, metadata=None):
-            pass
-
-        async def aadd(self, role, content, metadata=None):
-            self.add(role, content, metadata)
-
-    class FakeLLM:
-        def chat_with_history(self, user_input, history, system_prompt):
-            return f"fallback:{user_input}"
-
-    core = object.__new__(AgentCore)
-    core._state_lock = asyncio.Lock()
-    core.memory = FakeMemory()
-    core.llm = FakeLLM()
-
-    # 提供 fake session（_afallback_chat 通过 self.session.aget_short_term 读取历史）
-    class _FakeSession:
-        async def aget_short_term(self, session_id=None):
-            return []
-    core._session_registry = _FakeSession()
-
-    def _raise(exc):
-        async def _raise_exc(message):
-            raise exc
-
-        core.achat_structured = _raise_exc
-        return asyncio.run(core.achat("hello"))
-
-    # When: 两类异常先后发生。
-    runtime_result = _raise(RuntimeError("model unavailable"))
-    generic_result = _raise(ValueError("bad payload"))
-
-    # Then: 两类异常都降级为纯 LLM 对话。
-    assert runtime_result == "fallback:hello"
-    assert generic_result == "fallback:hello"
-
-
-def test_achat_reraises_langgraph_interrupt_exceptions():
-    # Given: LangGraph 抛出 GraphInterrupt 这类按类名识别的中断异常。
-    from agent.agent_core import AgentCore
-
-    class GraphInterrupt(Exception):
-        pass
-
-    core = object.__new__(AgentCore)
-    core._state_lock = asyncio.Lock()
-    core._afallback_chat = lambda message: pytest.fail("中断不应降级到 fallback")
-
-    async def _raise_graph_interrupt(message):
-        raise GraphInterrupt("paused")
-
-    core.achat_structured = _raise_graph_interrupt
-
-    # When/Then: 中断异常原样抛出。
-    with pytest.raises(GraphInterrupt):
-        asyncio.run(core.achat("hello"))
 
 
 # ============ _parse_turn_result ============

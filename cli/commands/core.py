@@ -36,7 +36,7 @@ async def show_info(context: CommandContext) -> CommandOutcome:
     context.print(f"\n当前提供商: {info['provider_name']}")
     context.print(f"当前模型:   {info['model']}")
     context.print(f"API地址:    {info['base_url']}")
-    mem = await context.agent.aget_memory_summary()
+    mem = await context.agent.session_manager.aget_memory_summary()
     context.print("\n--- 记忆状态 ---")
     context.print(f"当前会话:   {mem['thread_id']}")
     context.print(f"Checkpoint: {mem['checkpoint_backend']} → {mem['checkpoint_file']}")

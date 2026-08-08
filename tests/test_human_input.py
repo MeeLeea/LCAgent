@@ -143,7 +143,7 @@ def test_resume_structured_invokes_command_resume_with_same_thread_config():
 
     core = object.__new__(AgentCore)
     core.agent_executor = FakeExecutor()
-    core.memory = SimpleNamespace(thread_id="thread-123", get_config=lambda: {"configurable": {"thread_id": "thread-123"}})
+    core._initial_thread_id = "thread-123"
     core.max_iterations = 25
     core._state_lock = asyncio.Lock()
     core._acompact_if_needed = no_compact
@@ -547,21 +547,10 @@ def test_resume_after_switching_thread_proceeds_in_default_chat_mode():
     assert resumed.status == "completed"
 
 
-def test_interrupted_run_records_final_important_assistant_memory_after_resume():
+def test_interrupted_run_completes_after_resume():
     # Given: an interrupted AgentCore run later completes by resume.
+    # Memory recording is now SessionManager's responsibility (three-layer architecture).
     from agent.agent_core import AgentCore
-
-    recorded_events = []
-
-    class FakeWriteMiddleware:
-        async def submit_event(self, thread_id, role, content, important=False):
-            recorded_events.append((thread_id, role, content, important))
-
-    class FakeMemory:
-        thread_id = "thread-memory"
-
-        def get_config(self):
-            return {"configurable": {"thread_id": "thread-memory"}}
 
     class FakeExecutor:
         def __init__(self):
@@ -571,50 +560,27 @@ def test_interrupted_run_records_final_important_assistant_memory_after_resume()
             self.calls += 1
             if self.calls == 1:
                 return {"__interrupt__": [Interrupt(value={"kind": "human_choice"}, id="i-1")]}
-            return {"messages": [AIMessage(content="approved result")]} 
+            return {"messages": [AIMessage(content="approved result")]}
 
         async def ainvoke(self, value, config):
             self.calls += 1
             if self.calls == 1:
                 return {"__interrupt__": [Interrupt(value={"kind": "human_choice"}, id="i-1")]}
-            return {"messages": [AIMessage(content="approved result")]} 
+            return {"messages": [AIMessage(content="approved result")]}
 
     core = object.__new__(AgentCore)
-    core.memory = FakeMemory()
+    core._initial_thread_id = "thread-memory"
     core.agent_executor = FakeExecutor()
     core.max_iterations = 25
     core.verbose = False
     core.agent_core_prompt = "test prompt"
     core._state_lock = asyncio.Lock()
-    core._memory_write_middleware = FakeWriteMiddleware()
 
     # When: run interrupts and then completes after resume.
     interrupted = asyncio.run(core.arun_structured("needs approval"))
     completed = asyncio.run(core.aresume_structured({"choice_id": "approve"}))
 
-    # Then: the final assistant output is saved as important memory after completion.
+    # Then: the run interrupts and resumes correctly.
     assert interrupted.status == "interrupted"
     assert completed.status == "completed"
-    assert ("thread-memory", "assistant", "approved result", True) in recorded_events
-
-
-def test_legacy_run_and_chat_raise_on_interrupt_instead_of_empty_string():
-    # Given: legacy wrappers receive an interrupted structured turn.
-    from agent.agent_core import AgentCore, AgentTurnResult
-
-    interrupted = AgentTurnResult.interrupted([Interrupt(value={}, id="i-1")])
-    core = object.__new__(AgentCore)
-    async def arun_structured(task):
-        return interrupted
-
-    async def achat_structured(message):
-        return interrupted
-
-    core.arun_structured = arun_structured
-    core.achat_structured = achat_structured
-
-    # When / Then: callers get an explicit error instead of an empty string.
-    with pytest.raises(RuntimeError, match="interrupt"):
-        asyncio.run(core.arun("needs approval"))
-    with pytest.raises(RuntimeError, match="interrupt"):
-        asyncio.run(core.achat("needs approval"))
+    assert completed.output == "approved result"

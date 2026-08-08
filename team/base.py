@@ -142,26 +142,6 @@ class TeamAgent:
         
         return "\n".join(system).strip(), templates
     
-    @classmethod
-    def load_workflow_template(cls, prompt_file: str | None, name: str, fallback: str) -> str:
-        """
-        从 AGENT.md 加载指定工作流模板小节
-        
-        Args:
-            prompt_file: AGENT.md 路径(相对项目根或绝对路径),为 None 或文件不存在时用 fallback
-            name: 工作流小节名(如 "manager_plan")
-            fallback: 小节缺失时的默认模板
-        
-        Returns:
-            模板文本
-        """
-        content = cls._read_prompt_file(prompt_file)
-        if content is not None:
-            _, templates = cls.parse_prompt_sections(content)
-            if name in templates:
-                return templates[name]
-        return fallback
-    
     @staticmethod
     def render_template(template: str, **kwargs) -> str:
         """

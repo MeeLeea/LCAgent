@@ -337,28 +337,6 @@ class MetricsCollector:
             self._session_start = time.time()
             self._turn_count = 0
 
-    @property
-    def llm_call_count(self) -> int:
-        return len(self._llm_calls)
-
-    @property
-    def tool_call_count(self) -> int:
-        return len(self._tool_calls)
-
-    @property
-    def compaction_count(self) -> int:
-        return len(self._compactions)
-
-
-def estimate_tokens(text: str) -> int:
-    """粗略估算文本的 token 数（字符数 / 4）
-
-    中英文混合场景下约 4 字符 ≈ 1 token，取整除作为下界估算。
-    """
-    if not text:
-        return 0
-    return max(1, len(text) // 4)
-
 
 __all__ = [
     "CompactionMetric",
@@ -367,5 +345,4 @@ __all__ = [
     "MetricsCollector",
     "ToolCallMetric",
     "ToolStats",
-    "estimate_tokens",
 ]

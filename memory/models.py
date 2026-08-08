@@ -2,7 +2,7 @@
 
 定义长期记忆的核心数据模型：
 - ``ThreadFactItem``: 单条长期记忆（存储到 LangGraph Store）
-- ``AgentEvent``: 待评估是否写入长期记忆的 Agent 事件
+- ``MemoryInputEvent``: 待评估是否写入长期记忆的 Agent 事件（原 AgentEvent，重命名以释放 AgentEvent 给执行事件模型）
 - ``MemoryCategory``: 记忆分类枚举
 - ``judge_long_term_memory``: 事件分类判定函数
 
@@ -74,8 +74,8 @@ class ThreadFactItem:
 
 
 @dataclass
-class AgentEvent:
-    """待评估是否写入长期记忆的事件。
+class MemoryInputEvent:
+    """待评估是否写入长期记忆的事件（原 AgentEvent，重命名以释放 AgentEvent 给执行事件模型）。
 
     由中间件在每轮 Agent 执行结束后构建，传入
     :func:`judge_long_term_memory` 判定分类。
@@ -105,7 +105,7 @@ class AgentEvent:
     is_technical_decision: bool = False
 
 
-def judge_long_term_memory(event: AgentEvent) -> MemoryCategory:
+def judge_long_term_memory(event: MemoryInputEvent) -> MemoryCategory:
     """判断一条 Agent 事件是否下沉长期记忆。
 
     返回分类；返回 :attr:`MemoryCategory.SKIP` 表示只保存在 checkpoint 短期会话记忆。
@@ -168,7 +168,7 @@ def judge_long_term_memory(event: AgentEvent) -> MemoryCategory:
 
 
 __all__ = [
-    "AgentEvent",
+    "MemoryInputEvent",
     "MemoryCategory",
     "ThreadFactItem",
     "judge_long_term_memory",

@@ -42,12 +42,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 def mock_agent():
     """Mock AgentCore 实例"""
     agent = MagicMock()
-    agent.memory = MagicMock()
-    agent.memory.thread_id = "test-thread-123"
-    agent.memory._async_mode = False
-    agent.memory.aclear_long_term = AsyncMock()
-
-    # 会话管理已迁移到 agent.session
     agent.session = MagicMock()
     agent.session.current_session_id = "test-thread-123"
     agent.session.new_session = MagicMock(return_value="new-thread-456")
@@ -59,25 +53,27 @@ def mock_agent():
     agent.session.workflow_name_of = MagicMock(return_value=None)
     agent.session.aswitch_session = AsyncMock()
     agent.session.aexport_session = AsyncMock()
-    agent.aget_memory_summary = AsyncMock(return_value={
+
+    # session_manager mock（三层架构：所有上层流量通过 session_manager）
+    agent.session_manager.aget_memory_summary = AsyncMock(return_value={
         "thread_id": "test-thread-123",
         "checkpoint_messages": 10,
         "checkpoint_backend": "sqlite",
-        "checkpoint_file": "memory/checkpoints.sqlite",
+        "checkpoint_file": "data/checkpoints.sqlite",
         "long_term_count": 5,
         "total_threads": 3,
     })
 
     # execute_command 端点用 set_current_session 切换当前会话
     agent.set_current_session = MagicMock()
-    agent.aclear_long_term_memory = AsyncMock(return_value=2)
+    agent.session_manager.aclear_long_term_memory = AsyncMock(return_value=2)
     agent.get_available_tools = MagicMock(return_value=["calculator", "web_search", "ask_human"])
     agent.switch_llm = MagicMock()
     agent.aswitch_llm = AsyncMock(side_effect=agent.switch_llm)
     agent.aclose = AsyncMock(return_value=None)
     
-    # Mock astream_chat：普通对话返回 token + done 事件
-    async def mock_astream_chat(message: str, thread_id: str | None = None) -> AsyncIterator[dict[str, Any]]:
+    # Mock achat_stream（通过 session_manager）：普通对话返回 token + done 事件
+    async def mock_achat_stream(message: str, thread_id: str | None = None) -> AsyncIterator[dict[str, Any]]:
         if "工具调用" in message:
             # 模拟工具调用场景
             yield {"type": "token", "content": "正在"}
@@ -106,17 +102,20 @@ def mock_agent():
             yield {"type": "token", "content": "，"}
             yield {"type": "token", "content": "有什么可以帮你"}
             yield {"type": "done"}
-    
-    agent.astream_chat = mock_astream_chat
-    
-    # Mock astream_resume：HITL 恢复
-    async def mock_astream_resume(payload: dict[str, Any], thread_id: str | None = None) -> AsyncIterator[dict[str, Any]]:
+
+    agent.session_manager.achat_stream = mock_achat_stream
+
+    # Mock aresume_stream（通过 session_manager）：HITL 恢复
+    async def mock_aresume_stream(payload: dict[str, Any], thread_id: str | None = None) -> AsyncIterator[dict[str, Any]]:
         user_response = payload.get("user_response", "")
         yield {"type": "token", "content": f"收到回复：{user_response}"}
         yield {"type": "token", "content": "，继续执行"}
         yield {"type": "done"}
-    
-    agent.astream_resume = mock_astream_resume
+
+    agent.session_manager.aresume_stream = mock_aresume_stream
+
+    # Mock aclose（lifespan 关闭时调用）
+    agent.session_manager.aclose = AsyncMock(return_value=None)
 
     # Mock metrics 收集器
     agent.metrics = MagicMock()
@@ -164,15 +163,15 @@ def mock_agent():
     })
     agent.metrics.reset = MagicMock()
 
-    # Mock manually_compact（异步）
-    agent.manually_compact = AsyncMock(return_value={
+    # Mock manually_compact（异步，通过 session_manager）
+    agent.session_manager.manually_compact = AsyncMock(return_value={
         "summary": "用户讨论了 API 设计和测试策略",
         "messages_before": 60,
         "messages_after": 22,
     })
 
-    # Mock 记忆压缩（异步接口）
-    agent.acompress_memory = AsyncMock(return_value={
+    # Mock 记忆压缩（异步接口，通过 session_manager）
+    agent.session_manager.acompress_memory = AsyncMock(return_value={
         "success": True,
         "original_count": 5,
         "original_chars": 2000,
@@ -184,6 +183,9 @@ def mock_agent():
         {"name": "pptx", "description": "PPT 生成技能"},
         {"name": "pdf", "description": "PDF 处理技能"},
     ])
+
+    # MagicMock 自动创建属性，需显式设为 None 避免 lifespan 中 await 失败
+    agent._memory_context = None
 
     return agent
 
@@ -1188,7 +1190,7 @@ def test_get_metrics_no_agent(mock_llm):
     with patch("api.server.agent", None), \
          patch("api.server.llm", mock_llm), \
          patch("api.server.pick_default_provider", return_value="zhipu"), \
-         patch("api.server.build_agent", AsyncMock(return_value=(MagicMock(get_available_tools=MagicMock(return_value=[]), metrics=None, aclose=AsyncMock()), mock_llm))), \
+         patch("api.server.build_agent", AsyncMock(return_value=(MagicMock(get_available_tools=MagicMock(return_value=[]), metrics=None, aclose=AsyncMock(), session_manager=MagicMock(aclose=AsyncMock()), _memory_context=None), mock_llm))), \
          patch("api.server.safety_module.set_confirm_backend"):
         from api.server import app
         with TestClient(app) as c, patch("api.server.agent", None), patch("api.server.llm", mock_llm):
@@ -1214,7 +1216,7 @@ def test_compact_success(client, mock_agent):
 
 def test_compact_no_need(client, mock_agent):
     """测试消息数未超阈值时返回 compacted=False"""
-    mock_agent.manually_compact = AsyncMock(return_value=None)
+    mock_agent.session_manager.manually_compact = AsyncMock(return_value=None)
     response = client.post("/api/compact")
     assert response.status_code == 200
 
@@ -1225,7 +1227,7 @@ def test_compact_no_need(client, mock_agent):
 
 def test_compact_error(client, mock_agent):
     """测试压缩异常返回 500"""
-    mock_agent.manually_compact = AsyncMock(side_effect=RuntimeError("压缩失败"))
+    mock_agent.session_manager.manually_compact = AsyncMock(side_effect=RuntimeError("压缩失败"))
     response = client.post("/api/compact")
     assert response.status_code == 500
     assert "压缩失败" in response.json()["detail"]
@@ -1255,7 +1257,7 @@ def test_compress_memory(client, mock_agent):
     assert data["success"] is True
     assert data["original_count"] == 5
     assert data["compressed_chars"] == 500
-    mock_agent.acompress_memory.assert_awaited_once()
+    mock_agent.session_manager.acompress_memory.assert_awaited_once()
 
 
 def test_clear_memory_long(client, mock_agent):
@@ -1266,7 +1268,7 @@ def test_clear_memory_long(client, mock_agent):
     data = response.json()
     assert data["cleared"] is True
     assert data["scope"] == "long"
-    mock_agent.aclear_long_term_memory.assert_awaited_once()
+    mock_agent.session_manager.aclear_long_term_memory.assert_awaited_once()
     mock_agent.session.new_session.assert_not_called()
 
 
@@ -1278,7 +1280,7 @@ def test_clear_memory_short(client, mock_agent):
     data = response.json()
     assert data["scope"] == "short"
     mock_agent.session.new_session.assert_called_once()
-    mock_agent.aclear_long_term_memory.assert_not_called()
+    mock_agent.session_manager.aclear_long_term_memory.assert_not_called()
 
 
 def test_clear_memory_all(client, mock_agent):
@@ -1288,7 +1290,7 @@ def test_clear_memory_all(client, mock_agent):
 
     data = response.json()
     assert data["scope"] == "all"
-    mock_agent.aclear_long_term_memory.assert_awaited_once()
+    mock_agent.session_manager.aclear_long_term_memory.assert_awaited_once()
     mock_agent.session.new_session.assert_called_once()
 
 

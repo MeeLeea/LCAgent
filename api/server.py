@@ -49,6 +49,7 @@ from agent.llm_client import LLMClient, load_providers
 from agent.message_utils import stringify_content  # 消息内容序列化
 from cli.commands import CommandContext, dispatch_command
 from cli.commands.provider import create_llm
+from memory import MemoryContext
 from tools import safety as safety_module
 
 # --------------------------------------------------------------------------- #
@@ -58,8 +59,7 @@ LLM_FILE = os.path.join(BASE_DIR, "config", "llm_config.json")
 MCP_CONFIG_FILE = os.path.join(BASE_DIR, "config", "mcp_servers.json")
 AGENT_CONFIG_FILE = os.path.join(BASE_DIR, "agent", "agent_config.json")
 SERVER_CONFIG_FILE = os.path.join(BASE_DIR, "config", "server_config.json")
-MEMORY_FILE = os.path.join(BASE_DIR, "memory", "memory.json")
-CHECKPOINT_FILE = os.path.join(BASE_DIR, "memory", "checkpoints_async.sqlite")
+CHECKPOINT_FILE = os.path.join(BASE_DIR, "data", "checkpoints_async.sqlite")
 WEB_DIST = os.path.join(BASE_DIR, "web", "dist")
 
 
@@ -131,12 +131,21 @@ async def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
     agent_prompt_file = cfg.get("agent_prompt_file")
     skills_dir = resolve_path(cfg["skills_dir"], BASE_DIR)
     mcp_config_file = resolve_path(cfg["mcp_config_file"], BASE_DIR)
+    # 三层架构：先创建 MemoryContext（记忆基础设施），再创建 AgentCore（纯执行内核）
+    memory_ctx = await MemoryContext.acreate(
+        checkpoint_file=CHECKPOINT_FILE,
+        short_term_size=cfg["memory_size"],
+        use_sqlite=True,
+        process_type="server",
+        llm_getter=lambda: new_llm,
+        buffer_delay_seconds=cfg.get("memory_buffer_delay_seconds", 20),
+        max_buffer_messages=cfg.get("memory_max_buffer_messages", 30),
+        max_facts_per_thread=cfg.get("memory_max_facts_per_thread", 50),
+        recall_limit=cfg.get("memory_recall_limit", 10),
+    )
     new_agent = await AgentCore.acreate(
         llm_client=new_llm,
         name=cfg["name"],
-        memory_size=cfg["memory_size"],
-        long_term_memory_file=MEMORY_FILE,
-        checkpoint_file=CHECKPOINT_FILE,
         max_iterations=cfg["max_iterations"],
         verbose=cfg["verbose"],
         mcp_config_file=mcp_config_file,
@@ -149,7 +158,15 @@ async def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
         agent_prompt_file=agent_prompt_file,
         max_execution_history=cfg.get("max_execution_history", 100),
         tool_timeout=cfg.get("tool_timeout", 120),
+        checkpointer=memory_ctx.checkpointer,
+        store=memory_ctx.store,
+        extra_middleware=[memory_ctx.read_middleware],
+        initial_thread_id=memory_ctx.thread_id,
+        async_conn=memory_ctx.async_conn,
     )
+    # 注入 MemoryManager → SessionManager 懒初始化时会自动接收
+    new_agent.set_memory_manager(memory_ctx.memory_manager)
+    new_agent._memory_context = memory_ctx  # 供 aclose 时关闭 SQLite 连接
     return new_agent, new_llm
 
 
@@ -168,7 +185,11 @@ async def lifespan(_: FastAPI):
         yield
     finally:
         if agent is not None:
-            await agent.aclose()
+            await agent.session_manager.aclose()
+            # 关闭 MemoryContext（释放 SQLite 连接等底层资源）
+            mem_ctx = getattr(agent, "_memory_context", None)
+            if mem_ctx is not None:
+                await mem_ctx.aclose()
         agent = None
         llm = None
 
@@ -581,7 +602,7 @@ def _is_execution_command(command: str) -> bool:
         command: 去掉了前导 ``/`` 的命令字符串
 
     Returns:
-        是否为执行型命令。是则走 astream_chat 流式通道，否则走 dispatch_command 管理通道。
+        是否为执行型命令。是则走 session_manager.achat_stream 流式通道，否则走 dispatch_command 管理通道。
     """
     low = command.lower()
     if low.startswith(("json:", "react:", "cot:")):
@@ -682,8 +703,8 @@ async def chat(req: ChatRequest):
                     if _is_execution_command(command):
                         # 执行型命令：走流式 runner，显式传 thread_id 保证多会话隔离
                         logger.info("执行型命令 [%s]，走流式通道", tid)
-                        # 把命令原文传给 astream_chat（它会自动匹配技能）
-                        async for ev in agent.astream_chat(command, thread_id=tid):
+                        # 把命令原文传给 achat_stream（它会自动匹配技能）
+                        async for ev in agent.session_manager.achat_stream(command, thread_id=tid):
                             yield _sse(_enrich_done(ev))
                         logger.info("完成 [%s]", tid)
                         return
@@ -737,7 +758,7 @@ async def chat(req: ChatRequest):
             
             # 普通对话模式（显式传 thread_id 实现多会话隔离）
             try:
-                async for event in agent.astream_chat(message, thread_id=tid):
+                async for event in agent.session_manager.achat_stream(message, thread_id=tid):
                     yield _sse(_enrich_done(event))
                 logger.info("完成 [%s]", tid)
             except Exception as e:
@@ -765,7 +786,7 @@ async def chat_resume(req: ResumeRequest):
         logger.info("恢复会话 [%s]", tid)
         async with _thread_lock(tid):
             try:
-                async for event in agent.astream_resume(req.payload, thread_id=tid):
+                async for event in agent.session_manager.aresume_stream(req.payload, thread_id=tid):
                     yield _sse(event)
                 logger.info("恢复完成 [%s]", tid)
             except Exception as e:
@@ -905,7 +926,7 @@ async def compact_context(thread_id: str | None = None):
     logger.info("手动压缩上下文 [%s]", tid)
     async with _thread_lock(tid):
         try:
-            result = await agent.manually_compact(thread_id=tid)
+            result = await agent.session_manager.manually_compact(thread_id=tid)
         except Exception as e:
             logger.error("压缩失败 [%s]: %s", tid, e)
             raise HTTPException(status_code=500, detail=f"压缩失败: {e}")
@@ -923,7 +944,7 @@ async def get_memory_summary():
     """获取记忆摘要统计（当前会话消息数、长期记忆条数、checkpoint 信息）"""
     if not agent:
         raise HTTPException(status_code=503, detail="Agent 未初始化")
-    return await agent.aget_memory_summary()
+    return await agent.session_manager.aget_memory_summary()
 
 
 @app.post("/api/compress")
@@ -935,7 +956,7 @@ async def compress_long_term_memory():
     async with chat_lock:
         logger.info("压缩长期记忆")
         try:
-            result = await agent.acompress_memory()
+            result = await agent.session_manager.acompress_memory()
         except Exception as e:
             logger.error("长期记忆压缩失败: %s", e)
             raise HTTPException(status_code=500, detail=f"压缩失败: {e}")
@@ -953,7 +974,7 @@ async def clear_memory(scope: str = "long"):
     """
     async with chat_lock:
         if scope in ("long", "长期"):
-            cleared = await agent.aclear_long_term_memory()
+            cleared = await agent.session_manager.aclear_long_term_memory()
             logger.info("已清空长期记忆 (%d 条 facts)", cleared)
         elif scope in ("short", "短期"):
             # 短期记忆 = 当前会话 checkpoint；开启新会话替代删除
@@ -961,7 +982,7 @@ async def clear_memory(scope: str = "long"):
             agent.set_current_session(tid)
             logger.info("已清空短期记忆（新会话: %s）", tid)
         elif scope in ("all", "全部"):
-            cleared = await agent.aclear_long_term_memory()
+            cleared = await agent.session_manager.aclear_long_term_memory()
             tid = agent.session.new_session()
             agent.set_current_session(tid)
             logger.info("已清空全部记忆 (长期 %d 条 facts + 短期，新会话: %s)", cleared, tid)

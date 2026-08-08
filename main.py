@@ -20,13 +20,13 @@ from cli.commands import CommandContext, dispatch_command
 from cli.commands.core import show_ready
 from cli.commands.provider import create_llm, select_provider
 from cli.human_input import chat_until_completion, run_structured_until_completion
+from memory import MemoryContext
 from tools import safety as safety_module
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LLM_FILE = os.path.join(BASE_DIR, "config", "llm_config.json")
 MCP_CONFIG_FILE = os.path.join(BASE_DIR, "config", "mcp_servers.json")
 AGENT_CONFIG_FILE = os.path.join(BASE_DIR, "agent", "agent_config.json")
-MEMORY_FILE = os.path.join(BASE_DIR, "memory", "memory.json")
 CHECKPOINT_FILE = os.path.join(BASE_DIR, "memory", "checkpoints_async.sqlite")
 
 
@@ -55,12 +55,21 @@ async def build_agent(provider: str, process_type: str | None = None) -> tuple[A
     skills_dir = resolve_path(config["skills_dir"], BASE_DIR)
     mcp_config_file = resolve_path(config["mcp_config_file"], BASE_DIR)
     print("初始化Agent(含MCP工具加载 + Checkpoint 持久化)...")
+    # 三层架构：先创建 MemoryContext（记忆基础设施），再创建 AgentCore（纯执行内核）
+    memory_ctx = await MemoryContext.acreate(
+        checkpoint_file=CHECKPOINT_FILE,
+        short_term_size=config["memory_size"],
+        use_sqlite=True,
+        process_type=process_type,
+        llm_getter=lambda: llm,
+        buffer_delay_seconds=config.get("memory_buffer_delay_seconds", 20),
+        max_buffer_messages=config.get("memory_max_buffer_messages", 30),
+        max_facts_per_thread=config.get("memory_max_facts_per_thread", 50),
+        recall_limit=config.get("memory_recall_limit", 10),
+    )
     agent = await AgentCore.acreate(
         llm_client=llm,
         name=config["name"],
-        memory_size=config["memory_size"],
-        long_term_memory_file=MEMORY_FILE,
-        checkpoint_file=CHECKPOINT_FILE,
         max_iterations=config["max_iterations"],
         verbose=config["verbose"],
         mcp_config_file=mcp_config_file,
@@ -73,7 +82,15 @@ async def build_agent(provider: str, process_type: str | None = None) -> tuple[A
         agent_prompt_file=agent_prompt_file,
         max_execution_history=config.get("max_execution_history", 100),
         tool_timeout=config.get("tool_timeout", 120),
+        checkpointer=memory_ctx.checkpointer,
+        store=memory_ctx.store,
+        extra_middleware=[memory_ctx.read_middleware],
+        initial_thread_id=memory_ctx.thread_id,
+        async_conn=memory_ctx.async_conn,
     )
+    # 注入 MemoryManager → SessionManager 懒初始化时会自动接收
+    agent.set_memory_manager(memory_ctx.memory_manager)
+    agent._memory_context = memory_ctx  # 供 aclose 时关闭 SQLite 连接
     return agent, llm
 
 
@@ -127,7 +144,11 @@ async def main() -> None:
                 print(f"\n错误: {error}")
                 print("请重试...")
     finally:
-        await agent.aclose()
+        await agent.session_manager.aclose()
+        # 关闭 MemoryContext（释放 SQLite 连接等底层资源）
+        mem_ctx = getattr(agent, "_memory_context", None)
+        if mem_ctx is not None:
+            await mem_ctx.aclose()
 
 
 if __name__ == "__main__":

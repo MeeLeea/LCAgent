@@ -7,7 +7,7 @@
 
 设计要点：
     - 工具通过模块级 configure() 注入 TaskStore 和可选的 SchedulerEngine
-    - 未 configure 时使用默认 DB 路径（memory/scheduled_tasks.sqlite）
+    - 未 configure 时使用默认 DB 路径（data/scheduled_tasks.sqlite）
     - 周期任务登记时，若引擎已运行则立即注册 cron job；否则等引擎启动时同步
     - 返回 JSON 字符串（与项目中 get_local_time 等工具风格一致）
 """
@@ -19,10 +19,10 @@ from langchain_core.tools import tool
 
 from scheduler.store import TaskStore
 
-# ---- 默认 DB 路径（锚定项目根的 memory/ 目录） ---
+# ---- 默认 DB 路径（锚定项目根的 data/ 目录） ---
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_DEFAULT_DB_PATH = os.path.join(_PROJECT_ROOT, "memory", "scheduled_tasks.sqlite")
+_DEFAULT_DB_PATH = os.path.join(_PROJECT_ROOT, "data", "scheduled_tasks.sqlite")
 
 
 # ---- 模块级单例（通过 configure 注入） ---

@@ -163,24 +163,6 @@ class MCPServerConnection:
             self._tools = []
             self._status = ServerStatus.DISCONNECTED
 
-    async def health_check(self) -> bool:
-        """健康检查：尝试获取工具列表，成功则视为健康
-
-        Returns:
-            True=健康, False=不健康
-        """
-        if self._status != ServerStatus.CONNECTED:
-            return False
-
-        try:
-            if self._client is None:
-                return False
-            # 用缓存的工具列表做轻量检查：工具列表非空即视为健康
-            # （真正的 get_tools 调用开销大，仅在 reconnect 时做）
-            return len(self._tools) > 0
-        except Exception:
-            return False
-
     def get_info(self) -> ServerInfo:
         """获取状态信息"""
         transport = self.config.get("transport", "stdio")
@@ -223,10 +205,6 @@ class MCPPool:
         self.config_file = config_file
         self._connections: dict[str, MCPServerConnection] = {}
         self._lock = asyncio.Lock()
-
-    @property
-    def connections(self) -> dict[str, MCPServerConnection]:
-        return dict(self._connections)
 
     def _load_config(self) -> dict[str, dict[str, Any]]:
         """读取配置文件中的已启用 server"""
@@ -297,15 +275,6 @@ class MCPPool:
             return await conn.reconnect()
         return False
 
-    async def reload_all(self) -> int:
-        """重连所有 server
-
-        Returns:
-            成功加载的工具总数
-        """
-        await self.initialize()
-        return len(self.get_all_tools())
-
     def get_all_tools(self) -> list[BaseTool]:
         """获取所有已连接 server 的工具列表"""
         tools: list[BaseTool] = []
@@ -317,11 +286,6 @@ class MCPPool:
     def get_server_infos(self) -> list[ServerInfo]:
         """获取所有 server 的状态信息"""
         return [conn.get_info() for conn in self._connections.values()]
-
-    def get_server_info(self, name: str) -> ServerInfo | None:
-        """获取单个 server 的状态信息"""
-        conn = self._connections.get(name)
-        return conn.get_info() if conn else None
 
     async def close(self) -> None:
         """关闭所有连接"""

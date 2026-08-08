@@ -19,13 +19,11 @@ from agent.logging_config import (
     LOG_LEVELS,
     StructuredFormatter,
     TraceContext,
+    _thread_id,
+    _trace_id,
     generate_trace_id,
-    get_log_level,
     get_log_level_name,
-    get_thread_id,
-    get_trace_id,
     set_log_level,
-    set_trace_context,
     setup_logging,
 )
 
@@ -38,43 +36,43 @@ class TestTraceContext:
     """TraceContext 上下文管理器测试"""
 
     def test_set_trace_id_within_context(self):
-        assert get_trace_id() == "-"
+        assert _trace_id.get() == "-"
 
         with TraceContext(trace_id="abc123"):
-            assert get_trace_id() == "abc123"
+            assert _trace_id.get() == "abc123"
 
         # 退出后恢复
-        assert get_trace_id() == "-"
+        assert _trace_id.get() == "-"
 
     def test_set_thread_id_within_context(self):
-        assert get_thread_id() == "-"
+        assert _thread_id.get() == "-"
 
         with TraceContext(thread_id="thread-xyz"):
-            assert get_thread_id() == "thread-xyz"
+            assert _thread_id.get() == "thread-xyz"
 
-        assert get_thread_id() == "-"
+        assert _thread_id.get() == "-"
 
     def test_set_both(self):
         with TraceContext(trace_id="t1", thread_id="th1"):
-            assert get_trace_id() == "t1"
-            assert get_thread_id() == "th1"
+            assert _trace_id.get() == "t1"
+            assert _thread_id.get() == "th1"
 
-        assert get_trace_id() == "-"
-        assert get_thread_id() == "-"
+        assert _trace_id.get() == "-"
+        assert _thread_id.get() == "-"
 
     def test_nested_contexts(self):
         with TraceContext(trace_id="outer"):
-            assert get_trace_id() == "outer"
+            assert _trace_id.get() == "outer"
             with TraceContext(trace_id="inner"):
-                assert get_trace_id() == "inner"
+                assert _trace_id.get() == "inner"
             # 退出 inner 后恢复到 outer
-            assert get_trace_id() == "outer"
+            assert _trace_id.get() == "outer"
 
-        assert get_trace_id() == "-"
+        assert _trace_id.get() == "-"
 
     def test_auto_generate_trace_id(self):
         with TraceContext(auto_generate_trace=True) as ctx:
-            tid = get_trace_id()
+            tid = _trace_id.get()
             assert tid != "-"
             assert len(tid) == 8
             assert ctx.trace_id == tid
@@ -82,16 +80,8 @@ class TestTraceContext:
     def test_no_args_does_nothing(self):
         """不传任何参数时，上下文不做任何修改"""
         with TraceContext():
-            assert get_trace_id() == "-"
-            assert get_thread_id() == "-"
-
-    def test_set_trace_context_function(self):
-        """set_trace_context 直接设置（不自动恢复）"""
-        set_trace_context(trace_id="direct", thread_id="th-direct")
-        assert get_trace_id() == "direct"
-        assert get_thread_id() == "th-direct"
-        # 清理（不污染其他测试）
-        set_trace_context(trace_id="-", thread_id="-")
+            assert _trace_id.get() == "-"
+            assert _thread_id.get() == "-"
 
     def test_generate_trace_id_format(self):
         tid = generate_trace_id()
@@ -252,7 +242,7 @@ class TestAsyncTraceContext:
         async def run():
             with TraceContext(trace_id="async-1"):
                 await asyncio.sleep(0.001)
-                return get_trace_id()
+                return _trace_id.get()
 
         result = asyncio.run(run())
         assert result == "async-1"
@@ -262,7 +252,7 @@ class TestAsyncTraceContext:
         async def task(trace_id: str) -> str:
             with TraceContext(trace_id=trace_id):
                 await asyncio.sleep(0.01)
-                return get_trace_id()
+                return _trace_id.get()
 
         async def main():
             results = await asyncio.gather(
@@ -279,7 +269,7 @@ class TestAsyncTraceContext:
         async def run():
             with TraceContext(trace_id="temp"):
                 await asyncio.sleep(0)
-            return get_trace_id()
+            return _trace_id.get()
 
         result = asyncio.run(run())
         assert result == "-"
@@ -287,7 +277,7 @@ class TestAsyncTraceContext:
     def test_trace_context_with_async_with(self):
         async def run():
             async with TraceContext(trace_id="aio-ctx", thread_id="aio-th"):
-                return get_trace_id(), get_thread_id()
+                return _trace_id.get(), _thread_id.get()
 
         tid, thid = asyncio.run(run())
         assert tid == "aio-ctx"
@@ -304,24 +294,24 @@ class TestRuntimeLogLevel:
 
     def test_set_log_level_with_string_name(self):
         """通过字符串名称设置级别（不区分大小写）"""
-        original = get_log_level()
+        original = logging.getLogger().level
         try:
             set_log_level("DEBUG")
-            assert get_log_level() == logging.DEBUG
+            assert logging.getLogger().level == logging.DEBUG
             assert get_log_level_name() == "DEBUG"
 
             set_log_level("warning")
-            assert get_log_level() == logging.WARNING
+            assert logging.getLogger().level == logging.WARNING
             assert get_log_level_name() == "WARNING"
         finally:
             logging.getLogger().setLevel(original)
 
     def test_set_log_level_with_int_constant(self):
         """通过 logging 整型常量设置级别"""
-        original = get_log_level()
+        original = logging.getLogger().level
         try:
             set_log_level(logging.ERROR)
-            assert get_log_level() == logging.ERROR
+            assert logging.getLogger().level == logging.ERROR
             assert get_log_level_name() == "ERROR"
         finally:
             logging.getLogger().setLevel(original)
@@ -336,18 +326,9 @@ class TestRuntimeLogLevel:
         with pytest.raises(TypeError, match="必须为 str 或 int"):
             set_log_level(None)  # type: ignore[arg-type]
 
-    def test_get_log_level_returns_current(self):
-        """get_log_level 返回当前 root logger 级别"""
-        original = get_log_level()
-        try:
-            logging.getLogger().setLevel(logging.CRITICAL)
-            assert get_log_level() == logging.CRITICAL
-        finally:
-            logging.getLogger().setLevel(original)
-
     def test_get_log_level_name_returns_readable_string(self):
         """get_log_level_name 返回可读级别名称"""
-        original = get_log_level()
+        original = logging.getLogger().level
         try:
             logging.getLogger().setLevel(logging.INFO)
             assert get_log_level_name() == "INFO"

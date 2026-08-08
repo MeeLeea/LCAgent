@@ -37,7 +37,7 @@ sys.path.insert(0, BASE_DIR)
 from main import LLM_FILE, build_agent
 
 REMOTE_CONFIG_FILE = os.path.join(BASE_DIR, "config", "remote_control.json")
-REMOTE_THREAD_FILE = os.path.join(BASE_DIR, "memory", "remote_thread_id.txt")
+REMOTE_THREAD_FILE = os.path.join(BASE_DIR, "data", "remote_thread_id.txt")
 
 logger = logging.getLogger(__name__)
 
@@ -364,7 +364,7 @@ def _handle_status(chat_id: str) -> None:
     extra = ""
     if agent:
         try:
-            history = _run_on_agent_loop(lambda: agent.aget_execution_history(), timeout=5)
+            history = _run_on_agent_loop(lambda: agent.session_manager.aget_execution_history(), timeout=5)
             extra = f" | 工具:{len(agent.tools)} 步骤:{len(history)}"
         except Exception:
             extra = f" | 工具:{len(agent.tools)}"

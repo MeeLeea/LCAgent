@@ -53,9 +53,12 @@ class FakeAgent:
 
     def get_template(self, name: str) -> str:
         """懒加载模板:优先读 AGENT.md 小节,缺失回退默认模板"""
-        return TeamAgent.load_workflow_template(
-            self.prompt_file, name, self.default_templates.get(name, "")
-        )
+        content = TeamAgent._read_prompt_file(self.prompt_file)
+        if content is not None:
+            _, templates = TeamAgent.parse_prompt_sections(content)
+            if name in templates:
+                return templates[name]
+        return self.default_templates.get(name, "")
 
     def render_template(self, template: str, **kwargs) -> str:
         """占位符替换"""
@@ -191,16 +194,6 @@ def test_parse_prompt_sections():
     assert "请制定计划" not in system
     assert templates["manager_plan"] == "请制定计划:\n{task}"
     assert templates["summarize_context"] == "你是一个提炼助手。"
-
-
-def test_load_workflow_template(tmp_path):
-    """测试从 AGENT.md 加载工作流模板,小节缺失/文件缺失回退默认"""
-    prompt_file = tmp_path / "AGENT.md"
-    prompt_file.write_text("## workflow:worker_exec\n\n请执行计划:\n{plan}", encoding="utf-8")
-
-    assert TeamAgent.load_workflow_template(str(prompt_file), "worker_exec", "默认") == "请执行计划:\n{plan}"
-    assert TeamAgent.load_workflow_template(str(prompt_file), "manager_plan", "默认计划") == "默认计划"
-    assert TeamAgent.load_workflow_template(None, "worker_exec", "默认") == "默认"
 
 
 def test_render_template():
@@ -549,20 +542,19 @@ def test_run_simple_workflow_with_memory():
     assert result["final_answer"] == "最终答案: 完成"
 
 
-class FakeFact:
-    """模拟 ThreadFactItem"""
-    def __init__(self, content, category="important"):
-        self.content = content
-        self.category = category
+class FakeMemoryManager:
+    """模拟 MemoryManager 的 recall_text 接口"""
+    def __init__(self, recall_text_result: str = ""):
+        self._recall_text_result = recall_text_result
+
+    async def recall_text(self, thread_id: str, limit: int | None = None) -> str:
+        return self._recall_text_result
 
 
-class FakeLongTermMemory:
-    """模拟 ThreadMemoryStore 的 query_facts 接口"""
-    def __init__(self, facts=None):
-        self._facts = facts or []
-
-    async def query_facts(self, thread_id):
-        return self._facts
+class FakeSessionManager:
+    """模拟 SessionManager，暴露 memory 属性"""
+    def __init__(self, memory=None):
+        self.memory = memory
 
 
 class FakeMemory:
@@ -595,8 +587,10 @@ def test_build_memory_context():
     class FakeAgent:
         def __init__(self):
             self.session = FakeSession()
-            self.long_term_memory = FakeLongTermMemory(
-                facts=[FakeFact("用户偏好中文", "important")]
+            self._session_manager = FakeSessionManager(
+                memory=FakeMemoryManager(
+                    recall_text_result="【长期记忆】\n- [记忆] 用户偏好中文\n"
+                )
             )
 
     text = asyncio.run(abuild_memory_context(FakeAgent()))
@@ -621,7 +615,9 @@ def test_build_memory_context_empty():
     class FakeAgent:
         def __init__(self):
             self.session = FakeSession()
-            self.long_term_memory = FakeLongTermMemory()
+            self._session_manager = FakeSessionManager(
+                memory=FakeMemoryManager(recall_text_result="")
+            )
 
     assert asyncio.run(abuild_memory_context(FakeAgent())) == ""
 
@@ -642,7 +638,7 @@ def test_build_memory_context_truncation(monkeypatch):
     class FakeAgent:
         def __init__(self):
             self.session = FakeSession()
-            self.long_term_memory = FakeLongTermMemory()
+            # 无 _session_manager，长期记忆跳过，仅短期记忆触发截断
 
     text = asyncio.run(abuild_memory_context(FakeAgent()))
     assert "已截断" in text
@@ -671,7 +667,6 @@ class FakeAgentCore:
         self.agent_executor = FakeExecutor()
         self.memory = FakeMemory()
         self.session = FakeSession()
-        self.long_term_memory = FakeLongTermMemory()
 
     def _invoke_config(self, thread_id=None):
         return {"configurable": {"thread_id": "t1"}}

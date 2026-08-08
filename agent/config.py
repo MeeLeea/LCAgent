@@ -2,16 +2,25 @@
 运行时配置加载 - 将原本硬编码在 main.py 的参数外置到 agent/agent_config.json
 
 支持的键(均带默认值,缺省不报错):
-    name                  str   Agent 名称
-    max_iterations        int   单次 invoke 最大推理步数(recursion_limit)
-    skills_dir            str    技能目录(相对项目根或绝对路径)
-    auto_match_skills     bool   任务自动匹配并注入技能
-    enable_mcp            bool   是否加载 MCP 工具
-    memory_size           int    兼容旧 API 的记忆容量
-    verbose               bool   是否打印详细过程
-    mcp_config_file       str    MCP 配置文件(相对项目根或绝对路径)
-    max_context_messages  int    长上下文裁剪阈值(0=关闭)
-    context_trim_keep     int    裁剪时保留的最近消息条数
+    name                       str   Agent 名称
+    max_iterations             int   单次 invoke 最大推理步数(recursion_limit)
+    skills_dir                 str    技能目录(相对项目根或绝对路径)
+    auto_match_skills          bool   任务自动匹配并注入技能
+    enable_mcp                 bool   是否加载 MCP 工具
+    memory_size                int    短期消息窗口大小（传递给 SessionRegistry.aget_short_term）
+    verbose                    bool   是否打印详细过程
+    mcp_config_file            str    MCP 配置文件(相对项目根或绝对路径)
+    max_context_messages       int    长上下文裁剪阈值(0=关闭)
+    context_trim_keep          int    裁剪时保留的最近消息条数
+    max_execution_history      int    执行历史最大条数
+    tool_timeout               int    工具调用超时(秒)
+
+Memory 层配置（默认值见 memory/config.py，JSON 中同名键自动透传）:
+    memory_buffer_delay_seconds   int  记忆写入防抖延迟(秒)
+    memory_max_buffer_messages    int  防抖 buffer 最大消息数(超出强制刷新)
+    memory_max_facts_per_thread   int  单线程最大 fact 条数(超出 LRU 淘汰)
+    memory_recall_limit           int  召回长期记忆时的默认条数上限
+    session_enable_memory         bool SessionManager 是否启用长期记忆处理
 
 Agent 核心提示词加载顺序：
     1. agent/AGENT.md（优先）
@@ -87,9 +96,8 @@ def load_agent_config(config_file: str) -> dict[str, Any]:
         try:
             with open(config_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            for key in DEFAULTS:
-                if key in data:
-                    cfg[key] = data[key]
+            # 透传 JSON 中所有键（含 memory 层配置），默认值仅覆盖 DEFAULTS 中定义的键
+            cfg.update(data)
         except (OSError, json.JSONDecodeError):
             pass
     
