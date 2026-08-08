@@ -575,7 +575,7 @@ self.memory.add("assistant", output)  # ← 无 important,不写 memory.json
 
 ```python
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CHECKPOINT_FILE = os.path.join(BASE_DIR, "memory", "checkpoints_async.sqlite")  # Checkpoint 数据库（异步 saver）
+CHECKPOINT_FILE = os.path.join(BASE_DIR, "data", "checkpoints_async.sqlite")  # Checkpoint 数据库（异步 saver）
 MEMORY_FILE = os.path.join(BASE_DIR, "memory", "memory.json")            # 长期记忆
 ```
 
@@ -679,7 +679,7 @@ API地址:    https://api.deepseek.com
 
 --- 记忆状态 ---
 当前会话:   thread-a4d099d2
-Checkpoint: sqlite → D:\work\LangChainAgent\memory\checkpoints_async.sqlite
+Checkpoint: sqlite → D:\work\LangChainAgent\data\checkpoints_async.sqlite
 已存消息:   8 条
 长期记忆:   5 条
 总会话数:   2
@@ -2012,7 +2012,7 @@ API地址:    https://api.deepseek.com
 
 --- 记忆状态 ---
 当前会话:   thread-a4d099d2
-Checkpoint: sqlite → D:\work\LangChainAgent\memory\checkpoints_async.sqlite
+Checkpoint: sqlite → D:\work\LangChainAgent\data\checkpoints_async.sqlite
 已存消息:   8 条
 长期记忆:   2 条
 总会话数:   1
