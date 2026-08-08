@@ -56,6 +56,48 @@ class FakeAsyncTool(FakeSyncTool):
 class TestWrapToolWithTimeout:
     """单工具包装测试"""
 
+    def test_structured_tool_coroutine_ainvoke_works(self):
+        """langchain-core 1.x 回归: 带 coroutine 的 StructuredTool(MCP 工具形态)包装后 ainvoke
+
+        1.x 的 BaseTool.arun() 按类型注解检测 _arun 是否声明 `config: RunnableConfig`，
+        包装函数若写成 (*args, **kwargs) 会检测不到、不注入 config，导致原始
+        StructuredTool._arun 报 “missing 1 required keyword-only argument: 'config'”。
+        """
+        from langchain_core.tools import StructuredTool
+
+        async def add_async(x: int, y: int) -> int:
+            return x + y
+
+        tool = StructuredTool.from_function(
+            func=None,
+            coroutine=add_async,
+            name="add",
+            description="加法",
+            args_schema=None,
+        )
+        wrap_tool_with_timeout(tool, timeout=5.0)
+
+        result = asyncio.run(tool.ainvoke({"x": 1, "y": 2}))
+        assert result == 3
+
+    def test_structured_tool_sync_func_ainvoke_works(self):
+        """同步 func 的 StructuredTool 包装后 ainvoke 仍可用(走 run_in_executor 同步路径)"""
+        from langchain_core.tools import StructuredTool
+
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        tool = StructuredTool.from_function(
+            func=add,
+            name="add",
+            description="加法",
+            args_schema=None,
+        )
+        wrap_tool_with_timeout(tool, timeout=5.0)
+
+        result = asyncio.run(tool.ainvoke({"x": 1, "y": 2}))
+        assert result == 3
+
     def test_normal_sync_tool_returns_result(self):
         # Given: 一个正常执行的同步工具（无原生 _arun）
         tool = FakeSyncTool(name="calc", _run_result=42)
