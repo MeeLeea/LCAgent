@@ -44,7 +44,7 @@ AGENT_CONFIG_FILE = os.path.join(BASE_DIR, "agent", "agent_config.json")
 SCHEDULER_CONFIG_FILE = os.path.join(BASE_DIR, "config", "scheduler_config.json")
 DEFAULT_DB_PATH = os.path.join(BASE_DIR, "data", "scheduled_tasks.sqlite")
 MEMORY_FILE = os.path.join(BASE_DIR, "data", "memory.json")
-CHECKPOINT_FILE = os.path.join(BASE_DIR, "data", "checkpoints.sqlite")
+CHECKPOINT_FILE = os.path.join(BASE_DIR, "data", "checkpoints_async.sqlite")
 
 
 # ---- 调度器配置加载（与 config.load_agent_config 同模式） ----
