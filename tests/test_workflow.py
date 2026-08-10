@@ -10,9 +10,9 @@ import pytest
 
 from cli.commands.workflow import workflow_command
 from graph.simple import (
+    arun_simple_workflow,
     build_simple_workflow,
     manager_plan_node,
-    run_simple_workflow,
     summarize_context,
     terminator_final_node,
     worker_exec_node,
@@ -304,7 +304,7 @@ def test_run_simple_workflow():
     terminator = FakeAgent(name="terminator", response="最终答案: 全部完成")
     
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
-    result = run_simple_workflow(graph, "测试任务")
+    result = asyncio.run(arun_simple_workflow(graph, "测试任务"))
     
     # 验证最终状态
     assert result["task"] == "测试任务"
@@ -491,7 +491,7 @@ def test_workflow_thread_isolation():
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
     
     # 第一次运行
-    result1 = run_simple_workflow(graph, "任务1")
+    result1 = asyncio.run(arun_simple_workflow(graph, "任务1"))
     
     # 第二次运行(重置 agent 调用记录)
     manager.calls.clear()
@@ -501,7 +501,7 @@ def test_workflow_thread_isolation():
     worker.response = "结果2"
     terminator.response = "答案2"
     
-    result2 = run_simple_workflow(graph, "任务2")
+    result2 = asyncio.run(arun_simple_workflow(graph, "任务2"))
     
     # 验证两次运行结果独立
     assert result1["task"] == "任务1"
@@ -525,7 +525,7 @@ def test_run_simple_workflow_with_memory():
     terminator = FakeAgent(name="terminator", response="最终答案: 完成")
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
 
-    result = run_simple_workflow(graph, "测试任务", raw_context="用户: 之前聊过偏好中文")
+    result = asyncio.run(arun_simple_workflow(graph, "测试任务", raw_context="用户: 之前聊过偏好中文"))
 
     # manager 两次调用:summarize + plan
     assert manager.calls[0] == ("summarize", "用户: 之前聊过偏好中文")
@@ -656,6 +656,13 @@ class FakeExecutor:
 class FakeSession:
     """模拟 SessionRegistry 的短期记忆接口"""
     current_session_id = "t1"
+    checkpointer = None  # 测试无持久化
+
+    def generate_session_id(self, workflow_name=None):
+        return f"test-workflow-{workflow_name}-thread-xxxx"
+
+    def is_workflow_session(self, session_id):
+        return False
 
     async def aget_short_term(self, session_id=None):
         return []
@@ -744,6 +751,13 @@ def test_run_workflow_injects_memory(monkeypatch):
 
     class FakeSessionWithMemory:
         current_session_id = "t1"
+        checkpointer = None
+
+        def generate_session_id(self, workflow_name=None):
+            return f"test-workflow-{workflow_name}-thread-xxxx"
+
+        def is_workflow_session(self, session_id):
+            return False
 
         async def aget_short_term(self, session_id=None):
             return [{"role": "user", "content": "之前聊过X"}]
@@ -752,10 +766,10 @@ def test_run_workflow_injects_memory(monkeypatch):
 
     captured = {}
 
-    def fake_build(name):
+    def fake_build(name, checkpointer=None):
         return ("graph", {})
 
-    def fake_run(graph, task, raw_context="", on_node_start=None, on_node_end=None):
+    async def fake_run(graph, task, raw_context="", thread_id=None, on_node_start=None, on_node_end=None):
         captured["raw_context"] = raw_context
         return {"final_answer": "答案"}
 
@@ -782,12 +796,12 @@ def test_run_simple_workflow_node_callbacks():
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
 
     events: list[tuple[str, str]] = []
-    run_simple_workflow(
+    asyncio.run(arun_simple_workflow(
         graph,
         "测试任务",
         on_node_start=lambda n: events.append(("start", n)),
         on_node_end=lambda n: events.append(("end", n)),
-    )
+    ))
 
     expected = ["summarize", "manager_plan", "worker_exec", "terminator_final"]
     # start/end 各 4 次,且顺序与执行链路一致
@@ -805,7 +819,7 @@ def test_run_simple_workflow_no_callbacks_still_works():
     terminator = FakeAgent(name="terminator", response="答案")
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
 
-    result = run_simple_workflow(graph, "测试任务")
+    result = asyncio.run(arun_simple_workflow(graph, "测试任务"))
     assert result["final_answer"] == "答案"
 
 
@@ -816,10 +830,10 @@ def test_run_workflow_emits_workflow_events(monkeypatch):
 
     events: list[dict[str, str]] = []
 
-    def fake_build(name):
+    def fake_build(name, checkpointer=None):
         return ("graph", {"manager": object(), "worker": object(), "terminator": object()})
 
-    def fake_run(graph, task, raw_context="", on_node_start=None, on_node_end=None):
+    async def fake_run(graph, task, raw_context="", thread_id=None, on_node_start=None, on_node_end=None):
         # 模拟 4 个业务节点依次执行:每个节点 start → end
         for node in ("summarize", "manager_plan", "worker_exec", "terminator_final"):
             if on_node_start:

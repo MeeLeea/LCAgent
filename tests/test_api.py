@@ -44,6 +44,7 @@ def mock_agent():
     agent = MagicMock()
     agent.session = MagicMock()
     agent.session.current_session_id = "test-thread-123"
+    agent.session.checkpointer = None  # 测试无持久化
     agent.session.new_session = MagicMock(return_value="new-thread-456")
     agent.session.new_workflow_session = MagicMock(return_value="server-workflow-simple-abc12345")
     agent.session.alist_sessions = AsyncMock(return_value=["thread-1", "thread-2"])
@@ -551,7 +552,7 @@ def test_get_workflow_cached(client, mock_agent):
     """测试工作流结构被缓存: 连续请求只构建一次"""
     calls = []
 
-    def fake_build(name: str):
+    def fake_build(name: str, checkpointer=None):
         calls.append(name)
         return FakeCompiledGraph(), {}
 
@@ -568,7 +569,7 @@ def test_get_workflow_cached(client, mock_agent):
 
 def test_get_workflow_unknown_name(client, mock_agent):
     """测试未知工作流名返回 404"""
-    def fake_build(name: str):
+    def fake_build(name: str, checkpointer=None):
         raise KeyError(f"未知工作流: {name}")
 
     with patch("graph.registry.build_workflow", side_effect=fake_build):
@@ -580,7 +581,7 @@ def test_get_workflow_unknown_name(client, mock_agent):
 
 def test_get_workflow_build_error(client, mock_agent):
     """测试工作流构建异常返回 500"""
-    def fake_build(name: str):
+    def fake_build(name: str, checkpointer=None):
         raise RuntimeError("构建失败")
 
     with patch("graph.registry.build_workflow", side_effect=fake_build):

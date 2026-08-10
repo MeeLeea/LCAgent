@@ -47,9 +47,12 @@ def _parse_workflow_task(task_text: str) -> tuple[str, str]:
     return workflow_name, task
 
 
-def _execute_workflow_task(task_id: Any, task_text: str) -> tuple[bool, str]:
+async def _arun_workflow_task(task_id: Any, task_text: str) -> tuple[bool, str]:
     """
-    执行工作流任务（延迟导入 graph 模块避免循环依赖）
+    异步执行工作流任务（延迟导入 graph 模块避免循环依赖）
+
+    工作流运行器已异步化（graph.ainvoke），本协程在事件循环内 await 执行；
+    execute_task 通过 asyncio.run 在独立事件循环中调用本协程（与 Agent 任务路径一致）。
 
     Args:
         task_id: 任务 ID（用于日志）
@@ -70,7 +73,7 @@ def _execute_workflow_task(task_id: Any, task_text: str) -> tuple[bool, str]:
     logger.info("  任务内容: %s", task[:80])
 
     try:
-        from graph.registry import list_workflows, run_workflow_by_name
+        from graph.registry import arun_workflow_by_name, list_workflows
     except ImportError as exc:
         return False, f"无法导入工作流模块: {exc}"
 
@@ -87,7 +90,7 @@ def _execute_workflow_task(task_id: Any, task_text: str) -> tuple[bool, str]:
         logger.info("  ✓ 节点完成: %s", node)
 
     try:
-        result = run_workflow_by_name(
+        result = await arun_workflow_by_name(
             workflow_name,
             task,
             on_node_start=_on_node_start,
@@ -192,9 +195,12 @@ def execute_task(task: dict[str, Any], agent_factory: AgentFactory) -> tuple[boo
 
     logger.info("开始执行任务 #%d (%s): %s", task_id, task_type, task_text[:80])
 
-    # 工作流任务路由
+    # 工作流任务路由（运行器已异步化，在独立事件循环中执行）
     if _is_workflow_task(task_text):
-        return _execute_workflow_task(task_id, task_text)
+        try:
+            return asyncio.run(_arun_workflow_task(task_id, task_text))
+        except Exception as exc:
+            return False, f"工作流执行异常: {exc}"
 
     # 普通 Agent 任务
     try:

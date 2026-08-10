@@ -84,6 +84,13 @@ class SessionRegistry:
         # CLI 单会话当前指针（并发场景必须传显式 session_id，不依赖此值）
         self.current_session_id: str = self.generate_session_id()
 
+    # ============ 属性暴露 ============
+
+    @property
+    def checkpointer(self) -> BaseCheckpointSaver:
+        """共享 checkpointer 实例（供工作流构建器注入持久化）。"""
+        return self._checkpointer
+
     # ============ Session ID 生成 ============
 
     def generate_session_id(self, workflow_name: str | None = None) -> str:

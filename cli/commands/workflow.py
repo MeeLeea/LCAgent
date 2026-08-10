@@ -74,6 +74,10 @@ async def run_workflow(context: CommandContext, name: str, task: str) -> dict:
     """
     运行指定工作流 - 异步版本
 
+    从会话层注入 checkpointer，使工作流图编译带持久化：
+    工作流在专属 thread_id 下运行，状态自动保存到 checkpointer，
+    后续可通过同一 thread_id 恢复工作流进度。
+
     Args:
         context: 命令上下文
         name: 工作流名称
@@ -84,11 +88,21 @@ async def run_workflow(context: CommandContext, name: str, task: str) -> dict:
     """
     # 函数内延迟导入,避免循环依赖
     from graph.registry import build_workflow, get_workflow_runner
-    from graph.simple import run_simple_workflow
+    from graph.simple import arun_simple_workflow
 
     context.print(f"\n构建工作流: {name}")
 
-    graph, agents = build_workflow(name)
+    # 从会话层获取 checkpointer + 确定工作流 thread_id
+    # 若当前会话已是工作流专属会话（API 层通过 /api/session?type=workflow 创建），
+    # 复用其 thread_id 实现持久化绑定；否则生成新的工作流 thread_id（CLI 场景）。
+    checkpointer = getattr(context.agent.session, "checkpointer", None)
+    current_sid = context.agent.session.current_session_id
+    if context.agent.session.is_workflow_session(current_sid):
+        workflow_thread_id = current_sid
+    else:
+        workflow_thread_id = context.agent.session.generate_session_id(name)
+
+    graph, agents = build_workflow(name, checkpointer=checkpointer)
 
     # 从构建结果动态获取角色名,避免写死
     role_names = "、".join(agents.keys())
@@ -112,12 +126,13 @@ async def run_workflow(context: CommandContext, name: str, task: str) -> dict:
 
     _emit({"type": "workflow_status", "status": "running"})
     try:
-        # 获取工作流专用运行器,缺失则回退到通用运行器
-        runner = get_workflow_runner(name) or run_simple_workflow
-        result = runner(
+        # 获取工作流专用异步运行器,缺失则回退到通用异步运行器
+        runner = get_workflow_runner(name) or arun_simple_workflow
+        result = await runner(
             graph,
             task,
             raw_context=await abuild_memory_context(context.agent),
+            thread_id=workflow_thread_id,
             on_node_start=_on_node_start,
             on_node_end=_on_node_end,
         )

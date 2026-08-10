@@ -10,7 +10,7 @@ from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from graph.common import NodeCallback, run_compiled_workflow
+from graph.common import NodeCallback, arun_compiled_workflow
 from graph.registry import register_workflow
 
 
@@ -71,13 +71,15 @@ def terminator_final_node(state: WorkflowState, terminator) -> WorkflowState:
 
 
 # 3. 构建工作流图
-def build_simple_workflow(agents: dict) -> StateGraph:
+def build_simple_workflow(agents: dict, checkpointer=None) -> StateGraph:
     """
     构建监督者模式工作流
 
     Args:
         agents: 角色字典,需包含 manager/worker/terminator 三个键,
             分别对应管理者/执行者/终结者 Agent 实例
+        checkpointer: LangGraph checkpointer 实例。传入时图编译带持久化，
+            工作流状态按 thread_id 保存/恢复；为 None 时无持久化（测试/临时运行）。
 
     Returns:
         编译好的 LangGraph StateGraph
@@ -101,25 +103,28 @@ def build_simple_workflow(agents: dict) -> StateGraph:
     builder.add_edge("worker_exec", "terminator_final")
     builder.add_edge("terminator_final", END)
 
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer)
 
 
 # 4. 运行工作流
-def run_simple_workflow(
+async def arun_simple_workflow(
     graph: StateGraph,
     task: str,
     raw_context: str = "",
+    thread_id: str | None = None,
     on_node_start: NodeCallback | None = None,
     on_node_end: NodeCallback | None = None,
     on_node_error: NodeCallback | None = None,
 ) -> dict:
     """
-    运行监督者工作流
+    运行监督者工作流（异步）
 
     Args:
         graph: 编译好的工作流图
         task: 用户任务
         raw_context: 原始记忆文本(当前会话+长期记忆),为空则不注入记忆
+        thread_id: 会话线程 ID。为 None 时自动生成；传入显式值时配合
+            checkpointer 编译的图可实现状态持久化。
         on_node_start: 节点开始回调,接收节点名(用于运行进度跟踪)
         on_node_end: 节点结束回调,接收节点名
         on_node_error: 节点异常回调,接收节点名
@@ -127,11 +132,12 @@ def run_simple_workflow(
     Returns:
         包含 final_answer 的结果字典
     """
-    return run_compiled_workflow(
+    return await arun_compiled_workflow(
         graph,
         task,
         state_fields={"plan": "", "worker_result": "", "final_answer": ""},
         raw_context=raw_context,
+        thread_id=thread_id,
         on_node_start=on_node_start,
         on_node_end=on_node_end,
         on_node_error=on_node_error,
@@ -143,7 +149,7 @@ def run_simple_workflow(
 register_workflow(
     "simple",
     builder=build_simple_workflow,
-    runner=run_simple_workflow,
+    runner=arun_simple_workflow,
     roles=["manager", "worker", "terminator"],
     description="监督者模式工作流(Manager 拆解→Worker 执行→Terminator 汇总)",
 )

@@ -11,7 +11,7 @@
 
 工作流规格字段:
   - builder:     构建函数 build_xxx(agents: dict) -> 编译好的 StateGraph
-  - runner:      自定义运行器,缺失时回退到 graph.simple.run_simple_workflow
+  - runner:      自定义异步运行器,缺失时回退到 graph.simple.arun_simple_workflow
   - roles:       该工作流依赖的角色列表,缺失时构建全部已注册角色
   - description: 工作流描述,用于 CLI 列表展示
 """
@@ -86,8 +86,8 @@ def register_workflow(
     Args:
         name: 工作流名称
         builder: 工作流构建函数,签名 build_xxx(agents: dict) -> StateGraph
-        runner: 工作流运行函数,签名 run_xxx(graph, task, ...) -> dict
-            缺失时回退到 graph.simple.run_simple_workflow
+        runner: 工作流异步运行函数,签名 run_xxx(graph, task, ...) -> dict
+            缺失时回退到 graph.simple.arun_simple_workflow
         roles: 该工作流依赖的角色名列表,为 None 时构建全部已注册角色
         description: 工作流描述(用于 CLI 列表展示)
     """
@@ -119,7 +119,7 @@ def _get_workflow_spec(name: str) -> dict:
 
 
 def get_workflow_runner(name: str) -> Callable | None:
-    """获取工作流的运行器函数,缺失返回 None(由调用方回退到 run_simple_workflow)"""
+    """获取工作流的异步运行器函数,缺失返回 None(由调用方回退到 arun_simple_workflow)"""
     return _get_workflow_spec(name)["runner"]
 
 
@@ -140,7 +140,7 @@ def list_workflows() -> list[tuple[str, str]]:
 # ──────────────────────────────────────────────
 # 构建入口
 # ──────────────────────────────────────────────
-def build_workflow(name: str) -> tuple[object, dict[str, object]]:
+def build_workflow(name: str, checkpointer=None) -> tuple[object, dict[str, object]]:
     """
     构建指定名称的工作流(静默返回,不打印)
 
@@ -149,6 +149,8 @@ def build_workflow(name: str) -> tuple[object, dict[str, object]]:
 
     Args:
         name: 工作流名称(如 "simple"/"pipline")
+        checkpointer: LangGraph checkpointer 实例。传入时图编译带持久化，
+            工作流状态按 thread_id 保存/恢复；为 None 时无持久化。
 
     Returns:
         (graph, agents) 元组:
@@ -192,8 +194,8 @@ def build_workflow(name: str) -> tuple[object, dict[str, object]]:
 
     agents = {role: _build(role) for role in roles_to_build}
 
-    # 调用工作流构建器(统一接收 agents 字典)
-    graph = spec["builder"](agents)
+    # 调用工作流构建器(统一接收 agents 字典 + checkpointer)
+    graph = spec["builder"](agents, checkpointer=checkpointer)
 
     return graph, agents
 
@@ -233,21 +235,27 @@ _load_builtin_workflows()
 # ──────────────────────────────────────────────
 # 独立执行入口(供 scheduler 等非 CLI 场景使用)
 # ──────────────────────────────────────────────
-def run_workflow_by_name(
+async def arun_workflow_by_name(
     workflow_name: str,
     task: str,
+    checkpointer=None,
+    thread_id: str | None = None,
     on_node_start: Callable | None = None,
     on_node_end: Callable | None = None,
 ) -> dict:
     """
-    按名称构建并运行工作流(不依赖 CLI 上下文)
+    按名称构建并异步运行工作流(不依赖 CLI 上下文)
 
     供 scheduler/executor 等非 CLI 场景调用:只需工作流名称和任务文本,
-    内部完成构建 → 运行 → 返回结果字典。
+    内部完成构建 → 异步运行 → 返回结果字典。
 
     Args:
         workflow_name: 工作流名称(如 "simple"/"systemc_cmodel")
         task: 用户任务文本
+        checkpointer: LangGraph checkpointer 实例。传入时图编译带持久化；
+            为 None 时无持久化（scheduler 场景默认无持久化）。
+        thread_id: 会话线程 ID。为 None 时自动生成；传入显式值时配合
+            checkpointer 可实现状态持久化。
         on_node_start: 节点开始回调(可选,接收节点名)
         on_node_end: 节点结束回调(可选,接收节点名)
 
@@ -258,17 +266,18 @@ def run_workflow_by_name(
         KeyError: 工作流不存在或角色未注册
         Exception: 工作流执行中的异常
     """
-    graph, _agents = build_workflow(workflow_name)
+    graph, _agents = build_workflow(workflow_name, checkpointer=checkpointer)
 
-    # 获取工作流专用运行器,缺失时回退到 run_simple_workflow
+    # 获取工作流专用运行器,缺失时回退到 arun_simple_workflow
     runner = get_workflow_runner(workflow_name)
     if runner is None:
-        from graph.simple import run_simple_workflow as runner
+        from graph.simple import arun_simple_workflow as runner
 
-    return runner(
+    return await runner(
         graph,
         task,
         raw_context="",  # scheduler 场景无会话记忆
+        thread_id=thread_id,
         on_node_start=on_node_start,
         on_node_end=on_node_end,
     )

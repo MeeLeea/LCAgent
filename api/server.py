@@ -434,6 +434,10 @@ def _workflow_snapshot(name: str) -> dict:
     节点状态为初始 pending；运行时的实时进度由 /api/chat 的 SSE 事件
     (workflow_node / workflow_status)推送，前端据此更新本快照的节点状态。
 
+    从全局 agent.session 获取 checkpointer 注入 build_workflow，使图编译带持久化，
+    与 CLI 执行路径保持一致。缓存仅存储结构 JSON（nodes/edges），
+    checkpointer 不影响图结构，因此 lru_cache 按 name 缓存安全。
+
     Args:
         name: 工作流名称
 
@@ -445,7 +449,12 @@ def _workflow_snapshot(name: str) -> dict:
     """
     from graph.registry import build_workflow
 
-    graph, _ = build_workflow(name)
+    # 从全局 agent 获取 checkpointer（API 层持久化注入）
+    checkpointer = None
+    if agent is not None:
+        checkpointer = getattr(agent.session, "checkpointer", None)
+
+    graph, _ = build_workflow(name, checkpointer=checkpointer)
 
     graph_obj = graph.get_graph()
     nodes = [
