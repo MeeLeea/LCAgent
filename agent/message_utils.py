@@ -7,6 +7,9 @@
 import re
 from typing import Any
 
+from .events import make_interrupt_dict
+from .llm_client import _RETRYABLE_KEYWORDS
+
 # ============ LLM 异常提取 ============
 
 def _extract_status_code(raw: str) -> str:
@@ -62,19 +65,11 @@ def extract_llm_error(e: Exception) -> str:
         return f"{code_hint}模型当前访问量过大或触发限流(429)，请稍后重试，或切换模型/提供商。"
 
     # 5xx / 服务过载类错误(含纯文本网关提示)
-    transient_keywords = (
-        "service temporarily unavailable",
-        "service unavailable",
-        "temporarily unavailable",
-        "internal server error",
-        "bad gateway",
-        "gateway timeout",
-        "server overloaded",
-        "temporary failure",
-    )
+    # 关键词清单与 llm_client.should_retry 共用 _RETRYABLE_KEYWORDS，避免两处维护漂移；
+    # "too many requests" 已在上面 429 分支先行返回，此处不会受影响
     is_server_error = (
         status_code.startswith("5")
-        or any(k in low for k in transient_keywords)
+        or any(k in low for k in _RETRYABLE_KEYWORDS)
     )
     if is_server_error:
         code_hint = f"[HTTP {status_code}] " if status_code else ""
@@ -122,12 +117,11 @@ def build_interrupt_event(value: Any) -> dict[str, Any]:
         前端可消费的事件字典，包含 type、prompt、choices 三个字段
     """
     if isinstance(value, dict) and value.get("kind") in ("human_choice", "dangerous_command"):
-        return {
-            "type": "interrupt",
-            "prompt": str(value.get("prompt") or "需要人工输入"),
-            "choices": value.get("choices") or [],
-        }
-    return {"type": "interrupt", "prompt": stringify_content(value), "choices": []}
+        return make_interrupt_dict(
+            str(value.get("prompt") or "需要人工输入"),
+            value.get("choices") or [],
+        )
+    return make_interrupt_dict(stringify_content(value), [])
 
 
 __all__ = [

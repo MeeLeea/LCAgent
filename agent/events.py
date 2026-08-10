@@ -59,6 +59,15 @@ def _naive_now_iso() -> str:
     return datetime.now().isoformat()  # noqa: DTZ005
 
 
+def make_interrupt_dict(prompt: str, choices: list[Any]) -> dict[str, Any]:
+    """构造中断事件的前端 SSE dict（前端协议格式的唯一来源）。
+
+    ``AgentEvent.to_sse_dict`` 的 INTERRUPT 分支与 ``message_utils.build_interrupt_event``
+    共用此函数，避免同一 {type, prompt, choices} 结构在多处重复书写。
+    """
+    return {"type": "interrupt", "prompt": prompt, "choices": choices}
+
+
 @dataclass(frozen=True, slots=True)
 class AgentEvent:
     """标准化 Agent 执行事件。
@@ -279,11 +288,7 @@ class AgentEvent:
                 "content": self.content,
             }
         elif self.event_type == EventType.INTERRUPT:
-            return {
-                "type": "interrupt",
-                "prompt": self.interrupt_prompt,
-                "choices": self.interrupt_choices,
-            }
+            return make_interrupt_dict(self.interrupt_prompt, self.interrupt_choices)
         elif self.event_type == EventType.CANCELLED:
             return {"type": "cancelled", "content": self.content}
         elif self.event_type == EventType.ERROR:

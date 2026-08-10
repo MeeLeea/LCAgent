@@ -9,8 +9,6 @@
 """
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
 import os
 from typing import TYPE_CHECKING
@@ -124,20 +122,11 @@ async def arebuild_agent_from_team_dir(
     # 剥离 ## workflow:* 小节,只取角色系统提示词
     role_prompt, _templates = TeamAgent.parse_prompt_sections(content)
 
-    # provider/model 不在 load_agent_config 的 DEFAULTS 白名单内,
-    # 需从原始 JSON 直接读取(缺省则沿用当前 LLM)
-    def _read_raw_cfg() -> dict:
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return {}
-
-    raw_cfg: dict = await asyncio.to_thread(_read_raw_cfg)
-
+    # provider/model 经 load_agent_config 的 cfg.update(data) 透传(cfg 不过滤键)，
+    # 直接读取即可；缺省则沿用当前 LLM
     # 3. 判断是否需要切换 LLM(provider/model 变化)
-    target_provider = (raw_cfg.get("provider") or agent.llm.provider).lower()
-    target_model = raw_cfg.get("model") or agent.llm.model
+    target_provider = (config.get("provider") or agent.llm.provider).lower()
+    target_model = config.get("model") or agent.llm.model
     llm_changed = (
         target_provider != agent.llm.provider or target_model != agent.llm.model
     )

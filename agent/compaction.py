@@ -172,18 +172,8 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
         if not new_summary:
             return None
 
-        pruned_keep = self._prune_tool_outputs(to_keep)
-
-        return {
-            "messages": [
-                # REMOVE_ALL_MESSAGES 先清空，再写入压缩后的消息
-                # 这样 checkpoint 中旧消息被彻底移除，不再占用存储
-                _make_remove_all(),
-                SystemMessage(content=self.SUMMARY_HEADER + new_summary),
-                *pruned_keep,
-            ],
-            "summary": new_summary,
-        }
+        result, _ = self._build_compact_result(new_summary, to_keep)
+        return result
 
     # ============ 核心压缩逻辑 ============
 
@@ -203,27 +193,8 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
         if not new_summary:
             return None
 
-        pruned_keep = self._prune_tool_outputs(to_keep)
-
-        result = {
-            "messages": [
-                _make_remove_all(),
-                SystemMessage(content=self.SUMMARY_HEADER + new_summary),
-                *pruned_keep,
-            ],
-            "summary": new_summary,
-        }
-
-        # 自动触发的压缩指标回调
-        if self._on_compaction is not None:
-            messages_after = len(pruned_keep) + 1  # +1 for summary SystemMessage
-            duration_ms = (time.time() - _start) * 1000
-            try:
-                self._on_compaction("auto", len(messages), messages_after, len(new_summary), duration_ms)
-            except Exception as error:
-                # 指标回调失败不影响压缩主流程,记录后继续
-                logger.warning("压缩指标回调失败: %s", error)
-
+        result, messages_after = self._build_compact_result(new_summary, to_keep)
+        self._notify_compaction_metric(len(messages), messages_after, len(new_summary), _start)
         return result
 
     async def _do_compact_async(self, state: dict[str, Any]) -> dict[str, Any] | None:
@@ -242,28 +213,52 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
         if not new_summary:
             return None
 
-        pruned_keep = self._prune_tool_outputs(to_keep)
-
-        result = {
-            "messages": [
-                _make_remove_all(),
-                SystemMessage(content=self.SUMMARY_HEADER + new_summary),
-                *pruned_keep,
-            ],
-            "summary": new_summary,
-        }
-
-        # 自动触发的压缩指标回调
-        if self._on_compaction is not None:
-            messages_after = len(pruned_keep) + 1  # +1 for summary SystemMessage
-            duration_ms = (time.time() - _start) * 1000
-            try:
-                self._on_compaction("auto", len(messages), messages_after, len(new_summary), duration_ms)
-            except Exception as error:
-                # 指标回调失败不影响压缩主流程,记录后继续
-                logger.warning("压缩指标回调失败: %s", error)
-
+        result, messages_after = self._build_compact_result(new_summary, to_keep)
+        self._notify_compaction_metric(len(messages), messages_after, len(new_summary), _start)
         return result
+
+    def _build_compact_result(
+        self, new_summary: str, to_keep: list[AnyMessage]
+    ) -> tuple[dict[str, Any], int]:
+        """构造压缩结果：REMOVE_ALL 标记 + 摘要 SystemMessage + Prune 后的保留消息。
+
+        Args:
+            new_summary: 生成的增量摘要文本
+            to_keep: 待保留的近期消息列表
+
+        Returns:
+            (状态更新字典, 压缩后消息数 messages_after)
+        """
+        pruned_keep = self._prune_tool_outputs(to_keep)
+        return (
+            {
+                "messages": [
+                    # REMOVE_ALL_MESSAGES 先清空，再写入压缩后的消息
+                    # 这样 checkpoint 中旧消息被彻底移除，不再占用存储
+                    _make_remove_all(),
+                    SystemMessage(content=self.SUMMARY_HEADER + new_summary),
+                    *pruned_keep,
+                ],
+                "summary": new_summary,
+            },
+            len(pruned_keep) + 1,  # +1 for summary SystemMessage
+        )
+
+    def _notify_compaction_metric(
+        self,
+        messages_before: int,
+        messages_after: int,
+        summary_length: int,
+        start: float,
+    ) -> None:
+        """自动触发的压缩指标回调（失败不影响压缩主流程，记录后继续）。"""
+        if self._on_compaction is None:
+            return
+        duration_ms = (time.time() - start) * 1000
+        try:
+            self._on_compaction("auto", messages_before, messages_after, summary_length, duration_ms)
+        except Exception as error:
+            logger.warning("压缩指标回调失败: %s", error)
 
     # ============ 增量摘要 ============
 

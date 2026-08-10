@@ -338,11 +338,8 @@ class MetricsCollector:
             self._turn_count = 0
 
 
+# 仅对外暴露收集器；LLMCallMetric / ToolCallMetric / CompactionMetric / ToolStats /
+# LLMStats 属内部实现细节，由 MetricsCollector 内部构造使用，不对外导出
 __all__ = [
-    "CompactionMetric",
-    "LLMCallMetric",
-    "LLMStats",
     "MetricsCollector",
-    "ToolCallMetric",
-    "ToolStats",
 ]

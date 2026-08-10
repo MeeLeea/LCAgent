@@ -7,23 +7,24 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import AsyncIterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from collections.abc import AsyncIterator
 from typing import Any, Literal
-
-from typing_extensions import Self
 
 from langchain.agents import create_agent
 from langchain_core.messages import (
     AIMessage,
+    AIMessageChunk,
     BaseMessage,
     HumanMessage,
     ToolMessage,
 )
 from langchain_core.tools import BaseTool
 from langgraph.types import Command, Interrupt
+from typing_extensions import Self
 
+from session import SessionManager, SessionRegistry, SessionStore
 from tools.mcp_loader import DEFAULT_CONFIG_FILE
 from tools.mcp_pool import MCPPool, ServerStatus
 from tools.skills import SkillManager, default_skills_dir
@@ -35,11 +36,12 @@ from .compaction import (
     LCAgentCompactionMiddleware,
     LCAgentState,
 )
+from .events import AgentEvent
 from .exceptions import AgentStateError
-from .llm_client import LLMClient
+from .llm_client import RETRY_ATTEMPTS, RETRY_MAX_DELAY, LLMClient, should_retry
 from .logging_config import TraceContext, generate_trace_id
+from .message_utils import build_interrupt_event, extract_llm_error, stringify_content
 from .metrics import MetricsCollector
-from session import SessionManager, SessionRegistry, SessionStore
 from .skill_middleware import SkillInjectionMiddleware
 
 logger = logging.getLogger(__name__)
@@ -358,7 +360,6 @@ class AgentCore:
         - ``agent.session_manager.new_session()``
         """
         if getattr(self, "_session_manager", None) is None:
-            from session import SessionManager
             mm = getattr(self, "_memory_manager", None)
             self._session_manager = SessionManager(self, memory=mm)
         return self._session_manager
@@ -945,14 +946,11 @@ class AgentCore:
             trace_id: 追踪 ID
             collected_output: 可选列表，收集 TOKEN 文本用于最终 DONE 事件
         """
-        from .events import AgentEvent, EventType
-        from .message_utils import extract_llm_error, stringify_content
-        from .llm_client import RETRY_ATTEMPTS, RETRY_MAX_DELAY, should_retry
-        from langchain_core.messages import AIMessage, AIMessageChunk
-        from tools.terminal_tools import UserRejectedCommandError
-
         graph = self.agent_executor
         recorded_msg_ids: set[str] = set()
+        # 已发出 TOOL_CALL 事件的 tool_call_id 集合：
+        # on_chat_model_end 检测到 tool_calls 时提前发出，on_tool_start 据此去重
+        emitted_tool_call_ids: set[str] = set()
 
         for attempt in range(RETRY_ATTEMPTS):
             emitted = False
@@ -981,11 +979,15 @@ class AgentCore:
                                     text, thread_id=thread_id, trace_id=trace_id
                                 )
                     elif event_name == "on_tool_start":
+                        # on_chat_model_end 已提前发出 TOOL_CALL 时跳过（去重）
+                        tc_id = data_dict.get("tool_call_id") or data_dict.get("name") or ""
+                        if tc_id and tc_id in emitted_tool_call_ids:
+                            continue
                         name = data_dict.get("name")
                         tool_input = data_dict.get("input")
                         emitted = True
                         yield AgentEvent.tool_call(
-                            tool_call_id=data_dict.get("tool_call_id") or name or "",
+                            tool_call_id=tc_id,
                             name=name or "",
                             args=tool_input,
                             thread_id=thread_id,
@@ -1022,6 +1024,21 @@ class AgentCore:
                                     provider=getattr(llm, "provider", ""),
                                     model=getattr(llm, "model", "") or "",
                                 )
+                            # 提前发出 TOOL_CALL：LLM 回复完成时 tool_calls 已确定，
+                            # 无需等待 LangGraph 路由到工具节点（on_tool_start），
+                            # 前端可更早显示工具名 + "执行中"
+                            for tc in getattr(output, "tool_calls", None) or []:
+                                tc_id = tc.get("id", "") if isinstance(tc, dict) else ""
+                                if tc_id and tc_id not in emitted_tool_call_ids:
+                                    emitted_tool_call_ids.add(tc_id)
+                                    emitted = True
+                                    yield AgentEvent.tool_call(
+                                        tool_call_id=tc_id,
+                                        name=tc.get("name", "") if isinstance(tc, dict) else "",
+                                        args=tc.get("args") if isinstance(tc, dict) else None,
+                                        thread_id=thread_id,
+                                        trace_id=trace_id,
+                                    )
                 return
             except UserRejectedCommandError:
                 await self._arepair_rejected_tool_calls(config)
@@ -1049,9 +1066,6 @@ class AgentCore:
         trace_id: str,
     ) -> AgentEvent | None:
         """流结束后检查是否被 ask_human 中断，返回 INTERRUPT 事件或 None。"""
-        from .events import AgentEvent
-        from .message_utils import build_interrupt_event
-
         graph = self.agent_executor
         try:
             state = await graph.aget_state(config)
@@ -1102,8 +1116,6 @@ class AgentCore:
             is_run_mode: True=执行模式（DONE 事件标记 is_important），
                          False=对话模式
         """
-        from .events import AgentEvent
-
         self._ensure_not_closed()
         tid = self._current_sid(thread_id)
         trace_id = generate_trace_id()
@@ -1161,8 +1173,6 @@ class AgentCore:
             payload: 恢复数据
             thread_id: 目标会话线程 ID（为 None 时使用当前会话）
         """
-        from .events import AgentEvent
-
         self._ensure_not_closed()
         tid = self._current_sid(thread_id)
         trace_id = generate_trace_id()

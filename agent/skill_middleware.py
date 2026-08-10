@@ -62,17 +62,6 @@ class SkillInjectionMiddleware(AgentMiddleware):
             return ""
         return self.skill_manager.render_block(sorted(names))
 
-    def wrap_model_call(
-        self,
-        request: ModelRequest[ContextT],
-        handler: Callable[[ModelRequest[ContextT]], Any],
-    ) -> Any:
-        """同步版本：注入技能指引块到 system message。"""
-        skill_block = self._compute_skill_block(request.state)
-        if not skill_block:
-            return handler(request)
-        return handler(self._inject(request, skill_block))
-
     async def awrap_model_call(
         self,
         request: ModelRequest[ContextT],
