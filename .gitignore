@@ -53,7 +53,6 @@ calibrate_*.png
 *.log
 
 .omo/
-drafts/
 node_modules/
 data/
 .agents/
