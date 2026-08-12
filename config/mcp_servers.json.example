@@ -1,3 +1,9 @@
 {
-  "servers": {}
+  "servers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "D:\\work"],
+      "enabled": true
+    }
+  }
 }

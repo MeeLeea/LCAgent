@@ -4,19 +4,19 @@
     "skills_dir": ".agents/skills",
     "auto_match_skills": true,
     "enable_mcp": true,
-    "memory_size": 10,
     "verbose": true,
     "mcp_config_file": "config/mcp_servers.json",
-    "max_context_messages": 0,
-    "context_trim_keep": 12,
     "agent_prompt_file": "agent/AGENT.md",
+
     "max_execution_history": 100,
+    "max_context_messages": 30,
+    "context_trim_keep": 12,
     "tool_timeout": 120,
 
+    "memory_size": 10,
     "memory_buffer_delay_seconds": 20,
     "memory_max_buffer_messages": 30,
     "memory_max_facts_per_thread": 50,
     "memory_recall_limit": 10,
-
     "session_enable_memory": true
 }

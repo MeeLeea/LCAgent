@@ -2206,19 +2206,31 @@ asyncio.run(main())
 
 原先硬编码在 `main.py` 的运行时参数已外置到此文件，由 [agent/config.py](agent/config.py) 的 `load_agent_config` 加载并与默认值合并（缺省键不报错）。
 
-| 键                       | 类型 | 默认值                      | 说明                                                  |
-| ------------------------ | ---- | --------------------------- | ----------------------------------------------------- |
-| `name`                 | str  | `LCAgent`                 | Agent 名称（可通过`agent.name` 访问）               |
-| `max_iterations`       | int  | 15                          | 单次`invoke` 最大推理步数（即 `recursion_limit`） |
-| `skills_dir`           | str  | `.agents/skills`          | 技能目录（相对项目根或绝对路径）                      |
-| `auto_match_skills`    | bool | true                        | 任务自动匹配并注入相关技能                            |
-| `enable_mcp`           | bool | true                        | 是否加载 MCP 工具                                     |
-| `memory_size`          | int  | 10                          | 兼容旧 API 的记忆容量                                 |
-| `verbose`              | bool | true                        | 是否打印详细过程                                      |
-| `mcp_config_file`      | str  | `config/mcp_servers.json` | MCP 配置文件（相对项目根或绝对路径）                  |
-| `max_context_messages` | int  | 0                           | 长上下文裁剪阈值（0 = 关闭）                          |
-| `context_trim_keep`    | int  | 12                          | 裁剪时保留的最近消息条数                              |
-| `agent_prompt_file`    | str  | `agent/AGENT.md`          | Agent 核心提示词文件路径（相对项目根或绝对路径）      |
+| 键                            | 类型 | 默认值                          | 说明                                                         |
+| ----------------------------- | ---- | ------------------------------- | ------------------------------------------------------------ |
+| `name`                      | str  | `LCAgent`                     | Agent 名称（可通过`agent.name` 访问）                      |
+| `max_iterations`            | int  | 15                             | 单次`invoke` 最大推理步数（即 `recursion_limit`）        |
+| `skills_dir`                | str  | `.agents/skills`             | 技能目录（相对项目根或绝对路径）                             |
+| `auto_match_skills`         | bool | true                           | 任务自动匹配并注入相关技能                                   |
+| `enable_mcp`                | bool | true                           | 是否加载 MCP 工具                                            |
+| `memory_size`               | int  | 10                             | 短期消息窗口大小（传递给 `SessionRegistry.aget_short_term`） |
+| `verbose`                   | bool | true                           | 是否打印详细过程                                             |
+| `mcp_config_file`           | str  | `config/mcp_servers.json`    | MCP 配置文件（相对项目根或绝对路径）                         |
+| `max_context_messages`      | int  | 0                              | 长上下文裁剪阈值（0 = 关闭）                                 |
+| `context_trim_keep`         | int  | 12                             | 裁剪时保留的最近消息条数                                     |
+| `max_execution_history`     | int  | 100                            | 执行历史最大条数                                             |
+| `agent_prompt_file`         | str  | `agent/AGENT.md`             | Agent 核心提示词文件路径（相对项目根或绝对路径）             |
+| `tool_timeout`              | int  | 120                            | 工具调用超时（秒）                                           |
+
+**Memory 层配置**（同文件同名键透传，默认值见 [memory/config.py](memory/config.py)）：
+
+| 键                              | 类型 | 默认值 | 说明                                  |
+| ------------------------------- | ---- | ------ | ------------------------------------- |
+| `memory_buffer_delay_seconds` | int  | 20     | 记忆写入防抖延迟（秒）                 |
+| `memory_max_buffer_messages`  | int  | 30     | 防抖 buffer 最大消息数（超出强制刷新） |
+| `memory_max_facts_per_thread` | int  | 50     | 单线程最大 fact 条数（超出 LRU 淘汰）  |
+| `memory_recall_limit`         | int  | 10     | 召回长期记忆时的默认条数上限           |
+| `session_enable_memory`       | bool | true   | SessionManager 是否启用长期记忆处理    |
 
 修改后重启 `main.py` 即可生效。
 

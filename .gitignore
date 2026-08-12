@@ -51,7 +51,7 @@ Thumbs.db
 # Project specific
 calibrate_*.png
 *.log
-
+.opencode/
 .omo/
 node_modules/
 data/
