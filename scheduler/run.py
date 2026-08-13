@@ -136,6 +136,8 @@ def make_agent_factory(provider: str):
         # 注入 MemoryManager → SessionManager 懒初始化时会自动接收
         agent.set_memory_manager(memory_ctx.memory_manager)
         agent._memory_context = memory_ctx  # 供 executor aclose 时关闭 SQLite 连接
+        # 动态绑定：记忆组件直接读取 agent 当前 LLM，保持与主对话一致
+        memory_ctx.bind_llm(lambda: agent.llm)
         return agent
 
     return factory

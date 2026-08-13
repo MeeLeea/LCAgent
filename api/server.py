@@ -167,6 +167,9 @@ async def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
     # 注入 MemoryManager → SessionManager 懒初始化时会自动接收
     new_agent.set_memory_manager(memory_ctx.memory_manager)
     new_agent._memory_context = memory_ctx  # 供 aclose 时关闭 SQLite 连接
+    # 动态绑定：记忆组件直接读取 agent 当前 LLM，切换 provider 后自动同步
+    # （修复 /api/providers/switch 后记忆抽取仍用启动时旧 LLMClient 的问题）
+    memory_ctx.bind_llm(lambda: new_agent.llm)
     return new_agent, new_llm
 
 
