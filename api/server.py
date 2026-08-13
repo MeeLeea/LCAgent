@@ -267,6 +267,7 @@ class ChatRequest(BaseModel):
 class CreateThreadRequest(BaseModel):
     type: str | None = "chat"
     workflow_name: str | None = None
+    workspace_path: str | None = None
 
 
 class ResumeRequest(BaseModel):
@@ -507,16 +508,25 @@ async def list_threads():
 
 @app.post("/api/threads")
 async def create_thread(req: CreateThreadRequest | None = None):
-    """新建会话，返回 thread_id。type=workflow 时创建专属工作流会话。"""
+    """新建会话，返回 thread_id。
+
+    type=workflow 时创建专属工作流会话。
+    workspace_path 指定会话绑定的外部工作空间路径（可选，用于多会话工作目录隔离）。
+    """
     async with chat_lock:
         if req and req.type == "workflow":
             workflow_name = req.workflow_name or "simple"
-            tid = agent.session.new_workflow_session(workflow_name)
+            tid = agent.session.new_workflow_session(
+                workflow_name,
+                workspace_path=req.workspace_path if req else None,
+            )
             agent.set_current_session(tid)
         else:
-            tid = agent.session.new_session()
+            tid = agent.session.new_session(
+                workspace_path=req.workspace_path if req else None,
+            )
             agent.set_current_session(tid)
-    logger.info("创建会话: %s", tid)
+    logger.info("创建会话: %s (workspace=%s)", tid, req.workspace_path if req else None)
     return {"thread_id": tid}
 
 

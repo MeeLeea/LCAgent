@@ -633,7 +633,9 @@ def test_create_workflow_thread(client, mock_agent):
 
     data = response.json()
     assert data["thread_id"] == "server-workflow-simple-abc12345"
-    mock_agent.session.new_workflow_session.assert_called_once_with("simple")
+    mock_agent.session.new_workflow_session.assert_called_once_with(
+        "simple", workspace_path=None
+    )
 
 
 def test_create_workflow_thread_default_name(client, mock_agent):
@@ -643,7 +645,9 @@ def test_create_workflow_thread_default_name(client, mock_agent):
         json={"type": "workflow"},
     )
     assert response.status_code == 200
-    mock_agent.session.new_workflow_session.assert_called_once_with("simple")
+    mock_agent.session.new_workflow_session.assert_called_once_with(
+        "simple", workspace_path=None
+    )
 
 
 def test_list_workflows(client):

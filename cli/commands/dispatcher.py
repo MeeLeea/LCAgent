@@ -17,6 +17,7 @@ from . import (
     skills,
     threads,
     workflow,
+    workspace,
 )
 from .types import BREAK, HANDLED, UNHANDLED, CommandContext, CommandOutcome
 
@@ -83,6 +84,8 @@ async def dispatch_command(context: CommandContext, user_input: str) -> CommandO
         return await _invoke(safety.safety_command, context, user_input)
     if low == "workflow" or low.startswith("workflow:"):
         return await _invoke(workflow.workflow_command, context, user_input)
+    if low == "workspace" or low.startswith(("workspace ", "workspace:")):
+        return await _invoke(workspace.workspace_command, context, user_input)
     if low == "metrics" or low.startswith("metrics:"):
         return await _invoke(metrics.metrics_command, context, user_input)
     if low == "log" or low.startswith("log:"):

@@ -53,6 +53,7 @@ def new_thread(context: CommandContext) -> CommandOutcome:
     context.agent.set_current_session(new)
     context.print(f"\n已开启新会话: {new}")
     context.print(f"原会话 {old} 已保留,可用 'thread' 切回")
+    context.print("提示: 可用 'workspace <path>' 绑定工作空间目录")
     return HANDLED
 
 
