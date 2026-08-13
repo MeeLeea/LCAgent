@@ -322,3 +322,69 @@ class TestProperties:
 
         mgr, _ = _make_manager()
         assert isinstance(mgr.write_middleware, ThreadMemoryWriteMiddleware)
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  LLM 热切换绑定（bind_llm）
+# ════════════════════════════════════════════════════════════════════════
+
+
+class TestBindLlm:
+    """绑定/替换记忆 LLM 获取器：provider 热切换后记忆抽取应跟随新 LLM。"""
+
+    def test_bind_llm_replaces_manager_and_write_middleware_getter(self):
+        """bind_llm 后 MemoryManager 与写中间件的 llm_getter 应返回新 LLM。"""
+        old_llm = _FakeLLM()
+        new_llm = _FakeLLM()
+        mgr, _ = _make_manager(llm_getter=lambda: old_llm)
+
+        assert mgr._llm_getter() is old_llm
+        assert mgr.write_middleware._llm_getter() is old_llm
+
+        mgr.bind_llm(lambda: new_llm)
+
+        assert mgr._llm_getter() is new_llm
+        assert mgr.write_middleware._llm_getter() is new_llm
+
+    def test_fact_extraction_uses_bound_llm_after_provider_switch(self):
+        """模拟切换 provider：bind 新 LLM 后 flush 抽取应使用新 LLM 请求。"""
+        old_llm = _FakeLLM(response="[]")  # 旧 LLM 返回空（不抽取）
+        new_llm = _FakeLLM(response=json.dumps([
+            {"content": "切换后抽取的事实", "category": "user_fact", "confidence": 0.9}
+        ]))
+        mgr, store = _make_manager(llm_getter=lambda: old_llm, buffer_delay_seconds=999)
+
+        async def run():
+            # 切换 provider：替换为读取 agent.llm 的 getter（模拟入口 bind 调用）
+            mgr.bind_llm(lambda: new_llm)
+            await mgr.submit_user_message("t1", "用户偏好信息")
+            await mgr.flush_all()
+
+        asyncio.run(run())
+
+        # 旧 LLM 未被调用，新 LLM 完成抽取并落库
+        assert old_llm.calls == []
+        assert new_llm.calls != []
+        facts = asyncio.run(store.query_facts("t1"))
+        assert len(facts) == 1
+        assert facts[0].content == "切换后抽取的事实"
+
+    def test_memory_context_bind_llm_forwards_to_manager(self):
+        """MemoryContext.bind_llm 应透传到内部 MemoryManager。"""
+        from memory.context import MemoryContext
+
+        old_llm = _FakeLLM()
+        new_llm = _FakeLLM()
+        mgr, _ = _make_manager(llm_getter=lambda: old_llm)
+        ctx = MemoryContext(
+            agent_memory=MagicMock(),
+            read_middleware=MagicMock(),
+            memory_manager=mgr,
+        )
+
+        assert ctx.memory_manager._llm_getter() is old_llm
+
+        ctx.bind_llm(lambda: new_llm)
+
+        assert ctx.memory_manager._llm_getter() is new_llm
+        assert ctx.memory_manager.write_middleware._llm_getter() is new_llm

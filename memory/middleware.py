@@ -87,6 +87,17 @@ class ThreadMemoryWriteMiddleware:
         # 保护 buffer 和 timers 的并发访问
         self._buffer_lock = asyncio.Lock()
 
+    def bind_llm(self, llm_getter: Callable[[], Any]) -> None:
+        """运行时替换 LLM 获取器（支持 provider 热切换后即时生效）。
+
+        入口创建 Agent 后调用，将记忆抽取的 LLM 来源动态绑定到
+        ``agent.llm``，保证主对话与记忆抽取始终使用同一当前 LLM。
+
+        Args:
+            llm_getter: 返回当前 LLMClient 的 callable
+        """
+        self._llm_getter = llm_getter
+
     # ============ 事件接收 & 防抖 ============
 
     async def submit_event(

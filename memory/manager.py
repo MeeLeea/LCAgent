@@ -109,6 +109,19 @@ class MemoryManager:
         """写中间件实例（供 flush_all / shutdown 等生命周期管理使用）。"""
         return self._write_middleware
 
+    def bind_llm(self, llm_getter: Callable[[], Any]) -> None:
+        """运行时替换 LLM 获取器，并同步到写中间件（支持 provider 热切换）。
+
+        入口创建 Agent 后调用，将记忆组件（召回/压缩/事实抽取）的 LLM
+        来源动态绑定到 ``agent.llm``，确保切换提供商后记忆链路不再使用
+        启动时的旧 LLMClient。
+
+        Args:
+            llm_getter: 返回当前 LLMClient 的 callable
+        """
+        self._llm_getter = llm_getter
+        self._write_middleware.bind_llm(llm_getter)
+
     # ============ 召回（读） ============
 
     async def recall(

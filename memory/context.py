@@ -103,6 +103,18 @@ class MemoryContext:
         """MemoryManager 实例（长期记忆召回/消费/压缩/清理）。"""
         return self._memory_manager
 
+    def bind_llm(self, llm_getter: Any) -> None:
+        """运行时替换记忆链路的 LLM 获取器（支持 provider 热切换）。
+
+        入口程序在创建 AgentCore 后调用，将记忆组件（事实抽取/召回/压缩）
+        的 LLM 来源动态绑定到当前 Agent 的 ``agent.llm``，
+        避免切换提供商后记忆抽取仍使用启动时的旧 LLMClient。
+
+        Args:
+            llm_getter: 返回当前 LLMClient 的 callable
+        """
+        self._memory_manager.bind_llm(llm_getter)
+
     # ============ 生命周期 ============
 
     async def aclose(self) -> None:
