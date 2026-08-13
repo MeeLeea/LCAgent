@@ -33,19 +33,29 @@ class SessionContext:
         session_id: str,
         checkpointer: BaseCheckpointSaver,
         recursion_limit: int = 25,
+        workspace_path: str | None = None,
     ) -> SessionContext:
         """构建会话上下文。
+
+        workspace_path 作为 Session 固有属性注入 config.configurable，
+        供文件代理工具与 cwd 中间件在运行时只读消费。LLM 不可见此参数
+        （由框架从 RunnableConfig 自动注入到工具，且不进 schema）。
 
         Args:
             session_id: 会话线程 ID。
             checkpointer: 共享 checkpointer。
             recursion_limit: LangGraph 递归上限（= max_iterations）。
+            workspace_path: 会话绑定的外部工作空间绝对路径。
+                            为 None 时不注入（兼容无工作空间的旧会话）。
 
         Returns:
             SessionContext 实例。
         """
+        configurable: dict[str, Any] = {"thread_id": session_id}
+        if workspace_path is not None:
+            configurable["workspace_path"] = workspace_path
         config: dict[str, Any] = {
-            "configurable": {"thread_id": session_id},
+            "configurable": configurable,
             "recursion_limit": recursion_limit,
         }
         return cls(session_id=session_id, config=config, checkpointer=checkpointer)
