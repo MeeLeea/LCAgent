@@ -282,6 +282,7 @@ function rebindThread(get: StoreGet, set: StoreSet, oldKey: string, newKey: stri
 /**
  * 统一处理某线程的流式事件（sendMessage / resume 共用）。
  * 事件始终写入该线程的消息缓冲；仅当该线程是当前线程时同步到 messages 展示。
+ * 返回当前有效的线程 key（thread_created 事件后更新为后端分配的真实 ID）。
  */
 function handleStreamEvent(
   get: StoreGet,
@@ -289,8 +290,8 @@ function handleStreamEvent(
   threadId: string,
   ev: StreamEvent,
   ctx: { finish: () => void },
-) {
-  if (terminatedThreads.has(threadId)) return
+): string {
+  if (terminatedThreads.has(threadId)) return threadId
   const arr = [...(get().messagesByThread[threadId] ?? [])]
   const lastIndex = arr.length - 1
   const last = arr[lastIndex]
@@ -299,14 +300,16 @@ function handleStreamEvent(
     case 'thread_created':
       rebindThread(get, set, threadId, ev.thread_id)
       get().fetchThreads()
-      break
+      return ev.thread_id
     case 'token':
-      if (!last || last.role !== 'assistant') return
+      if (!last || last.role !== 'assistant') return threadId
       arr[lastIndex] = { ...last, content: last.content + ev.content }
       commitThreadMessages(get, set, threadId, arr)
       break
     case 'tool_call':
-      if (!last || last.role !== 'assistant') return
+      if (!last || last.role !== 'assistant') return threadId
+      // ask_human 的 UI 由 INTERRUPT 事件渲染，不添加到 toolCalls 避免重复显示
+      if (ev.name === 'ask_human') return threadId
       arr[lastIndex] = {
         ...last,
         toolCalls: [...(last.toolCalls ?? []), { id: ev.id, name: ev.name, args: ev.args }],
@@ -314,7 +317,9 @@ function handleStreamEvent(
       commitThreadMessages(get, set, threadId, arr)
       break
     case 'tool_result':
-      if (!last || last.role !== 'assistant') return
+      if (!last || last.role !== 'assistant') return threadId
+      // ask_human 的结果不渲染为 ToolCallCard（避免孤儿 toolResult）
+      if (ev.name === 'ask_human') return threadId
       arr[lastIndex] = {
         ...last,
         toolResults: [
@@ -325,7 +330,7 @@ function handleStreamEvent(
       commitThreadMessages(get, set, threadId, arr)
       break
     case 'interrupt': {
-      if (!last || last.role !== 'assistant') return
+      if (!last || last.role !== 'assistant') return threadId
       arr[lastIndex] = { ...last, streaming: false, interrupted: true }
       const info: InterruptInfo = { prompt: ev.prompt, choices: ev.choices }
       set((s) => {
@@ -339,7 +344,7 @@ function handleStreamEvent(
       break
     }
     case 'cancelled':
-      if (!last || last.role !== 'assistant') return
+      if (!last || last.role !== 'assistant') return threadId
       arr[lastIndex] = {
         ...last,
         streaming: false,
@@ -350,7 +355,7 @@ function handleStreamEvent(
       get().fetchThreads()
       break
     case 'error':
-      if (!last || last.role !== 'assistant') return
+      if (!last || last.role !== 'assistant') return threadId
       // 避免重复追加多条错误
       if (!last.error) {
         arr[lastIndex] = {
@@ -381,7 +386,7 @@ function handleStreamEvent(
       break
     }
     case 'done': {
-      if (!last || last.role !== 'assistant') return
+      if (!last || last.role !== 'assistant') return threadId
       arr[lastIndex] = { ...last, streaming: false }
       commitThreadMessages(get, set, threadId, arr)
       set((s) => {
@@ -399,6 +404,7 @@ function handleStreamEvent(
       break
     }
   }
+  return threadId
 }
 
 /** 把后端原始消息列表转换为前端回合结构 */
@@ -408,12 +414,14 @@ function rawToMessages(raw: RawMessage[]): ChatMessage[] {
     if (m.role === 'user') {
       turns.push({ id: nextId(), role: 'user', content: m.content })
     } else if (m.role === 'assistant') {
-      if (m.tool_calls && m.tool_calls.length) {
+      // ask_human 的 UI 由 InterruptCard 渲染，从 tool_calls 中过滤掉
+      const toolCalls = (m.tool_calls ?? []).filter((tc) => tc.name !== 'ask_human')
+      if (toolCalls.length) {
         turns.push({
           id: nextId(),
           role: 'assistant',
           content: m.content || '',
-          toolCalls: m.tool_calls,
+          toolCalls,
           toolResults: [],
         })
       } else {
@@ -426,6 +434,8 @@ function rawToMessages(raw: RawMessage[]): ChatMessage[] {
         }
       }
     } else if (m.role === 'tool') {
+      // 跳过 ask_human 的工具结果
+      if (m.name === 'ask_human') continue
       const last = turns[turns.length - 1]
       if (last && last.role === 'assistant' && last.toolResults) {
         last.toolResults.push({ id: m.id ?? '', name: m.name ?? '', content: m.content })
@@ -686,14 +696,42 @@ export const useStore = create<AppState>((set, get) => ({
     commitThreadMessages(get, set, key, arr)
     markStreaming(get, set, key, true)
 
-    const finish = makeFinish(get, set, key)
-    const watchdogHandler = makeWatchdogHandler(get, set, key, finish)
+    // 可变线程 key：thread_created 事件后由 handleStreamEvent 返回新值，
+    // 确保后续事件（token/done 等）写入正确的线程缓冲。
+    // 修复：此前 key 为闭包常量，rebindThread 迁移状态后旧 key 的缓冲被删除，
+    // 后续事件因找不到消息而被忽略，streaming 永不复位（需刷新才更新）。
+    let activeKey = key
+
+    const finish = () => {
+      if (terminatedThreads.has(activeKey)) return
+      terminatedThreads.add(activeKey)
+      clearWatchdog(activeKey)
+      delete abortFns[activeKey]
+      markStreaming(get, set, activeKey, false)
+    }
+
+    const watchdogHandler = () => {
+      const msgs = [...(get().messagesByThread[activeKey] ?? [])]
+      const lastIndex = msgs.length - 1
+      const last = msgs[lastIndex]
+      if (last && last.role === 'assistant' && last.streaming) {
+        msgs[lastIndex] = {
+          ...last,
+          streaming: false,
+          error: true,
+          content: last.content + (last.content ? '\n\n' : '') + '> ⏱️ 响应超时，请重试。',
+        }
+        commitThreadMessages(get, set, activeKey, msgs)
+      }
+      finish()
+    }
+
     armWatchdog(key, watchdogHandler)
 
     abortFns[key] = api.streamChat({ message: trimmed, thread_id: rawThreadId }, (ev) => {
       // 每收到任意事件，重置看门狗（复用同一超时处理器，保持兜底有效）
-      if (!terminatedThreads.has(key)) armWatchdog(key, watchdogHandler)
-      handleStreamEvent(get, set, key, ev, { finish })
+      activeKey = handleStreamEvent(get, set, activeKey, ev, { finish })
+      if (!terminatedThreads.has(activeKey)) armWatchdog(activeKey, watchdogHandler)
     })
   },
 
