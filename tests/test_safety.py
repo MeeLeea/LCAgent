@@ -401,3 +401,81 @@ def test_interrupt_confirm_payload_shape(monkeypatch):
         {"id": "deny", "label": "拒绝执行"},
     ]
 
+
+# ============ check_workspace_escape 测试 ============
+
+def test_workspace_escape_empty_path():
+    """空路径被拒绝。"""
+    resolved, error = safety.check_workspace_escape("", "D:/proj")
+    assert resolved == ""
+    assert "为空" in error
+
+
+def test_workspace_escape_relative_path_resolved(tmp_path):
+    """相对路径正确解析为 workspace 内绝对路径。"""
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    (ws / "test.txt").write_text("hello", encoding="utf-8")
+
+    resolved, error = safety.check_workspace_escape("test.txt", str(ws))
+    assert error == ""
+    assert resolved == os.path.realpath(str(ws / "test.txt"))
+
+
+def test_workspace_escape_dotdot_blocked(tmp_path):
+    """../ 逃逸被拦截。"""
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+
+    resolved, error = safety.check_workspace_escape("../../etc/passwd", str(ws))
+    assert resolved == ""
+    assert "逃逸" in error
+
+
+def test_workspace_escape_absolute_outside_blocked(tmp_path):
+    """绝对路径指向 workspace 外被拦截。"""
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    outside = tmp_path / "secret.txt"
+    outside.write_text("secret", encoding="utf-8")
+
+    resolved, error = safety.check_workspace_escape(str(outside), str(ws))
+    assert resolved == ""
+    assert "逃逸" in error
+
+
+def test_workspace_escape_absolute_inside_allowed(tmp_path):
+    """绝对路径指向 workspace 内允许。"""
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    (ws / "sub").mkdir()
+    target = ws / "sub" / "file.txt"
+
+    resolved, error = safety.check_workspace_escape(str(target), str(ws))
+    assert error == ""
+    assert resolved == os.path.realpath(str(target))
+
+
+def test_workspace_escape_case_insensitive_windows(tmp_path):
+    """Windows 大小写不敏感：不同大小写 workspace 路径应正确校验。"""
+    ws = tmp_path / "Workspace"
+    ws.mkdir()
+    (ws / "test.txt").write_text("ok", encoding="utf-8")
+
+    # 用小写 workspace 路径校验大写实际路径
+    _resolved, error = safety.check_workspace_escape(
+        "test.txt", str(ws).lower()
+    )
+    assert error == ""
+
+
+def test_workspace_escape_subdirectory_allowed(tmp_path):
+    """workspace 子目录路径允许。"""
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    (ws / "sub").mkdir()
+
+    resolved, error = safety.check_workspace_escape("sub/file.txt", str(ws))
+    assert error == ""
+    assert "sub" in resolved
+
