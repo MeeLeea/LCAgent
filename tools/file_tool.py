@@ -1,79 +1,14 @@
+"""文件工具模块
+
+文件读写工具由 MCP-Filesystem server 提供（read_file/write_file/list_directory/
+create_directory/move_file/search_files/get_file_info 等）。
+
+本模块不再定义本地文件工具，避免与 MCP 加载的同名工具冲突。
+
+工作空间隔离由 agent/workspace_middleware.py 的 FilesystemSecurityMiddleware
+在工具调用前拦截实现：
+- 从 config.configurable 读取当前会话 workspace_path
+- 将 LLM 传入的相对路径解析为 workspace 内绝对路径
+- commonpath 校验防止路径逃逸
+- 注入解析后的绝对路径到工具 args
 """
-文件读写工具 - 使用LangChain @tool装饰器
-"""
-import os
-from typing import Any
-
-from langchain_core.tools import tool
-
-
-@tool
-def read_file(file_path: str) -> dict[str, Any]:
-    """
-    读取文件内容工具。根据给定的文件路径读取文件内容。
-
-    Args:
-        file_path: 要读取的文件路径
-
-    Returns:
-        包含文件内容的字典，成功时包含content字段
-    """
-    try:
-        if not os.path.exists(file_path):
-            return {
-                "success": False,
-                "error": f"文件不存在: {file_path}",
-                "content": None
-            }
-
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-
-        return {
-            "success": True,
-            "file_path": file_path,
-            "content": content,
-            "size": len(content),
-            "message": f"成功读取文件，共 {len(content)} 个字符"
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "content": None
-        }
-
-
-@tool
-def write_file(file_path: str, content: str, mode: str = 'w') -> dict[str, Any]:
-    """
-    写入文件内容工具。将内容写入指定文件路径。
-
-    Args:
-        file_path: 文件路径
-        content: 要写入的内容
-        mode: 写入模式，'w'为覆盖，'a'为追加，默认'w'
-
-    Returns:
-        操作结果字典
-    """
-    try:
-        dir_path = os.path.dirname(file_path)
-        if dir_path and not os.path.exists(dir_path):
-            os.makedirs(dir_path, exist_ok=True)
-
-        with open(file_path, mode, encoding='utf-8') as f:
-            f.write(content)
-
-        return {
-            "success": True,
-            "file_path": file_path,
-            "size": len(content),
-            "mode": mode,
-            "message": f"成功写入文件，共 {len(content)} 个字符"
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }

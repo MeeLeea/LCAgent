@@ -6,7 +6,6 @@ from cli.human_input import ask_human
 
 from .calculator import calculate
 from .create_tools import create_tool
-from .file_tool import read_file, write_file
 from .get_local_time import get_local_time
 from .open_file import open_file, open_sqlite
 from .scheduler_tool import (
@@ -23,8 +22,6 @@ from .terminal_tools import run_cmd, run_python, run_shell
 # 导出所有本地工具供Agent使用
 all_tools = [
     search,
-    read_file,
-    write_file,
     calculate,
     run_shell,
     run_python,
@@ -54,12 +51,10 @@ __all__ = [
     'list_scheduled_tasks',
     'open_file',
     'open_sqlite',
-    'read_file',
     'read_skill',
     'run_cmd',
     'run_python',
     'run_shell',
     'schedule_task',
     'search',
-    'write_file',
 ]
