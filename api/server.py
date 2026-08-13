@@ -267,6 +267,7 @@ class ChatRequest(BaseModel):
 class CreateThreadRequest(BaseModel):
     type: str | None = "chat"
     workflow_name: str | None = None
+    workspace_path: str | None = None
 
 
 class ResumeRequest(BaseModel):
@@ -295,6 +296,10 @@ class SwitchRoleRequest(BaseModel):
 class SafetyUpdateRequest(BaseModel):
     mode: str | None = None
     confirm_dangerous: bool | None = None
+
+
+class SetWorkspaceRequest(BaseModel):
+    path: str
 
 
 # --------------------------------------------------------------------------- #
@@ -507,16 +512,25 @@ async def list_threads():
 
 @app.post("/api/threads")
 async def create_thread(req: CreateThreadRequest | None = None):
-    """新建会话，返回 thread_id。type=workflow 时创建专属工作流会话。"""
+    """新建会话，返回 thread_id。
+
+    type=workflow 时创建专属工作流会话。
+    workspace_path 指定会话绑定的外部工作空间路径（可选，用于多会话工作目录隔离）。
+    """
     async with chat_lock:
         if req and req.type == "workflow":
             workflow_name = req.workflow_name or "simple"
-            tid = agent.session.new_workflow_session(workflow_name)
+            tid = agent.session.new_workflow_session(
+                workflow_name,
+                workspace_path=req.workspace_path if req else None,
+            )
             agent.set_current_session(tid)
         else:
-            tid = agent.session.new_session()
+            tid = agent.session.new_session(
+                workspace_path=req.workspace_path if req else None,
+            )
             agent.set_current_session(tid)
-    logger.info("创建会话: %s", tid)
+    logger.info("创建会话: %s (workspace=%s)", tid, req.workspace_path if req else None)
     return {"thread_id": tid}
 
 
@@ -1071,6 +1085,125 @@ async def export_thread(thread_id: str, fmt: str = "text"):
     header = f"# 对话导出 - {thread_id}\n\n" if fmt == "markdown" else f"对话导出 - {thread_id}\n{'=' * 40}\n"
     content = header + sep.join(blocks)
     return {"thread_id": thread_id, "format": fmt, "content": content}
+
+
+# --------------------------------------------------------------------------- #
+# 工作空间绑定（Workspace）
+# --------------------------------------------------------------------------- #
+@app.get("/api/threads/{thread_id}/workspace")
+async def get_workspace(thread_id: str):
+    """查看指定会话绑定的工作空间路径（对应 CLI ``workspace`` 命令）。
+
+    Returns:
+        thread_id 与 workspace（未绑定时为 None）
+    """
+    if not agent:
+        raise HTTPException(status_code=503, detail="Agent 未初始化")
+    ws = await agent.session.aget_workspace(session_id=thread_id)
+    logger.info("查询工作空间 [%s]: %s", thread_id, ws or "(未绑定)")
+    return {"thread_id": thread_id, "workspace": ws}
+
+
+@app.post("/api/threads/{thread_id}/workspace")
+async def set_workspace(thread_id: str, req: SetWorkspaceRequest):
+    """设置/修改指定会话的工作空间绑定（对应 CLI ``workspace <path>`` 命令）。
+
+    路径校验由 ``SessionRegistry.aset_workspace`` 完成：必须是已存在的目录、
+    非系统关键目录。校验失败（ValueError）返回 400。
+
+    Returns:
+        thread_id 与规范化后的绝对路径
+    """
+    if not agent:
+        raise HTTPException(status_code=503, detail="Agent 未初始化")
+    logger.info("绑定工作空间 [%s]: %s", thread_id, req.path)
+    try:
+        real = await agent.session.aset_workspace(req.path, session_id=thread_id)
+    except ValueError as e:
+        logger.warning("绑定失败 [%s]: %s", thread_id, e)
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"thread_id": thread_id, "workspace": real}
+
+
+@app.delete("/api/threads/{thread_id}/workspace")
+async def clear_workspace(thread_id: str):
+    """清除指定会话的工作空间绑定（对应 CLI ``workspace:clear`` 命令）。
+
+    Returns:
+        thread_id 与 cleared 状态（True=原绑定存在已清除，False=原本无绑定）
+    """
+    if not agent:
+        raise HTTPException(status_code=503, detail="Agent 未初始化")
+    existed = await agent.session.aclear_workspace(session_id=thread_id)
+    logger.info("清除工作空间 [%s]: existed=%s", thread_id, existed)
+    return {"thread_id": thread_id, "cleared": existed}
+
+
+@app.get("/api/workspace/browse")
+async def browse_workspace(path: str | None = None):
+    """浏览文件系统目录结构（仅返回子目录），供前端文件检索器选择工作空间。
+
+    与 ``/api/threads/{thread_id}/workspace`` 配合：本端点负责"检索"目录树，
+    用户选定目录后由前端调用 POST ``workspace`` 完成绑定并记录。
+
+    安全限制：
+      - 路径必须是已存在的目录，否则返回 400
+      - 仅返回子目录（不返回文件），避免泄露文件级信息
+      - 跳过隐藏目录（``.`` 开头）与无权限目录
+      - 无 ``path`` 时：Windows 返回可用盘符列表，其他平台从根目录 ``/`` 开始
+
+    Args:
+        path: 要浏览的目录绝对路径，为空时返回浏览起点
+
+    Returns:
+        path: 当前规范化路径（起点时为空串）
+        entries: 子目录列表 ``[{name, path, has_children}]``
+        is_root: 是否为浏览起点（盘符列表/根目录）
+    """
+    import string
+    import sys
+
+    def _has_subdir(full: str) -> bool:
+        """快速判断目录是否含子目录（命中即返回，最多扫 256 个条目）。"""
+        try:
+            for i, sub in enumerate(os.listdir(full)):
+                if i >= 256:
+                    break
+                if os.path.isdir(os.path.join(full, sub)):
+                    return True
+        except (PermissionError, OSError):
+            pass
+        return False
+
+    # 无 path：返回浏览起点
+    if not path:
+        if sys.platform == "win32":
+            drives = []
+            for letter in string.ascii_uppercase:
+                drive = f"{letter}:\\"
+                if os.path.exists(drive):
+                    drives.append({"name": f"{letter}:", "path": drive, "has_children": True})
+            return {"path": "", "entries": drives, "is_root": True}
+        path = "/"
+
+    real_path = os.path.realpath(os.path.abspath(path))
+    if not os.path.isdir(real_path):
+        raise HTTPException(status_code=400, detail=f"路径不存在或不是目录: {real_path}")
+
+    entries = []
+    try:
+        for name in sorted(os.listdir(real_path)):
+            full = os.path.join(real_path, name)
+            if not os.path.isdir(full):
+                continue
+            # 跳过隐藏目录
+            if name.startswith("."):
+                continue
+            entries.append({"name": name, "path": full, "has_children": _has_subdir(full)})
+    except PermissionError:
+        raise HTTPException(status_code=403, detail=f"无权限访问: {real_path}")
+
+    return {"path": real_path, "entries": entries, "is_root": False}
 
 
 # 生产环境：如果前端已构建（web/dist），则由本服务直接托管静态文件

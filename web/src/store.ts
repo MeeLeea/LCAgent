@@ -76,6 +76,9 @@ interface AppState {
   // LLM 累计 token 用量（输入栏右下角展示）
   totalTokens: number
 
+  // 工作空间（当前会话绑定的工作目录，输入栏左下角展示）
+  workspace: string | null
+
   // 工作流
   workflows: string[]
   workflow: WorkflowInfo | null
@@ -127,6 +130,11 @@ interface AppState {
   // 团队角色
   fetchRoles: () => Promise<void>
   switchRole: (role: string) => Promise<void>
+
+  // 工作空间
+  fetchWorkspace: (thread_id: string) => Promise<void>
+  setWorkspace: (path: string) => Promise<boolean>
+  clearWorkspace: () => Promise<void>
 }
 
 /** 当前线程是否正在流式输出（派生选择器，供组件订阅） */
@@ -453,6 +461,7 @@ export const useStore = create<AppState>((set, get) => ({
   roles: [],
   currentRole: null,
   totalTokens: 0,
+  workspace: null,
   viewMode: 'chat',
   workflows: [],
   workflow: null,
@@ -563,6 +572,8 @@ export const useStore = create<AppState>((set, get) => ({
       currentThreadId: id,
       pendingInterrupt: s.pendingInterrupts[id] ?? null,
     }))
+    // 加载该会话绑定的工作空间（输入栏左下角展示）
+    void get().fetchWorkspace(id)
     const cached = get().messagesByThread[id]
     if (cached) {
       set({ messages: cached })
@@ -589,6 +600,7 @@ export const useStore = create<AppState>((set, get) => ({
         currentThreadId: r.thread_id,
         messages: [],
         pendingInterrupt: null,
+        workspace: null,
         messagesByThread: { ...s.messagesByThread, [r.thread_id]: [] },
       }))
       await get().fetchThreads()
@@ -604,6 +616,7 @@ export const useStore = create<AppState>((set, get) => ({
         currentThreadId: r.thread_id,
         messages: [],
         pendingInterrupt: null,
+        workspace: null,
         messagesByThread: { ...s.messagesByThread, [r.thread_id]: [] },
       }))
       await get().fetchThreads()
@@ -831,6 +844,44 @@ export const useStore = create<AppState>((set, get) => ({
       console.log('[前端] 角色切换完成')
     } catch (e) {
       console.error('[前端] 切换角色失败:', e)
+    }
+  },
+
+  fetchWorkspace: async (thread_id) => {
+    try {
+      const r = await api.getWorkspace(thread_id)
+      // 防止异步竞态：仅当仍是当前会话时才更新
+      if (get().currentThreadId === thread_id) {
+        set({ workspace: r.workspace })
+      }
+    } catch {
+      if (get().currentThreadId === thread_id) set({ workspace: null })
+    }
+  },
+
+  setWorkspace: async (path) => {
+    const tid = get().currentThreadId
+    if (!tid) return false
+    try {
+      const r = await api.setWorkspace(tid, path)
+      set({ workspace: r.workspace })
+      console.log('[前端] 工作空间已绑定:', r.workspace)
+      return true
+    } catch (e) {
+      console.error('[前端] 设置工作空间失败:', e)
+      return false
+    }
+  },
+
+  clearWorkspace: async () => {
+    const tid = get().currentThreadId
+    if (!tid) return
+    try {
+      await api.clearWorkspace(tid)
+      set({ workspace: null })
+      console.log('[前端] 工作空间已清除')
+    } catch (e) {
+      console.error('[前端] 清除工作空间失败:', e)
     }
   },
 }))

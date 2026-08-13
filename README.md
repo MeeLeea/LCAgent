@@ -38,25 +38,25 @@
   - [记忆系统（Memory）](#记忆系统memory)
     - [设计架构](#设计架构)
     - [上下文注入机制（重要）](#上下文注入机制重要)
-      - [`react:` 和 `chat()` → 只用 checkpoint](#react-和-chat--只用-checkpoint)
-      - [`cot:` → checkpoint + memory.json](#cot--checkpoint--memoryjson)
+      - [`react:` 和 `chat()` → 事件驱动写入 + prompt 注入读取](#react-和-chat--事件驱动写入--prompt-注入读取)
+      - [`cot:` → 仅短期记忆](#cot--仅短期记忆)
       - [技能指引与长上下文摘要的注入](#技能指引与长上下文摘要的注入)
       - [对比表](#对比表)
     - [两层存储对比](#两层存储对比)
     - [三种模式的记忆行为](#三种模式的记忆行为)
     - [Checkpoint 持久化原理](#checkpoint-持久化原理)
-    - [长期记忆触发原理](#长期记忆触发原理)
+    - [长期记忆写入流水线](#长期记忆写入流水线)
     - [为什么 cot 不写入 checkpoint](#为什么-cot-不写入-checkpoint)
     - [文件位置](#文件位置)
-    - [会话(Thread)管理](#会话thread管理)
     - [记忆管理命令](#记忆管理命令)
     - [压缩长期记忆（compress）](#压缩长期记忆compress)
       - [工作流程](#工作流程)
       - [压缩提示词](#压缩提示词)
       - [使用示例](#使用示例)
-      - [压缩后的 memory.json 格式](#压缩后的-memoryjson-格式)
+      - [压缩后的 Store 格式](#压缩后的-store-格式)
       - [特点与注意事项](#特点与注意事项)
     - [记忆相关 API](#记忆相关-api)
+  - [会话管理（Session）](#会话管理session)
   - [工具系统（Tools）](#工具系统tools)
     - [1. 本地工具（Local Tools）](#1-本地工具local-tools)
     - [2. MCP 工具（MCP Server Tools）](#2-mcp-工具mcp-server-tools)
@@ -225,22 +225,36 @@ LangChainAgent/
 │   ├── engine.py            # APScheduler 引擎
 │   └── run.py               # 独立进程入口
 ├── data/                  # 运行时数据库目录（自动生成）
-│   ├── checkpoints_async.sqlite # Checkpoint 持久化数据库（异步 saver）
-│   ├── memory.json          # 长期记忆文件（用于 compress 摘要）
+│   ├── checkpoints_async.sqlite # Checkpoint 持久化数据库 + 长期记忆 Store（同一文件）
 │   └── scheduled_tasks.sqlite# 定时任务数据库
+├── memory/                 # 记忆模块（三层架构 Memory 层，与 agent 平级）
+│   ├── __init__.py         # 包导出
+│   ├── agent_memory.py     # AgentMemory：checkpointer + Store 基础设施
+│   ├── config.py           # Memory 配置默认值
+│   ├── context.py          # MemoryContext：统一工厂（入口程序调用）
+│   ├── lock_pool.py        # ThreadMemoryLockPool：per-thread 并发锁池
+│   ├── manager.py          # MemoryManager：统一门面（召回/消费/压缩/清理）
+│   ├── middleware.py       # 读写中间件（防抖 buffer + Fact 抽取 + prompt 注入）
+│   ├── models.py           # 数据模型与事件分类判定（MemoryCategory / ThreadFactItem）
+│   └── store.py            # ThreadMemoryStore：Store 业务封装（per-thread 隔离）
 ├── agent/
 │   ├── __init__.py
 │   ├── agent_config.json    # Agent 运行时参数
 │   ├── AGENT.md             # Agent 核心系统提示词（行为规则）
 │   ├── llm_client.py        # 统一大模型封装（多提供商 + 多模型）
 │   ├── config.py            # 运行时配置加载(agent/agent_config.json)
-│   ├── memory.py            # AgentMemory：checkpoint + 长期记忆 + 会话管理
 │   ├── compaction.py        # 长上下文压缩中间件（增量摘要 + 工具输出 Prune）
 │   ├── metrics.py           # 运行时指标收集（LLM/工具/压缩统计，线程安全）
 │   ├── logging_config.py    # 结构化日志（trace_id/thread_id 上下文注入）
 │   ├── exceptions.py        # 统一异常层次（LCAgentError 及其子类）
 │   ├── message_utils.py     # LLM 异常信息提取（中文化错误提示）
 │   └── agent_core.py        # Agent 核心调度：run/chat/cot 三种模式 + HITL + 异步 API
+├── session/                 # 会话管理模块（三层架构 Session 层）
+│   ├── context.py           # SessionContext：单会话运行时上下文（session_id + config + checkpointer）
+│   ├── store.py             # SessionStore：基于 LangGraph Store 的 per-session 瞬态状态
+│   ├── registry.py          # SessionRegistry：会话生命周期管理（生成/查询/删除/消息读取）
+│   ├── workspace_store.py   # WorkspaceStore：session_id ↔ workspace_path 映射
+│   └── manager.py           # SessionManager：对外门面 & 会话调度（封装 Agent + Memory）
 ├── team/                    # 多 Agent 团队协作模块
 │   ├── __init__.py          # 导出 ManagerAgent/WorkerAgent/TerminatorAgent
 │   ├── factory.py           # 团队 Agent 工厂函数
@@ -328,12 +342,13 @@ LangChainAgent/
 | [main.py](main.py)                                       | 交互式命令行入口 + Agent 构建接口                                                                                           |
 | [agent/llm_client.py](agent/llm_client.py)               | 从`config/llm_config.json` 读取提供商配置，支持运行时切换提供商/模型                                                      |
 | [agent/config.py](agent/config.py)                       | 加载`agent/agent_config.json`，统一运行时配置                                                                             |
-| [agent/memory.py](agent/memory.py)                       | 双层记忆：Checkpoint（自动）+ memory.json（手动）+ 对话导出                                                                 |
+| [memory/](memory/)                                       | 三层架构 Memory 层：`AgentMemory`（checkpointer + Store 基础设施）/ `MemoryContext`（统一工厂）/ `MemoryManager`（统一门面）/ `ThreadMemoryStore`（Store 业务封装）/ 读写中间件（防抖 + Fact 抽取 + prompt 注入）/ per-thread 锁池 |
 | [agent/compaction.py](agent/compaction.py)               | 长上下文压缩中间件：增量摘要 + 工具输出 Prune + 保留近期消息，摘要随 checkpoint 持久化、per-thread 隔离                      |
 | [agent/metrics.py](agent/metrics.py)                     | `MetricsCollector`：线程安全的运行时指标收集（LLM 调用 / 工具执行 / 压缩统计）                                            |
 | [agent/logging_config.py](agent/logging_config.py)       | 结构化日志：`contextvars` 实现 trace_id / thread_id 异步安全注入                                                          |
 | [agent/exceptions.py](agent/exceptions.py)               | 统一异常层次：`LCAgentError` 基类及 MCP/超时/压缩/中断/状态等子类                                                         |
 | [agent/agent_core.py](agent/agent_core.py)               | Agent 核心：`run()` / `chat()` / `cot()` 三种模式 + 全套异步 API + `AgentTurnResult` 结构化暂停/恢复 + 技能注入 + 压缩/裁剪 |
+| [session/](session/)                                     | 三层架构 Session 层：`SessionContext`（单会话运行时上下文）/ `SessionStore`（per-session 瞬态状态）/ `SessionRegistry`（生命周期管理）/ `WorkspaceStore`（工作空间映射）/ `SessionManager`（对外门面 & 会话调度） |
 | [team/](team/)                                           | 多 Agent 团队协作：ManagerAgent（拆解）/ WorkerAgent（执行）/ TerminatorAgent（汇总）+ 工厂函数                             |
 | [graph/simple.py](graph/simple.py)                       | LangGraph 监督者模式工作流编排（Manager→Worker→Terminator）                                                               |
 | [tools/skills.py](tools/skills.py)                       | `SkillManager`：扫描/匹配/渲染本地技能                                                                                    |
@@ -394,69 +409,107 @@ Agent 有三种执行模式，对应三种不同的交互入口：
 
 ### 设计架构
 
-Agent 采用 **LangGraph Checkpoint + 长期记忆** 双层设计，由 [agent/memory.py](agent/memory.py) 的 `AgentMemory` 类实现：
+记忆系统为独立的 **三层架构 Memory 层**（[memory/](memory/)，与 `agent/` `session/` 平级），由 [memory/manager.py](memory/manager.py) 的 `MemoryManager` 作为统一门面，底层封装 **LangGraph Checkpoint（短期）+ BaseStore 长期记忆（facts）** 双层存储：
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                       AgentMemory                              │
-│                                                                │
-│  ┌───────────────────────────┐  ┌─────────────────────────┐  │
-│  │   Checkpoint (自动)        │  │   长期记忆 (手动)         │  │
-│  │   SQLite 持久化            │  │   memory.json            │  │
-│  │                           │  │                           │  │
-│  │   • Agent 每步执行后自动写 │  │   • 仅 important=True 写入│  │
-│  │   • 完整状态(消息+工具调用)│  │   • 仅 react/cot 触发     │  │
-│  │   • 按 thread_id 隔离      │  │   • 用于 compress 摘要    │  │
-│  │   • 程序重启可恢复         │  │   • 跨会话保留关键信息    │  │
-│  └───────────────────────────┘  └─────────────────────────┘  │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│            memory/ 包（三层架构 Memory 层，与 agent 平级）         │
+│                                                                  │
+│  统一门面  MemoryManager  ── recall / consume_event / compress   │
+│                                                                  │
+│  ┌────────────────────────┐  ┌──────────────────────────────┐   │
+│  │  Checkpoint (自动)      │  │  长期记忆 Store (事件驱动)    │   │
+│  │  AsyncSqliteSaver      │  │  AsyncSqliteStore             │   │
+│  │  checkpoints_async.sql │  │  namespace=(thread_id,        │   │
+│  │  (MemoryContext 注入)  │  │   "thread_facts")             │   │
+│  │                        │  │                              │   │
+│  │  • Agent 每步执行后自动写│  │  • 写: ThreadMemoryWrite     │   │
+│  │  • 完整状态(消息+工具调用)│  │    Middleware 防抖→LLM 抽取  │   │
+│  │  • 按 thread_id 隔离    │  │  • 读: ThreadMemoryRead      │   │
+│  │  • 程序重启可恢复       │  │    Middleware 注入 SystemMsg │   │
+│  │                        │  │  • 去重 + LRU 淘汰(50条)     │   │
+│  └────────────────────────┘  └──────────────────────────────┘   │
+│                                                                  │
+│  基础设施: AgentMemory(checkpointer+Store) / MemoryContext(工厂)  │
+│           ThreadMemoryLockPool(per-thread 锁) / models.py(分类)  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-> 在此双层之上，还有一层 **Compaction 压缩中间件**（[agent/compaction.py](agent/compaction.py)）负责控制**单会话内的上下文长度**：当 checkpoint 恢复的消息数超过阈值时，`before_model` 自动把旧消息增量摘要成 `state.summary`（随 checkpoint 持久化、per-thread 隔离），并 Prune 过长的历史工具输出，无需新开 thread。详见[可观测性与可靠性 → 长上下文压缩中间件](#长上下文压缩中间件compaction)。
+**数据流**（读写分离）：
+
+```
+写: SessionManager 消费 AgentEvent 流（submit_user_message / consume_event）
+     → 非阻塞投递到 WriteMiddleware 防抖 buffer（20s 窗口）
+     → LLM Fact 抽取（格式化事实 + 分类 + 置信度）
+     → 无效过滤 / 本地去重 → 批量写入 ThreadMemoryStore
+     → LRU 淘汰（单 thread 超 50 条时）
+
+读: ThreadMemoryReadMiddleware.awrap_model_call（每个 model 调用前）
+     → query_facts(thread_id) 读取该 thread 全部 facts
+     → 格式化为文本追加到 SystemMessage（【长期记忆】块）
+     → 非阻塞更新 last_used_at（供 LRU 淘汰）
+```
+
+**组件职责**：
+
+| 组件 | 文件 | 职责 |
+| ---- | ---- | ---- |
+| `MemoryManager` | [memory/manager.py](memory/manager.py) | 统一门面：`recall` / `recall_text` / `submit_user_message` / `consume_event` / `compress` / `clear` / `flush_all` |
+| `MemoryContext` | [memory/context.py](memory/context.py) | 统一工厂：入口程序（main/api/scheduler）调用 `acreate()` 组装全部组件，暴露 checkpointer / store / read_middleware / memory_manager |
+| `AgentMemory` | [memory/agent_memory.py](memory/agent_memory.py) | checkpointer（`AsyncSqliteSaver`）+ 长期记忆 Store（`AsyncSqliteStore`）基础设施 |
+| `ThreadMemoryStore` | [memory/store.py](memory/store.py) | Store 业务封装：facts 的增/查/批量写/LRU 淘汰/摘要替换/会话级清空 |
+| `ThreadMemoryWriteMiddleware` | [memory/middleware.py](memory/middleware.py) | 写服务：事件接收 + 防抖 buffer + Fact 抽取流水线（非 AgentMiddleware） |
+| `ThreadMemoryReadMiddleware` | [memory/middleware.py](memory/middleware.py) | 读中间件（AgentMiddleware）：`awrap_model_call` 注入 facts 到 SystemMessage |
+| `ThreadMemoryLockPool` | [memory/lock_pool.py](memory/lock_pool.py) | per-thread `asyncio.Lock` 池：串行化同一 thread 的写入，不同 thread 并行 |
+| `models.py` | [memory/models.py](memory/models.py) | `MemoryCategory` / `ThreadFactItem` / `MemoryInputEvent` / `judge_long_term_memory` 分类判定 |
+| `config.py` | [memory/config.py](memory/config.py) | 运行时参数默认值（buffer 延迟 / 上限 / fact 上限 / 召回条数） |
+
+> 除此之外还有一层 **Compaction 压缩中间件**（[agent/compaction.py](agent/compaction.py)）负责控制**单会话内的上下文长度**：当 checkpoint 恢复的消息数超过阈值时，`before_model` 自动把旧消息增量摘要成 `state.summary`（随 checkpoint 持久化、per-thread 隔离），并 Prune 过长的历史工具输出，无需新开 thread。注意这与记忆系统的 `compress` 命令是两回事（前者压缩会话上下文，后者压缩长期记忆 facts）。详见[可观测性与可靠性 → 长上下文压缩中间件](#长上下文压缩中间件compaction)。
 
 ### 上下文注入机制（重要）
 
 一个常见疑问：**Agent 在对话时，历史消息从哪里来？** 答案取决于模式。
 
-#### `react:` 和 `chat()` → 只用 checkpoint
+#### `react:` 和 `chat()` → 事件驱动写入 + prompt 注入读取
+
+Agent 模式下，LLM 上下文由 **checkpoint 恢复的历史消息 + ReadMiddleware 注入的长期记忆 facts** 共同组成：
 
 ```python
-# run() / chat()
-result = self.agent_executor.invoke(
-    {"messages": [HumanMessage(content=task)]},   # ← 只传当前这一条
-    config=self.memory.get_config()               # ← 传 thread_id
-)
+# arun_events()：graph 恢复 checkpoint 历史
+config = self._invoke_config(thread_id)          # {"configurable": {"thread_id": ...}}
+async for ev in self._arun_graph_events({"messages": [HumanMessage(content=message)]}, config, ...)
 ```
 
-- 调用时**只传当前这条新消息**
-- 历史消息由 **LangGraph 从 checkpoint 自动恢复**（按 thread_id 取出该会话所有历史消息，拼到新消息前面）
-- **memory.json 完全不参与** LLM 上下文
+- **历史消息**：LangGraph 从 checkpoint 自动恢复（按 thread_id 取出该会话所有历史消息，拼到新消息前面）
+- **长期记忆**：`ThreadMemoryReadMiddleware` 在每个 model 调用前（`awrap_model_call`）从 Store 读取该 thread 的 facts，格式化为文本追加到 SystemMessage，随请求一起发给 LLM
+- **写入路径**：SessionManager 在事件流消费时调用 `submit_user_message()` / `consume_event()` 非阻塞投递，经防抖 + LLM 抽取后写入 Store
 
 ```
 invoke(新消息, thread_id)
    ↓
-LangGraph: 从 checkpoint 读该 thread 的全部历史
-   ↓
-[历史消息1, 历史消息2, ..., 新消息] → 传给 LLM
+[历史消息1, ..., 新消息] + SystemMessage(【长期记忆】块) → 传给 LLM
    ↓
 LLM 回复 → 写回 checkpoint
+   ↓
+DONE / TOOL_RESULT 事件 → SessionManager.consume_event() → 防抖 → LLM 抽取 → 写 Store
 ```
 
-#### `cot:` → checkpoint + memory.json
+#### `cot:` → 仅短期记忆
 
 ```python
-# cot()（异步）
-context = await self.session.aget_short_term() + self.memory.get_long_term(3)
+# acot()（异步）
+short_term = await self.session.aget_short_term()   # ← 仅 checkpointer 的短期历史
 response = self.llm.chat_with_history(
     user_input=task,
-    history=context,   # ← 短期(checkpoint) + 长期(memory.json)
+    history=short_term,
+    system_prompt=system_prompt,
     ...
 )
 ```
 
 - `session.aget_short_term()` → 从 **SessionRegistry**（封装 checkpointer）取当前会话的消息（转 dict）
-- `memory.get_long_term(3)` → 从 **memory.json** 取最近 3 条长期记忆
-- 两者拼接后作为 history 传给 LLM
+- **不经过 Agent 执行**、不触发读写中间件，因此长期记忆 facts **不参与** cot 的上下文
+- cot 的输入输出也不消费（提交）到记忆流水线
 
 #### 技能指引与长上下文摘要的注入
 
@@ -472,56 +525,61 @@ self.agent_executor = self._create_agent_executor(
 
 | 来源         | 触发方式                                  | 说明                                              |
 | ------------ | ----------------------------------------- | ------------------------------------------------- |
+| 长期记忆     | 事件驱动自动沉淀，model 调用前注入         | ReadMiddleware 注入 Store facts（`【长期记忆】` 块） |
 | 手动技能     | `skill:<name>`                          | 后续对话都会注入该技能指引，直到`skill:clear`   |
 | 自动匹配技能 | `auto_match_skills=true`                | 根据任务与技能描述的关键词重叠度自动注入相关技能  |
 | 长上下文压缩 | 消息数超 `max_messages` 时 `before_model` 自动触发 | 由 Compaction 中间件增量摘要旧消息，写入 `state.summary`（随 checkpoint 持久化、per-thread 隔离），无需新开 thread |
 
 #### 对比表
 
-| 模式       | checkpoint  | memory.json    | 技能指引  | 长上下文压缩 | 说明                             |
-| ---------- | ----------- | -------------- | --------- | ------------ | -------------------------------- |
-| `react:` | ✅ 自动注入 | ❌ 不参与      | ✅ 可注入 | ✅ 中间件触发 | LangGraph 自动恢复该 thread 历史 |
-| 普通对话   | ✅ 自动注入 | ❌ 不参与      | ✅ 可注入 | ✅ 中间件触发 | 同上，但不打印步骤、不存长期     |
-| `cot:`   | ✅ 手动取   | ✅ 取最近 3 条 | ❌ 不注入 | ❌ 不触发    | 绕过 Agent，纯 LLM 推理          |
+| 模式       | checkpoint | Store facts | 技能指引 | 长上下文压缩 | 说明                             |
+| ---------- | ---------- | ----------- | -------- | ------------ | -------------------------------- |
+| `react:` | ✅ 自动恢复 | ✅ 自动注入 | ✅ 可注入 | ✅ 中间件触发 | `is_run_mode=True`，DONE 事件标记重要 |
+| 普通对话   | ✅ 自动恢复 | ✅ 自动注入 | ✅ 可注入 | ✅ 中间件触发 | 不标记重要，写入照常（事件驱动） |
+| `cot:`   | ✅ 手动取   | ❌ 不参与    | ❌ 不注入 | ❌ 不触发    | 绕过 Agent，纯 LLM 推理，不写长期 |
 
-> ⚠️ **重要副作用**：由于 `react:` 和普通对话**不读 memory.json**，意味着你在会话 A 里用 `react:` 做的事（已存入 memory.json），切到会话 B 再用 `react:` 时，**LLM 看不到**会话 A 的关键信息。只有 `cot:` 模式或 `compress` 命令才会读 memory.json。也就是说 **memory.json 的跨会话"记忆"能力目前只对 cot 生效**。
+> ⚠️ **重要副作用**：`react:` / 普通对话的记忆只按 **thread_id** 隔离（namespace `(thread_id, "thread_facts")`）。切到新的 thread（会话 B）后，ReadMiddleware 只注入会话 B 自己的 facts，**看不到**会话 A 沉淀的长期记忆。跨会话共享记忆目前不支持——长期记忆与 checkpoint 一样按会话隔离。
 
 ### 两层存储对比
 
 | 类型                 | 存储方式                               | 触发时机                   | 保存内容                           | 持久化  | 用途                              |
 | -------------------- | -------------------------------------- | -------------------------- | ---------------------------------- | ------- | --------------------------------- |
 | **Checkpoint** | `data/checkpoints_async.sqlite` (SQLite) | Agent 每步执行后自动       | 完整状态(消息+工具调用链+中间变量) | ✅ 永久 | 程序重启恢复对话、多会话隔离      |
-| **长期记忆**   | `data/memory.json` (JSON)          | 手动标记`important=True` | 仅 react/cot 的最终结果            | ✅ 永久 | 跨会话保留关键决策、用于 compress |
+| **长期记忆**   | 同一 SQLite 文件（`AsyncSqliteStore`） | 事件驱动 + LLM 抽取（防抖 20s 后批量） | facts（content + category + confidence） | ✅ 永久 | 跨会话保留关键信息、注入 prompt、compress |
 
 ### 三种模式的记忆行为
 
-| 模式           | 调用方法   | 写入 Checkpoint | 写入 memory.json | 说明                          |
-| -------------- | ---------- | --------------- | ---------------- | ----------------------------- |
-| `react:任务` | `run()`  | ✅ 自动         | ✅ 手动触发      | ReAct 结果重要，永久保存      |
-| `cot:任务`   | `cot()`  | ❌ 不写         | ✅ 手动触发      | CoT 不走 Agent，仅存结论      |
-| 普通输入       | `chat()` | ✅ 自动         | ❌ 不写          | 闲聊仅存 checkpoint，用完即丢 |
+| 模式           | 调用方法   | 写入 Checkpoint | 写入长期记忆 Store | 说明                          |
+| -------------- | ---------- | --------------- | ------------------ | ----------------------------- |
+| `react:任务` | `arun_events(is_run_mode=True)` | ✅ 自动 | ✅ 事件驱动（用户消息标记 important） | ReAct 结果重要，DONE 事件标记 is_important |
+| `cot:任务`   | `acot()`    | ❌ 不写         | ❌ 不写             | CoT 绕过 Agent，纯 LLM 推理，无事件流 |
+| 普通输入       | `achat_stream()` | ✅ 自动 | ✅ 事件驱动（不标记 important） | 对话同样参与记忆抽取，只是不强调重要 |
 
-> **关键区别**：Checkpoint 由 LangGraph 自动管理，无需手动干预；长期记忆需显式传 `metadata={"important": True}` 才会写入 `memory.json`。
+> **关键区别**：Checkpoint 由 LangGraph 自动管理，无需手动干预；长期记忆由**事件驱动流水线**自动沉淀（分类判定 + LLM 抽取 + 去重），`important` 标记只是提高"值得评估"的优先级，不再决定是否写入。
 
 ### Checkpoint 持久化原理
 
-Agent 创建时传入 `checkpointer`，LangGraph 在每次 `invoke()` 后自动保存状态到 SQLite：
+checkpointer 由入口程序（[main.py](main.py) / [api/server.py](api/server.py) / [scheduler/run.py](scheduler/run.py)）通过 `MemoryContext.acreate()` 创建后注入 `AgentCore`，LangGraph 在每次执行后自动保存状态到 SQLite：
 
 ```python
-# agent/agent_core.py
-agent = create_react_agent(
-    model=chat_model,
-    tools=self.tools,
-    prompt=self._get_system_prompt(),
-    checkpointer=self.memory.get_checkpointer(),  # ← 自动持久化
+# main.py：先创建 MemoryContext，再注入 AgentCore
+memory_ctx = await MemoryContext.acreate(
+    checkpoint_file=CHECKPOINT_FILE,
+    llm_getter=lambda: llm,
+    ...
 )
-
-# 调用时传 thread_id,LangGraph 自动恢复该会话历史
-result = self.agent_executor.invoke(
-    {"messages": [HumanMessage(content=task)]},
-    config=self.memory.get_config()  # {"configurable": {"thread_id": "..."}}
+agent = await AgentCore.acreate(
+    llm_client=llm,
+    checkpointer=memory_ctx.checkpointer,            # ← 自动持久化
+    store=memory_ctx.store,                          # ← 长期记忆 Store
+    extra_middleware=[memory_ctx.read_middleware],   # ← 长期记忆读取中间件
+    initial_thread_id=memory_ctx.thread_id,
+    async_conn=memory_ctx.async_conn,
 )
+agent.set_memory_manager(memory_ctx.memory_manager)  # ← 注入 MemoryManager
 ```
+
+调用时传 thread_id，LangGraph 自动恢复该会话历史（`_invoke_config` 构造 `{"configurable": {"thread_id": ...}}`）。
 
 **核心能力**：
 
@@ -533,138 +591,98 @@ result = self.agent_executor.invoke(
 | 完整状态保存 | 保存消息、工具调用链、中间变量(不止文本)                                       |
 | 图暂停/恢复  | `ask_human` 触发 interrupt 后，用同一 `thread_id` 的 checkpoint 继续当前图 |
 
-### 长期记忆触发原理
+### 长期记忆写入流水线
 
-Checkpoint 是自动全量保存，长期记忆是**手动精选**——只有 `important=True` 的内容才写入：
+长期记忆不再是"手动标记 important"的简单追加，而是**事件驱动 + LLM 抽取**的完整流水线。写入在 [memory/middleware.py](memory/middleware.py) 的 `ThreadMemoryWriteMiddleware` 中实现：
 
-```python
-# agent/memory.py
-def add(self, role, content, metadata=None):
-    # 只在 important=True 时才写入 memory.json
-    if metadata and metadata.get("important", False):
-        self.long_term_memory.append(item)
-        self._save_long_term_memory()
-    # 普通(非important)由 checkpoint 自动处理,这里不再存
+```
+submit_event(thread_id, role, content, important)   # SessionManager 非阻塞调用
+   ↓ 投递到防抖 buffer（同 thread 新事件重置 20s 计时）
+   ↓ 限流：单 thread buffer 上限 30 条
+   ↓
+_a_run_pipeline()  （buffer 超时后批量处理）
+   ↓
+① 分类判定  judge_long_term_memory(MemoryInputEvent)
+   ↓ 非 SKIP 的事件进入下一步
+② LLM Fact 抽取  _a_extract_facts()
+   ↓ 从原始消息提取 {"content", "category", "confidence"} JSON 列表
+③ 无效内容过滤（空 content 丢弃）
+④ 本地去重（与 Store 已存在的 fact content 比对，批次内去重）
+⑤ 批量写入  save_facts_batch() → ThreadMemoryStore
+   ↓
+⑥ LRU 淘汰  prune_facts()（单 thread 超 50 条时淘汰最久未使用）
 ```
 
-在 [agent/agent_core.py](agent/agent_core.py) 中：
+**事件来源**：SessionManager 消费 AgentEvent 流时调用：
 
 ```python
-# run() 和 cot() 模式 - 存长期
-self.memory.add("user", task)
-self.memory.add("assistant", output, {"important": True})  # ← 触发持久化
-
-# chat() 模式 - 不存长期(由 checkpoint 自动保存)
-self.memory.add("user", message)
-self.memory.add("assistant", output)  # ← 无 important,不写 memory.json
+# session/manager.py（achat_stream / arun_stream 中）
+if self._memory is not None:
+    await self._memory.submit_user_message(tid, message, important=is_run_mode)
+    # 执行过程中：
+    if event.is_memory_worthy:          # DONE / TOOL_RESULT 事件
+        await self._memory.consume_event(event)
 ```
+
+- `is_run_mode=True`（`react:` 模式）→ 用户消息标记 `important=True`
+- `DONE` / `TOOL_RESULT` 事件（`AgentEvent.is_memory_worthy`）→ 提交给记忆流水线评估
+- `TOKEN` / `TOOL_CALL` / `INTERRUPT` 事件不单独提交
+
+**分类判定**（[memory/models.py](memory/models.py) 的 `judge_long_term_memory`）：
+
+| 分类 | 取值 | 判定条件 |
+| ---- | ---- | -------- |
+| `USER_FACT` | `user_fact` | 用户告知的个人信息、习惯、偏好 |
+| `LESSON_EXPERIENCE` | `lesson` | 工具踩坑、稳定推理结论、不可行方案（同类失败 ≥2 次） |
+| `BUSINESS_ENTITY` | `business` | 项目配置、关键路径、接口、长期目标 |
+| `IMPORTANT_CONVERSATION` | `conv` | 用户显式说"记住"、重要技术决策 |
+| `SKIP` | `skip` | 临时资源 / 未确认猜想 / 一次性子任务 / 单次失败 → 不写入 |
+
+> **LLM 抽取是第二道闸门**：分类判定只决定"值得评估"，最终是否入库由 LLM 从原始对话中抽取结构化事实决定，并附带 `category` 与 `confidence`（置信度），无效分类回退为 `conv`。
 
 ### 为什么 cot 不写入 checkpoint
 
-`cot()` 方法直接调用 `self.llm.chat_with_history()`，**绕过了 `agent_executor.invoke()`**，因此 checkpoint 不会记录。这是设计上的选择：
+`acot()` 方法直接调用 `self.llm.chat_with_history()`，**绕过了 `agent_executor`（LangGraph 执行）**，因此 checkpoint 不会记录。这是设计上的选择：
 
 - **cot 的语义**：纯推理，不调用工具
 - **避免被 Agent 拦截**：走 Agent 通道 LLM 可能自己决定调用工具，违背 cot 初衷
-- **checkpoint 是为 Agent 设计的**：cot 没有工具调用链，用 memory.json 存结论即可
+- **checkpoint 是为 Agent 设计的**：cot 没有工具调用链，也没有事件流，无需沉淀
 
-**副作用**：cot 之间无法续接(第二次 cot 看不到第一次 cot 的对话)，只能通过 memory.json 的长期记忆间接看到摘要。
+**副作用**：cot 之间无法续接（第二次 cot 看不到第一次 cot 的对话），只能用 `session.aget_short_term()` 手动取历史作为上下文。
 
 ### 文件位置
 
-由 [main.py](main.py) 配置：
+由 [main.py](main.py) 配置 checkpoint 文件路径；长期记忆与会话工作目录映射均**复用同一 SQLite 文件**，按表隔离：
 
 ```python
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CHECKPOINT_FILE = os.path.join(BASE_DIR, "data", "checkpoints_async.sqlite")  # Checkpoint 数据库（异步 saver）
-MEMORY_FILE = os.path.join(BASE_DIR, "memory", "memory.json")            # 长期记忆
+CHECKPOINT_FILE = os.path.join(BASE_DIR, "data", "checkpoints_async.sqlite")
 ```
 
-| 文件                          | 格式      | 内容                                |
-| ----------------------------- | --------- | ----------------------------------- |
-| `data/checkpoints_async.sqlite` | SQLite    | Agent 执行状态(按 thread_id 隔离)   |
-| `data/memory.json`        | JSON 数组 | react/cot 的最终结果(用于 compress) |
+所有持久化数据集中在**单一 SQLite 文件** `data/checkpoints_async.sqlite` 中：
 
-> 全异步迁移后 CLI / API / 飞书均使用 `AsyncSqliteSaver`，checkpoint 数据库为
-> `checkpoints_async.sqlite`。旧版同步运行的 `checkpoints.sqlite` 不再写入，可手动删除。
+| 表 / 数据                | 管理者             | 内容                                                                |
+| ----------------------- | ------------------ | ------------------------------------------------------------------- |
+| `checkpoints` / `writes` | `AsyncSqliteSaver` | Agent 执行状态（消息 + 工具调用链，按 `thread_id` 隔离）            |
+| LangGraph Store 表       | `AsyncSqliteStore` | 长期记忆 facts（per-thread namespace 隔离，替代旧 `memory.json`）   |
+| `session_workspaces`     | `WorkspaceStore`   | `session_id ↔ workspace_path` 映射（多会话工作目录隔离）            |
 
-`memory.json` 文件格式：
+> **长期记忆存储**：长期记忆由 LangGraph `BaseStore`（`AsyncSqliteStore`，见 [memory/store.py](memory/store.py) 的 `ThreadMemoryStore`）管理，与 checkpoint 复用同一 SQLite 文件，按 `(thread_id, "thread_facts")` namespace 天然实现 per-thread 隔离。`compress` 命令现改为对该 Store 中的 facts 做摘要替换（`replace_with_summary`）。
 
-```json
-[
-  {
-    "role": "user",
-    "content": "react:帮我搜索Python教程",
-    "timestamp": "2026-07-06T10:30:00.123456",
-    "metadata": {"important": true}
-  },
-  {
-    "role": "assistant",
-    "content": "已为你找到以下Python教程...",
-    "timestamp": "2026-07-06T10:30:02.654321",
-    "metadata": {"important": true}
-  }
-]
-```
+> checkpoint 与 Store 各持有**独立的 `aiosqlite` 连接**（均启用 WAL 模式 + `busy_timeout=10000`），支持多进程（CLI / API / 调度器 / 飞书）并发读写。
 
-> 两个文件都会**自动创建父目录**，无需手动建 `data/` 文件夹。
+> `data/` 父目录会在首次连接时**自动创建**，无需手动建文件夹。
 >
-> **查看 checkpoints_async.sqlite**：可用 [DB Browser for SQLite](https://sqlitebrowser.org/dl/) 打开，或让 Agent 调用 `open_sqlite` 工具自动打开。
-
-### 会话(Thread)管理
-
-基于 checkpoint 的 `thread_id` 机制，支持多会话管理：
-
-| 命令                   | 作用                                               | 示例                            |
-| ---------------------- | -------------------------------------------------- | ------------------------------- |
-| `thread`             | 方向键选择切换会话(显示第一条用户消息与消息数预览) | `thread`                      |
-| `thread:new`         | 开启新会话(原会话保留)                             | `thread:new`                  |
-| `thread:delete <id>` | 删除指定会话(二次确认,不可恢复)                    | `thread:delete thread-abc123` |
-
-> 切换会话统一走 `thread` 方向键菜单，无需手动输入 thread_id。
->
-> 在 `thread` 菜单中，使用方向键移动高亮项，按 `Enter` 切换会话，按 `Esc` 取消；按 `Ctrl+D` 可删除当前高亮会话。删除前会要求输入 `y` 或 `yes` 确认。
->
-> 菜单中每个会话直接用第一条用户消息作为标题（超长自动截断），不调用 LLM，因此会话再多也不会卡顿。
-
-**示例**：
-
-```
-你: thread
- 选择会话 (共 2 个,↑↓ 选择,Enter 切换)
-  (↑↓ 选择, Enter 切换, Ctrl+D 删除, Esc 取消)
-    thread-a4d099d2  [6 条消息]
-  ❯ thread-b1dc3b2a  [0 条消息] (当前)
-----------------------------------------
-(按 Enter 切换)
-
-你: thread:new
-已开启新会话: thread-c7e8f1a3
-原会话 thread-a4d099d2 已保留,可用 'thread' 切回
-
-你: thread:delete thread-a4d099d2
-确认删除会话 'thread-a4d099d2'? 此操作不可恢复 [y/N]: y
-已删除会话: thread-a4d099d2
-```
-
-在会话菜单中删除高亮会话的操作示例：
-
-```
-你: thread
-  (↑↓ 选择, Enter 切换, Ctrl+D 删除, Esc 取消)
-  ❯ thread-b1dc3b2a  [0 条消息] (当前)
-
-确认删除会话 'thread-b1dc3b2a'? 此操作不可恢复 [y/N]: y
-已删除会话: thread-b1dc3b2a
-```
+> **查看 SQLite 内容**：可用 [DB Browser for SQLite](https://sqlitebrowser.org/dl/) 打开，或让 Agent 调用 `open_sqlite` 工具自动打开。
 
 ### 记忆管理命令
 
 | 命令                        | 作用                                 |
 | --------------------------- | ------------------------------------ |
-| `clear` 或 `clear long` | 清空长期记忆 + 删除`memory.json`   |
+| `clear` 或 `clear long` | 清空当前线程的长期记忆 facts（`MemoryManager.clear`） |
 | `clear short`             | 清空当前会话(开启新 thread 替代删除) |
-| `clear all`               | 全部清空                             |
-| `compress` 或 `压缩`    | 压缩长期记忆(LLM 摘要后替换原内容)   |
+| `clear all`               | 全部清空（长期 facts + 新会话）      |
+| `compress` 或 `压缩`    | 压缩长期记忆(LLM 摘要后替换单个摘要 fact) |
 | `thread`                  | 方向键选择切换会话                   |
 | `thread:new`              | 开启新会话                           |
 | `thread:delete <id>`      | 删除指定会话(二次确认)               |
@@ -687,24 +705,22 @@ Checkpoint: sqlite → D:\work\LangChainAgent\data\checkpoints_async.sqlite
 
 ### 压缩长期记忆（compress）
 
-随着 `react:` / `cot:` 不断积累，`memory.json` 会越来越大。`compress` 命令通过 LLM 把所有长期记忆压缩成一份摘要，再写回 `memory.json`。
+随着对话不断积累，Store 中的 facts 会越来越多（单 thread 上限 50 条，超出 LRU 淘汰）。`compress` 命令通过 LLM 把所有 facts 压缩成一份摘要，再替换为**单条摘要 fact**。
 
-> **注意**：compress 只压缩 `memory.json`，不影响 `checkpoints_async.sqlite`。
+> **注意**：compress 只压缩**长期记忆 facts**，不影响 checkpoint（完整对话历史保留在 `checkpoints_async.sqlite`）。
 
 #### 工作流程
 
 ```
-memory.json (N条原始记忆)
+Store facts (N条原始记忆)
        ↓
-拼接为文本 + 压缩提示词
+MemoryManager.compress(thread_id) 拼接为文本 + 压缩提示词
        ↓
-发送给 LLM
+LLM 生成摘要（阻塞调用放入 asyncio.to_thread，不阻塞事件循环）
        ↓
-LLM 生成摘要
+ThreadMemoryStore.replace_with_summary(thread_id, summary)
        ↓
-用摘要替换原 N 条记忆（变成 1 条）
-       ↓
-保存回 memory.json
+删除全部旧 facts → 写入 1 条摘要 fact（category=conv, confidence=1.0）
 ```
 
 #### 压缩提示词
@@ -734,29 +750,21 @@ LLM 生成摘要
 - 已通过 config/llm_config.json 配置多个 LLM 提供商
 - 修复了 StructuredTool 同步调用问题
 - ...
---- 已保存到 memory.json ---
+--- 已保存到长期记忆 Store ---
 ```
 
-#### 压缩后的 memory.json 格式
+#### 压缩后的 Store 格式
 
-```json
-[
-  {
-    "role": "system",
-    "content": "[历史记忆摘要 2026-07-06T12:00:00]\n- 用户要求创建...\n- 已配置...",
-    "timestamp": "2026-07-06T12:00:00",
-    "metadata": {
-      "important": true,
-      "type": "summary",
-      "original_count": 8,
-      "original_chars": 4523,
-      "compressed_chars": 687
-    }
-  }
-]
-```
+摘要作为单条 `ThreadFactItem` 写入 Store（namespace `(thread_id, "thread_facts")`）：
 
-`metadata` 中保留了压缩前的条数和字符数，便于追溯。
+| 字段 | 值 |
+| ---- | - |
+| `content` | `[历史记忆摘要]\n{summary}` |
+| `category` | `conv`（重要对话） |
+| `confidence` | `1.0` |
+| `fact_id` | 新生成的 uuid hex |
+
+`MemoryManager.compress()` 返回 `{"success", "original_count", "original_chars", "compressed_chars", "summary"}`，其中保留压缩前的条数与字符数，便于追溯。
 
 #### 特点与注意事项
 
@@ -764,50 +772,180 @@ LLM 生成摘要
 | ----------------- | ------------------------------------------------------- |
 | 保留关键信息      | system prompt 要求 LLM 保留用户意图、决策、事实         |
 | 结构化输出        | 按主题分条，便于后续查阅                                |
-| 可追溯            | `metadata` 保存原始条数和字符数                       |
-| 可多次压缩        | 再次`compress` 会对已有摘要再压缩                     |
-| LLM 失败不丢数据  | 调用失败则原记忆不变，不会写回                          |
-| **不可逆**  | 压缩后原条目无法恢复，建议重要数据先备份`memory.json` |
-| 不影响 checkpoint | 只压缩 memory.json，checkpoints_async.sqlite 保留完整历史     |
+| 可追溯            | 返回 `original_count` / `original_chars` / `compressed_chars` |
+| 可多次压缩        | 再次`compress` 会对已有摘要 fact 再压缩                |
+| LLM 失败不丢数据  | 调用失败则原 facts 不变，不会替换                      |
+| **不可逆**  | 压缩后原 facts 无法恢复，重要数据可先用 `export` 备份  |
+| 不影响 checkpoint | 只压缩 Store facts，checkpoints_async.sqlite 保留完整历史 |
 
-> 💡 **建议**：在长期记忆较多时（如 50+ 条）使用，平时少量记忆无需压缩。
+> 💡 **建议**：在长期记忆较多时（如 50 条上限附近）使用，平时少量记忆无需压缩。
 
 ### 记忆相关 API
 
-`AgentMemory` 提供**双模式强隔离**：
+记忆系统的对外接口分三层：**入口程序 → `MemoryContext`（工厂）→ `MemoryManager`（门面）→ `ThreadMemoryStore`（存储）**。SessionManager 是上层唯一调用方，Agent 不直接触碰记忆组件。
 
-- **同步模式**：直接 `AgentMemory(...)`（脚本 / 同步 CLI / 测试），使用 `sqlite3` + `SqliteSaver`
-- **异步模式**：`await AgentMemory.acreate(...)`（`AgentCore.acreate` / API Server），使用 `aiosqlite` + `AsyncSqliteSaver`
+#### MemoryContext（统一工厂，入口程序使用）
 
-> ⚠️ **隔离规则**：异步实例（`acreate`）上调用同步方法会直接抛 `RuntimeError`（`_check_not_async` 守卫），防止事件循环内阻塞与跨线程混跑。请在异步环境统一使用带 `a` 前缀的异步版本；`close()` / `__enter__` 在异步模式同样被禁用，改用 `aclose()` / `async with`。
+| 成员 | 说明 |
+| ---- | ---- |
+| `await MemoryContext.acreate(...)` | 异步创建全部记忆组件（checkpointer + Store + 锁池 + 读写中间件 + MemoryManager） |
+| `ctx.checkpointer` | LangGraph checkpointer（传给 `AgentCore` / `SessionRegistry`） |
+| `ctx.store` | LangGraph `BaseStore`（传给 `create_agent(store=...)`） |
+| `ctx.read_middleware` | `ThreadMemoryReadMiddleware`（传给 `extra_middleware`） |
+| `ctx.thread_id` | 初始会话线程 ID |
+| `ctx.async_conn` | 异步 SQLite 连接（供 SessionRegistry 共享） |
+| `ctx.memory_manager` | `MemoryManager` 实例（注入 SessionManager） |
+| `await ctx.aclose()` | 刷新记忆 buffer、关闭中间件、释放 SQLite 连接 |
 
-> ℹ️ **会话管理已迁移**：`new/switch/list/delete/get_messages/get_short_term/export/summarize` 等会话级方法已迁移至 `agent.session`（`SessionRegistry`），`AgentMemory` 仅保留 checkpointer 初始化与长期记忆管理。
+#### MemoryManager（统一门面，SessionManager 使用）
 
-| 同步（仅同步实例可用）               | 异步（推荐）                             | 说明                                                   |
-| ------------------------------------ | ---------------------------------------- | ------------------------------------------------------ |
-| `get_checkpointer()`                 | -                                        | 获取 checkpointer 实例(传给 create_react_agent)        |
-| `get_config()`                       | -                                        | 返回`{"configurable": {"thread_id": ...}}`(传给 invoke) |
-| `get_long_term(limit)`               | `get_long_term(limit)`（纯内存，共用）   | 获取最近 N 条长期记忆                                  |
-| `add(role, content, metadata)`       | `aadd(role, content, metadata)`          | 添加记忆，`important=True` 触发写 memory.json          |
-| `clear_long_term()`                  | `aclear_long_term()`                     | 清空长期记忆并删除文件                                 |
-| `compress_memory(cb)`                | `acompress_memory(cb)`                   | 压缩长期记忆（LLM 摘要后替换原内容）                   |
+| 方法 | 说明 |
+| ---- | ---- |
+| `await recall(thread_id, limit=None)` | 召回该 thread 的长期记忆 facts（按创建时间升序，截取最近 limit 条，默认 10） |
+| `await recall_text(thread_id, limit=None)` | 召回并格式化为文本片段（`【长期记忆】` 块，供注入 prompt） |
+| `await submit_user_message(thread_id, content, important=False)` | 提交用户消息到写中间件（非阻塞，防抖） |
+| `await consume_event(event)` | 消费 AgentEvent（`is_memory_worthy` 的 DONE / TOOL_RESULT），提交到写中间件（非阻塞） |
+| `await compress(thread_id)` | 压缩该 thread 长期记忆（LLM 摘要替换为单条 fact） |
+| `await clear(thread_id)` | 清空该 thread 全部 facts，返回清除数量 |
+| `await count_facts(thread_id)` | 统计该 thread 的 fact 条数 |
+| `await flush_all()` | 立即处理所有 buffer 事件（Agent 关闭前调用） |
+| `await shutdown()` | 关闭写中间件（取消定时器、清理 buffer） |
 
-会话管理（`SessionRegistry`，通过 `agent.session` 访问）：
+#### ThreadMemoryReadMiddleware（读，LangGraph 中间件）
 
-| 方法                                  | 说明                                                   |
-| ------------------------------------- | ------------------------------------------------------ |
-| `new_session()`                       | 开启新会话，返回 session_id                            |
-| `new_workflow_session(workflow_name)` | 开启工作流会话                                         |
-| `aswitch_session(session_id)`         | 切换到指定会话                                         |
-| `adelete_session(session_id)`         | 删除指定会话(删当前会话时自动切换到其他会话)           |
-| `alist_sessions()`                    | 列出所有会话 ID                                        |
-| `aget_messages(session_id)`           | 从 checkpoint 获取指定会话的所有消息                   |
-| `aget_short_term(session_id, limit)`  | 从 checkpoint 取消息转为 dict 格式                     |
-| `aexport_session(session_id, fmt)`    | 导出指定会话为可读文本/Markdown                        |
-| `asummarize(session_id)`              | 返回会话统计信息(含 session_id、消息数、会话数)        |
-| `is_workflow_session(session_id)`     | 判断是否为工作流会话                                   |
+| 方法 | 说明 |
+| ---- | ---- |
+| `awrap_model_call(request, handler)` | 每个 model 调用前从 Store 读取该 thread facts，组装为 `【长期记忆】` 文本块追加到 SystemMessage，再调用 handler |
 
-`AgentCore` 侧对应新增：`aget_memory_summary()` 与 `acompress_memory()`（后者内部把阻塞的 LLM 调用放入 `asyncio.to_thread`，避免阻塞事件循环）。
+#### ThreadMemoryStore（存储封装，底层）
+
+| 方法 | 说明 |
+| ---- | ---- |
+| `await query_facts(thread_id)` | 读取该 thread 全部 facts（按 create_time 升序） |
+| `await save_fact / save_facts_batch(thread_id, items)` | 写入单条 / 批量 facts（按 fact_id 幂等覆盖） |
+| `await prune_facts(thread_id)` | LRU 淘汰（超 max_facts 后删除最久未使用） |
+| `await touch_fact(thread_id, fact_id)` | 更新 last_used_at（读取时非阻塞触发） |
+| `await clear_thread_memory(thread_id)` | 清空该 thread 全部 facts |
+| `await replace_with_summary(thread_id, summary)` | 删除全部 facts 后写入单条摘要 fact |
+
+#### SessionManager 委托接口（对外推荐入口）
+
+| 方法 | 说明 |
+| ---- | ---- |
+| `await aget_memory_summary()` | 记忆状态统计（thread_id / checkpoint 消息数 / 长期记忆条数 / 总会话数） |
+| `await acompress_memory()` | 压缩当前线程长期记忆（阻塞 LLM 调用放入 `asyncio.to_thread`） |
+| `await aclear_long_term_memory()` | 清空当前线程长期记忆 |
+
+---
+
+## 会话管理（Session）
+
+会话（Session / Thread）是对话隔离的基本单元，每个会话对应一个 `thread_id`（即 session_id），历史消息、工具调用链、执行历史、挂起中断等状态按会话隔离并持久化。早期会话管理内嵌在 `AgentMemory` 中，现已抽离为独立的 `session/` 模块（三层架构）：`SessionRegistry` 负责生命周期、`SessionStore` 负责瞬态状态、`SessionManager` 作为对外门面。
+
+### 架构总览
+
+```
+session/
+├── context.py          # SessionContext：单会话运行时上下文（session_id + config + checkpointer）
+├── store.py            # SessionStore：基于 LangGraph Store 的 per-session 瞬态状态
+├── registry.py         # SessionRegistry：会话生命周期管理（生成/查询/删除/消息读取）
+├── workspace_store.py  # WorkspaceStore：session_id ↔ workspace_path 映射
+└── manager.py          # SessionManager：对外门面 & 会话调度（封装 Agent + Memory）
+```
+
+| 组件            | 职责                                                                                       |
+| --------------- | ------------------------------------------------------------------------------------------ |
+| `SessionContext` | 单个会话的运行时上下文（session_id + LangGraph config + checkpointer）                      |
+| `SessionStore`   | 基于 LangGraph Store 的 per-session 瞬态状态：`execution_history`（执行历史）/ `pending_interrupts`（挂起中断） |
+| `SessionRegistry` | 会话生命周期管理（生成/查询/删除/消息读取），桥接 checkpointer 与 Store                    |
+| `WorkspaceStore` | `session_id ↔ workspace_path` 映射（多会话工作目录隔离）                                  |
+| `SessionManager` | 对外门面 & 会话调度（封装 Agent + Memory），承接所有流式/并发/记忆调度                      |
+
+> **设计要点**：`AgentCore` 实例只持有不可变配置 + 共享的编译图 / Store / checkpointer，可安全在多会话间复用；所有会话级可变状态通过 `session_id` 显式隔离（`active_skills` 等放入 `LCAgentState` 随 checkpoint per-thread 持久化）。
+
+### Session ID 生成
+
+`SessionRegistry.generate_session_id()` 生成会话 ID，格式为 `[进程类型-][workflow-工作流名-]thread-8位随机`：
+
+| 示例                            | 说明                                              |
+| ------------------------------- | ------------------------------------------------- |
+| `thread-a4d099d2`               | 普通会话                                          |
+| `workflow-simple-thread-abc123` | 专属工作流会话（`workflow-{名称}-thread-{后缀}`） |
+| `server-thread-...`             | 带 `process_type` 前缀（多进程隔离，server/scheduler/feishu 各进程前缀不同） |
+
+- `is_workflow_session(session_id)` / `workflow_name_of(session_id)`：判断并反解工作流会话。
+- `current_session_id` 是 **CLI 单会话语义**的当前指针；**并发场景必须显式传 `session_id`**，不依赖该共享指针。
+
+### 会话生命周期（SessionRegistry API）
+
+`agent.session`（`AgentCore.session` 属性）暴露 `SessionRegistry`：
+
+| 方法                                | 说明                                                                  |
+| ----------------------------------- | --------------------------------------------------------------------- |
+| `new_session(workspace_path=None)`  | 开启新会话（原会话保留在数据库），更新 current_session_id             |
+| `new_workflow_session(workflow_name)` | 开启专属工作流会话（ID 含 `workflow-{名称}`）                        |
+| `aswitch_session(session_id)`       | 切换到指定会话（恢复历史 + warm workspace 缓存）                      |
+| `adelete_session(session_id)`       | 删除会话：清 checkpoint + Store + workspace 绑定（删当前会话时自动切换到其他会话） |
+| `alist_sessions(all_types=False)`   | 列出所有可见会话（checkpoint 存量 ∪ 当前会话）                        |
+| `asummarize(session_id)`            | 返回会话统计（session_id / 消息数 / 总会话数）                        |
+| `aget_messages(session_id)`         | 从 checkpoint 获取该会话所有消息                                      |
+| `aget_short_term(session_id, limit)` | 取最近 N 条消息转 dict 格式（兼容旧 API）                             |
+| `aexport_session(session_id, fmt)`  | 导出会话为可读文本（`text`）或 Markdown（`markdown`）                 |
+| `aclose()`                          | 关闭 checkpointer 持有的 SQLite 连接                                  |
+
+### 工作空间绑定（Workspace）
+
+每个会话可绑定一个工作空间目录（文件与执行类工具被限制在该目录内），由 `WorkspaceStore` 持久化：
+
+| 方法                            | 说明                                                              |
+| ------------------------------- | ----------------------------------------------------------------- |
+| `aset_workspace(path, session_id=None)` | 设置/修改会话工作空间（缓存 + DB 双写）                  |
+| `aget_workspace(session_id=None)` | 获取会话工作空间路径（缓存优先，未命中查 DB）                   |
+| `aclear_workspace(session_id=None)` | 清除会话工作空间绑定（`True`=原绑定存在已清除）                 |
+| `awarm_workspace(session_id)`   | 进程重启后从 DB 加载 workspace 到缓存，使 `get_context()` 同步读命中 |
+
+> 路径校验（`_validate_workspace_path`）：必须为**已存在的目录**的绝对路径；禁止宿主根目录、用户主目录、系统目录（Windows `C:\Windows` / `System32`）。
+
+CLI 命令 `workspace` / `workspace <路径>` / `workspace:clear` 即对应上述 API；`get_context()` 读取 `SessionContext` 供每次图执行注入。
+
+HTTP API（[api/server.py](api/server.py)）同样暴露三个 RESTful 端点，供 Web 前端调用：
+
+| 方法     | 路径                                      | 对应 CLI            | 说明                                                          |
+| -------- | ----------------------------------------- | ------------------- | ------------------------------------------------------------- |
+| `GET`    | `/api/threads/{thread_id}/workspace`      | `workspace`         | 查询绑定（`workspace` 字段为 `null` 表示未绑定）              |
+| `POST`   | `/api/threads/{thread_id}/workspace`      | `workspace <路径>`  | 设置/修改绑定，body `{"path": "..."}`；路径非法返回 400       |
+| `DELETE` | `/api/threads/{thread_id}/workspace`      | `workspace:clear`   | 清除绑定，返回 `{"cleared": true/false}`                      |
+
+### SessionManager 门面
+
+`AgentCore.session_manager`（懒初始化）是上层流量的统一入口，封装 Agent + Memory：
+
+- **流式接口**：`achat_stream` / `aresume_stream` / `arun_stream`，产出 SSE 事件（`token` / `tool_call` / `tool_result` / `interrupt` / `cancelled` / `error` / `done`）
+- **非流式接口**：`achat` / `aresume` / `arun`，收集全部 token 为最终文本
+- **会话管理委托**：`new_session` / `new_workflow_session` / `set_current_session` / `current_session_id` / `alist_sessions` / `aswitch_session` / `adelete_session` / `aget_messages` / `aexport_session` / `asummarize`
+- **记忆管理委托**：`aget_memory_summary` / `acompress_memory` / `aclear_long_term_memory`
+- **执行历史**：`aget_execution_history` / `aclear_history`
+- **上下文压缩**：`manually_compact(force, thread_id)`
+- **生命周期**：`aclose()`（刷新记忆 buffer + 释放 Agent 资源）
+
+**per-thread 并发锁**（`SessionManager._thread_locks`）：
+
+- 同一 `thread_id` 的请求持有同一把 `asyncio.Lock`，严格串行，保证 checkpoint 读写一致；
+- 不同 `thread_id` 各自独立锁，可同时流式对话互不阻塞。
+
+> ⚠️ **初始化顺序**：首次访问 `session_manager` 前必须先调用 `set_memory_manager()` 注入 MemoryManager，否则 SessionManager 将在**无记忆功能**下初始化（重试会抛 `RuntimeError`）。
+
+### 与 CLI 的关系
+
+| 命令                                        | 作用                                                                      |
+| ------------------------------------------- | ------------------------------------------------------------------------- |
+| `thread`                                    | 方向键菜单切换会话（显示首条用户消息预览 + 消息数；Enter 切换、Ctrl+D 删除、Esc 取消） |
+| `thread:new`                                | 开启新会话（原会话保留，可随时切回）                                       |
+| `thread:delete <id>`                        | 删除指定会话（二次确认，不可恢复；删当前会话自动切换到其他会话）           |
+| `export` 或 `export:<thread_id> [路径]`    | 导出对话为 Markdown（默认存`exports/`）                                  |
+| `workspace <路径>` / `workspace:clear`      | 绑定/清除当前会话工作空间                                                  |
+
+> **存储位置**：会话历史在 `data/checkpoints_async.sqlite` 的 `checkpoints` / `writes` 表（按 `thread_id` 隔离）；工作空间映射在 `session_workspaces` 表；执行历史与挂起中断写入 LangGraph Store（瞬态，随会话删除清理）。详见[记忆系统 → 文件位置](#文件位置)。
 
 ---
 
@@ -1701,6 +1839,10 @@ output = chat_until_completion(agent, "需要人工选择时请先问我")
 | `safety:confirm <on\|off>`                 | 开关危险命令确认                                                           |
 | `workflow`                                | 列出可用的多 Agent 工作流                                                  |
 | `workflow:<name> <任务>`                  | 运行指定工作流（如`workflow:simple 帮我分析项目结构`）                   |
+| `workspace`                               | 查看当前会话绑定的工作空间目录                                             |
+| `workspace <路径>`                        | 为当前会话绑定/修改工作空间（文件与执行类工具将被限制在该目录内）         |
+| `workspace:clear`                         | 清除当前会话的工作空间绑定                                                 |
+| `workspace:help`                          | 显示 workspace 命令帮助                                                    |
 | `export` 或 `export:<thread_id> [路径]` | 导出对话为 Markdown(默认存`exports/`)                                    |
 | `json:<任务>`                             | 让 Agent 以 JSON 对象返回结果并解析展示                                    |
 | `quit` / `exit`                         | 退出                                                                       |
@@ -1757,7 +1899,7 @@ Terminator (汇总结果,返回最终答案)
 
 工作流把当前 CLI 会话的记忆注入任务上下文,并在结束后写回,形成记忆闭环:
 
-1. **记忆提取**:`run_workflow` 调用 `build_memory_context` 从 `context.agent.memory` 提取当前会话短期记忆与长期记忆,拼装为文本(超 `MAX_RAW_CONTEXT_CHARS` 自动截断)。
+1. **记忆提取**:`run_workflow` 调用 `build_memory_context` 从当前会话提取短期记忆（checkpoint）与长期记忆（`MemoryManager.recall_text`，经 `session_manager.memory` 访问）,拼装为文本(超 `MAX_RAW_CONTEXT_CHARS` 自动截断)。
 2. **Manager 总结分发**:工作流首个节点 `summarize` 调用 `ManagerAgent.summarize_context` 把原始记忆提炼成上下文摘要,存入 `WorkflowState.context_summary`。下游仅 `manager_plan` 与 `terminator_final` 节点注入该摘要,`worker_exec` 不注入(靠 plan 承接记忆)。
 3. **写回闭环**:工作流结束后,`_record_workflow_result` 把 `workflow:<name> <task>`(HumanMessage)与 `final_answer`(AIMessage)写入当前会话 checkpoint。
 
@@ -2062,7 +2204,7 @@ Agent 调用 `ask_human` 暂停图执行，等待人工选择后继续：
 已导出会话 thread-b1dc3b2a 到 我的导出/backup.md
 ```
 
-由 [agent/session/registry.py](agent/session/registry.py) 的 `SessionRegistry.aexport_session()` 实现，将 checkpoint 中的对话渲染为可读 Markdown。
+由 [session/registry.py](session/registry.py) 的 `SessionRegistry.aexport_session()` 实现，将 checkpoint 中的对话渲染为可读 Markdown。
 
 ### 7. JSON 模式
 
@@ -2110,38 +2252,54 @@ MCP Servers:
 
 ```python
 import asyncio
+from memory import MemoryContext
 from agent import AgentCore
 from agent.llm_client import LLMClient
 
 async def main() -> None:
-    # 创建客户端和Agent（异步工厂：AsyncSqliteSaver 绑定创建它的事件循环）
+    # 创建客户端
     llm = LLMClient(provider="deepseek", config_file="config/llm_config.json")
+
+    # 三层架构：先创建 MemoryContext（记忆基础设施），再创建 AgentCore（纯执行内核）
+    memory_ctx = await MemoryContext.acreate(
+        checkpoint_file="data/checkpoints_async.sqlite",  # Checkpoint + 长期记忆 Store（同一 SQLite 文件）
+        llm_getter=lambda: llm,                            # 供 LLM 抽取/压缩记忆使用（支持热切换）
+        short_term_size=10,
+        buffer_delay_seconds=20,                           # 记忆防抖窗口（秒）
+        max_buffer_messages=30,                            # 单 thread 防抖 buffer 上限
+        max_facts_per_thread=50,                           # 单 thread 最大 fact 条数（LRU 淘汰）
+        recall_limit=10,                                   # 召回默认条数上限
+    )
+
     agent = await AgentCore.acreate(
         llm_client=llm,
         name="LCAgent",                                    # Agent 名称（默认 LCAgent）
-        memory_size=10,
-        long_term_memory_file="data/memory.json",        # 长期记忆(用于 compress)
-        checkpoint_file="data/checkpoints_async.sqlite", # Checkpoint 持久化（异步 saver）
         max_iterations=15,
         mcp_config_file="config/mcp_servers.json",
         enable_mcp=True,
         skills_dir=".agents/skills",
         auto_match_skills=True,
         max_context_messages=0,                           # 0=关闭长上下文裁剪
-        context_trim_keep=12
+        context_trim_keep=12,
+        checkpointer=memory_ctx.checkpointer,             # ← checkpoint 持久化
+        store=memory_ctx.store,                           # ← 长期记忆 Store
+        extra_middleware=[memory_ctx.read_middleware],    # ← 长期记忆读取中间件
+        initial_thread_id=memory_ctx.thread_id,
+        async_conn=memory_ctx.async_conn,
     )
+    agent.set_memory_manager(memory_ctx.memory_manager)   # ← 注入 MemoryManager（SessionManager 懒初始化时接收）
 
 # 内置变量：agent.name 与 agent.llm（LLM 是 Agent 的内置变量）
     print(agent.name)   # -> LCAgent
     print(agent.llm.get_info())  # 直接通过 agent.llm 访问当前 LLM 客户端
 
-    # 普通对话（自动判断是否调用工具，自动写 checkpoint，不存长期记忆）
+    # 普通对话（自动写 checkpoint；事件驱动沉淀长期记忆，经防抖 + LLM 抽取后入库）
     response = await agent.achat("帮我创建一个叫 test 的文件夹")
 
-    # Agent模式（自动调用工具，打印步骤，写 checkpoint + 存长期记忆）
+    # Agent模式（自动调用工具，打印步骤，写 checkpoint；用户消息标记 important，DONE 事件标记 is_important）
     result = await agent.arun("计算 123 * 456 并把结果写入 result.txt")
 
-    # CoT模式（纯推理，不调用工具，不写 checkpoint，存长期记忆）
+    # CoT模式（纯推理，不调用工具，不写 checkpoint，不沉淀长期记忆）
     result = agent.cot("分析机器学习的应用场景")
 
     # Human-in-the-loop 结构化入口：achat_structured/arun_structured 返回 AgentTurnResult
@@ -2175,12 +2333,12 @@ async def main() -> None:
     print(await agent.session.alist_sessions())            # 列出所有会话
     print(await agent.session.aexport_session(fmt="markdown"))  # 导出当前会话为 Markdown 文本
 
-    # 记忆管理（长期记忆仍在 agent.memory，异步接口）
-    await agent.memory.aclear_long_term()      # 清空长期记忆
+    # 记忆管理（经 SessionManager 委托 MemoryManager）
+    await agent.session_manager.aclear_long_term_memory()   # 清空当前线程长期记忆
     print(await agent.session.asummarize())    # 查看会话统计(含 session_id、消息数)
 
-    # 压缩长期记忆
-    result = await agent.acompress_memory()
+    # 压缩长期记忆（LLM 摘要后替换为单条 fact）
+    result = await agent.session_manager.acompress_memory()
     print(f"压缩率: {1 - result['compressed_chars']/result['original_chars']:.1%}")
 
     # MCP 工具管理
@@ -2194,6 +2352,7 @@ async def main() -> None:
     agent.set_auto_match(False)      # 关闭任务自动匹配
 
     await agent.aclose()             # 释放异步资源
+    await memory_ctx.aclose()        # 刷新记忆 buffer、关闭中间件、释放 SQLite 连接
 
 asyncio.run(main())
 ```
@@ -2431,7 +2590,7 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 | `tests/test_human_input.py`                 | LangGraph HITL：interrupt、恢复、并行选择和线程隔离              |
 | `tests/test_terminal.py`                    | 终端工具：输出截断、护栏拒绝、安全执行(mock subprocess)          |
 | `tests/test_calculator.py`                  | 计算器工具：表达式求值、错误处理                                 |
-| `tests/test_memory.py`                      | `AgentMemory`：长期记忆、会话管理(SQLite)                      |
+| `tests/test_memory.py`                      | memory/ 包 `AgentMemory`：checkpointer + Store 基础设施的初始化、SQLite/acreate/aclose |
 | `tests/test_agent_core_regressions.py`      | Agent 核心回归：HITL 恢复、会话隔离、技能匹配、长上下文裁剪等    |
 | `tests/test_scheduler.py`                   | 定时任务调度：TaskStore CRUD、原子抢占、重试逻辑                 |
 | `tests/test_api.py`                         | API Server：端点路由、流式聊天、命令执行（FastAPI TestClient）   |

@@ -14,9 +14,8 @@
 """
 import asyncio
 from types import SimpleNamespace
-from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage
 
 
 # --------------------------------------------------------------------------- #
@@ -213,3 +212,120 @@ def test_server_thread_locks_isolate_threads():
             return acquired
 
     assert asyncio.run(run()) is True
+
+
+# --------------------------------------------------------------------------- #
+# workspace_path per-session 隔离（WorkspaceStore + SessionContext）
+# --------------------------------------------------------------------------- #
+def test_workspace_isolation_between_sessions(tmp_path):
+    """两会话绑定不同 workspace，get_context 返回各自 workspace_path。"""
+    from langgraph.checkpoint.memory import MemorySaver
+
+    from session import SessionRegistry, SessionStore
+
+    ws_a = tmp_path / "proj-a"
+    ws_a.mkdir()
+    ws_b = tmp_path / "proj-b"
+    ws_b.mkdir()
+
+    reg = SessionRegistry(
+        checkpointer=MemorySaver(),
+        store=SessionStore(),
+        async_conn=None,  # 内存模式
+    )
+
+    sid_a = reg.new_session(workspace_path=str(ws_a))
+    sid_b = reg.new_session(workspace_path=str(ws_b))
+
+    ctx_a = reg.get_context(sid_a)
+    ctx_b = reg.get_context(sid_b)
+
+    assert ctx_a.config["configurable"]["workspace_path"] == str(ws_a.resolve())
+    assert ctx_b.config["configurable"]["workspace_path"] == str(ws_b.resolve())
+    assert ctx_a.config["configurable"]["workspace_path"] != ctx_b.config["configurable"]["workspace_path"]
+
+
+def test_workspace_not_set_passes_none():
+    """未绑定 workspace 的旧会话，get_context 不注入 workspace_path。"""
+    from langgraph.checkpoint.memory import MemorySaver
+
+    from session import SessionRegistry, SessionStore
+
+    reg = SessionRegistry(
+        checkpointer=MemorySaver(),
+        store=SessionStore(),
+        async_conn=None,
+    )
+    sid = reg.new_session()  # 不传 workspace_path
+
+    ctx = reg.get_context(sid)
+    assert "workspace_path" not in ctx.config["configurable"]
+
+
+def test_workspace_delete_clears_binding(tmp_path):
+    """adelete_session 清理 workspace 记录。"""
+    from langgraph.checkpoint.memory import MemorySaver
+
+    from session import SessionRegistry, SessionStore
+
+    ws = tmp_path / "proj-a"
+    ws.mkdir()
+
+    reg = SessionRegistry(
+        checkpointer=MemorySaver(),
+        store=SessionStore(),
+        async_conn=None,
+    )
+    sid = reg.new_session(workspace_path=str(ws))
+    assert reg.get_context(sid).config["configurable"]["workspace_path"] == str(ws.resolve())
+
+    asyncio.run(reg.adelete_session(sid))
+
+    # 删除后缓存已清
+    assert reg._workspace_store.get_cached(sid) is None
+
+
+def test_workspace_switch_warms_cache(tmp_path):
+    """aswitch_session warm 缓存，使 get_context 同步读可命中。"""
+    from langgraph.checkpoint.memory import MemorySaver
+
+    from session import SessionRegistry, SessionStore
+
+    ws = tmp_path / "proj-a"
+    ws.mkdir()
+
+    reg = SessionRegistry(
+        checkpointer=MemorySaver(),
+        store=SessionStore(),
+        async_conn=None,
+    )
+    sid = reg.new_session(workspace_path=str(ws))
+    # 模拟进程重启：清空缓存
+    reg._workspace_store._cache.clear()
+    assert reg.get_context(sid).config["configurable"].get("workspace_path") is None
+
+    # aswitch warm 缓存（内存模式下 aget 从缓存读，已清空则返回 None）
+    # 但 set_cached 已在 new_session 时写入，这里验证 warm 不报错
+    asyncio.run(reg.aswitch_session(sid))
+
+
+def test_workspace_persist_and_warm_roundtrip():
+    """aset 持久化 + aget warm 的往返一致性（内存模式）。"""
+    from session.workspace_store import WorkspaceStore
+
+    store = WorkspaceStore(async_conn=None)
+
+    async def run():
+        await store.aset("s1", "D:/proj-a")
+        # 清缓存模拟重启
+        store._cache.clear()
+        # 内存模式清缓存后 aget 返回 None（无 DB 源）
+        return await store.aget("s1")
+
+    result = asyncio.run(run())
+    # 内存模式下清缓存 = 数据丢失，aget 返回 None
+    assert result is None
+
+    # 但 set_cached + get_cached 同步路径立即可用
+    store.set_cached("s2", "D:/proj-b")
+    assert store.get_cached("s2") == "D:/proj-b"

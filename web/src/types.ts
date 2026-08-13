@@ -178,6 +178,26 @@ export interface ExportResult {
   content: string
 }
 
+/** 工作空间绑定信息（GET/POST /api/threads/{id}/workspace） */
+export interface WorkspaceInfo {
+  thread_id: string
+  workspace: string | null
+}
+
+/** 文件检索器：单个目录条目 */
+export interface BrowseEntry {
+  name: string
+  path: string
+  has_children: boolean
+}
+
+/** 文件检索器：目录浏览结果（GET /api/workspace/browse） */
+export interface BrowseResult {
+  path: string
+  entries: BrowseEntry[]
+  is_root: boolean
+}
+
 /** SSE 事件联合类型 */
 export type StreamEvent =
   | { type: 'thread_created'; thread_id: string }

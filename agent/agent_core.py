@@ -43,6 +43,7 @@ from .logging_config import TraceContext, generate_trace_id
 from .message_utils import build_interrupt_event, extract_llm_error, stringify_content
 from .metrics import MetricsCollector
 from .skill_middleware import SkillInjectionMiddleware
+from .workspace_middleware import WorkspaceSecurityMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -537,6 +538,9 @@ class AgentCore:
         )
         self._skill_middleware = skill_middleware
 
+        # 工作空间安全中间件：拦截文件/执行类工具，注入 workspace 路径 + 逃逸校验
+        workspace_middleware = WorkspaceSecurityMiddleware()
+
         # create_agent 直接返回可调用的agent
         wrapped_tools = wrap_tools_with_timeout(self.tools, self.tool_timeout)
         agent = create_agent(
@@ -546,7 +550,12 @@ class AgentCore:
             checkpointer=self._checkpointer,
             store=self._store,
             state_schema=LCAgentState,
-            middleware=[compaction_middleware, skill_middleware, *self._extra_middleware],
+            middleware=[
+                compaction_middleware,
+                skill_middleware,
+                workspace_middleware,
+                *self._extra_middleware,
+            ],
         )
         # 保存中间件引用，供手动压缩使用
         self._compaction_middleware = compaction_middleware
@@ -1120,6 +1129,12 @@ class AgentCore:
         tid = self._current_sid(thread_id)
         trace_id = generate_trace_id()
 
+        # warm workspace 缓存：断点续跑/进程重启后缓存可能为空，
+        # 从 DB 加载 workspace_path 到缓存，使 get_context 同步读可命中
+        reg = getattr(self, "_session_registry", None)
+        if reg is not None:
+            await reg.awarm_workspace(tid)
+
         with TraceContext(trace_id=trace_id, thread_id=tid):
             logger.info("arun_events: %s", message[:100])
             config = self._invoke_config(thread_id)
@@ -1176,6 +1191,11 @@ class AgentCore:
         self._ensure_not_closed()
         tid = self._current_sid(thread_id)
         trace_id = generate_trace_id()
+
+        # warm workspace 缓存：恢复中断会话时确保 workspace_path 已加载
+        reg = getattr(self, "_session_registry", None)
+        if reg is not None:
+            await reg.awarm_workspace(tid)
 
         with TraceContext(trace_id=trace_id, thread_id=tid):
             logger.info("aresume_events: thread=%s", tid)

@@ -17,10 +17,12 @@ from .context import SessionContext
 from .manager import SessionManager
 from .registry import SessionRegistry
 from .store import SessionStore
+from .workspace_store import WorkspaceStore
 
 __all__ = [
     "SessionContext",
     "SessionManager",
     "SessionRegistry",
     "SessionStore",
+    "WorkspaceStore",
 ]

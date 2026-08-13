@@ -623,3 +623,62 @@ def confirm(prompt: str) -> bool:
         return ans in ("y", "yes", "是")
     except (EOFError, KeyboardInterrupt, OSError):
         return False
+
+
+# ============ 工作空间逃逸校验 ============
+
+def check_workspace_escape(path: str, workspace: str) -> tuple[str, str]:
+    """校验路径是否落在 workspace 内，返回解析后的绝对路径 + 校验结果。
+
+    供 WorkspaceSecurityMiddleware 调用，统一复用 safety.py 的路径规范化能力
+    （_normalize_path：absolute + realpath + normcase），保证与安全护栏的路径
+    处理逻辑一致。
+
+    解析规则：
+    - path 为绝对路径：直接规范化
+    - path 为相对路径：基于 workspace 解析为绝对路径
+    - 最终用 commonpath 校验 resolved 必须在 workspace 内
+
+    Args:
+        path: 待校验的路径（相对或绝对，来自 LLM 传入的工具参数）
+        workspace: 当前会话的 workspace 绝对路径
+
+    Returns:
+        (resolved_path, error)
+        - 校验通过：resolved_path = 规范化后的绝对路径，error = ""
+        - 校验失败：resolved_path = ""，error = 中文错误原因
+
+    Note:
+        不抛异常，由调用方根据 error 决定如何处理（如中间件返回 ToolMessage）。
+        与 check_command/check_path 的返回风格保持一致。
+    """
+    if not path:
+        return "", "路径为空"
+
+    # 复用 safety.py 的 _normalize_path 保证规范化一致性
+    workspace_norm = _normalize_path(workspace)
+
+    # 解析为绝对路径
+    if os.path.isabs(path):
+        resolved = path
+    else:
+        resolved = os.path.join(workspace, path)
+
+    resolved_norm = _normalize_path(resolved)
+
+    # commonpath 校验：resolved 必须在 workspace 内
+    try:
+        if os.path.commonpath([workspace_norm, resolved_norm]) != workspace_norm:
+            return "", (
+                f"路径逃逸：{path} 解析为 {resolved}，"
+                f"超出工作空间边界 {workspace}"
+            )
+    except ValueError:
+        # commonpath 在不同盘符时抛 ValueError，视为逃逸
+        return "", (
+            f"路径逃逸：{path} 解析为 {resolved}，"
+            f"不在工作空间 {workspace} 内"
+        )
+
+    # 返回规范化前的绝对路径（保留原始大小写，给 MCP/工具用）
+    return os.path.realpath(resolved), ""
