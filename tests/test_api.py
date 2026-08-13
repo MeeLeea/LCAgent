@@ -54,6 +54,10 @@ def mock_agent():
     agent.session.workflow_name_of = MagicMock(return_value=None)
     agent.session.aswitch_session = AsyncMock()
     agent.session.aexport_session = AsyncMock()
+    # workspace 绑定（GET/POST/DELETE /api/threads/{thread_id}/workspace）
+    agent.session.aget_workspace = AsyncMock(return_value=None)
+    agent.session.aset_workspace = AsyncMock(return_value="/real/abs/workspace")
+    agent.session.aclear_workspace = AsyncMock(return_value=True)
 
     # session_manager mock（三层架构：所有上层流量通过 session_manager）
     agent.session_manager.aget_memory_summary = AsyncMock(return_value={
@@ -1429,6 +1433,83 @@ def test_export_thread_invalid_format(client, mock_agent):
     """测试无效格式返回 400"""
     response = client.get("/api/threads/thread-1/export?fmt=pdf")
     assert response.status_code == 400
+
+
+# --------------------------------------------------------------------------- #
+# 工作空间绑定（Workspace）
+# --------------------------------------------------------------------------- #
+def test_get_workspace_unbound(client, mock_agent):
+    """测试查询未绑定工作空间的会话：workspace 字段为 None"""
+    mock_agent.session.aget_workspace.return_value = None
+    response = client.get("/api/threads/test-thread-123/workspace")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["thread_id"] == "test-thread-123"
+    assert data["workspace"] is None
+    mock_agent.session.aget_workspace.assert_awaited_once_with(session_id="test-thread-123")
+
+
+def test_get_workspace_bound(client, mock_agent):
+    """测试查询已绑定工作空间的会话：返回规范化后的绝对路径"""
+    mock_agent.session.aget_workspace.return_value = "/path/to/workspace"
+    response = client.get("/api/threads/test-thread-123/workspace")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["thread_id"] == "test-thread-123"
+    assert data["workspace"] == "/path/to/workspace"
+
+
+def test_set_workspace_success(client, mock_agent):
+    """测试成功绑定工作空间：返回 SessionRegistry 规范化后的绝对路径"""
+    mock_agent.session.aset_workspace.return_value = "/real/abs/path"
+    response = client.post(
+        "/api/threads/test-thread-123/workspace",
+        json={"path": "/some/path"},
+    )
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["thread_id"] == "test-thread-123"
+    assert data["workspace"] == "/real/abs/path"
+    mock_agent.session.aset_workspace.assert_awaited_once_with(
+        "/some/path", session_id="test-thread-123"
+    )
+
+
+def test_set_workspace_invalid_path(client, mock_agent):
+    """测试绑定无效路径（不存在/系统目录等）返回 400"""
+    mock_agent.session.aset_workspace.side_effect = ValueError("路径不存在: /nonexistent")
+    response = client.post(
+        "/api/threads/test-thread-123/workspace",
+        json={"path": "/nonexistent"},
+    )
+    assert response.status_code == 400
+    assert "路径不存在" in response.json()["detail"]
+
+
+def test_clear_workspace_existed(client, mock_agent):
+    """测试清除已存在的工作空间绑定：cleared=True"""
+    mock_agent.session.aclear_workspace.return_value = True
+    response = client.delete("/api/threads/test-thread-123/workspace")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["thread_id"] == "test-thread-123"
+    assert data["cleared"] is True
+    mock_agent.session.aclear_workspace.assert_awaited_once_with(session_id="test-thread-123")
+
+
+def test_clear_workspace_not_existed(client, mock_agent):
+    """测试清除原本无绑定的工作空间：cleared=False（非错误）"""
+    mock_agent.session.aclear_workspace.return_value = False
+    response = client.delete("/api/threads/test-thread-123/workspace")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["thread_id"] == "test-thread-123"
+    assert data["cleared"] is False
 
 
 # --------------------------------------------------------------------------- #

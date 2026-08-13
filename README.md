@@ -908,6 +908,14 @@ session/
 
 CLI 命令 `workspace` / `workspace <路径>` / `workspace:clear` 即对应上述 API；`get_context()` 读取 `SessionContext` 供每次图执行注入。
 
+HTTP API（[api/server.py](api/server.py)）同样暴露三个 RESTful 端点，供 Web 前端调用：
+
+| 方法     | 路径                                      | 对应 CLI            | 说明                                                          |
+| -------- | ----------------------------------------- | ------------------- | ------------------------------------------------------------- |
+| `GET`    | `/api/threads/{thread_id}/workspace`      | `workspace`         | 查询绑定（`workspace` 字段为 `null` 表示未绑定）              |
+| `POST`   | `/api/threads/{thread_id}/workspace`      | `workspace <路径>`  | 设置/修改绑定，body `{"path": "..."}`；路径非法返回 400       |
+| `DELETE` | `/api/threads/{thread_id}/workspace`      | `workspace:clear`   | 清除绑定，返回 `{"cleared": true/false}`                      |
+
 ### SessionManager 门面
 
 `AgentCore.session_manager`（懒初始化）是上层流量的统一入口，封装 Agent + Memory：

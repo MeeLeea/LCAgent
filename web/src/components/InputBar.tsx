@@ -1,7 +1,8 @@
 // 输入栏：自适应文本框 + 发送/停止按钮 + 工具列表 + 字符计数 + 上下文 Token 估算 + 快捷键
 import { useRef, useState, useEffect, useMemo } from 'react'
-import { ArrowUp, Square, Wrench, Keyboard, Users, Check, Loader2 } from 'lucide-react'
+import { ArrowUp, Square, Wrench, Keyboard, Users, Check, Loader2, FolderOpen } from 'lucide-react'
 import { useStore, isWorkflowThread, selectIsStreaming } from '../store'
+import { WorkspacePicker } from './WorkspacePicker'
 
 export function InputBar() {
   const [text, setText] = useState('')
@@ -9,6 +10,7 @@ export function InputBar() {
   const [shortcutOpen, setShortcutOpen] = useState(false)
   const [rolePopoverOpen, setRolePopoverOpen] = useState(false)
   const [switchingRole, setSwitchingRole] = useState(false)
+  const [wsPickerOpen, setWsPickerOpen] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const toolWrapRef = useRef<HTMLDivElement>(null)
   const shortcutWrapRef = useRef<HTMLDivElement>(null)
@@ -23,6 +25,7 @@ export function InputBar() {
   const roles = useStore((s) => s.roles)
   const currentRole = useStore((s) => s.currentRole)
   const switchRole = useStore((s) => s.switchRole)
+  const workspace = useStore((s) => s.workspace)
 
   const currentThread = threads.find((t) => t.thread_id === currentThreadId)
   const isWorkflow = currentThread
@@ -253,10 +256,6 @@ export function InputBar() {
             )}
           </div>
           <div className="input-right">
-            {/* 当前会话上下文估算 token */}
-            <span className="token-count" title={`当前会话上下文估算 Token: ${contextTokens.toLocaleString()}`}>
-              {formatTokens(contextTokens)}
-            </span>
             {isStreaming ? (
               <button className="send-btn stop" onClick={stopStreaming} title="停止生成">
                 <Square size={14} fill="currentColor" />
@@ -274,6 +273,21 @@ export function InputBar() {
           </div>
         </div>
       </div>
+      {/* 工作目录栏（输入框下方，点击打开文件检索器） */}
+      <div className="ws-bar">
+        <button
+          className="ws-bar-btn"
+          onClick={() => setWsPickerOpen(true)}
+          title={workspace ? `工作目录：${workspace}（点击修改）` : '点击选择工作目录'}
+        >
+          <FolderOpen size={13} />
+          <span className="ws-bar-path">{workspace || '选择工作目录'}</span>
+        </button>
+        <span className="token-count" title={`当前会话上下文估算 Token: ${contextTokens.toLocaleString()}`}>
+          {formatTokens(contextTokens)}
+        </span>
+      </div>
+      {wsPickerOpen && <WorkspacePicker onClose={() => setWsPickerOpen(false)} />}
     </div>
   )
 }
