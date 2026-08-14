@@ -30,7 +30,7 @@ from typing import Any
 
 logger = logging.getLogger("api.server")
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -654,7 +654,7 @@ def _unsupported_runner(agent_obj: object, text: str) -> str:
 
 # 双方共用：捕获执行型命令统一走流式，其余走管理型 dispatch_command
 @app.post("/api/chat")
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, request: Request):
     """SSE 流式聊天。支持普通对话和命令执行（如 /skill:pptx <task>、/json:、/react: 等）。"""
 
     async def event_stream():
@@ -753,7 +753,19 @@ async def chat(req: ChatRequest):
                         # 实时消费队列：print → token 事件；workflow 事件 → 结构化 SSE 事件
                         outcome = None
                         while True:
-                            kind, payload = await output_queue.get()
+                            # 客户端断开检测：前端 abort 后及时释放锁，避免新请求被阻塞
+                            if await request.is_disconnected():
+                                logger.info("客户端断开 [%s]，中止命令输出", tid)
+                                dispatch_task.cancel()
+                                try:
+                                    await dispatch_task
+                                except asyncio.CancelledError:
+                                    pass
+                                return
+                            try:
+                                kind, payload = await asyncio.wait_for(output_queue.get(), timeout=2.0)
+                            except asyncio.TimeoutError:
+                                continue
                             if kind == "print":
                                 yield _sse({"type": "token", "content": payload})
                             elif kind == "event":
@@ -785,6 +797,9 @@ async def chat(req: ChatRequest):
             # 普通对话模式（显式传 thread_id 实现多会话隔离）
             try:
                 async for event in agent.session_manager.achat_stream(message, thread_id=tid):
+                    if await request.is_disconnected():
+                        logger.info("客户端断开 [%s]，中止流式输出", tid)
+                        break
                     yield _sse(_enrich_done(event))
                 logger.info("完成 [%s]", tid)
             except Exception as e:
@@ -803,7 +818,7 @@ async def chat(req: ChatRequest):
 
 
 @app.post("/api/chat/resume")
-async def chat_resume(req: ResumeRequest):
+async def chat_resume(req: ResumeRequest, request: Request):
     """SSE 流式恢复被 ask_human 中断的会话。"""
 
     async def event_stream():
@@ -813,6 +828,9 @@ async def chat_resume(req: ResumeRequest):
         async with _thread_lock(tid):
             try:
                 async for event in agent.session_manager.aresume_stream(req.payload, thread_id=tid):
+                    if await request.is_disconnected():
+                        logger.info("客户端断开 [%s]，中止恢复流", tid)
+                        break
                     yield _sse(event)
                 logger.info("恢复完成 [%s]", tid)
             except Exception as e:

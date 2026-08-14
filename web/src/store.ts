@@ -696,6 +696,10 @@ export const useStore = create<AppState>((set, get) => ({
     commitThreadMessages(get, set, key, arr)
     markStreaming(get, set, key, true)
 
+    // 清除上一轮的终止标记：finish() 会将 key 加入 terminatedThreads 且永不删除，
+    // 若不清理，后续 handleStreamEvent 的 early return 会丢弃所有事件（需刷新才恢复）
+    terminatedThreads.delete(key)
+
     // 可变线程 key：thread_created 事件后由 handleStreamEvent 返回新值，
     // 确保后续事件（token/done 等）写入正确的线程缓冲。
     // 修复：此前 key 为闭包常量，rebindThread 迁移状态后旧 key 的缓冲被删除，
@@ -789,6 +793,9 @@ export const useStore = create<AppState>((set, get) => ({
     const arr = [...get().messages, assistantMsg]
     commitThreadMessages(get, set, threadId, arr)
     markStreaming(get, set, threadId, true)
+
+    // 清除上一轮的终止标记，确保恢复流的事件不被阻塞
+    terminatedThreads.delete(threadId)
 
     const finish = makeFinish(get, set, threadId)
     const watchdogHandler = makeWatchdogHandler(get, set, threadId, finish)
