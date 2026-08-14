@@ -204,43 +204,58 @@ class TeamAgent:
     def _create_tool_agent(self) -> None:
         """创建轻量工具 agent(仅当有 tools 时调用)"""
         from langchain.agents import create_agent
-        
+
+        # 延迟导入避免循环依赖(agent.workspace_middleware 顶层仅依赖 langchain,
+        # 且 agent_core 早已在顶层导入该模块,此处只是保险)
+        from agent.workspace_middleware import WorkspaceSecurityMiddleware
+
         chat_model = self.llm.get_chat_model()
         
-        # 不带 checkpointer,单轮执行无需持久化
+        # 不带 checkpointer,单轮执行无需持久化;挂工作空间安全中间件,
+        # 使工作流内工具调用同样受 workspace 隔离约束(路径解析 + 逃逸校验)
         self.agent_executor = create_agent(
             model=chat_model,
             tools=self.tools,
             system_prompt=self.system_prompt,
+            middleware=[WorkspaceSecurityMiddleware()],
         )
     
-    def invoke(self, task: str) -> str:
+    def invoke(self, task: str, config: dict | None = None) -> str:
         """
         执行单轮任务
         
         Args:
             task: 任务描述
+            config: 外层运行配置(RunnableConfig,含 configurable.workspace_path)。
+                仅工具模式消费:提取 workspace_path 注入内部 agent 调用,
+                使 WorkspaceSecurityMiddleware 生效;纯文本模式忽略。
             
         Returns:
             执行结果字符串
         """
         # 工具模式:通过 agent 循环执行
         if self.agent_executor:
-            return self._invoke_with_tools(task)
+            return self._invoke_with_tools(task, config)
         
         # 纯文本模式:直接 LLM 调用
         return self._invoke_pure_text(task)
     
-    def _invoke_with_tools(self, task: str) -> str:
+    def _invoke_with_tools(self, task: str, config: dict | None = None) -> str:
         """工具模式执行(带 ReAct 推理循环)"""
         if self.verbose:
             logger.info("[%s] 执行任务(工具模式): %s", self.name, task[:100])
         
         try:
-            config = {"recursion_limit": self.max_iterations}
+            run_config: dict = {"recursion_limit": self.max_iterations}
+            # 仅提取 workspace_path 构造最小 config,严禁转发外层 config 的
+            # callbacks/thread_id 等运行时字段——外层 NodeTrackingHandler 使用
+            # asyncio.Queue(run_inline=True),跨线程透传会在内部 agent 步骤误触发回调。
+            configurable = config.get("configurable") if config else None
+            if isinstance(configurable, dict) and configurable.get("workspace_path"):
+                run_config["configurable"] = {"workspace_path": configurable["workspace_path"]}
             result = self.agent_executor.invoke(
                 {"messages": [HumanMessage(content=task)]},
-                config=config
+                config=run_config
             )
             
             # 从返回的消息列表中提取最后一条 AIMessage

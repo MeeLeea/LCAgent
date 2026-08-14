@@ -28,7 +28,7 @@ class WorkerAgent(TeamAgent):
         ),
     }
 
-    def execute_task(self, plan: str, injector: PromptInjector | None = None) -> str:
+    def execute_task(self, plan: str, injector: PromptInjector | None = None, config: dict | None = None) -> str:
         """
         执行计划中的子任务(结合技能注入)
 
@@ -39,6 +39,8 @@ class WorkerAgent(TeamAgent):
         Args:
             plan: Manager 拆解出的执行计划
             injector: 技能注入器;为 None 时跳过技能注入
+            config: 外层运行配置(含 configurable.workspace_path),透传给
+                self.invoke 使工具调用受 workspace 隔离约束
 
         Returns:
             子任务执行结果文本
@@ -47,4 +49,4 @@ class WorkerAgent(TeamAgent):
         prompt = self.render_template(template, plan=plan)
         if injector is not None:
             prompt = injector.inject_into_prompt(prompt, plan)
-        return self.invoke(prompt)
+        return self.invoke(prompt, config)
