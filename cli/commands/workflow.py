@@ -124,6 +124,16 @@ async def run_workflow(context: CommandContext, name: str, task: str) -> dict:
         context.print(f"✓ 节点完成: {node}")
         _emit({"type": "workflow_node", "node": node, "status": "done"})
 
+    # 从会话上下文获取 workspace_path,使工作流内 Worker 工具调用受
+    # WorkspaceSecurityMiddleware 约束(与 Agent 路径一致的隔离语义)。
+    # 未绑定工作空间的会话取到 None → 不注入 → 工具调用不做隔离(兼容旧会话)。
+    workspace_path = None
+    try:
+        session_ctx = context.agent.session.get_context(current_sid).config
+        workspace_path = session_ctx.get("configurable", {}).get("workspace_path")
+    except Exception:
+        workspace_path = None
+
     _emit({"type": "workflow_status", "status": "running"})
     try:
         # 获取工作流专用异步运行器,缺失则回退到通用异步运行器
@@ -133,6 +143,7 @@ async def run_workflow(context: CommandContext, name: str, task: str) -> dict:
             task,
             raw_context=await abuild_memory_context(context.agent),
             thread_id=workflow_thread_id,
+            workspace_path=workspace_path,
             on_node_start=_on_node_start,
             on_node_end=_on_node_end,
         )
