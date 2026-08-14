@@ -125,7 +125,12 @@ export function WorkflowView() {
           <select
             className="workflow-select"
             value={selectValue}
-            onChange={(e) => fetchWorkflow(e.target.value, true)}
+            disabled={isStreaming}
+            onChange={(e) => {
+              const name = e.target.value
+              fetchWorkflow(name, true)
+              newWorkflowThread(name)
+            }}
             title="切换工作流"
           >
             {workflows.map((w) => (

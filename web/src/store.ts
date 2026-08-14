@@ -40,6 +40,20 @@ export function isWorkflowThread(t: { thread_id: string; type?: 'chat' | 'workfl
   return t.type === 'workflow' || t.thread_id.includes('workflow')
 }
 
+/** 从 thread_id 中反解工作流名称（与后端 registry.workflow_name_of 逻辑一致） */
+export function workflowNameOf(threadId: string): string | null {
+  let body: string
+  if (threadId.startsWith('workflow-')) {
+    body = threadId.slice('workflow-'.length)
+  } else if (threadId.includes('-workflow-')) {
+    body = threadId.split('-workflow-', 2)[1]
+  } else {
+    return null
+  }
+  const idx = body.lastIndexOf('-thread-')
+  return idx >= 0 ? body.slice(0, idx) : body
+}
+
 /**
  * 剥离后端写回记忆的 "workflow:" 命令前缀（仅显示层使用，不动原始消息数据，
  * 以保证重新生成/编辑重发时仍携带完整命令）。
@@ -582,6 +596,9 @@ export const useStore = create<AppState>((set, get) => ({
       currentThreadId: id,
       pendingInterrupt: s.pendingInterrupts[id] ?? null,
     }))
+    // 同步工作流显示：从 thread_id 反解工作流名称并加载对应图结构
+    const wfName = workflowNameOf(id)
+    if (wfName) void get().fetchWorkflow(wfName, true)
     // 加载该会话绑定的工作空间（输入栏左下角展示）
     void get().fetchWorkspace(id)
     const cached = get().messagesByThread[id]
