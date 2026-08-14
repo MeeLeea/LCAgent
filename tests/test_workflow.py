@@ -64,6 +64,45 @@ class FakeAgent:
         """占位符替换"""
         return TeamAgent.render_template(template, **kwargs)
 
+    def plan_task(self, task: str, context_summary: str = "", injector=None) -> str:
+        """记录计划调用并返回模拟结果"""
+        prompt = self.render_template(
+            self.get_template("manager_plan"), task=task, context_summary=context_summary
+        )
+        if injector is not None:
+            prompt = injector.inject_into_prompt(prompt, task)
+        self.calls.append(("invoke", prompt))
+        return self.response
+
+    def execute_task(self, plan: str, injector=None) -> str:
+        """记录执行调用并返回模拟结果"""
+        prompt = self.render_template(self.get_template("worker_exec"), plan=plan)
+        if injector is not None:
+            prompt = injector.inject_into_prompt(prompt, plan)
+        self.calls.append(("invoke", prompt))
+        return self.response
+
+    def finalize(
+        self,
+        task: str,
+        plan: str,
+        worker_result: str,
+        context_summary: str = "",
+        injector=None,
+    ) -> str:
+        """记录汇总调用并返回模拟结果"""
+        prompt = self.render_template(
+            self.get_template("terminator_final"),
+            task=task,
+            plan=plan,
+            worker_result=worker_result,
+            context_summary=context_summary,
+        )
+        if injector is not None:
+            prompt = injector.inject_into_prompt(prompt, task)
+        self.calls.append(("invoke", prompt))
+        return self.response
+
 
 # ==================== 测试工作流节点 ====================
 
@@ -137,6 +176,73 @@ def test_manager_plan_node_with_summary():
     prompt = manager.calls[0][1]
     assert "记忆上下文摘要:" in prompt
     assert "用户偏好中文" in prompt
+
+
+def test_pipline_manager_plan_node_uses_plan_task():
+    """测试 pipline 的 Manager 节点:委托给 Manager.plan_task,带技能注入"""
+    from graph.pipline import manager_plan_node as pipline_manager_plan_node
+
+    class FakeInjector:
+        def inject_into_prompt(self, prompt: str, task: str) -> str:
+            return f"{prompt}\n\n【技能指引:{task}】"
+
+    manager = FakeAgent(name="manager", response="计划")
+    state = {"task": "任务", "context_summary": "用户偏好中文"}
+
+    result = asyncio.run(pipline_manager_plan_node(state, manager, injector=FakeInjector()))
+
+    assert result["plan"] == "计划"
+    prompt = manager.calls[0][1]
+    assert "记忆上下文摘要:" in prompt
+    assert "用户偏好中文" in prompt
+    assert "【技能指引:任务】" in prompt
+
+
+def test_pipline_worker_exec_node_uses_execute_task():
+    """测试 pipline 的 Worker 节点:委托给 Worker.execute_task,带技能注入"""
+    from graph.pipline import worker_exec_node as pipline_worker_exec_node
+
+    class FakeInjector:
+        def inject_into_prompt(self, prompt: str, task: str) -> str:
+            return f"{prompt}\n\n【技能指引:{task}】"
+
+    worker = FakeAgent(name="worker", response="已完成")
+    state = {"plan": "计划: 步骤1"}
+
+    result = asyncio.run(pipline_worker_exec_node(state, worker, injector=FakeInjector()))
+
+    assert result["worker_result"] == "已完成"
+    prompt = worker.calls[0][1]
+    assert "请执行以下计划" in prompt
+    assert "步骤1" in prompt
+    assert "【技能指引:计划: 步骤1】" in prompt
+
+
+def test_pipline_terminator_final_node_uses_finalize():
+    """测试 pipline 的 Terminator 节点:委托给 Terminator.finalize,带技能注入"""
+    from graph.pipline import terminator_final_node as pipline_terminator_final_node
+
+    class FakeInjector:
+        def inject_into_prompt(self, prompt: str, task: str) -> str:
+            return f"{prompt}\n\n【技能指引:{task}】"
+
+    terminator = FakeAgent(name="terminator", response="最终答案")
+    state = {
+        "task": "任务",
+        "plan": "计划",
+        "worker_result": "结果",
+        "context_summary": "用户偏好中文",
+    }
+
+    result = asyncio.run(pipline_terminator_final_node(state, terminator, injector=FakeInjector()))
+
+    assert result["final_answer"] == "最终答案"
+    prompt = terminator.calls[0][1]
+    assert "原始任务" in prompt
+    assert "执行计划" in prompt
+    assert "执行结果" in prompt
+    assert "用户偏好中文" in prompt
+    assert "【技能指引:任务】" in prompt
 
 
 def test_terminator_final_node_with_summary():

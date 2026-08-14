@@ -8,7 +8,7 @@ TeamAgent 轻量基类 - 为多 Agent 工作流设计的轻量角色
 """
 import logging
 import os
-from typing import ClassVar
+from typing import ClassVar, Protocol
 
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import BaseTool
@@ -19,6 +19,17 @@ logger = logging.getLogger(__name__)
 
 # AGENT.md 中工作流提示词小节的标题前缀(角色系统提示词加载时会被剥离)
 WORKFLOW_SECTION_PREFIX = "## workflow:"
+
+
+class PromptInjector(Protocol):
+    """提示词注入器协议(鸭子类型,兼容 graph.common.SkillInjector)
+
+    仅声明工作流节点需要的注入接口,避免 TeamAgent 及其子类对 graph 层的
+    强依赖(循环导入防护):任何提供 inject_into_prompt 的对象皆可注入。
+    """
+
+    def inject_into_prompt(self, prompt: str, task: str) -> str:
+        """把技能指引块追加到 prompt 末尾,返回注入后的提示词"""
 
 
 class TeamAgent:

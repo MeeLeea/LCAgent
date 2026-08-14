@@ -20,7 +20,6 @@ from langgraph.graph import END, START, StateGraph
 from graph.common import (
     NodeCallback,
     SkillInjector,
-    ainvoke_team_agent,
     arun_compiled_workflow,
 )
 from graph.registry import register_workflow
@@ -54,22 +53,16 @@ async def manager_plan_node(state: WorkflowState, manager, injector=None) -> Wor
     """Manager 拆解任务,生成执行计划(结合记忆上下文摘要)"""
     task = state["task"]
     summary = state.get("context_summary", "")
-    template = manager.get_template("manager_plan")
-    prompt = manager.render_template(template, task=task, context_summary=summary)
-    if injector is not None:
-        prompt = injector.inject_into_prompt(prompt, task)
-    result = await ainvoke_team_agent(manager, prompt)
+    # TeamAgent.plan_task 为同步方法,经 to_thread 异步执行避免阻塞事件循环
+    result = await asyncio.to_thread(manager.plan_task, task, summary, injector)
     return {"plan": result}
 
 
 async def worker_exec_node(state: WorkflowState, worker, injector=None) -> WorkflowState:
     """Worker 执行计划中的子任务"""
     plan = state["plan"]
-    template = worker.get_template("worker_exec")
-    prompt = worker.render_template(template, plan=plan)
-    if injector is not None:
-        prompt = injector.inject_into_prompt(prompt, plan)
-    result = await ainvoke_team_agent(worker, prompt)
+    # TeamAgent.execute_task 为同步方法,经 to_thread 异步执行避免阻塞事件循环
+    result = await asyncio.to_thread(worker.execute_task, plan, injector)
     return {"worker_result": result}
 
 
@@ -79,18 +72,10 @@ async def terminator_final_node(state: WorkflowState, terminator, injector=None)
     plan = state["plan"]
     worker_result = state["worker_result"]
     summary = state.get("context_summary", "")
-    template = terminator.get_template("terminator_final")
-
-    prompt = terminator.render_template(
-        template,
-        task=task,
-        plan=plan,
-        worker_result=worker_result,
-        context_summary=summary,
+    # TeamAgent.finalize 为同步方法,经 to_thread 异步执行避免阻塞事件循环
+    result = await asyncio.to_thread(
+        terminator.finalize, task, plan, worker_result, summary, injector
     )
-    if injector is not None:
-        prompt = injector.inject_into_prompt(prompt, task)
-    result = await ainvoke_team_agent(terminator, prompt)
     return {"final_answer": result}
 
 

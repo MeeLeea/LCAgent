@@ -4,7 +4,7 @@ Terminator Agent - 负责汇总 Worker 执行结果并返回最终答案
 from typing import ClassVar
 
 from graph.registry import register_agent
-from team.base import TeamAgent
+from team.base import PromptInjector, TeamAgent
 
 
 @register_agent("terminator", "team/terminator/agent_config.json", tools=None)
@@ -26,3 +26,39 @@ class TerminatorAgent(TeamAgent):
             "请汇总以上信息,为用户提供清晰的最终答案。"
         ),
     }
+
+    def finalize(
+        self,
+        task: str,
+        plan: str,
+        worker_result: str,
+        context_summary: str = "",
+        injector: PromptInjector | None = None,
+    ) -> str:
+        """
+        汇总执行结果并生成最终答案(结合记忆上下文摘要与技能注入)
+
+        供工作流 terminator_final 节点调用:渲染 terminator_final 模板 → 可选
+        技能注入 → LLM 生成最终答案。为同步方法,节点层经 asyncio.to_thread 异步执行。
+
+        Args:
+            task: 用户原始任务
+            plan: Manager 拆解出的执行计划
+            worker_result: Worker 执行结果
+            context_summary: 上下文摘要(可为空串)
+            injector: 技能注入器;为 None 时跳过技能注入
+
+        Returns:
+            最终答案文本
+        """
+        template = self.get_template("terminator_final")
+        prompt = self.render_template(
+            template,
+            task=task,
+            plan=plan,
+            worker_result=worker_result,
+            context_summary=context_summary,
+        )
+        if injector is not None:
+            prompt = injector.inject_into_prompt(prompt, task)
+        return self.invoke(prompt)
