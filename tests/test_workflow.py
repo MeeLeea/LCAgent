@@ -74,7 +74,7 @@ class FakeAgent:
         self.calls.append(("invoke", prompt))
         return self.response
 
-    def execute_task(self, plan: str, injector=None) -> str:
+    def execute_task(self, plan: str, injector=None, config=None) -> str:
         """记录执行调用并返回模拟结果"""
         prompt = self.render_template(self.get_template("worker_exec"), plan=plan)
         if injector is not None:
@@ -492,12 +492,12 @@ def test_register_agent_tools_passthrough():
 
 
 def test_builtin_agents_registered():
-    """测试三个内置角色(manager/worker/terminator)已通过装饰器注册"""
+    """测试内置角色(manager/worker/terminator/architect)已通过装饰器注册"""
     import team  # noqa: F401 - 触发各 agent 模块加载,完成注册
     from graph.registry import AGENT_REGISTRY
     from team.base import TeamAgent
     
-    for role in ("manager", "worker", "terminator"):
+    for role in ("manager", "worker", "terminator", "architect"):
         assert role in AGENT_REGISTRY
         spec = AGENT_REGISTRY[role]
         assert issubclass(spec["agent_class"], TeamAgent)
@@ -878,7 +878,7 @@ def test_run_workflow_injects_memory(monkeypatch):
     def fake_build(name, checkpointer=None):
         return ("graph", {})
 
-    async def fake_run(graph, task, raw_context="", thread_id=None, on_node_start=None, on_node_end=None):
+    async def fake_run(graph, task, raw_context="", thread_id=None, workspace_path=None, on_node_start=None, on_node_end=None):
         captured["raw_context"] = raw_context
         return {"final_answer": "答案"}
 
@@ -942,7 +942,7 @@ def test_run_workflow_emits_workflow_events(monkeypatch):
     def fake_build(name, checkpointer=None):
         return ("graph", {"manager": object(), "worker": object(), "terminator": object()})
 
-    async def fake_run(graph, task, raw_context="", thread_id=None, on_node_start=None, on_node_end=None):
+    async def fake_run(graph, task, raw_context="", thread_id=None, workspace_path=None, on_node_start=None, on_node_end=None):
         # 模拟 4 个业务节点依次执行:每个节点 start → end
         for node in ("summarize", "manager_plan", "worker_exec", "terminator_final"):
             if on_node_start:
