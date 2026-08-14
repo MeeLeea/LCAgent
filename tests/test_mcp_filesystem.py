@@ -16,11 +16,50 @@ from __future__ import annotations
 
 import asyncio
 import os
+from dataclasses import dataclass
+from typing import Any
 
 import pytest
 
 # 标记为需要真实 MCP 进程的慢测试
 pytestmark = pytest.mark.slow
+
+
+@dataclass
+class FakeRuntime:
+    """模拟 ToolRuntime，只保留中间件用到的 config 字段。"""
+
+    config: dict[str, Any]
+
+
+@dataclass
+class FakeToolCallRequest:
+    """模拟 ToolCallRequest，使 override() 返回含真实 args 的对象。
+
+    绕开 MagicMock 的链式属性返回 MagicMock 问题：
+    override() 返回新的 FakeToolCallRequest，其 tool_call 指向真实 dict。
+    结构对齐 langchain 1.3 ToolCallRequest：config 在 runtime.config 而非顶层。
+    """
+
+    tool_call: dict[str, Any]
+    runtime: FakeRuntime
+
+    def override(self, **kwargs: Any) -> FakeToolCallRequest:
+        """返回新的 request，tool_call 用 kwargs 覆盖。"""
+        new_tc = dict(self.tool_call)
+        if "tool_call" in kwargs:
+            new_tc = dict(kwargs["tool_call"])
+        return FakeToolCallRequest(tool_call=new_tc, runtime=self.runtime)
+
+
+def _make_request(
+    tool_name: str, args: dict[str, Any], config: dict[str, Any], call_id: str = "call-1"
+) -> FakeToolCallRequest:
+    """构造 FakeToolCallRequest，config 挂在 runtime.config。"""
+    return FakeToolCallRequest(
+        tool_call={"name": tool_name, "args": args, "id": call_id},
+        runtime=FakeRuntime(config=config),
+    )
 
 
 def _has_npx() -> bool:
@@ -114,15 +153,9 @@ class TestMCPFilesystemWorkspaceIsolation:
             }
         }
 
-        # 构造 ToolCallRequest mock
-        from unittest.mock import MagicMock
-        request = MagicMock()
-        request.tool_call = {
-            "name": "read_file",
-            "args": {"path": "secret_a.txt"},
-            "id": "call-1",
-        }
-        request.config = config
+        request = _make_request(
+            "read_file", {"path": "secret_a.txt"}, config, "call-1"
+        )
 
         # 中间件拦截后调用真实 MCP 工具
         def handler(req):
@@ -130,8 +163,10 @@ class TestMCPFilesystemWorkspaceIsolation:
 
         result = mw.wrap_tool_call(request, handler)
 
-        # 应成功读取 workspace_a 内的文件
-        assert "secret_a_content" in str(result.content)
+        # 成功路径：MCP 工具 invoke 返回 (content, artifact) 元组，
+        # content 为字符串或 content block 列表，统一转字符串断言
+        content = result[0] if isinstance(result, tuple) else result
+        assert "secret_a_content" in str(content)
 
     def test_cross_session_isolation(
         self, mcp_pool, workspace_a, workspace_b
@@ -155,35 +190,30 @@ class TestMCPFilesystemWorkspaceIsolation:
             }
         }
 
-        from unittest.mock import MagicMock
-
         # 会话 A 尝试读 B 的文件（相对路径逃逸）
-        request_a = MagicMock()
-        request_a.tool_call = {
-            "name": "read_file",
-            "args": {"path": "../workspace_b/secret_b.txt"},
-            "id": "call-a",
-        }
-        request_a.config = config_a
+        request_a = _make_request(
+            "read_file",
+            {"path": "../workspace_b/secret_b.txt"},
+            config_a,
+            "call-a",
+        )
 
         def handler_a(req):
             return read_file_tool.invoke(req.tool_call["args"], config_a)
 
         result = mw.wrap_tool_call(request_a, handler_a)
-        # 逃逸被拦截
+        # 逃逸被中间件拦截，返回 ToolMessage（未调用 handler / MCP 工具）
         assert "逃逸" in result.content
 
         # 会话 B 正常读自己的文件
-        request_b = MagicMock()
-        request_b.tool_call = {
-            "name": "read_file",
-            "args": {"path": "secret_b.txt"},
-            "id": "call-b",
-        }
-        request_b.config = config_b
+        request_b = _make_request(
+            "read_file", {"path": "secret_b.txt"}, config_b, "call-b"
+        )
 
         def handler_b(req):
             return read_file_tool.invoke(req.tool_call["args"], config_b)
 
         result_b = mw.wrap_tool_call(request_b, handler_b)
-        assert "secret_b_content" in str(result_b.content)
+        # 成功路径：MCP 工具 invoke 返回 (content, artifact) 元组
+        content_b = result_b[0] if isinstance(result_b, tuple) else result_b
+        assert "secret_b_content" in str(content_b)
