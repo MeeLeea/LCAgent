@@ -271,7 +271,10 @@ LangChainAgent/
 │       ├── agent_config.json
 │       └── AGENT.md
 ├── graph/                   # LangGraph 工作流编排
-│   └── simple.py            # 监督者模式工作流（Manager→Worker→Terminator）
+│   ├── common.py            # 工作流通用能力：异步执行辅助 + 技能注入 + 跨轮次记忆压缩
+│   ├── simple.py            # 监督者模式工作流（Manager→Worker→Terminator，异步节点）
+│   ├── pipline.py           # 流水线模式工作流（异步节点，与 simple 同构）
+│   └── registry.py          # 工作流/Agent 注册表与构建入口
 ├── tools/
 │   ├── __init__.py          # 本地工具注册
 │   ├── search.py            # 联网搜索工具(Tavily API)
@@ -350,7 +353,10 @@ LangChainAgent/
 | [agent/agent_core.py](agent/agent_core.py)               | Agent 核心：`run()` / `chat()` / `cot()` 三种模式 + 全套异步 API + `AgentTurnResult` 结构化暂停/恢复 + 技能注入 + 压缩/裁剪 |
 | [session/](session/)                                     | 三层架构 Session 层：`SessionContext`（单会话运行时上下文）/ `SessionStore`（per-session 瞬态状态）/ `SessionRegistry`（生命周期管理）/ `WorkspaceStore`（工作空间映射）/ `SessionManager`（对外门面 & 会话调度） |
 | [team/](team/)                                           | 多 Agent 团队协作：ManagerAgent（拆解）/ WorkerAgent（执行）/ TerminatorAgent（汇总）+ 工厂函数                             |
-| [graph/simple.py](graph/simple.py)                       | LangGraph 监督者模式工作流编排（Manager→Worker→Terminator）                                                               |
+| [graph/common.py](graph/common.py)                       | 工作流通用能力：`ainvoke_team_agent` 异步执行辅助、`SkillInjector` 技能注入、`arun_compiled_workflow` 跨轮次记忆压缩            |
+| [graph/simple.py](graph/simple.py)                       | LangGraph 监督者模式工作流编排（Manager→Worker→Terminator，异步节点）                                                               |
+| [graph/pipline.py](graph/pipline.py)                     | LangGraph 流水线模式工作流编排（异步节点，与 simple 同构）                                                                          |
+| [graph/registry.py](graph/registry.py)                   | 工作流/Agent 注册表：`register_workflow` / `register_agent` / `build_workflow`                                                       |
 | [tools/skills.py](tools/skills.py)                       | `SkillManager`：扫描/匹配/渲染本地技能                                                                                    |
 | [tools/skill_tool.py](tools/skill_tool.py)               | `read_skill` 工具：LLM 在任务中自助读取技能指引                                                                           |
 | [tools/mcp_pool.py](tools/mcp_pool.py)                   | `MCPPool`：per-server 连接管理 + 健康探测 + 自动重连，替代全量重载                                                        |
@@ -1884,12 +1890,20 @@ Terminator (汇总结果,返回最终答案)
 
 **轻量设计**：团队 Agent 继承 `TeamAgent` 轻量基类,不继承 `AgentCore`。相比完整智能体:
 
-- **无会话记忆/checkpoint**:单轮任务执行,不需要持久化历史(但工作流会在外层注入当前会话记忆,见「记忆注入机制」)
+- **无会话记忆/checkpoint**:TeamAgent 自身单轮执行、不管理历史(但工作流会在外层注入当前会话记忆,见「记忆注入机制」;跨轮次记忆由工作流图 checkpointer 承载,见「异步化与跨轮次压缩」)
 - **按需工具注入**:Manager/Terminator 纯 LLM 推理,Worker 注入工具列表后用 `create_agent` 构建轻量 ReAct 循环
 - **快速构建**:不加载 MCP Server、不扫描技能目录、不创建 SQLite checkpointer
 - **能力边界清晰**:规划/汇总角色不暴露危险工具(如 `run_shell`),Worker 才拥有工具执行能力
 - **自带 LLM 配置**:每个 agent 的 `agent_config.json` 里配置 `provider` + `model`,TeamAgent 内部创建 LLMClient
 - **可定制 LLM 采样参数**:子类可通过类属性或 `__init__` 参数覆盖 `temperature`/`max_tokens`(如 WorkerAgent 用 `temperature=0.3` 提升执行确定性、`max_tokens=4096` 放宽输出上限)
+
+### 异步化与跨轮次压缩
+
+工作流节点已全面异步化,并具备技能注入与跨轮次记忆压缩能力(全部实现在 `graph/common.py`,TeamAgent 零改动):
+
+- **异步节点执行**:`simple.py` / `pipline.py` 的四个业务节点(`summarize`/`manager_plan`/`worker_exec`/`terminator_final`)全部为 `async`。节点经 `ainvoke_team_agent()` 执行团队 Agent——优先调用 `agent.ainvoke()`(若未来 TeamAgent 提供异步接口);否则用 `asyncio.to_thread()` 包装同步 `invoke()`,避免阻塞事件循环,多 Agent 并行不互相阻塞。
+- **技能注入(SkillInjector)**:`build_simple_workflow` 接受 `skills_dir` / `auto_match_skills` 参数,构建时创建 `SkillInjector`(复用 `tools.skills.SkillManager` 的确定性打分匹配 + 指引块渲染)。节点渲染 prompt 后调用 `inject_into_prompt()` 把命中技能(`match_skills(task)`)的指引块追加到 prompt 末尾,已含技能块时跳过(防重复)。
+- **跨轮次记忆压缩**:`arun_simple_workflow` / `arun_pipline_workflow` 接受 `thread_id` 与 `max_history_chars` 参数。当图编译时注入 checkpointer 且传入 `thread_id`,运行前 `_aget_previous_workflow_summary()` 从 checkpoint 读取上一轮状态(`task`/`plan`/`worker_result`/`final_answer`),超长截断为摘要(默认 6000 字符)拼入 `raw_context`(`【上一轮工作流记录】` 块),实现多轮运行间的上下文延续与压缩。无 checkpointer / 无历史 / 读取失败时静默降级,不影响运行。
 
 ### 状态隔离机制
 
@@ -1899,7 +1913,7 @@ Terminator (汇总结果,返回最终答案)
 
 工作流运行期间可实时感知节点执行进度（CLI 打印 + Web 前端节点高亮）：
 
-- **节点级回调**：`run_simple_workflow` 接受可选 `on_node_start` / `on_node_end` 回调（接收节点名）。内部通过 LangGraph 的 `config["callbacks"]` 注入 `NodeTrackingHandler`（位于 `graph/common.py`），利用节点执行时 `metadata["langgraph_node"]` 字段识别业务节点（哨兵节点与内部 agent 子图会被过滤），在节点开始/结束/异常时触发回调。不传回调时零额外开销。
+- **节点级回调**：`arun_simple_workflow` 接受可选 `on_node_start` / `on_node_end` 回调（接收节点名）。内部通过 LangGraph 的 `config["callbacks"]` 注入 `NodeTrackingHandler`（位于 `graph/common.py`），利用节点执行时 `metadata["langgraph_node"]` 字段识别业务节点（哨兵节点与内部 agent 子图会被过滤），在节点开始/结束/异常时触发回调。不传回调时零额外开销。
 - **CLI 场景**：`run_workflow` 把节点状态打印到终端（`▸ 节点开始: manager_plan` / `✓ 节点完成: manager_plan`）。
 - **Web 场景**：`CommandContext.workflow_event_cb` 把结构化事件（`workflow_node` / `workflow_status`）经 `/api/chat` 的 SSE 流实时推送；服务端将管理型命令的 `dispatch_command` 放到后台线程执行、输出经 `asyncio.Queue` 实时转发，前端 `WorkflowView` 据此高亮节点卡片与流程图。
 
@@ -1922,7 +1936,7 @@ Terminator (汇总结果,返回最终答案)
 | `## workflow:worker_exec`       | `team/worker/AGENT.md`     | Worker 执行子任务的用户消息模板                    |
 | `## workflow:terminator_final`  | `team/terminator/AGENT.md` | Terminator 汇总结果的用户消息模板(内含记忆摘要段)  |
 
-模板用 `{task}`/`{plan}`/`{worker_result}`/`{context_summary}` 占位,运行时以 `TeamAgent.render_template` 做字符串替换(即使模板含 JSON 花括号也不会报错)。各节点在需要时经 `TeamAgent.get_template(name)` 懒加载对应小节(首次读取后缓存),缺失回退各角色类的 `default_templates` 默认模板。加载/解析逻辑见 `team/base.py`;角色系统提示词在 `team/factory.py` 构建 TeamAgent 时经 `TeamAgent.parse_prompt_sections` 剥离工作流小节,避免模板混入 system prompt。
+模板用 `{task}`/`{plan}`/`{worker_result}`/`{context_summary}` 占位,运行时以 `TeamAgent.render_template` 做字符串替换(即使模板含 JSON 花括号也不会报错)。各节点在需要时经 `TeamAgent.get_template(name)` 加载对应小节(与系统提示词共用 __init__ 的一次解析缓存,不重复读文件),缺失回退各角色类的 `default_templates` 默认模板。加载/解析逻辑见 `team/base.py`;角色系统提示词在 `TeamAgent.__init__` 自动经 `parse_prompt_sections` 从 `prompt_file` 解析并剥离工作流小节,避免模板混入 system prompt(显式传入 `system_prompt` 时优先)。
 
 ### 使用方式
 
@@ -1969,24 +1983,35 @@ Terminator (汇总结果,返回最终答案)
 #### 2. 编程接口
 
 ```python
+import asyncio
 from graph.registry import build_workflow
-from graph.simple import run_simple_workflow
+from graph.simple import arun_simple_workflow
 
-# 方式1: 构建并运行
+# 方式1: 构建并运行(异步接口)
 graph, agents = build_workflow("simple")
-result = run_simple_workflow(graph, "帮我分析项目结构")
+result = asyncio.run(arun_simple_workflow(graph, "帮我分析项目结构"))
 print(result["final_answer"])
 
 # 可选: 手动传入记忆上下文(经 Manager 总结后注入 plan/final 节点)
-result = run_simple_workflow(graph, "帮我分析项目结构", raw_context="用户: 之前聊过项目背景")
+result = asyncio.run(arun_simple_workflow(
+    graph, "帮我分析项目结构",
+    raw_context="用户: 之前聊过项目背景",
+))
 
 # 可选: 节点进度回调(节点开始/结束时触发,接收节点名,用于进度跟踪)
-result = run_simple_workflow(
+result = asyncio.run(arun_simple_workflow(
     graph,
     "帮我分析项目结构",
     on_node_start=lambda node: print(f"节点开始: {node}"),
     on_node_end=lambda node: print(f"节点完成: {node}"),
-)
+))
+
+# 可选: 跨轮次记忆压缩(需 checkpointer 编译的图 + 显式 thread_id,
+# 同一 thread 多轮运行,第二轮自动注入【上一轮工作流记录】)
+from langgraph.checkpoint.memory import MemorySaver
+graph2, agents2 = build_workflow("simple", checkpointer=MemorySaver())
+r1 = asyncio.run(arun_simple_workflow(graph2, "第一轮任务", thread_id="wf-1"))
+r2 = asyncio.run(arun_simple_workflow(graph2, "第二轮任务", thread_id="wf-1"))
 
 # 方式2: 通过 CLI 层封装(带打印提示)
 from cli.commands.workflow import run_workflow
@@ -2046,7 +2071,7 @@ def build_my_workflow(agents: dict) -> StateGraph:
 register_workflow(
     name="my_flow",
     builder=build_my_workflow,
-    runner=run_my_workflow,          # 可选,缺失时回退到 run_simple_workflow
+    runner=run_my_workflow,          # 可选,缺失时回退到 arun_simple_workflow
     roles=["my_agent"],              # 可选,声明依赖角色(仅构建这些角色)
     description="我的自定义工作流",  # 可选,CLI 列表展示用
 )
@@ -2062,7 +2087,7 @@ from graph.registry import register_workflow
 register_workflow(
     name="my_flow",
     builder=build_my_workflow,
-    runner=run_my_workflow,          # 可选,缺失时回退到 run_simple_workflow
+    runner=run_my_workflow,          # 可选,缺失时回退到 arun_simple_workflow
     roles=["my_agent"],              # 可选,声明依赖角色(仅构建这些角色)
     description="我的自定义工作流",  # 可选,CLI 列表展示用
 )
@@ -2412,7 +2437,7 @@ Agent 的核心系统提示词（行为规则）已从 `agent_config.json` 中�
 
 自定义 Agent 行为规则时，直接编辑 `agent/AGENT.md` 即可，无需修改代码或 JSON 配置。
 
-> **注意**：`agent_prompt_file` 指定的 AGENT.md 同时也承载工作流提示词模板（`## workflow:*` 小节）。构建 TeamAgent 时（`team/factory.py`）会经 `TeamAgent.parse_prompt_sections` 剥离这些小节，避免模板内容混入 system prompt（详见「工作流提示词外置」）。
+> **注意**：`agent_prompt_file` 指定的 AGENT.md 同时也承载工作流提示词模板（`## workflow:*` 小节）。构建 TeamAgent 时（`team/factory.py`）只需传 `prompt_file`，`TeamAgent.__init__` 会自动经 `parse_prompt_sections` 剥离这些小节并解析出 system prompt，避免模板内容混入（详见「工作流提示词外置」）。
 
 #### 长上下文裁剪（Long-Context Trimming）
 

@@ -50,7 +50,7 @@ class TeamAgent:
         
         Args:
             name: Agent 名称
-            system_prompt: 角色系统提示词(从 AGENT.md 加载)
+            system_prompt: 角色系统提示词(可选;为空且提供 prompt_file 时自动从中解析)
             tools: 可选工具列表(为 None 或空列表时为纯文本模式)
             max_iterations: Agent 最大迭代次数(仅工具模式有效)
             verbose: 是否打印详细执行过程
@@ -59,7 +59,7 @@ class TeamAgent:
             config_file: LLM 配置文件路径(默认 config/llm_config.json)
             temperature: LLM 采样温度,不传则用类属性默认值
             max_tokens: LLM 最大生成 token 数,不传则用类属性默认值
-            prompt_file: 角色 AGENT.md 路径,用于加载工作流节点提示词模板
+            prompt_file: 角色 AGENT.md 路径,同时提供系统提示词与工作流节点提示词模板
         """
         # 参数优先,否则回退到类属性默认值
         self.temperature = temperature if temperature is not None else self.temperature
@@ -73,14 +73,22 @@ class TeamAgent:
             max_tokens=self.max_tokens,
         )
         self.name = name
-        self.system_prompt = system_prompt
         self.prompt_file = prompt_file
         self.tools = list(tools) if tools else []
         self.max_iterations = max_iterations
         self.verbose = verbose
         
-        # 工作流模板缓存(懒加载:首次 get_template 时解析 AGENT.md)
+        # 工作流模板缓存(None 表示尚未解析;解析过一次后不再重复读文件)
         self._workflow_templates: dict[str, str] | None = None
+        
+        # 角色系统提示词:显式传入优先;为空时自动从 prompt_file 解析
+        # (parse_prompt_sections 会剥离 ## workflow:* 小节,与模板共用同一次文件读取)
+        if not system_prompt and prompt_file:
+            content = self._read_prompt_file(prompt_file)
+            if content is not None:
+                system_prompt, templates = self.parse_prompt_sections(content)
+                self._workflow_templates = templates
+        self.system_prompt = system_prompt
         
         # 工具模式:创建轻量 agent executor
         if self.tools:
@@ -164,7 +172,10 @@ class TeamAgent:
     
     def get_template(self, name: str) -> str:
         """
-        懒加载角色 AGENT.md 的 `## workflow:{name}` 小节,缺失回退类默认模板
+        获取角色 AGENT.md 的 `## workflow:{name}` 小节,缺失回退类默认模板
+        
+        模板在 __init__ 自动解析系统提示词时(或首次调用时)解析一次,
+        之后复用缓存,避免重复读文件。
         
         Args:
             name: 工作流小节名(如 "manager_plan")

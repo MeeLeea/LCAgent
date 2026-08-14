@@ -3,14 +3,26 @@
 
 与 graph/simple.py 结构相同(独立保留状态/节点/图定义),通过
 register_workflow 在模块被 import 时自注册(方式二)。
+
+异步化说明：
+    节点函数全部为 async，通过 graph.common.ainvoke_team_agent 执行团队 Agent
+    （TeamAgent 无 ainvoke 时自动用 asyncio.to_thread 包装，不阻塞事件循环）；
+    技能注入通过 SkillInjector 在节点渲染 prompt 时追加技能指引块（TeamAgent 零改动）。
 """
 from __future__ import annotations
 
+import asyncio
+from functools import partial
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from graph.common import NodeCallback, arun_compiled_workflow
+from graph.common import (
+    NodeCallback,
+    SkillInjector,
+    ainvoke_team_agent,
+    arun_compiled_workflow,
+)
 from graph.registry import register_workflow
 
 
@@ -26,32 +38,42 @@ class WorkflowState(TypedDict):
 
 
 # 2. 节点函数(提示词模板由各角色 TeamAgent 懒加载,节点需要时调用 get_template)
-def summarize_context(state: WorkflowState, manager) -> WorkflowState:
-    """Manager 提炼记忆上下文,生成分发给下游节点的上下文摘要"""
-    result = manager.summarize_context(state.get("raw_context", ""))
+async def summarize_context(state: WorkflowState, manager, injector=None) -> WorkflowState:
+    """Manager 提炼记忆上下文,生成分发给下游节点的上下文摘要
+
+    raw_context 为空时仍调用 manager.summarize_context（其内部短路返回空串），
+    保持调用链可观测性（测试依赖 summarize 总是被调用的行为）。
+    """
+    raw = state.get("raw_context", "")
+    # TeamAgent.summarize_context 为同步方法,经 to_thread 异步执行避免阻塞事件循环
+    result = await asyncio.to_thread(manager.summarize_context, raw)
     return {"context_summary": result}
 
 
-def manager_plan_node(state: WorkflowState, manager) -> WorkflowState:
+async def manager_plan_node(state: WorkflowState, manager, injector=None) -> WorkflowState:
     """Manager 拆解任务,生成执行计划(结合记忆上下文摘要)"""
     task = state["task"]
     summary = state.get("context_summary", "")
     template = manager.get_template("manager_plan")
     prompt = manager.render_template(template, task=task, context_summary=summary)
-    result = manager.invoke(prompt)
+    if injector is not None:
+        prompt = injector.inject_into_prompt(prompt, task)
+    result = await ainvoke_team_agent(manager, prompt)
     return {"plan": result}
 
 
-def worker_exec_node(state: WorkflowState, worker) -> WorkflowState:
+async def worker_exec_node(state: WorkflowState, worker, injector=None) -> WorkflowState:
     """Worker 执行计划中的子任务"""
     plan = state["plan"]
     template = worker.get_template("worker_exec")
     prompt = worker.render_template(template, plan=plan)
-    result = worker.invoke(prompt)
+    if injector is not None:
+        prompt = injector.inject_into_prompt(prompt, plan)
+    result = await ainvoke_team_agent(worker, prompt)
     return {"worker_result": result}
 
 
-def terminator_final_node(state: WorkflowState, terminator) -> WorkflowState:
+async def terminator_final_node(state: WorkflowState, terminator, injector=None) -> WorkflowState:
     """Terminator 汇总结果并返回最终答案(结合记忆上下文摘要)"""
     task = state["task"]
     plan = state["plan"]
@@ -66,12 +88,19 @@ def terminator_final_node(state: WorkflowState, terminator) -> WorkflowState:
         worker_result=worker_result,
         context_summary=summary,
     )
-    result = terminator.invoke(prompt)
+    if injector is not None:
+        prompt = injector.inject_into_prompt(prompt, task)
+    result = await ainvoke_team_agent(terminator, prompt)
     return {"final_answer": result}
 
 
 # 3. 构建工作流图
-def build_pipline_workflow(agents: dict, checkpointer=None) -> StateGraph:
+def build_pipline_workflow(
+    agents: dict,
+    checkpointer=None,
+    skills_dir: str | None = None,
+    auto_match_skills: bool = True,
+) -> StateGraph:
     """
     构建监督者模式工作流
 
@@ -80,6 +109,8 @@ def build_pipline_workflow(agents: dict, checkpointer=None) -> StateGraph:
             分别对应管理者/执行者/终结者 Agent 实例
         checkpointer: LangGraph checkpointer 实例。传入时图编译带持久化，
             工作流状态按 thread_id 保存/恢复；为 None 时无持久化（测试/临时运行）。
+        skills_dir: 技能目录路径,为 None 时使用默认目录(.agents/skills)
+        auto_match_skills: 是否在节点渲染 prompt 时按任务自动匹配注入技能
 
     Returns:
         编译好的 LangGraph StateGraph
@@ -88,13 +119,22 @@ def build_pipline_workflow(agents: dict, checkpointer=None) -> StateGraph:
     worker = agents["worker"]
     terminator = agents["terminator"]
 
+    # 技能注入器:节点渲染 prompt 时追加匹配的技能指引块
+    injector = SkillInjector(
+        skills_dir=skills_dir,
+        auto_match=auto_match_skills,
+    )
+
     builder = StateGraph(WorkflowState)
 
-    # 添加节点(使用 lambda 绑定 agent 实例;提示词模板由节点内懒加载)
-    builder.add_node("summarize", lambda state: summarize_context(state, manager))
-    builder.add_node("manager_plan", lambda state: manager_plan_node(state, manager))
-    builder.add_node("worker_exec", lambda state: worker_exec_node(state, worker))
-    builder.add_node("terminator_final", lambda state: terminator_final_node(state, terminator))
+    # 添加节点(使用 partial 绑定 agent 实例;提示词模板由节点内懒加载)
+    # 注意:必须用 functools.partial 而非 lambda —— partial 保留 async 函数
+    # 的 coroutine 特征(LangGraph 据此判定节点为异步并 await),lambda 会返回
+    # 未 await 的 coroutine 导致 InvalidUpdateError
+    builder.add_node("summarize", partial(summarize_context, manager=manager, injector=injector))
+    builder.add_node("manager_plan", partial(manager_plan_node, manager=manager, injector=injector))
+    builder.add_node("worker_exec", partial(worker_exec_node, worker=worker, injector=injector))
+    builder.add_node("terminator_final", partial(terminator_final_node, terminator=terminator, injector=injector))
 
     # 添加边: START → summarize → manager_plan → worker_exec → terminator_final → END
     builder.add_edge(START, "summarize")
@@ -115,6 +155,7 @@ async def arun_pipline_workflow(
     on_node_start: NodeCallback | None = None,
     on_node_end: NodeCallback | None = None,
     on_node_error: NodeCallback | None = None,
+    max_history_chars: int = 6000,
 ) -> dict:
     """
     运行监督者工作流（异步）
@@ -128,6 +169,7 @@ async def arun_pipline_workflow(
         on_node_start: 节点开始回调,接收节点名(用于运行进度跟踪)
         on_node_end: 节点结束回调,接收节点名
         on_node_error: 节点异常回调,接收节点名
+        max_history_chars: 跨轮次记忆摘要最大字符数(超长截断)
 
     Returns:
         包含 final_answer 的结果字典
@@ -141,6 +183,7 @@ async def arun_pipline_workflow(
         on_node_start=on_node_start,
         on_node_end=on_node_end,
         on_node_error=on_node_error,
+        max_history_chars=max_history_chars,
     )
 
 

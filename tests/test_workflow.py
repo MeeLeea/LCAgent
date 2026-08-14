@@ -72,7 +72,7 @@ def test_summarize_context_node():
     manager = FakeAgent(name="manager", summary_response="记忆摘要: 项目背景A")
     state = {"raw_context": "用户: 之前聊过项目A"}
 
-    result = summarize_context(state, manager)
+    result = asyncio.run(summarize_context(state, manager))
 
     assert result["context_summary"] == "记忆摘要: 项目背景A"
     assert len(manager.calls) == 1
@@ -85,7 +85,7 @@ def test_manager_plan_node():
     manager = FakeAgent(name="manager", response="计划: 步骤1、步骤2")
     state = {"task": "帮我分析项目结构"}
     
-    result = manager_plan_node(state, manager)
+    result = asyncio.run(manager_plan_node(state, manager))
     
     assert result["plan"] == "计划: 步骤1、步骤2"
     assert len(manager.calls) == 1
@@ -98,7 +98,7 @@ def test_worker_exec_node():
     worker = FakeAgent(name="worker", response="已完成步骤1和步骤2")
     state = {"plan": "计划: 步骤1、步骤2"}
     
-    result = worker_exec_node(state, worker)
+    result = asyncio.run(worker_exec_node(state, worker))
     
     assert result["worker_result"] == "已完成步骤1和步骤2"
     assert len(worker.calls) == 1
@@ -115,7 +115,7 @@ def test_terminator_final_node():
         "worker_result": "已完成步骤1和步骤2"
     }
     
-    result = terminator_final_node(state, terminator)
+    result = asyncio.run(terminator_final_node(state, terminator))
     
     assert result["final_answer"] == "最终答案: 项目包含3个模块"
     assert len(terminator.calls) == 1
@@ -131,7 +131,7 @@ def test_manager_plan_node_with_summary():
     manager = FakeAgent(name="manager", response="计划")
     state = {"task": "任务", "context_summary": "用户偏好中文"}
 
-    result = manager_plan_node(state, manager)
+    result = asyncio.run(manager_plan_node(state, manager))
 
     assert result["plan"] == "计划"
     prompt = manager.calls[0][1]
@@ -149,7 +149,7 @@ def test_terminator_final_node_with_summary():
         "context_summary": "用户偏好中文",
     }
 
-    result = terminator_final_node(state, terminator)
+    result = asyncio.run(terminator_final_node(state, terminator))
 
     assert result["final_answer"] == "最终答案"
     prompt = terminator.calls[0][1]
@@ -166,7 +166,7 @@ def test_terminator_final_node_no_summary():
         "worker_result": "结果",
     }
 
-    terminator_final_node(state, terminator)
+    asyncio.run(terminator_final_node(state, terminator))
 
     prompt = terminator.calls[0][1]
     assert "记忆上下文摘要:" in prompt
@@ -281,14 +281,14 @@ def test_build_simple_workflow_with_prompt_file(tmp_path):
     terminator = FakeAgent(name="terminator", response="答案X", prompt_file=str(terminator_md))
 
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
-    graph.invoke({
+    asyncio.run(graph.ainvoke({
         "task": "任务T",
         "raw_context": "",
         "context_summary": "摘要S",
         "plan": "",
         "worker_result": "",
         "final_answer": "",
-    })
+    }))
 
     assert "按文件计划: 任务T" in manager.calls[1][1]
     assert "记忆块: 摘要S" in manager.calls[1][1]
@@ -573,6 +573,7 @@ class FakeMemory:
 def test_build_memory_context():
     """测试记忆文本提取:短期+长期拼装"""
     import asyncio
+
     from cli.commands.workflow import abuild_memory_context
 
     class FakeSession:
@@ -604,6 +605,7 @@ def test_build_memory_context():
 def test_build_memory_context_empty():
     """测试无记忆时返回空串"""
     import asyncio
+
     from cli.commands.workflow import abuild_memory_context
 
     class FakeSession:
@@ -625,6 +627,7 @@ def test_build_memory_context_empty():
 def test_build_memory_context_truncation(monkeypatch):
     """测试记忆文本超长截断"""
     import asyncio
+
     import cli.commands.workflow as wf_module
     from cli.commands.workflow import abuild_memory_context
     monkeypatch.setattr(wf_module, "MAX_RAW_CONTEXT_CHARS", 20)
@@ -891,3 +894,205 @@ def test_run_workflow_emits_workflow_events(monkeypatch):
         running_idx = node_events.index({"type": "workflow_node", "node": node, "status": "running"})
         done_idx = node_events.index({"type": "workflow_node", "node": node, "status": "done"})
         assert running_idx < done_idx
+
+
+# ==================== 测试 ainvoke_team_agent 异步执行 ====================
+
+class SyncOnlyAgent:
+    """仅有同步 invoke 的 Agent(模拟 TeamAgent)"""
+    def __init__(self, response="sync result"):
+        self.response = response
+        self.calls = []
+
+    def invoke(self, task: str) -> str:
+        self.calls.append(task)
+        return self.response
+
+
+class AsyncAgent:
+    """同时具备 ainvoke 的 Agent(模拟未来 TeamAgent 异步化)"""
+    def __init__(self, response="async result"):
+        self.response = response
+        self.calls = []
+
+    def invoke(self, task: str) -> str:
+        self.calls.append(("invoke", task))
+        return "sync path"
+
+    async def ainvoke(self, task: str) -> str:
+        self.calls.append(("ainvoke", task))
+        return self.response
+
+
+def test_ainvoke_team_agent_falls_back_to_invoke():
+    """无 ainvoke 时通过 to_thread 包装同步 invoke,不阻塞事件循环"""
+    from graph.common import ainvoke_team_agent
+
+    agent = SyncOnlyAgent(response="done")
+    result = asyncio.run(ainvoke_team_agent(agent, "任务"))
+    assert result == "done"
+    assert agent.calls == ["任务"]
+
+
+def test_ainvoke_team_agent_prefers_ainvoke():
+    """有 ainvoke 时优先调用异步接口"""
+    from graph.common import ainvoke_team_agent
+
+    agent = AsyncAgent(response="async done")
+    result = asyncio.run(ainvoke_team_agent(agent, "任务"))
+    assert result == "async done"
+    assert agent.calls == [("ainvoke", "任务")]
+
+
+# ==================== 测试 SkillInjector 技能注入 ====================
+
+def test_skill_injector_no_skills_dir(tmp_path):
+    """技能目录不存在时注入器正常降级(不抛异常)"""
+    from graph.common import SkillInjector
+
+    injector = SkillInjector(skills_dir=str(tmp_path / "nonexistent"), auto_match=True)
+    block = injector.build_skill_block("随便什么任务")
+    assert block == ""
+
+    prompt = injector.inject_into_prompt("原提示词", "任务")
+    assert prompt == "原提示词"
+
+
+def test_skill_injector_injects_matched_skill(tmp_path):
+    """任务匹配到技能时注入技能指引块"""
+    from graph.common import SkillInjector
+
+    skill_dir = tmp_path / "skills"
+    skill_md = skill_dir / "git" / "SKILL.md"
+    skill_md.parent.mkdir(parents=True)
+    skill_md.write_text(
+        "---\nname: git-commit\ndescription: commit git 提交 版本控制\n---\n# git 提交指引\n按规范提交",
+        encoding="utf-8",
+    )
+
+    injector = SkillInjector(skills_dir=str(skill_dir), auto_match=True)
+    # 任务包含 git/提交 关键词,应命中 git-commit 技能
+    block = injector.build_skill_block("请帮我提交代码")
+    assert "git-commit" in block
+
+    prompt = injector.inject_into_prompt("原提示词", "请帮我提交代码")
+    assert prompt.startswith("原提示词")
+    assert "git-commit" in prompt
+
+
+def test_skill_injector_auto_match_disabled(tmp_path):
+    """auto_match=False 时不自动注入技能块"""
+    from graph.common import SkillInjector
+
+    skill_dir = tmp_path / "skills"
+    skill_md = skill_dir / "git" / "SKILL.md"
+    skill_md.parent.mkdir(parents=True)
+    skill_md.write_text(
+        "---\nname: git-commit\ndescription: commit git\n---\n# git 提交指引",
+        encoding="utf-8",
+    )
+
+    injector = SkillInjector(skills_dir=str(skill_dir), auto_match=False)
+    block = injector.build_skill_block("请帮我提交代码")
+    assert block == ""
+
+    prompt = injector.inject_into_prompt("原提示词", "请帮我提交代码")
+    assert prompt == "原提示词"
+
+
+def test_skill_injector_skip_when_already_injected(tmp_path):
+    """已注入过技能块时不重复注入"""
+    from graph.common import SkillInjector
+
+    skill_dir = tmp_path / "skills"
+    skill_md = skill_dir / "git" / "SKILL.md"
+    skill_md.parent.mkdir(parents=True)
+    skill_md.write_text(
+        "---\nname: git-commit\ndescription: commit git\n---\n# git 提交指引",
+        encoding="utf-8",
+    )
+
+    injector = SkillInjector(skills_dir=str(skill_dir), auto_match=True)
+    prompt = "原提示词\n\n【已加载的技能指引(请在处理任务时遵循)】\nxxx"
+    result = injector.inject_into_prompt(prompt, "请帮我提交代码")
+    assert result == prompt
+
+
+# ==================== 测试跨轮次记忆压缩 ====================
+
+def test_workflow_cross_round_compression():
+    """同一 thread_id + checkpointer 多轮运行时,第二轮注入上一轮工作流记录"""
+    from langgraph.checkpoint.memory import MemorySaver
+
+    manager = FakeAgent(name="manager", response="计划: A、B、C", summary_response="摘要")
+    worker = FakeAgent(name="worker", response="执行结果: 完成")
+    terminator = FakeAgent(name="terminator", response="最终答案: 全部完成")
+
+    checkpointer = MemorySaver()
+    graph = build_simple_workflow(
+        {"manager": manager, "worker": worker, "terminator": terminator},
+        checkpointer=checkpointer,
+    )
+
+    # 第一轮:无历史,不注入
+    result1 = asyncio.run(arun_simple_workflow(graph, "第一轮任务", thread_id="wf-t1"))
+    assert result1["final_answer"] == "最终答案: 全部完成"
+    # summarize 节点第一轮 raw_context 为空
+    assert manager.calls[0][0] == "summarize"
+    assert manager.calls[0][1] == ""
+
+    # 第二轮:同一 thread_id,上一轮状态应注入 raw_context
+    manager.calls.clear()
+    worker.calls.clear()
+    terminator.calls.clear()
+    manager.response = "计划2"
+    worker.response = "结果2"
+    terminator.response = "答案2"
+
+    result2 = asyncio.run(arun_simple_workflow(graph, "第二轮任务", thread_id="wf-t1"))
+    assert result2["final_answer"] == "答案2"
+
+    # summarize 节点收到上一轮工作流记录
+    assert manager.calls[0][0] == "summarize"
+    assert "【上一轮工作流记录】" in manager.calls[0][1]
+    assert "第一轮任务" in manager.calls[0][1]
+    assert "最终答案: 全部完成" in manager.calls[0][1]
+
+
+def test_workflow_cross_round_compression_truncation():
+    """跨轮次记录超长时截断,不撑爆上下文"""
+    from langgraph.checkpoint.memory import MemorySaver
+
+    manager = FakeAgent(name="manager", response="计划", summary_response="摘要")
+    worker = FakeAgent(name="worker", response="结果")
+    terminator = FakeAgent(name="terminator", response="答案")
+
+    checkpointer = MemorySaver()
+    graph = build_simple_workflow(
+        {"manager": manager, "worker": worker, "terminator": terminator},
+        checkpointer=checkpointer,
+    )
+
+    asyncio.run(arun_simple_workflow(graph, "长内容任务 " + "X" * 500, thread_id="wf-t2"))
+
+    manager.calls.clear()
+    result2 = asyncio.run(
+        arun_simple_workflow(graph, "第二轮", thread_id="wf-t2", max_history_chars=100)
+    )
+    assert result2["final_answer"] == "答案"
+    summary_text = manager.calls[0][1]
+    assert "已截断" in summary_text
+    assert len(summary_text) < 300
+
+
+def test_workflow_cross_round_no_checkpointer():
+    """无 checkpointer 时跨轮次压缩静默降级,不影响运行"""
+    manager = FakeAgent(name="manager", response="计划", summary_response="摘要")
+    worker = FakeAgent(name="worker", response="结果")
+    terminator = FakeAgent(name="terminator", response="答案")
+
+    graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
+
+    result = asyncio.run(arun_simple_workflow(graph, "任务", thread_id="wf-t3"))
+    assert result["final_answer"] == "答案"
+    assert manager.calls[0][1] == ""  # 无历史,summarize 收到空 raw_context

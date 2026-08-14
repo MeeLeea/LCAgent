@@ -37,17 +37,12 @@ def build_team_agent(
     # 应用覆盖参数
     config.update(overrides)
     
-    # 解析角色 AGENT.md 绝对路径,供工作流节点提示词模板加载
+    # 解析角色 AGENT.md 绝对路径(system_prompt 与工作流模板均由 TeamAgent 自动解析)
     prompt_file = resolve_path(config.get("agent_prompt_file", "agent/AGENT.md"), base_dir)
-
-    content = TeamAgent._read_prompt_file(prompt_file) or ""
-    # 剥离 AGENT.md 中的 ## workflow:* 小节,避免模板混入系统提示词
-    system_prompt, _ = TeamAgent.parse_prompt_sections(content)
     
-    # 构建轻量 TeamAgent
+    # 构建轻量 TeamAgent(system_prompt 由 __init__ 从 prompt_file 自动解析)
     agent = agent_class(
         name=config["name"],
-        system_prompt=system_prompt,
         tools=tools,
         max_iterations=config["max_iterations"],
         verbose=config.get("verbose", False),
