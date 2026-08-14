@@ -274,6 +274,7 @@ LangChainAgent/
 │   ├── common.py            # 工作流通用能力：异步执行辅助 + 技能注入 + 跨轮次记忆压缩 + workspace 透传
 │   ├── simple.py            # 监督者模式工作流（Manager→Worker→Terminator，异步节点，worker_exec 接收 config 注入 workspace）
 │   ├── pipline.py           # 流水线模式工作流（异步节点，与 simple 同构，worker_exec 接收 config 注入 workspace）
+│   ├── rtl_graph.py         # RTL 芯片设计流水线（Manager 提炼→Architect 架构→Designer 设计↔Verification 多轮验证→Designer 交付）
 │   └── registry.py          # 工作流/Agent 注册表与构建入口（runner 支持 workspace_path 参数）
 ├── tools/
 │   ├── __init__.py          # 本地工具注册
@@ -357,6 +358,7 @@ LangChainAgent/
 | [graph/common.py](graph/common.py)                       | 工作流通用能力：`ainvoke_team_agent` 异步执行辅助、`SkillInjector` 技能注入、`arun_compiled_workflow` 跨轮次记忆压缩 + `workspace_path` 注入 `config.configurable`                                                                        |
 | [graph/simple.py](graph/simple.py)                       | LangGraph 监督者模式工作流编排（Manager→Worker→Terminator，异步节点）；`worker_exec` 节点接收 LangGraph 注入的 config（含 `workspace_path`）透传 Worker                                                                                     |
 | [graph/pipline.py](graph/pipline.py)                     | LangGraph 流水线模式工作流编排（异步节点，与 simple 同构）；`worker_exec` 节点同样透传 workspace config                                                                                                                                    |
+| [graph/rtl_graph.py](graph/rtl_graph.py)                 | RTL 芯片设计流水线：Manager 提炼上下文→Architect 计划/设计/分析/评审/规格→Designer 规格+编码↔Verification 验证多轮交互（条件路由 + max_rounds 限轮）→Designer 交付                                                                       |
 | [graph/registry.py](graph/registry.py)                   | 工作流/Agent 注册表：`register_workflow` / `register_agent` / `build_workflow`；runner 统一支持 `workspace_path` 透传                                                                                                                   |
 | [tools/skills.py](tools/skills.py)                       | `SkillManager`：扫描/匹配/渲染本地技能                                                                                                                                                                                                   |
 | [tools/skill_tool.py](tools/skill_tool.py)               | `read_skill` 工具：LLM 在任务中自助读取技能指引                                                                                                                                                                                          |
@@ -1072,6 +1074,7 @@ Agent 可以在任务中**阅读并使用这些技能指引**，支持三种方�
 | `find-skills` | 发现并安装 agent skills                |
 | `git-commit`  | 从 git diff 生成双语提交信息并执行提交 |
 | `pptx`        | 创建/读取/编辑`.pptx` 演示文稿       |
+| `vivado-2025.2` | Vivado 2025.2 FPGA 工程自动化构建（综合→实现→比特流，`run_skill.tcl` 一键流程） |
 
 > 中文任务通过内置中→英关键词扩展（如 提交→commit/git、演示→ppt/slides）实现与英文描述的匹配。
 
@@ -1937,6 +1940,36 @@ Worker (执行子任务)
 Terminator (汇总结果,返回最终答案)
 ```
 
+### 架构(rtl_graph)
+
+RTL 芯片设计流水线：`Manager` 提炼上下文 → `Architect` 五阶段架构（计划/设计/分析/评审/规格）→ `Designer` 规格+编码 ↔ `Verification` 多轮验证 → `Designer` 交付：
+
+```
+用户任务
+    ↓
+Manager (summarize_context,提炼记忆上下文)
+    ↓
+Architect (plan_task → design_task → analyze_task → review_task → spec_task)
+    ↓
+Designer (spec_design_task:规格梳理 + Filelist)
+    ↓
+Verification (spec_design_task:验证计划)
+    ↓
+┌──────────────────────────────────────────┐
+│  Designer (verilog_design_task:RTL 编码) │◄─┐
+│     ↓                                    │  │ 未通过且未达上限
+│  Verification (verilog_design_task:验证) │──┘
+└──────────────────────────────────────────┘
+    ↓ 验证通过 / 达 max_rounds 上限
+Designer (输出最终交付文件)
+    ↓
+最终答案
+```
+
+- **多轮交互**：`designer_verilog` → `verification_check` 构成迭代环，由 `route_after_verification` 条件路由判定。验证报告含"验证结论: PASS"标记即交付；未通过且轮次未达 `max_rounds`（默认 3）时携带验证反馈回到 Designer 重新编码；达上限强制交付，防止死循环。
+- **上下文衔接**：Architect 各阶段任务文本逐级拼接上游产物（计划→设计→分析→评审→规格），Designer/Verification 基于架构规格分工，多轮迭代时第二轮起注入上一轮验证报告反馈。
+- **角色注册**：`team/__init__.py` 未导入 `rtl_designer`/`rtl_verification`，由 `rtl_graph.py` 顶部显式导入触发 `@register_agent` 注册，与 `graph.registry` 无循环导入。
+
 ### 团队角色
 
 | Agent                     | 职责           | 工具能力                   | 配置                 |
@@ -1944,6 +1977,10 @@ Terminator (汇总结果,返回最终答案)
 | **ManagerAgent**    | 任务拆解与规划 | 纯文本推理(无工具)         | `team/manager/`    |
 | **WorkerAgent**     | 执行具体子任务 | 工具模式(注入全部本地工具) | `team/worker/`     |
 | **TerminatorAgent** | 汇总结果并返回 | 纯文本推理(无工具)         | `team/terminator/` |
+| **DesignerAgent**     | RTL 设计：规格梳理/模块拆分/Filelist/RTL 编码 | 纯文本推理(无工具) | `team/rtl_designer/` |
+| **VerificationAgent** | RTL 验证：验证计划/TB·UVM 框架/覆盖率/bug 定位 | 纯文本推理(无工具) | `team/rtl_verification/` |
+
+> **固定技能注入**：`VerificationAgent` 每次节点调用都会强制注入 `.agents/skills/vivado-2025.2` 技能指引（验证环境固定使用 Vivado Xsim，不依赖任务关键词自动匹配），见 `team/rtl_verification/rtl_verification.py::_inject_vivado_skill`。
 
 **轻量设计**：团队 Agent 继承 `TeamAgent` 轻量基类,不继承 `AgentCore`。相比完整智能体:
 
@@ -1992,6 +2029,8 @@ Terminator (汇总结果,返回最终答案)
 | `## workflow:summarize_context` | `team/manager/AGENT.md`    | `summarize_context` 的 system prompt             |
 | `## workflow:worker_exec`       | `team/worker/AGENT.md`     | Worker 执行子任务的用户消息模板                    |
 | `## workflow:terminator_final`  | `team/terminator/AGENT.md` | Terminator 汇总结果的用户消息模板(内含记忆摘要段)  |
+| `## workflow:spec_design`       | `team/rtl_designer/AGENT.md`、`team/rtl_verification/AGENT.md` | 设计/验证需求梳理与工程规划模板(环节 1-4)        |
+| `## workflow:verilog_design`    | `team/rtl_designer/AGENT.md`、`team/rtl_verification/AGENT.md` | RTL 编码 / Testbench·UVM 框架模板(环节 5-9)      |
 
 模板用 `{task}`/`{plan}`/`{worker_result}`/`{context_summary}` 占位,运行时以 `TeamAgent.render_template` 做字符串替换(即使模板含 JSON 花括号也不会报错)。各节点在需要时经 `TeamAgent.get_template(name)` 加载对应小节(与系统提示词共用 __init__ 的一次解析缓存,不重复读文件),缺失回退各角色类的 `default_templates` 默认模板。加载/解析逻辑见 `team/base.py`;角色系统提示词在 `TeamAgent.__init__` 自动经 `parse_prompt_sections` 从 `prompt_file` 解析并剥离工作流小节,避免模板混入 system prompt(显式传入 `system_prompt` 时优先)。
 

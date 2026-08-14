@@ -1,5 +1,5 @@
 {
-    "name": "manager",
+    "name": "rtl_verification",
     "max_iterations": 200,
     "skills_dir": ".agents/skills",
     "auto_match_skills": true,
@@ -11,7 +11,7 @@
     "context_trim_keep": 12,
     "max_execution_history": 100,
     "tool_timeout": 120,
-    "agent_prompt_file": "team/manager/AGENT.md",
+    "agent_prompt_file": "team/rtl_verification/AGENT.md",
     "provider": "yunwu",
     "model": "glm-5.2"
 }
