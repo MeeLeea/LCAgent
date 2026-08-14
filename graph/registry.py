@@ -240,6 +240,7 @@ async def arun_workflow_by_name(
     task: str,
     checkpointer=None,
     thread_id: str | None = None,
+    workspace_path: str | None = None,
     on_node_start: Callable | None = None,
     on_node_end: Callable | None = None,
 ) -> dict:
@@ -256,6 +257,8 @@ async def arun_workflow_by_name(
             为 None 时无持久化（scheduler 场景默认无持久化）。
         thread_id: 会话线程 ID。为 None 时自动生成；传入显式值时配合
             checkpointer 可实现状态持久化。
+        workspace_path: 会话绑定的工作空间绝对路径。为 None 时工作流内
+            Worker 工具调用不做 workspace 隔离（scheduler 场景默认无绑定）。
         on_node_start: 节点开始回调(可选,接收节点名)
         on_node_end: 节点结束回调(可选,接收节点名)
 
@@ -278,6 +281,7 @@ async def arun_workflow_by_name(
         task,
         raw_context="",  # scheduler 场景无会话记忆
         thread_id=thread_id,
+        workspace_path=workspace_path,
         on_node_start=on_node_start,
         on_node_end=on_node_end,
     )

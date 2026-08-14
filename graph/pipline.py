@@ -5,16 +5,22 @@
 register_workflow 在模块被 import 时自注册(方式二)。
 
 异步化说明：
-    节点函数全部为 async，通过 graph.common.ainvoke_team_agent 执行团队 Agent
-    （TeamAgent 无 ainvoke 时自动用 asyncio.to_thread 包装，不阻塞事件循环）；
-    技能注入通过 SkillInjector 在节点渲染 prompt 时追加技能指引块（TeamAgent 零改动）。
+    节点函数全部为 async，通过 asyncio.to_thread 执行团队 Agent 的同步方法
+    （不阻塞事件循环）；技能注入通过 SkillInjector 在节点渲染 prompt 时
+    追加技能指引块（TeamAgent 零改动）。
+
+workspace 隔离说明：
+    worker_exec 节点接收 LangGraph 注入的 config（含 configurable.workspace_path），
+    透传给 Worker.execute_task → self.invoke，使 Worker 工具调用受
+    WorkspaceSecurityMiddleware 约束（见 graph/common.arun_compiled_workflow）。
 """
 from __future__ import annotations
 
 import asyncio
 from functools import partial
-from typing import TypedDict
+from typing import Optional, TypedDict
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 
 from graph.common import (
@@ -58,11 +64,25 @@ async def manager_plan_node(state: WorkflowState, manager, injector=None) -> Wor
     return {"plan": result}
 
 
-async def worker_exec_node(state: WorkflowState, worker, injector=None) -> WorkflowState:
-    """Worker 执行计划中的子任务"""
+async def worker_exec_node(
+    state: WorkflowState,
+    worker,
+    injector=None,
+    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 见下文:须用 Optional 写法,LangGraph 注解判定仅接受该字符串形态
+) -> WorkflowState:
+    """Worker 执行计划中的子任务。
+
+    config 由 LangGraph 按节点签名以关键字注入（含 configurable.workspace_path），
+    透传给 Worker.execute_task 使工具调用受 workspace 隔离约束。
+
+    注:必须用 Optional[RunnableConfig] 而非 RunnableConfig | None——模块启用
+    ``from __future__ import annotations`` 后注解为字符串,仅
+    'Optional[RunnableConfig]'/'RunnableConfig' 在 LangGraph 判定中被接受,
+    'RunnableConfig | None' 字符串不匹配会导致 config 静默不注入。
+    """
     plan = state["plan"]
     # TeamAgent.execute_task 为同步方法,经 to_thread 异步执行避免阻塞事件循环
-    result = await asyncio.to_thread(worker.execute_task, plan, injector)
+    result = await asyncio.to_thread(worker.execute_task, plan, injector, config)
     return {"worker_result": result}
 
 
@@ -137,6 +157,7 @@ async def arun_pipline_workflow(
     task: str,
     raw_context: str = "",
     thread_id: str | None = None,
+    workspace_path: str | None = None,
     on_node_start: NodeCallback | None = None,
     on_node_end: NodeCallback | None = None,
     on_node_error: NodeCallback | None = None,
@@ -151,6 +172,8 @@ async def arun_pipline_workflow(
         raw_context: 原始记忆文本(当前会话+长期记忆),为空则不注入记忆
         thread_id: 会话线程 ID。为 None 时自动生成；传入显式值时配合
             checkpointer 编译的图可实现状态持久化。
+        workspace_path: 会话绑定的工作空间绝对路径。为 None 时工作流内
+            Worker 工具调用不做 workspace 隔离（兼容旧场景）。
         on_node_start: 节点开始回调,接收节点名(用于运行进度跟踪)
         on_node_end: 节点结束回调,接收节点名
         on_node_error: 节点异常回调,接收节点名
@@ -165,6 +188,7 @@ async def arun_pipline_workflow(
         state_fields={"plan": "", "worker_result": "", "final_answer": ""},
         raw_context=raw_context,
         thread_id=thread_id,
+        workspace_path=workspace_path,
         on_node_start=on_node_start,
         on_node_end=on_node_end,
         on_node_error=on_node_error,

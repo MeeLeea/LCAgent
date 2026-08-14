@@ -158,6 +158,7 @@ async def arun_compiled_workflow(
     state_fields: dict[str, str] | None = None,
     raw_context: str = "",
     thread_id: str | None = None,
+    workspace_path: str | None = None,
     on_node_start: NodeCallback | None = None,
     on_node_end: NodeCallback | None = None,
     on_node_error: NodeCallback | None = None,
@@ -178,6 +179,11 @@ async def arun_compiled_workflow(
         超长时截断为摘要并拼入 raw_context，实现多轮运行间的上下文延续
         与压缩（TeamAgent 自身无状态，记忆完全由工作流图 checkpointer 承载）。
 
+    workspace 隔离：
+        workspace_path 注入 config.configurable，节点经 config 透传给
+        Worker 角色，其工具调用由 WorkspaceSecurityMiddleware 约束在
+        workspace 内（路径解析 + 逃逸校验）。
+
     Args:
         graph: 编译好的 LangGraph StateGraph
         task: 用户任务
@@ -186,6 +192,8 @@ async def arun_compiled_workflow(
         raw_context: 原始记忆文本，为空则不注入记忆
         thread_id: 会话线程 ID。为 None 时自动生成（无持久化绑定）；
             传入显式值时配合 checkpointer 编译的图可实现状态持久化。
+        workspace_path: 会话绑定的工作空间绝对路径。为 None 时不注入
+            （工作流内工具调用不做 workspace 隔离，兼容旧场景）。
         on_node_start: 节点开始回调，接收节点名
         on_node_end: 节点结束回调，接收节点名
         on_node_error: 节点异常回调，接收节点名
@@ -196,7 +204,10 @@ async def arun_compiled_workflow(
     """
     tid = thread_id or f"workflow-{uuid.uuid4().hex[:8]}"
 
-    config: dict = {"configurable": {"thread_id": tid}}
+    configurable: dict[str, Any] = {"thread_id": tid}
+    if workspace_path is not None:
+        configurable["workspace_path"] = workspace_path
+    config: dict = {"configurable": configurable}
 
     # 跨轮次记忆压缩：从 checkpoint 读取上一轮工作流状态，截断为摘要注入 raw_context
     previous_summary = await _aget_previous_workflow_summary(graph, config, max_history_chars)
