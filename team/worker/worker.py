@@ -28,29 +28,6 @@ class WorkerAgent(TeamAgent):
         ),
     }
 
-    def execute_task(self, plan: str, injector: PromptInjector | None = None, config: dict | None = None) -> str:
-        """
-        执行计划中的子任务(结合技能注入)
-
-        供工作流 worker_exec 节点调用:渲染 worker_exec 模板 → 可选技能注入
-        → invoke 执行(Worker 具备工具能力,经 ReAct 循环调用工具)。
-        为同步方法,节点层经 asyncio.to_thread 异步执行。
-
-        Args:
-            plan: Manager 拆解出的执行计划
-            injector: 技能注入器;为 None 时跳过技能注入
-            config: 外层运行配置(含 configurable.workspace_path),透传给
-                self.invoke 使工具调用受 workspace 隔离约束
-
-        Returns:
-            子任务执行结果文本
-        """
-        template = self.get_template("worker_exec")
-        prompt = self.render_template(template, plan=plan)
-        if injector is not None:
-            prompt = injector.inject_into_prompt(prompt, plan)
-        return self.invoke(prompt, config)
-
     async def aexecute_task(
         self,
         plan: str,

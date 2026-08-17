@@ -11,7 +11,7 @@ import os
 from collections.abc import AsyncIterator
 from typing import ClassVar, Protocol
 
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool
 
 from agent.llm_client import LLMClient
@@ -221,26 +221,6 @@ class TeamAgent:
             middleware=[WorkspaceSecurityMiddleware()],
         )
     
-    def invoke(self, task: str, config: dict | None = None) -> str:
-        """
-        执行单轮任务
-        
-        Args:
-            task: 任务描述
-            config: 外层运行配置(RunnableConfig,含 configurable.workspace_path)。
-                仅工具模式消费:提取 workspace_path 注入内部 agent 调用,
-                使 WorkspaceSecurityMiddleware 生效;纯文本模式忽略。
-            
-        Returns:
-            执行结果字符串
-        """
-        # 工具模式:通过 agent 循环执行
-        if self.agent_executor:
-            return self._invoke_with_tools(task, config)
-        
-        # 纯文本模式:直接 LLM 调用
-        return self._invoke_pure_text(task)
-    
     async def ainvoke(self, task: str, config: dict | None = None) -> str:
         """异步执行单轮任务(等价 invoke 的异步版,TOKEN 级流式聚合)
 
@@ -355,54 +335,4 @@ class TeamAgent:
             if self.verbose:
                 logger.error("[%s] %s", self.name, error_msg)
             yield error_msg
-    
-    def _invoke_with_tools(self, task: str, config: dict | None = None) -> str:
-        """工具模式执行(带 ReAct 推理循环)"""
-        if self.verbose:
-            logger.info("[%s] 执行任务(工具模式): %s", self.name, task[:100])
-        
-        try:
-            run_config: dict = {"recursion_limit": self.max_iterations}
-            # 仅提取 workspace_path 构造最小 config,严禁转发外层 config 的
-            # callbacks/thread_id 等运行时字段——外层 NodeTrackingHandler 使用
-            # asyncio.Queue(run_inline=True),跨线程透传会在内部 agent 步骤误触发回调。
-            configurable = config.get("configurable") if config else None
-            if isinstance(configurable, dict) and configurable.get("workspace_path"):
-                run_config["configurable"] = {"workspace_path": configurable["workspace_path"]}
-            result = self.agent_executor.invoke(
-                {"messages": [HumanMessage(content=task)]},
-                config=run_config
-            )
-            
-            # 从返回的消息列表中提取最后一条 AIMessage
-            messages = result.get("messages", [])
-            for msg in reversed(messages):
-                if isinstance(msg, AIMessage) and msg.content:
-                    return str(msg.content)
-            
-            return ""
-            
-        except Exception as e:
-            error_msg = f"任务执行失败: {e!s}"
-            if self.verbose:
-                logger.error("[%s] %s", self.name, error_msg)
-            return error_msg
 
-    def _invoke_pure_text(self, task: str) -> str:
-        """纯文本模式执行(单次 LLM 调用)"""
-        if self.verbose:
-            logger.info("[%s] 执行任务(纯文本模式): %s", self.name, task[:100])
-        
-        try:
-            messages = [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": task}
-            ]
-            response = self.llm.chat(messages)
-            return response
-            
-        except Exception as e:
-            error_msg = f"任务执行失败: {e!s}"
-            if self.verbose:
-                logger.error("[%s] %s", self.name, error_msg)
-            return error_msg

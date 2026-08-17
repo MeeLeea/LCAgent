@@ -13,8 +13,7 @@ class DesignerAgent(TeamAgent):
     设计师 Agent,负责 RTL 设计、综合、布局布线等
 
     继承 TeamAgent 轻量基类,纯文本推理模式(不使用工具);各工作流方法
-    渲染对应 `## workflow:*` 小节 → 可选技能注入 → LLM 调用,同步方法由
-    节点层经 asyncio.to_thread 异步执行。
+    渲染对应 `## workflow:*` 小节 → 可选技能注入 → 异步 LLM 调用(TOKEN 级流式)。
     """
 
     # 工作流节点提示词的默认模板(仅 AGENT.md 缺失或未定义小节时兜底)
@@ -45,66 +44,6 @@ class DesignerAgent(TeamAgent):
             "跨时钟域信号必须显式同步,禁止直接跨域赋值。"
         ),
     }
-
-    def _run_rtl_design_task(
-        self,
-        template_name: str,
-        task: str,
-        injector: PromptInjector | None,
-    ) -> str:
-        """
-        RTL 设计工作流方法通用执行体:渲染模板 → 可选技能注入 → LLM 调用
-
-        作为所有 RTL 设计节点的通用执行体,通过 template_name 动态分发到
-        对应的 `## workflow:{name}` 小节模板(spec_design / verilog_design 等)。
-
-        Args:
-            template_name: 工作流小节名(对应 AGENT.md 的 `## workflow:{name}`)
-            task: 用户任务
-            injector: 技能注入器;为 None 时跳过技能注入
-
-        Returns:
-            LLM 生成结果文本
-        """
-        template = self.get_template(template_name)
-        prompt = self.render_template(template, task=task)
-        if injector is not None:
-            prompt = injector.inject_into_prompt(prompt, task)
-        return self.invoke(prompt)
-
-    def spec_design_task(self, task: str, injector: PromptInjector | None = None) -> str:
-        """
-        规格梳理与工程规划:需求约束梳理、模块拆分、目录树、接口表、设计思路与 Filelist
-
-        供工作流 spec_design 节点调用:对应 template_name="spec_design",渲染该模板
-        → 可选技能注入 → LLM 生成(输出 syn_filelist.f 与 sim_filelist.f,严格遵循输出
-        强制规则)。为同步方法,节点层经 asyncio.to_thread 异步执行。
-
-        Args:
-            task: 用户原始任务(模块需求/spec/接口)
-            injector: 技能注入器;为 None 时跳过技能注入
-
-        Returns:
-            规格梳理与工程规划结果文本
-        """
-        return self._run_rtl_design_task("spec_design", task, injector)
-
-    def verilog_design_task(self, task: str, injector: PromptInjector | None = None) -> str:
-        """
-        输出可综合 RTL 源码:按模块拆分、参数化设计,附风险清单与验证测试点
-
-        供工作流 verilog_design 节点调用:对应 template_name="verilog_design",渲染该模板
-        → 可选技能注入 → LLM 生成可综合 SystemVerilog 代码(端口严格对齐接口表,禁止仿真
-        语法混入)。为同步方法,节点层经 asyncio.to_thread 异步执行。
-
-        Args:
-            task: 用户原始任务(模块需求/spec/接口)
-            injector: 技能注入器;为 None 时跳过技能注入
-
-        Returns:
-            RTL 源码与配套输出结果文本
-        """
-        return self._run_rtl_design_task("verilog_design", task, injector)
 
     # ============ 异步版(供 rtl_graph 节点直接 await 调用) ============
 

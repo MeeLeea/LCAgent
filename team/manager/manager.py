@@ -34,29 +34,6 @@ class ManagerAgent(TeamAgent):
         ),
     }
 
-    def summarize_context(self, memory_text: str) -> str:
-        """
-        把当前会话记忆提炼成与任务相关的简洁上下文摘要
-
-        供工作流 summarize 节点调用:只消费一次原始记忆,下游各节点
-        通过 WorkflowState.context_summary 获取蒸馏后的上下文。
-
-        Args:
-            memory_text: 原始记忆文本(当前会话 + 长期记忆)
-
-        Returns:
-            上下文摘要字符串;memory_text 为空时直接返回空串,跳过 LLM 调用
-        """
-        memory_text = memory_text.strip()
-        if not memory_text:
-            return ""
-
-        messages = [
-            {"role": "system", "content": self.get_template("summarize_context")},
-            {"role": "user", "content": memory_text},
-        ]
-        return self.llm.chat(messages).strip()
-
     async def asummarize_context(self, memory_text: str, config: dict | None = None) -> str:
         """
         异步版 summarize_context(供 summarize 节点直接 await 调用)
@@ -76,27 +53,6 @@ class ManagerAgent(TeamAgent):
         async for chunk in self._astream_messages(messages, config):
             chunks.append(chunk)
         return "".join(chunks).strip()
-
-    def plan_task(self, task: str, context_summary: str = "", injector: PromptInjector | None = None) -> str:
-        """
-        拆解任务并生成执行计划(结合记忆上下文摘要)
-
-        供工作流 manager_plan 节点调用:渲染 manager_plan 模板 → 可选技能注入
-        → LLM 生成计划文本。为同步方法,节点层经 asyncio.to_thread 异步执行。
-
-        Args:
-            task: 用户原始任务
-            context_summary: 上下文摘要(可为空串)
-            injector: 技能注入器;为 None 时跳过技能注入
-
-        Returns:
-            生成的执行计划文本
-        """
-        template = self.get_template("manager_plan")
-        prompt = self.render_template(template, task=task, context_summary=context_summary)
-        if injector is not None:
-            prompt = injector.inject_into_prompt(prompt, task)
-        return self.invoke(prompt)
 
     async def aplan_task(
         self,

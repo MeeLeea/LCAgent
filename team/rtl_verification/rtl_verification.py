@@ -14,7 +14,7 @@ class VerificationAgent(TeamAgent):
 
     继承 TeamAgent 轻量基类,纯文本推理模式(不使用工具);各工作流方法
     渲染对应 `## workflow:*` 小节 → 可选技能注入 → 强制注入 vivado-2025.2
-    技能指引 → LLM 调用,同步方法由节点层经 asyncio.to_thread 异步执行。
+    技能指引 → 异步 LLM 调用(TOKEN 级流式)。
     """
 
     # 验证环境固定依赖 Vivado Xsim(AGENT.md 环境约束:当前仿真环境优先使用
@@ -53,34 +53,6 @@ class VerificationAgent(TeamAgent):
             "跨时钟域模块覆盖不同时钟相位与复位错位场景。"
         ),
     }
-
-    def _run_rtl_design_task(
-        self,
-        template_name: str,
-        task: str,
-        injector: PromptInjector | None,
-    ) -> str:
-        """
-        RTL 验证工作流方法通用执行体:渲染模板 → 技能注入 → LLM 调用
-
-        作为所有 RTL 验证节点的通用执行体,通过 template_name 动态分发到
-        对应的 `## workflow:{name}` 小节模板(spec_design / verilog_design 等)。
-
-        Args:
-            template_name: 工作流小节名(对应 AGENT.md 的 `## workflow:{name}`)
-            task: 用户任务
-            injector: 技能注入器;为 None 时跳过自动匹配技能注入
-
-        Returns:
-            LLM 生成结果文本
-        """
-        template = self.get_template(template_name)
-        prompt = self.render_template(template, task=task)
-        if injector is not None:
-            prompt = injector.inject_into_prompt(prompt, task)
-        # 强制注入 vivado-2025.2 技能(验证环境固定依赖 Vivado Xsim,不依赖自动匹配)
-        prompt = self._inject_vivado_skill(prompt)
-        return self.invoke(prompt)
 
     async def _arun_rtl_design_task_async(
         self,
@@ -134,36 +106,3 @@ class VerificationAgent(TeamAgent):
             return prompt
         return f"{prompt}\n\n{block}"
 
-    def spec_design_task(self, task: str, injector: PromptInjector | None = None) -> str:
-        """
-        验证需求梳理与验证方案规划:需求梳理、验证计划Checklist、文件规划、Vivado仿真Tcl脚本
-
-        供工作流 spec_design 节点调用:对应 template_name="spec_design",渲染该模板
-        → 可选技能注入 → 强制注入 vivado-2025.2 → LLM 生成(输出环节 1-4,严格遵循
-        输出强制流程)。为同步方法,节点层经 asyncio.to_thread 异步执行。
-
-        Args:
-            task: 用户原始任务(待验证模块需求/spec/RTL/filelist/bug现象)
-            injector: 技能注入器;为 None 时跳过自动匹配技能注入
-
-        Returns:
-            验证需求梳理与验证方案规划结果文本
-        """
-        return self._run_rtl_design_task("spec_design", task, injector)
-
-    def verilog_design_task(self, task: str, injector: PromptInjector | None = None) -> str:
-        """
-        输出 Testbench / UVM 框架代码:定向SV tb 或 UVM 组件框架,附 covergroup、断言与风险预判
-
-        供工作流 verilog_design 节点调用:对应 template_name="verilog_design",渲染该模板
-        → 可选技能注入 → 强制注入 vivado-2025.2 → LLM 生成(输出环节 5-9,严格遵循
-        输出强制流程)。为同步方法,节点层经 asyncio.to_thread 异步执行。
-
-        Args:
-            task: 用户原始任务(待验证模块需求/spec/RTL/filelist/bug现象)
-            injector: 技能注入器;为 None 时跳过自动匹配技能注入
-
-        Returns:
-            Testbench / UVM 框架代码与配套输出结果文本
-        """
-        return self._run_rtl_design_task("verilog_design", task, injector)
