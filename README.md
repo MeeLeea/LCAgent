@@ -244,12 +244,13 @@ LangChainAgent/
 │   ├── llm_client.py        # 统一大模型封装（多提供商 + 多模型）
 │   ├── config.py            # 运行时配置加载(agent/agent_config.json)
 │   ├── compaction.py        # 长上下文压缩中间件（增量摘要 + 工具输出 Prune）
-│   ├── metrics.py           # 运行时指标收集（LLM/工具/压缩统计，线程安全）
 │   ├── message_utils.py     # LLM 异常信息提取（中文化错误提示）
 │   └── agent_core.py        # Agent 核心调度：run/chat/cot 三种模式 + HITL + 异步 API
 ├── utils/                   # 通用工具（与业务解耦，供 agent/graph/session 等共用）
+│   ├── events.py            # 标准化执行事件模型（AgentEvent / EventType，含节点进度事件）
+│   ├── exceptions.py        # 统一异常层次（LCAgentError 及其子类）
 │   ├── logging_config.py    # 结构化日志（trace_id/thread_id 上下文注入）
-│   └── exceptions.py        # 统一异常层次（LCAgentError 及其子类）
+│   └── metrics.py           # 运行时指标收集（LLM/工具/压缩统计，线程安全）
 ├── session/                 # 会话管理模块（三层架构 Session 层）
 │   ├── context.py           # SessionContext：单会话运行时上下文（session_id + config + checkpointer）
 │   ├── store.py             # SessionStore：基于 LangGraph Store 的 per-session 瞬态状态
@@ -350,7 +351,8 @@ LangChainAgent/
 | [agent/config.py](agent/config.py)                       | 加载`agent/agent_config.json`，统一运行时配置                                                                                                                                                                                            |
 | [memory/](memory/)                                       | 三层架构 Memory 层：`AgentMemory`（checkpointer + Store 基础设施）/ `MemoryContext`（统一工厂）/ `MemoryManager`（统一门面）/ `ThreadMemoryStore`（Store 业务封装）/ 读写中间件（防抖 + Fact 抽取 + prompt 注入）/ per-thread 锁池 |
 | [agent/compaction.py](agent/compaction.py)               | 长上下文压缩中间件：增量摘要 + 工具输出 Prune + 保留近期消息，摘要随 checkpoint 持久化、per-thread 隔离                                                                                                                                    |
-| [agent/metrics.py](agent/metrics.py)                     | `MetricsCollector`：线程安全的运行时指标收集（LLM 调用 / 工具执行 / 压缩统计）                                                                                                                                                           |
+| [utils/events.py](utils/events.py)                       | 标准化执行事件模型：`AgentEvent`（frozen dataclass）+ `EventType` 枚举（含 TOKEN/TOOL_*/INTERRUPT/ERROR/DONE/NODE_*）+ SSE dict 序列化，三层架构唯一通信载体                                                        |
+| [utils/metrics.py](utils/metrics.py)                     | `MetricsCollector`：线程安全的运行时指标收集（LLM 调用 / 工具执行 / 压缩统计）                                                                                                                                                           |
 | [utils/logging_config.py](utils/logging_config.py)       | 结构化日志：`contextvars` 实现 trace_id / thread_id 异步安全注入                                                                                                                                                                         |
 | [utils/exceptions.py](utils/exceptions.py)               | 统一异常层次：`LCAgentError` 基类及 MCP/超时/压缩/中断/状态等子类                                                                                                                                                                        |
 | [agent/agent_core.py](agent/agent_core.py)               | Agent 核心：`run()` / `chat()` / `cot()` 三种模式 + 全套异步 API + `AgentTurnResult` 结构化暂停/恢复 + 技能注入 + 压缩/裁剪                                                                                                        |
@@ -1496,7 +1498,7 @@ await pool.close()                 # 关闭所有连接
 
 ### 运行时指标（Metrics）
 
-[`agent/metrics.py`](agent/metrics.py) 的 `MetricsCollector` 挂在 `AgentCore.metrics` 上，**线程安全**，追踪三类核心指标：
+[`utils/metrics.py`](utils/metrics.py) 的 `MetricsCollector` 挂在 `AgentCore.metrics` 上，**线程安全**，追踪三类核心指标：
 
 | 类别     | 记录方法                                               | 汇总内容                                               |
 | -------- | ------------------------------------------------------ | ------------------------------------------------------ |
@@ -1510,10 +1512,10 @@ await pool.close()                 # 关闭所有连接
 
 ### 结构化日志（Logging）
 
-[`agent/logging_config.py`](agent/logging_config.py) 提供 **trace_id / thread_id 上下文注入**，基于 `contextvars` 实现 asyncio 安全传递：
+[`utils/logging_config.py`](utils/logging_config.py) 提供 **trace_id / thread_id 上下文注入**，基于 `contextvars` 实现 asyncio 安全传递：
 
 ```python
-from agent.logging_config import setup_logging, TraceContext
+from utils.logging_config import setup_logging, TraceContext
 
 setup_logging(level=logging.INFO)  # 程序入口调用一次（幂等），日志输出到 stderr（不污染 stdout 工具输出）
 
@@ -1535,7 +1537,7 @@ with TraceContext(trace_id="req-123", thread_id="thread-abc"):
 
 ### 统一异常层次
 
-[`agent/exceptions.py`](agent/exceptions.py) 定义分层异常，便于上层精准 `catch`：
+[`utils/exceptions.py`](utils/exceptions.py) 定义分层异常，便于上层精准 `catch`：
 
 ```
 LCAgentError                    ← 所有 LCAgent 异常的基类（含 detail 字段）
@@ -2008,7 +2010,7 @@ Designer (输出最终交付文件)
 
 工作流运行期间可实时感知节点执行进度（CLI 打印 + Web 前端节点高亮）：
 
-- **节点级回调**：`arun_simple_workflow` 接受可选 `on_node_start` / `on_node_end` 回调（接收节点名）。内部通过 LangGraph 的 `config["callbacks"]` 注入 `NodeTrackingHandler`（位于 `graph/common.py`），利用节点执行时 `metadata["langgraph_node"]` 字段识别业务节点（哨兵节点与内部 agent 子图会被过滤），在节点开始/结束/异常时触发回调。不传回调时零额外开销。
+- **节点级回调**：`arun_simple_workflow` 接受可选 `on_node_start` / `on_node_end` / `on_node_error` 回调（接收 `AgentEvent`，其中 NODE_START / NODE_END / NODE_ERROR 事件携带 `node` 节点名）。内部通过 LangGraph 的 `config["callbacks"]` 注入 `NodeTrackingHandler`（位于 `graph/common.py`），利用节点执行时 `metadata["langgraph_node"]` 字段识别业务节点（哨兵节点与内部 agent 子图会被过滤），在节点开始/结束/异常时构造 `AgentEvent` 并触发回调。不传回调时零额外开销。
 - **CLI 场景**：`run_workflow` 把节点状态打印到终端（`▸ 节点开始: manager_plan` / `✓ 节点完成: manager_plan`）。
 - **Web 场景**：`CommandContext.workflow_event_cb` 把结构化事件（`workflow_node` / `workflow_status`）经 `/api/chat` 的 SSE 流实时推送；服务端将管理型命令的 `dispatch_command` 放到后台线程执行、输出经 `asyncio.Queue` 实时转发，前端 `WorkflowView` 据此高亮节点卡片与流程图。
 
@@ -2736,6 +2738,7 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 | `tests/test_tool_wrapper.py`           | 工具超时包装：超时返回 JSON、按工具名覆盖、无限等待排除                                 |
 | `tests/test_logging_config.py`         | 结构化日志：trace_id/thread_id 上下文注入、TraceContext 恢复                            |
 | `tests/test_exceptions_and_close.py`   | 异常层次与生命周期：`LCAgentError` 子类、`aclose()` 资源释放                        |
+| `tests/test_events.py`                  | 事件模型：`AgentEvent` NODE_* 工厂方法、to_sse_dict workflow_node 映射、is_terminal 排除 |
 
 ### 在线连通性测试
 
