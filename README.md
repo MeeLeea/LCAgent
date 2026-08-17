@@ -2000,7 +2000,8 @@ Designer (输出最终交付文件)
 
 - **异步节点执行**:`simple.py` / `pipline.py` 的四个业务节点(`summarize`/`manager_plan`/`worker_exec`/`terminator_final`)全部为 `async`。节点经 `ainvoke_team_agent()` 执行团队 Agent——优先调用 `agent.ainvoke()`(若未来 TeamAgent 提供异步接口);否则用 `asyncio.to_thread()` 包装同步 `invoke()`,避免阻塞事件循环,多 Agent 并行不互相阻塞。
 - **技能注入(SkillInjector)**:`build_simple_workflow` 接受 `skills_dir` / `auto_match_skills` 参数,构建时创建 `SkillInjector`(复用 `tools.skills.SkillManager` 的确定性打分匹配 + 指引块渲染)。节点渲染 prompt 后调用 `inject_into_prompt()` 把命中技能(`match_skills(task)`)的指引块追加到 prompt 末尾,已含技能块时跳过(防重复)。
-- **跨轮次记忆压缩**:`arun_simple_workflow` / `arun_pipline_workflow` 接受 `thread_id` 与 `max_history_chars` 参数。当图编译时注入 checkpointer 且传入 `thread_id`,运行前 `_aget_previous_workflow_summary()` 从 checkpoint 读取上一轮状态(`task`/`plan`/`worker_result`/`final_answer`),超长截断为摘要(默认 6000 字符)拼入 `raw_context`(`【上一轮工作流记录】` 块),实现多轮运行间的上下文延续与压缩。无 checkpointer / 无历史 / 读取失败时静默降级,不影响运行。
+- **消息通道压缩(compaction)**:`simple.py` / `rtl_graph.py` / `pipline.py` 的 `WorkflowState` / `RTLGraphState` 新增 `messages`(LangGraph `add_messages` 通道)与 `summary` 字段,每个业务节点产出追加一条 `AIMessage`。`build_*_workflow` 接受 `compaction_config` 参数,经 `graph/common.py` 的 `_build_compaction_middleware` + `wrap_node_with_compaction` 包装节点:消息累计超过阈值(默认 50)时调用 `arun_compaction(force=True)` 把历史消息压缩为增量摘要并入 `summary`,防止长会话撑爆上下文。`compaction_config=None` 且 agent 无 LLM 时静默禁用。
+- **跨轮次上下文延续**:统一入口(CLI/API)经 `WorkflowAdapter`(`session/workflow_adapter.py`)执行——运行前从 workflow 专属会话的 checkpoint `messages` 通道读取历史节点产出(预览最多 5 条、每条截断 200 字符,拼为 `【历史执行记录】` 块),叠加 `MemoryManager.recall_text` 的长期记忆,合并注入 `raw_context`,实现多轮运行间的上下文延续。直接调用 `arun_simple_workflow` + `thread_id` 时,旧的 `_aget_previous_workflow_summary()`(checkpoint 摘要)仍可用(已标记 deprecated,待消息通道完全接管后移除)。
 
 ### 状态隔离机制
 
@@ -2016,11 +2017,11 @@ Designer (输出最终交付文件)
 
 ### 记忆注入机制
 
-工作流把当前 CLI 会话的记忆注入任务上下文,并在结束后写回,形成记忆闭环:
+工作流经统一 `SessionManager` 门面(`workflow_sm`,绑定 `WorkflowAdapter`)执行,记忆闭环由门面自动承载:
 
-1. **记忆提取**:`run_workflow` 调用 `build_memory_context` 从当前会话提取短期记忆（checkpoint）与长期记忆（`MemoryManager.recall_text`，经 `session_manager.memory` 访问）,拼装为文本(超 `MAX_RAW_CONTEXT_CHARS` 自动截断)。
+1. **记忆提取**:`WorkflowAdapter._build_raw_context` 执行前从 workflow 专属会话的 checkpoint `messages` 通道读取历史节点产出(预览最多 5 条、每条 200 字符),叠加 `MemoryManager.recall_text` 的长期记忆,合并注入 `raw_context`(超长自动截断)。
 2. **Manager 总结分发**:工作流首个节点 `summarize` 调用 `ManagerAgent.summarize_context` 把原始记忆提炼成上下文摘要,存入 `WorkflowState.context_summary`。下游仅 `manager_plan` 与 `terminator_final` 节点注入该摘要,`worker_exec` 不注入(靠 plan 承接记忆)。
-3. **写回闭环**:工作流结束后,`_record_workflow_result` 把 `workflow:<name> <task>`(HumanMessage)与 `final_answer`(AIMessage)写入当前会话 checkpoint。
+3. **写回闭环**:`workflow_sm.arun_stream` 内部自动执行——运行前 `submit_user_message(task, important=True)` 把任务写入长期记忆;结束后消费 DONE 事件(`consume_event`)沉淀最终答案,无需命令层手工写回。
 
 ### 工作流提示词外置
 
@@ -2053,8 +2054,6 @@ Designer (输出最终交付文件)
 
 ```
 构建工作流: simple
-初始化团队 Agent(Manager/Worker/Terminator)...
-工作流 simple 构建完成
 
 执行任务: 帮我分析 LCAgent 项目的目录结构
 --------------------------------------------------
@@ -2112,12 +2111,14 @@ graph2, agents2 = build_workflow("simple", checkpointer=MemorySaver())
 r1 = asyncio.run(arun_simple_workflow(graph2, "第一轮任务", thread_id="wf-1"))
 r2 = asyncio.run(arun_simple_workflow(graph2, "第二轮任务", thread_id="wf-1"))
 
-# 方式2: 通过 CLI 层封装(带打印提示)
+# 方式2: 通过 CLI 层封装(带打印提示,经统一 workflow_sm 门面执行)
 from cli.commands.workflow import run_workflow
 from cli.commands.types import CommandContext
 
-# 需要构造 CommandContext(简化示例,实际使用中从 main.py 获取)
-result = run_workflow(context, "simple", "帮我分析项目结构")
+# 需要构造 CommandContext(简化示例,实际使用中从 main.py 的 make_context 获取)。
+# context.workflow_sm 必须注入(create_workflow_session_manager 构建,与 chat 门面
+# 共享 SessionRegistry / MemoryManager),否则 run_workflow 抛 RuntimeError。
+result = asyncio.run(run_workflow(context, "simple", "帮我分析项目结构"))
 ```
 
 ### 扩展工作流
