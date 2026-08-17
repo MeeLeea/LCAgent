@@ -82,6 +82,31 @@ class VerificationAgent(TeamAgent):
         prompt = self._inject_vivado_skill(prompt)
         return self.invoke(prompt)
 
+    async def _arun_rtl_design_task_async(
+        self,
+        template_name: str,
+        task: str,
+        injector: PromptInjector | None,
+    ) -> str:
+        """RTL 验证工作流方法异步通用执行体:模板渲染/技能注入同步,LLM 调用异步流式
+
+        与同步版一致,始终强制注入 vivado-2025.2 技能指引(验证环境固定依赖)。
+        """
+        template = self.get_template(template_name)
+        prompt = self.render_template(template, task=task)
+        if injector is not None:
+            prompt = injector.inject_into_prompt(prompt, task)
+        prompt = self._inject_vivado_skill(prompt)
+        return await self.ainvoke(prompt)
+
+    async def aspec_design_task(self, task: str, injector: PromptInjector | None = None) -> str:
+        """异步版 spec_design_task(供 spec_design 节点调用)"""
+        return await self._arun_rtl_design_task_async("spec_design", task, injector)
+
+    async def averilog_design_task(self, task: str, injector: PromptInjector | None = None) -> str:
+        """异步版 verilog_design_task(供 verilog_design 节点调用)"""
+        return await self._arun_rtl_design_task_async("verilog_design", task, injector)
+
     def _inject_vivado_skill(self, prompt: str, skills_dir: str | None = None) -> str:
         """
         强制注入 vivado-2025.2 技能指引块,已含时跳过(防重复)

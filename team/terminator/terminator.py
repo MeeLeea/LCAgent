@@ -62,3 +62,29 @@ class TerminatorAgent(TeamAgent):
         if injector is not None:
             prompt = injector.inject_into_prompt(prompt, task)
         return self.invoke(prompt)
+
+    async def afinalize(
+        self,
+        task: str,
+        plan: str,
+        worker_result: str,
+        context_summary: str = "",
+        injector: PromptInjector | None = None,
+    ) -> str:
+        """
+        异步版 finalize(供 terminator_final 节点直接 await 调用)
+
+        模板渲染/技能注入保持同步(纯 CPU),仅 LLM 调用走异步流式
+        (``await self.ainvoke``),token 增量可透传到外层事件流。
+        """
+        template = self.get_template("terminator_final")
+        prompt = self.render_template(
+            template,
+            task=task,
+            plan=plan,
+            worker_result=worker_result,
+            context_summary=context_summary,
+        )
+        if injector is not None:
+            prompt = injector.inject_into_prompt(prompt, task)
+        return await self.ainvoke(prompt)

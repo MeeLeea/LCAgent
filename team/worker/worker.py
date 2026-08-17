@@ -50,3 +50,23 @@ class WorkerAgent(TeamAgent):
         if injector is not None:
             prompt = injector.inject_into_prompt(prompt, plan)
         return self.invoke(prompt, config)
+
+    async def aexecute_task(
+        self,
+        plan: str,
+        injector: PromptInjector | None = None,
+        config: dict | None = None,
+    ) -> str:
+        """
+        异步版 execute_task(供 worker_exec 节点直接 await 调用)
+
+        模板渲染/技能注入保持同步(纯 CPU),仅 LLM 调用走异步流式
+        (``await self.ainvoke``)。config(含 configurable.workspace_path 与
+        callbacks)透传给 ainvoke,使工具调用受 workspace 隔离约束、token
+        增量可流出到外层事件流。
+        """
+        template = self.get_template("worker_exec")
+        prompt = self.render_template(template, plan=plan)
+        if injector is not None:
+            prompt = injector.inject_into_prompt(prompt, plan)
+        return await self.ainvoke(prompt, config)

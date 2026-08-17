@@ -57,6 +57,26 @@ class ManagerAgent(TeamAgent):
         ]
         return self.llm.chat(messages).strip()
 
+    async def asummarize_context(self, memory_text: str) -> str:
+        """
+        异步版 summarize_context(供 summarize 节点直接 await 调用)
+
+        语义与同步版一致:memory_text 为空时短路返回空串,跳过 LLM 调用;
+        否则经 ``_astream_messages`` 流式聚合(TOKEN 增量可透传到外层事件流)。
+        """
+        memory_text = memory_text.strip()
+        if not memory_text:
+            return ""
+
+        messages = [
+            {"role": "system", "content": self.get_template("summarize_context")},
+            {"role": "user", "content": memory_text},
+        ]
+        chunks: list[str] = []
+        async for chunk in self._astream_messages(messages):
+            chunks.append(chunk)
+        return "".join(chunks).strip()
+
     def plan_task(self, task: str, context_summary: str = "", injector: PromptInjector | None = None) -> str:
         """
         拆解任务并生成执行计划(结合记忆上下文摘要)
@@ -77,3 +97,21 @@ class ManagerAgent(TeamAgent):
         if injector is not None:
             prompt = injector.inject_into_prompt(prompt, task)
         return self.invoke(prompt)
+
+    async def aplan_task(
+        self,
+        task: str,
+        context_summary: str = "",
+        injector: PromptInjector | None = None,
+    ) -> str:
+        """
+        异步版 plan_task(供 manager_plan 节点直接 await 调用)
+
+        模板渲染/技能注入保持同步(纯 CPU),仅 LLM 调用走异步流式
+        (``await self.ainvoke``),token 增量可透传到外层事件流。
+        """
+        template = self.get_template("manager_plan")
+        prompt = self.render_template(template, task=task, context_summary=context_summary)
+        if injector is not None:
+            prompt = injector.inject_into_prompt(prompt, task)
+        return await self.ainvoke(prompt)
