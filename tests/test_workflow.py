@@ -648,21 +648,6 @@ def test_run_simple_workflow_with_memory():
     assert result["final_answer"] == "最终答案: 完成"
 
 
-class FakeMemoryManager:
-    """模拟 MemoryManager 的 recall_text 接口"""
-    def __init__(self, recall_text_result: str = ""):
-        self._recall_text_result = recall_text_result
-
-    async def recall_text(self, thread_id: str, limit: int | None = None) -> str:
-        return self._recall_text_result
-
-
-class FakeSessionManager:
-    """模拟 SessionManager，暴露 memory 属性"""
-    def __init__(self, memory=None):
-        self.memory = memory
-
-
 class FakeMemory:
     """模拟 AgentMemory 的记忆读取接口"""
     def __init__(self, short_term=None, long_term=None):
@@ -674,83 +659,6 @@ class FakeMemory:
 
     def get_long_term(self, limit=5):
         return self._long
-
-
-def test_build_memory_context():
-    """测试记忆文本提取:短期+长期拼装"""
-    import asyncio
-
-    from cli.commands.workflow import abuild_memory_context
-
-    class FakeSession:
-        current_session_id = "t1"
-
-        async def aget_short_term(self, session_id=None):
-            return [
-                {"role": "user", "content": "你好"},
-                {"role": "assistant", "content": "你好!"},
-            ]
-
-    class FakeAgent:
-        def __init__(self):
-            self.session = FakeSession()
-            self._session_manager = FakeSessionManager(
-                memory=FakeMemoryManager(
-                    recall_text_result="【长期记忆】\n- [记忆] 用户偏好中文\n"
-                )
-            )
-
-    text = asyncio.run(abuild_memory_context(FakeAgent()))
-    assert "【当前会话】" in text
-    assert "user: 你好" in text
-    assert "assistant: 你好!" in text
-    assert "【长期记忆】" in text
-    assert "用户偏好中文" in text
-
-
-def test_build_memory_context_empty():
-    """测试无记忆时返回空串"""
-    import asyncio
-
-    from cli.commands.workflow import abuild_memory_context
-
-    class FakeSession:
-        current_session_id = "t1"
-
-        async def aget_short_term(self, session_id=None):
-            return []
-
-    class FakeAgent:
-        def __init__(self):
-            self.session = FakeSession()
-            self._session_manager = FakeSessionManager(
-                memory=FakeMemoryManager(recall_text_result="")
-            )
-
-    assert asyncio.run(abuild_memory_context(FakeAgent())) == ""
-
-
-def test_build_memory_context_truncation(monkeypatch):
-    """测试记忆文本超长截断"""
-    import asyncio
-
-    import cli.commands.workflow as wf_module
-    from cli.commands.workflow import abuild_memory_context
-    monkeypatch.setattr(wf_module, "MAX_RAW_CONTEXT_CHARS", 20)
-
-    class FakeSession:
-        current_session_id = "t1"
-
-        async def aget_short_term(self, session_id=None):
-            return [{"role": "user", "content": "这是一段很长很长的内容" * 10}]
-
-    class FakeAgent:
-        def __init__(self):
-            self.session = FakeSession()
-            # 无 _session_manager，长期记忆跳过，仅短期记忆触发截断
-
-    text = asyncio.run(abuild_memory_context(FakeAgent()))
-    assert "已截断" in text
 
 
 class FakeExecutor:
@@ -800,104 +708,94 @@ class WriteBackContext:
         self.output: list[str] = []
         # 与 CommandContext 对齐:工作流事件回调默认为空
         self.workflow_event_cb = None
+        # workflow 门面(绑定 WorkflowAdapter);None 时 run_workflow 抛错
+        self.workflow_sm = None
 
     def print(self, text: str) -> None:
         self.output.append(text)
 
 
-def test_record_workflow_result():
-    """测试写回:任务与最终答案写入当前会话 checkpoint"""
-    from cli.commands.workflow import _arecord_workflow_result
-    core = FakeAgentCore()
-    ctx = WriteBackContext(core)
-
-    asyncio.run(_arecord_workflow_result(ctx, "simple", "测试任务", {"final_answer": "最终答案"}))
-
-    assert len(core.agent_executor.updated) == 1
-    config, values = core.agent_executor.updated[0]
-    assert config == {"configurable": {"thread_id": "t1"}}
-    msgs = values["messages"]
-    assert msgs[0].content == "workflow:simple 测试任务"
-    assert msgs[1].content == "最终答案"
-
-
-def test_record_workflow_result_empty_answer():
-    """测试无最终答案时不写回"""
-    from cli.commands.workflow import _arecord_workflow_result
-    core = FakeAgentCore()
-    ctx = WriteBackContext(core)
-
-    asyncio.run(_arecord_workflow_result(ctx, "simple", "测试任务", {"final_answer": ""}))
-
-    assert core.agent_executor.updated == []
-
-
-def test_record_workflow_result_no_executor():
-    """测试没有 executor 时不写回也不报错"""
-    from cli.commands.workflow import _arecord_workflow_result
-    core = FakeAgentCore()
-    core.agent_executor = None
-    ctx = WriteBackContext(core)
-
-    asyncio.run(_arecord_workflow_result(ctx, "simple", "测试任务", {"final_answer": "答案"}))
-    # 不应抛异常
-
-
-def test_run_workflow_injects_memory(monkeypatch):
-    """测试 run_workflow:提取记忆传入图并写回会话"""
+def test_run_workflow_via_workflow_sm():
+    """run_workflow 经 workflow_sm.arun_stream 执行:节点事件打印 + done 收集 final_answer。"""
     import cli.commands.workflow as wf_module
 
-    class Mem:
-        def get_short_term(self, limit=None):
-            return [{"role": "user", "content": "之前聊过X"}]
+    class FakeWorkflowSM:
+        """模拟 SessionManager(workflow 门面):捕获调用并产出 SSE 事件流。"""
 
-        async def aget_short_term(self, limit=None):
-            return [{"role": "user", "content": "之前聊过X"}]
+        def __init__(self):
+            self.calls: list[tuple[str, str | None]] = []
+            self.events = [
+                {"type": "workflow_node", "node": "manager", "status": "running"},
+                {"type": "workflow_node", "node": "manager", "status": "done"},
+                {"type": "done", "content": "最终答案"},
+            ]
 
-        def get_long_term(self, limit=5):
-            return []
+        async def arun_stream(self, task, thread_id=None):
+            self.calls.append((task, thread_id))
+            for ev in self.events:
+                yield ev
 
-        def get_config(self):
-            return {"configurable": {"thread_id": "t1"}}
+    sm = FakeWorkflowSM()
+    ctx = WriteBackContext(FakeAgentCore())
+    ctx.workflow_sm = sm
 
+    result = asyncio.run(wf_module.run_workflow(ctx, "simple", "测试任务"))
+
+    assert result["final_answer"] == "最终答案"
+    # 非 workflow 会话 → generate_session_id(name)
+    assert sm.calls == [("测试任务", "test-workflow-simple-thread-xxxx")]
+    assert "▸ 节点开始: manager" in ctx.output
+    assert "✓ 节点完成: manager" in ctx.output
+
+
+def test_run_workflow_reuses_workflow_session():
+    """当前会话已是 workflow 专属会话时复用其 thread_id(持久化绑定)。"""
+    import cli.commands.workflow as wf_module
+
+    class FakeWorkflowSM:
+        def __init__(self):
+            self.calls: list[tuple[str, str | None]] = []
+
+        async def arun_stream(self, task, thread_id=None):
+            self.calls.append((task, thread_id))
+            yield {"type": "done", "content": "答案"}
+
+    sm = FakeWorkflowSM()
     core = FakeAgentCore()
-    core.memory = Mem()
-
-    class FakeSessionWithMemory:
-        current_session_id = "t1"
-        checkpointer = None
-
-        def generate_session_id(self, workflow_name=None):
-            return f"test-workflow-{workflow_name}-thread-xxxx"
-
-        def is_workflow_session(self, session_id):
-            return False
-
-        async def aget_short_term(self, session_id=None):
-            return [{"role": "user", "content": "之前聊过X"}]
-    core.session = FakeSessionWithMemory()
+    core.session.is_workflow_session = lambda sid: True
     ctx = WriteBackContext(core)
-
-    captured = {}
-
-    def fake_build(name, checkpointer=None):
-        return ("graph", {})
-
-    async def fake_run(graph, task, raw_context="", thread_id=None, workspace_path=None, on_node_start=None, on_node_end=None):
-        captured["raw_context"] = raw_context
-        return {"final_answer": "答案"}
-
-    monkeypatch.setattr("graph.registry.build_workflow", fake_build)
-    # 注册表捕获的是原始函数对象,monkeypatch 模块属性无法穿透,需直接 patch 注册表 runner
-    from graph.registry import WORKFLOWS
-
-    monkeypatch.setitem(WORKFLOWS["simple"], "runner", fake_run)
+    ctx.workflow_sm = sm
 
     result = asyncio.run(wf_module.run_workflow(ctx, "simple", "测试任务"))
 
     assert result["final_answer"] == "答案"
-    assert "user: 之前聊过X" in captured["raw_context"]
-    assert len(core.agent_executor.updated) == 1
+    assert sm.calls == [("测试任务", "t1")]  # 复用 FakeSession.current_session_id
+
+
+def test_run_workflow_error_event():
+    """workflow_sm 产出 error 事件时打印错误并转发给事件回调。"""
+    import cli.commands.workflow as wf_module
+
+    class FakeWorkflowSM:
+        async def arun_stream(self, task, thread_id=None):
+            yield {"type": "error", "content": "图执行失败"}
+
+    forwarded: list[dict] = []
+    sm = FakeWorkflowSM()
+    ctx = WriteBackContext(FakeAgentCore())
+    ctx.workflow_sm = sm
+    ctx.workflow_event_cb = lambda ev: forwarded.append(ev)
+
+    result = asyncio.run(wf_module.run_workflow(ctx, "simple", "测试任务"))
+
+    assert result["final_answer"] == ""
+    assert "工作流执行错误: 图执行失败" in "".join(ctx.output)
+    assert any(ev.get("type") == "error" for ev in forwarded)
+    # 整体状态复位:运行中 → 完成(error 事件不带 status,按类型过滤)
+    assert [ev.get("status") for ev in forwarded if ev.get("type") == "workflow_status"] == [
+        "running",
+        "done",
+    ]
 
 
 # ==================== 测试运行进度跟踪 ====================
@@ -937,48 +835,23 @@ def test_run_simple_workflow_no_callbacks_still_works():
     assert result["final_answer"] == "答案"
 
 
-def test_run_workflow_emits_workflow_events(monkeypatch):
+def test_run_workflow_emits_workflow_events():
     """测试 run_workflow:节点/整体状态通过 workflow_event_cb 转发结构化事件"""
     import cli.commands.workflow as wf_module
     from cli.commands.types import CommandContext
 
     events: list[dict[str, str]] = []
 
-    def fake_build(name, checkpointer=None):
-        return ("graph", {"manager": object(), "worker": object(), "terminator": object()})
+    class FakeWorkflowSM:
+        """模拟 workflow 门面:产出 4 个业务节点的 running/done 事件 + done。"""
 
-    async def fake_run(graph, task, raw_context="", thread_id=None, workspace_path=None, on_node_start=None, on_node_end=None):
-        # 模拟 4 个业务节点依次执行:每个节点 start → end
-        from utils.events import AgentEvent
-
-        for node in ("summarize", "manager_plan", "worker_exec", "terminator_final"):
-            if on_node_start:
-                on_node_start(AgentEvent.node_start(node=node))
-            if on_node_end:
-                on_node_end(AgentEvent.node_end(node=node))
-        return {"final_answer": "答案"}
-
-    monkeypatch.setattr("graph.registry.build_workflow", fake_build)
-    # 注册表捕获的是原始函数对象,monkeypatch 模块属性无法穿透,需直接 patch 注册表 runner
-    from graph.registry import WORKFLOWS
-
-    monkeypatch.setitem(WORKFLOWS["simple"], "runner", fake_run)
-
-    class Mem:
-        def get_short_term(self, limit=None):
-            return []
-
-        async def aget_short_term(self, limit=None):
-            return []
-
-        def get_long_term(self, limit=5):
-            return []
-
-        def get_config(self):
-            return {"configurable": {"thread_id": "t1"}}
+        async def arun_stream(self, task, thread_id=None):
+            for node in ("summarize", "manager_plan", "worker_exec", "terminator_final"):
+                yield {"type": "workflow_node", "node": node, "status": "running"}
+                yield {"type": "workflow_node", "node": node, "status": "done"}
+            yield {"type": "done", "content": "答案"}
 
     core = FakeAgentCore()
-    core.memory = Mem()
     ctx = CommandContext(
         agent=core,
         base_dir=".",
@@ -993,6 +866,7 @@ def test_run_workflow_emits_workflow_events(monkeypatch):
         chat_until_completion=lambda a, t: "",
         safety_backend=object(),
         workflow_event_cb=events.append,
+        workflow_sm=FakeWorkflowSM(),
     )
 
     asyncio.run(wf_module.run_workflow(ctx, "simple", "测试任务"))

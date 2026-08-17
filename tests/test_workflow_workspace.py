@@ -5,7 +5,7 @@
 - arun_compiled_workflow 把 workspace_path 注入 config.configurable
 - TeamAgent 工具模式构造最小 config(仅 workspace_path,不转发 callbacks)
 - TeamAgent._create_tool_agent 挂载 WorkspaceSecurityMiddleware
-- cli run_workflow 从会话上下文取 workspace_path 传入 runner
+- cli run_workflow 经 workflow_sm 执行(workspace 注入由 WorkflowAdapter 承载)
 
 运行：
   pytest tests/test_workflow_workspace.py -v
@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -214,16 +213,15 @@ def test_create_tool_agent_mounts_workspace_middleware(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# CLI 级:run_workflow 从会话上下文取 workspace_path
+# CLI 级:run_workflow 经 workflow_sm 执行(workspace 注入由 WorkflowAdapter 承载)
 # --------------------------------------------------------------------------- #
-def test_run_workflow_forwards_workspace_path(monkeypatch):
-    """run_workflow 把会话绑定的 workspace_path 传入工作流 runner。"""
+def test_run_workflow_via_workflow_sm():
+    """run_workflow 经 workflow_sm.arun_stream 执行:专属会话复用 thread_id + 事件转发。"""
     import cli.commands.workflow as wf_module
     from cli.commands.types import CommandContext
 
     class FakeSession:
         current_session_id = "workflow-simple-thread-abc"
-        checkpointer = None
 
         def generate_session_id(self, workflow_name=None) -> str:
             return "workflow-simple-thread-abc"
@@ -231,23 +229,26 @@ def test_run_workflow_forwards_workspace_path(monkeypatch):
         def is_workflow_session(self, session_id: str) -> bool:
             return True
 
-        def get_context(self, session_id: str | None = None) -> SimpleNamespace:
-            return SimpleNamespace(
-                config={"configurable": {"thread_id": "t1", "workspace_path": "C:/ws"}}
-            )
-
-        async def aget_short_term(self, session_id: str | None = None) -> list[dict]:
-            return []
-
     class FakeAgentCore:
         def __init__(self) -> None:
             self.session = FakeSession()
-            self._session_manager = None
-            self.agent_executor = None
 
-    core = FakeAgentCore()
+    class FakeWorkflowSM:
+        """模拟 workflow 门面:捕获调用并产出节点/done 事件。"""
+
+        def __init__(self):
+            self.calls: list[tuple[str, str | None]] = []
+
+        async def arun_stream(self, task, thread_id=None):
+            self.calls.append((task, thread_id))
+            yield {"type": "workflow_node", "node": "worker", "status": "running"}
+            yield {"type": "workflow_node", "node": "worker", "status": "done"}
+            yield {"type": "done", "content": "最终答案"}
+
+    forwarded: list[dict] = []
+    sm = FakeWorkflowSM()
     ctx = CommandContext(
-        agent=core,
+        agent=FakeAgentCore(),
         base_dir="",
         config_file="",
         mcp_config_file="",
@@ -260,66 +261,30 @@ def test_run_workflow_forwards_workspace_path(monkeypatch):
         chat_until_completion=lambda a, t: "",
         safety_backend=None,
         mcp_backend=None,
+        workflow_event_cb=lambda ev: forwarded.append(ev),
+        workflow_sm=sm,
     )
-
-    captured: dict[str, Any] = {}
-
-    def fake_build(name: str, checkpointer=None):
-        return ("graph", {})
-
-    async def fake_run(
-        graph,
-        task: str,
-        raw_context: str = "",
-        thread_id: str | None = None,
-        workspace_path: str | None = None,
-        on_node_start=None,
-        on_node_end=None,
-    ) -> dict:
-        captured["workspace_path"] = workspace_path
-        return {"final_answer": "答案"}
-
-    monkeypatch.setattr("graph.registry.build_workflow", fake_build)
-    from graph.registry import WORKFLOWS
-
-    monkeypatch.setitem(WORKFLOWS["simple"], "runner", fake_run)
 
     result = asyncio.run(wf_module.run_workflow(ctx, "simple", "测试任务"))
 
-    assert result["final_answer"] == "答案"
-    assert captured["workspace_path"] == "C:/ws"
+    assert result["final_answer"] == "最终答案"
+    # 专属 workflow 会话:复用 current_session_id(持久化绑定)
+    assert sm.calls == [("测试任务", "workflow-simple-thread-abc")]
+    # 节点事件转发给前端(SSE)
+    assert {"type": "workflow_node", "node": "worker", "status": "running"} in forwarded
+    assert {"type": "workflow_node", "node": "worker", "status": "done"} in forwarded
+    # 整体状态复位:运行中 → 完成
+    statuses = [ev.get("status") for ev in forwarded if ev.get("type") == "workflow_status"]
+    assert statuses == ["running", "done"]
 
 
-def test_run_workflow_workspace_none_when_unbound(monkeypatch):
-    """会话未绑定 workspace 时,run_workflow 传 workspace_path=None(兼容旧会话)。"""
+def test_run_workflow_requires_workflow_sm():
+    """workflow_sm 未注入 CommandContext 时 run_workflow 抛错(快速失败)。"""
     import cli.commands.workflow as wf_module
     from cli.commands.types import CommandContext
 
-    class FakeSession:
-        current_session_id = "t1"
-        checkpointer = None
-
-        def generate_session_id(self, workflow_name=None) -> str:
-            return "workflow-simple-thread-abc"
-
-        def is_workflow_session(self, session_id: str) -> bool:
-            return False
-
-        def get_context(self, session_id: str | None = None) -> SimpleNamespace:
-            return SimpleNamespace(config={"configurable": {"thread_id": "t1"}})
-
-        async def aget_short_term(self, session_id: str | None = None) -> list[dict]:
-            return []
-
-    class FakeAgentCore:
-        def __init__(self) -> None:
-            self.session = FakeSession()
-            self._session_manager = None
-            self.agent_executor = None
-
-    core = FakeAgentCore()
     ctx = CommandContext(
-        agent=core,
+        agent=MagicMock(),
         base_dir="",
         config_file="",
         mcp_config_file="",
@@ -332,31 +297,12 @@ def test_run_workflow_workspace_none_when_unbound(monkeypatch):
         chat_until_completion=lambda a, t: "",
         safety_backend=None,
         mcp_backend=None,
+        workflow_sm=None,
     )
 
-    captured: dict[str, Any] = {}
-
-    def fake_build(name: str, checkpointer=None):
-        return ("graph", {})
-
-    async def fake_run(
-        graph,
-        task: str,
-        raw_context: str = "",
-        thread_id: str | None = None,
-        workspace_path: str | None = None,
-        on_node_start=None,
-        on_node_end=None,
-    ) -> dict:
-        captured["workspace_path"] = workspace_path
-        return {"final_answer": "答案"}
-
-    monkeypatch.setattr("graph.registry.build_workflow", fake_build)
-    from graph.registry import WORKFLOWS
-
-    monkeypatch.setitem(WORKFLOWS["simple"], "runner", fake_run)
-
-    result = asyncio.run(wf_module.run_workflow(ctx, "simple", "测试任务"))
-
-    assert result["final_answer"] == "答案"
-    assert captured["workspace_path"] is None
+    try:
+        asyncio.run(wf_module.run_workflow(ctx, "simple", "测试任务"))
+    except RuntimeError as error:
+        assert "workflow_sm" in str(error)
+    else:
+        raise AssertionError("应抛出 RuntimeError")

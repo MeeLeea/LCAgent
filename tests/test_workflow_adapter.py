@@ -257,6 +257,39 @@ def test_arun_events_done_is_important_false_by_default(monkeypatch):
     assert events[-1].is_important is False
 
 
+def test_arun_events_injects_workspace_path(monkeypatch):
+    """会话绑定 workspace 时,workspace_path 写入 config.configurable(Worker 工具隔离)。"""
+    fake_graph = FakeGraph()
+    monkeypatch.setattr(
+        "graph.registry.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
+    reg = _make_registry()
+    reg.get_context.return_value = types.SimpleNamespace(workspace_path="C:/ws")
+    adapter = _make_adapter(reg)
+
+    _collect(adapter, thread_id="workflow-simple-thread-1")
+
+    configurable = fake_graph.last_config["configurable"]
+    assert configurable["thread_id"] == "workflow-simple-thread-1"
+    assert configurable["workspace_path"] == "C:/ws"
+
+
+def test_arun_events_no_workspace_path_by_default(monkeypatch):
+    """会话未绑定 workspace 时不注入 workspace_path(兼容旧会话)。"""
+    fake_graph = FakeGraph()
+    monkeypatch.setattr(
+        "graph.registry.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
+    adapter = _make_adapter()
+
+    _collect(adapter, thread_id="workflow-simple-thread-1")
+
+    configurable = fake_graph.last_config["configurable"]
+    assert "workspace_path" not in configurable
+
+
 # ────────────── 不支持能力 / 历史 / 压缩 / 生命周期 ──────────────
 
 
