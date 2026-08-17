@@ -17,11 +17,14 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Callable
 from typing import TypeVar
 
 from langchain_core.tools import BaseTool
+
+logger = logging.getLogger(__name__)
 
 # 项目根目录(基于本文件位置计算)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -162,6 +165,7 @@ def build_workflow(name: str, checkpointer=None) -> tuple[object, dict[str, obje
     """
     if name not in WORKFLOWS:
         available = ", ".join(WORKFLOWS.keys())
+        logger.warning("未知工作流: %s（可用: %s）", name, available)
         raise KeyError(f"未知工作流: {name}。可用工作流: {available}")
 
     spec = _get_workflow_spec(name)
@@ -172,6 +176,7 @@ def build_workflow(name: str, checkpointer=None) -> tuple[object, dict[str, obje
     def _build(role: str) -> object:
         if role not in AGENT_REGISTRY:
             available = ", ".join(AGENT_REGISTRY.keys()) or "(空)"
+            logger.warning("未注册的角色: %s（已注册: %s）", role, available)
             raise KeyError(f"未注册的角色: {role}。已注册角色: {available}")
         role_spec = AGENT_REGISTRY[role]
         return build_team_agent(
@@ -188,6 +193,7 @@ def build_workflow(name: str, checkpointer=None) -> tuple[object, dict[str, obje
         missing = [r for r in required_roles if r not in AGENT_REGISTRY]
         if missing:
             available = ", ".join(AGENT_REGISTRY.keys()) or "(空)"
+            logger.warning("工作流 '%s' 缺少角色: %s（已注册: %s）", name, missing, available)
             raise KeyError(f"工作流 '{name}' 缺少角色: {missing}。已注册角色: {available}")
     else:
         roles_to_build = list(AGENT_REGISTRY.keys())
@@ -197,6 +203,7 @@ def build_workflow(name: str, checkpointer=None) -> tuple[object, dict[str, obje
     # 调用工作流构建器(统一接收 agents 字典 + checkpointer)
     graph = spec["builder"](agents, checkpointer=checkpointer)
 
+    logger.info("工作流构建成功: %s（角色: %s）", name, ", ".join(sorted(roles_to_build)))
     return graph, agents
 
 

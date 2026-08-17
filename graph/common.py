@@ -17,11 +17,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from collections.abc import Callable
 from typing import Any
 
 from langchain_core.callbacks import BaseCallbackHandler
+
+from utils.logging_config import TraceContext
+
+logger = logging.getLogger(__name__)
 
 # 节点进度回调类型:接收节点名
 NodeCallback = Callable[[str], None]
@@ -204,6 +209,37 @@ async def arun_compiled_workflow(
     """
     tid = thread_id or f"workflow-{uuid.uuid4().hex[:8]}"
 
+    # 用 utils 的统一日志体系注入 trace_id，使工作流执行与 agent/session 日志同源可追踪
+    with TraceContext(trace_id=tid, thread_id=tid):
+        return await _arun_with_trace(
+            graph,
+            task,
+            state_fields,
+            raw_context,
+            tid,
+            workspace_path,
+            on_node_start,
+            on_node_end,
+            on_node_error,
+            max_history_chars,
+        )
+
+
+async def _arun_with_trace(
+    graph,
+    task: str,
+    state_fields: dict[str, str] | None,
+    raw_context: str,
+    tid: str,
+    workspace_path: str | None,
+    on_node_start: NodeCallback | None,
+    on_node_end: NodeCallback | None,
+    on_node_error: NodeCallback | None,
+    max_history_chars: int,
+) -> dict:
+    """在 TraceContext 内执行工作流主体（原 arun_compiled_workflow 逻辑）。"""
+    logger.info("工作流开始执行 [thread=%s]: %s", tid, task[:120])
+
     configurable: dict[str, Any] = {"thread_id": tid}
     if workspace_path is not None:
         configurable["workspace_path"] = workspace_path
@@ -239,7 +275,9 @@ async def arun_compiled_workflow(
             )
         ]
 
-    return await graph.ainvoke(initial_state, config=config)
+    result = await graph.ainvoke(initial_state, config=config)
+    logger.info("工作流执行完成 [thread=%s]", tid)
+    return result
 
 
 async def _aget_previous_workflow_summary(
@@ -262,8 +300,9 @@ async def _aget_previous_workflow_summary(
     """
     try:
         state = await graph.aget_state(config)
-    except Exception:
-        # 无 checkpointer 或读取失败：无跨轮次记忆，静默降级
+    except Exception as error:
+        # 无 checkpointer 或读取失败：无跨轮次记忆，静默降级（仅记录 debug 便于排查）
+        logger.debug("读取上一轮工作流状态失败 [thread=%s]: %s", config.get("configurable", {}).get("thread_id"), error)
         return ""
     if state is None:
         return ""
