@@ -754,11 +754,16 @@ def test_build_memory_context_truncation(monkeypatch):
 
 
 class FakeExecutor:
-    """记录 update_state 调用的假 executor"""
+    """记录 aupdate_state 调用的假 executor。
+
+    使用异步 ``aupdate_state`` 以匹配真实 LangGraph CompiledGraph 接口:
+    会话层 checkpointer 为 ``AsyncSqliteSaver``,同步 ``update_state``
+    在主线程会抛 ``Synchronous calls to AsyncSqliteSaver ...``。
+    """
     def __init__(self):
         self.updated = []
 
-    def update_state(self, config, values):
+    async def aupdate_state(self, config, values):
         self.updated.append((config, values))
 
 
@@ -802,11 +807,11 @@ class WriteBackContext:
 
 def test_record_workflow_result():
     """测试写回:任务与最终答案写入当前会话 checkpoint"""
-    from cli.commands.workflow import _record_workflow_result
+    from cli.commands.workflow import _arecord_workflow_result
     core = FakeAgentCore()
     ctx = WriteBackContext(core)
 
-    _record_workflow_result(ctx, "simple", "测试任务", {"final_answer": "最终答案"})
+    asyncio.run(_arecord_workflow_result(ctx, "simple", "测试任务", {"final_answer": "最终答案"}))
 
     assert len(core.agent_executor.updated) == 1
     config, values = core.agent_executor.updated[0]
@@ -818,23 +823,23 @@ def test_record_workflow_result():
 
 def test_record_workflow_result_empty_answer():
     """测试无最终答案时不写回"""
-    from cli.commands.workflow import _record_workflow_result
+    from cli.commands.workflow import _arecord_workflow_result
     core = FakeAgentCore()
     ctx = WriteBackContext(core)
 
-    _record_workflow_result(ctx, "simple", "测试任务", {"final_answer": ""})
+    asyncio.run(_arecord_workflow_result(ctx, "simple", "测试任务", {"final_answer": ""}))
 
     assert core.agent_executor.updated == []
 
 
 def test_record_workflow_result_no_executor():
     """测试没有 executor 时不写回也不报错"""
-    from cli.commands.workflow import _record_workflow_result
+    from cli.commands.workflow import _arecord_workflow_result
     core = FakeAgentCore()
     core.agent_executor = None
     ctx = WriteBackContext(core)
 
-    _record_workflow_result(ctx, "simple", "测试任务", {"final_answer": "答案"})
+    asyncio.run(_arecord_workflow_result(ctx, "simple", "测试任务", {"final_answer": "答案"}))
     # 不应抛异常
 
 

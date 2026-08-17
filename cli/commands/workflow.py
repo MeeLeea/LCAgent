@@ -49,8 +49,16 @@ async def abuild_memory_context(agent) -> str:
     return text
 
 
-def _record_workflow_result(context: CommandContext, name: str, task: str, result: dict) -> None:
-    """把工作流任务与最终答案写回当前会话记忆,形成记忆闭环"""
+async def _arecord_workflow_result(
+    context: CommandContext, name: str, task: str, result: dict
+) -> None:
+    """把工作流任务与最终答案写回当前会话记忆,形成记忆闭环。
+
+    必须使用 LangGraph 的异步接口 ``aupdate_state``：会话层 checkpointer 为
+    ``AsyncSqliteSaver``,在主线程(事件循环所在线程)同步调用 ``update_state``
+    会抛 ``Synchronous calls to AsyncSqliteSaver are only allowed from a
+    different thread``。同仓库 ``agent_core.py`` 各处亦统一使用 ``aupdate_state``。
+    """
     final_answer = result.get("final_answer", "")
     if not final_answer:
         return
@@ -58,7 +66,7 @@ def _record_workflow_result(context: CommandContext, name: str, task: str, resul
     if executor is None:
         return
     try:
-        executor.update_state(
+        await executor.aupdate_state(
             context.agent._invoke_config(),
             {"messages": [
                 HumanMessage(content=f"workflow:{name} {task}"),
@@ -150,7 +158,7 @@ async def run_workflow(context: CommandContext, name: str, task: str) -> dict:
     finally:
         # 无论成功失败都复位整体状态,避免前端 UI 停留在"运行中"
         _emit({"type": "workflow_status", "status": "done"})
-    _record_workflow_result(context, name, task, result)
+    await _arecord_workflow_result(context, name, task, result)
     return result
 
 
