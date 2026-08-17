@@ -57,7 +57,7 @@ class ManagerAgent(TeamAgent):
         ]
         return self.llm.chat(messages).strip()
 
-    async def asummarize_context(self, memory_text: str) -> str:
+    async def asummarize_context(self, memory_text: str, config: dict | None = None) -> str:
         """
         异步版 summarize_context(供 summarize 节点直接 await 调用)
 
@@ -73,7 +73,7 @@ class ManagerAgent(TeamAgent):
             {"role": "user", "content": memory_text},
         ]
         chunks: list[str] = []
-        async for chunk in self._astream_messages(messages):
+        async for chunk in self._astream_messages(messages, config):
             chunks.append(chunk)
         return "".join(chunks).strip()
 
@@ -103,6 +103,7 @@ class ManagerAgent(TeamAgent):
         task: str,
         context_summary: str = "",
         injector: PromptInjector | None = None,
+        config: dict | None = None,
     ) -> str:
         """
         异步版 plan_task(供 manager_plan 节点直接 await 调用)
@@ -114,4 +115,4 @@ class ManagerAgent(TeamAgent):
         prompt = self.render_template(template, task=task, context_summary=context_summary)
         if injector is not None:
             prompt = injector.inject_into_prompt(prompt, task)
-        return await self.ainvoke(prompt)
+        return await self.ainvoke(prompt, config)

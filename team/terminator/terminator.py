@@ -70,6 +70,7 @@ class TerminatorAgent(TeamAgent):
         worker_result: str,
         context_summary: str = "",
         injector: PromptInjector | None = None,
+        config: dict | None = None,
     ) -> str:
         """
         异步版 finalize(供 terminator_final 节点直接 await 调用)
@@ -87,4 +88,4 @@ class TerminatorAgent(TeamAgent):
         )
         if injector is not None:
             prompt = injector.inject_into_prompt(prompt, task)
-        return await self.ainvoke(prompt)
+        return await self.ainvoke(prompt, config)

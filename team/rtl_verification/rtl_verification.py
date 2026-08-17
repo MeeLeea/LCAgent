@@ -87,6 +87,7 @@ class VerificationAgent(TeamAgent):
         template_name: str,
         task: str,
         injector: PromptInjector | None,
+        config: dict | None = None,
     ) -> str:
         """RTL 验证工作流方法异步通用执行体:模板渲染/技能注入同步,LLM 调用异步流式
 
@@ -97,15 +98,15 @@ class VerificationAgent(TeamAgent):
         if injector is not None:
             prompt = injector.inject_into_prompt(prompt, task)
         prompt = self._inject_vivado_skill(prompt)
-        return await self.ainvoke(prompt)
+        return await self.ainvoke(prompt, config)
 
-    async def aspec_design_task(self, task: str, injector: PromptInjector | None = None) -> str:
+    async def aspec_design_task(self, task: str, injector: PromptInjector | None = None, config: dict | None = None) -> str:
         """异步版 spec_design_task(供 spec_design 节点调用)"""
-        return await self._arun_rtl_design_task_async("spec_design", task, injector)
+        return await self._arun_rtl_design_task_async("spec_design", task, injector, config)
 
-    async def averilog_design_task(self, task: str, injector: PromptInjector | None = None) -> str:
+    async def averilog_design_task(self, task: str, injector: PromptInjector | None = None, config: dict | None = None) -> str:
         """异步版 verilog_design_task(供 verilog_design 节点调用)"""
-        return await self._arun_rtl_design_task_async("verilog_design", task, injector)
+        return await self._arun_rtl_design_task_async("verilog_design", task, injector, config)
 
     def _inject_vivado_skill(self, prompt: str, skills_dir: str | None = None) -> str:
         """

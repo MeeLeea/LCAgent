@@ -114,30 +114,31 @@ class ArchiAgent(TeamAgent):
         task: str,
         context_summary: str,
         injector: PromptInjector | None,
+        config: dict | None = None,
     ) -> str:
         """架构工作流方法异步通用执行体:模板渲染/技能注入同步,LLM 调用异步流式"""
         template = self.get_template(template_name)
         prompt = self.render_template(template, task=task, context_summary=context_summary)
         if injector is not None:
             prompt = injector.inject_into_prompt(prompt, task)
-        return await self.ainvoke(prompt)
+        return await self.ainvoke(prompt, config)
 
-    async def aplan_task(self, task: str, context_summary: str = "", injector: PromptInjector | None = None) -> str:
+    async def aplan_task(self, task: str, context_summary: str = "", injector: PromptInjector | None = None, config: dict | None = None) -> str:
         """异步版 plan_task(供 architect_plan 节点调用)"""
-        return await self._arun_architect_task_async("architect_plan", task, context_summary, injector)
+        return await self._arun_architect_task_async("architect_plan", task, context_summary, injector, config)
 
-    async def adesign_task(self, task: str, context_summary: str = "", injector: PromptInjector | None = None) -> str:
+    async def adesign_task(self, task: str, context_summary: str = "", injector: PromptInjector | None = None, config: dict | None = None) -> str:
         """异步版 design_task(供 architect_design 节点调用)"""
-        return await self._arun_architect_task_async("architect_design", task, context_summary, injector)
+        return await self._arun_architect_task_async("architect_design", task, context_summary, injector, config)
 
-    async def aanalyze_task(self, task: str, context_summary: str = "", injector: PromptInjector | None = None) -> str:
+    async def aanalyze_task(self, task: str, context_summary: str = "", injector: PromptInjector | None = None, config: dict | None = None) -> str:
         """异步版 analyze_task(供 architect_analyze 节点调用)"""
-        return await self._arun_architect_task_async("architect_analyze", task, context_summary, injector)
+        return await self._arun_architect_task_async("architect_analyze", task, context_summary, injector, config)
 
-    async def areview_task(self, task: str, context_summary: str = "", injector: PromptInjector | None = None) -> str:
+    async def areview_task(self, task: str, context_summary: str = "", injector: PromptInjector | None = None, config: dict | None = None) -> str:
         """异步版 review_task(供 architect_review 节点调用)"""
-        return await self._arun_architect_task_async("architect_review", task, context_summary, injector)
+        return await self._arun_architect_task_async("architect_review", task, context_summary, injector, config)
 
-    async def aspec_task(self, task: str, context_summary: str = "", injector: PromptInjector | None = None) -> str:
+    async def aspec_task(self, task: str, context_summary: str = "", injector: PromptInjector | None = None, config: dict | None = None) -> str:
         """异步版 spec_task(供 architect_spec 节点调用)"""
-        return await self._arun_architect_task_async("architect_spec", task, context_summary, injector)
+        return await self._arun_architect_task_async("architect_spec", task, context_summary, injector, config)
