@@ -1,5 +1,5 @@
 """
-工作流共享组件 - 节点进度跟踪、异步执行、技能注入与跨轮次记忆压缩
+工作流共享组件 - 节点进度跟踪、异步执行、技能注入、跨轮次记忆压缩与会话化
 
 从 graph/simple.py 提取的公共逻辑，供所有工作流复用：
 - NodeCallback 类型别名
@@ -7,6 +7,7 @@
 - ainvoke_team_agent 异步执行团队 Agent（TeamAgent 零改动）
 - SkillInjector 节点 prompt 层技能注入（复用 tools.skills.SkillManager）
 - arun_compiled_workflow 通用异步工作流运行器（含跨轮次记忆压缩）
+- compaction 基础设施：节点级压缩 wrapper（消息通道超阈值时增量摘要）
 
 异步化说明：
     运行器使用 ``await graph.ainvoke(...)`` 而非同步 ``graph.invoke()``，
@@ -20,10 +21,12 @@ import asyncio
 import logging
 import uuid
 from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 from langchain_core.callbacks import BaseCallbackHandler
 
+from utils.compaction import CompactionConfig, LCAgentCompactionMiddleware
 from utils.events import AgentEvent
 from utils.logging_config import TraceContext
 
@@ -157,6 +160,97 @@ class SkillInjector:
         if "【已加载的技能指引" in prompt:
             return prompt
         return f"{prompt}\n\n{skill_block}"
+
+
+def _build_compaction_middleware(
+    agent: Any,
+    config: CompactionConfig | None = None,
+) -> LCAgentCompactionMiddleware | None:
+    """从团队 Agent 构造 compaction 中间件（消息通道压缩）。
+
+    从 ``agent.llm.get_chat_model()`` 获取摘要用 LLM；agent 无 llm 属性或
+    构造失败时返回 None（该工作流不启用压缩，静默降级）。
+
+    Args:
+        agent: 任一团队 Agent（manager/worker/terminator 等，取其 llm）
+        config: 压缩配置；为 None 时使用默认配置（阈值 50）
+
+    Returns:
+        压缩中间件实例；无法构造时返回 None
+    """
+    llm = getattr(agent, "llm", None)
+    get_chat_model = getattr(llm, "get_chat_model", None)
+    if not callable(get_chat_model):
+        logger.debug(
+            "Agent %s 无 llm.get_chat_model,compaction 中间件不启用",
+            getattr(agent, "name", "?"),
+        )
+        return None
+    try:
+        return LCAgentCompactionMiddleware(
+            model=llm.get_chat_model(),
+            config=config or CompactionConfig(),
+        )
+    except Exception as error:
+        logger.warning("compaction 中间件构造失败,已禁用: %s", error)
+        return None
+
+
+def wrap_node_with_compaction(node_fn: Callable, mw: LCAgentCompactionMiddleware | None) -> Callable:
+    """包装工作流节点函数,使消息通道超阈值时自动压缩。
+
+    mw 为 None 时原样返回节点（不启用压缩）。
+
+    Args:
+        node_fn: 待包装的异步节点函数
+        mw: compaction 中间件；None 表示不压缩
+
+    Returns:
+        包装后的节点函数（或原节点）
+    """
+    if mw is None:
+        return node_fn
+    return partial(_compaction_wrapper, node_fn, mw)
+
+
+async def _compaction_wrapper(
+    node_fn: Callable,
+    mw: LCAgentCompactionMiddleware,
+    state: dict[str, Any],
+    *args: Any,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """节点执行后检查消息通道,超阈值时增量压缩（节点级 compaction）。
+
+    累计消息数 = 节点执行前 state.messages + 节点本次追加的 messages。
+    超过 mw.config.max_messages 时调用 ``mw.arun_compaction(force=True)``
+    生成新摘要并清空旧消息（REMOVE_ALL + 摘要 SystemMessage + 保留近期
+    消息），合并进节点返回 dict 由 LangGraph reducer 落盘。
+
+    Args:
+        node_fn: 被包装的原始节点函数
+        mw: compaction 中间件（含阈值与摘要 LLM）
+        state: 节点输入状态
+        *args/**kwargs: 透传给节点函数的额外参数（agent/injector/config 等）
+
+    Returns:
+        节点返回 dict；若触发压缩则含更新后的 messages/summary
+    """
+    result = await node_fn(state, *args, **kwargs)
+    new_messages = result.get("messages")
+    if not new_messages:
+        return result
+    accumulated = [*state.get("messages", []), *new_messages]
+    if len(accumulated) > mw.config.max_messages:
+        update = await mw.arun_compaction(
+            accumulated,
+            state.get("summary", "") or "",
+            force=True,
+        )
+        if update:
+            result["messages"] = update["messages"]
+            result["summary"] = update["summary"]
+    return result
 
 
 async def arun_compiled_workflow(

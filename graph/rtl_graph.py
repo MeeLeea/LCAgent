@@ -28,10 +28,12 @@ from __future__ import annotations
 
 import asyncio
 from functools import partial
-from typing import Optional, TypedDict
+from typing import Annotated, Optional, TypedDict
 
+from langchain_core.messages import AIMessage, AnyMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
 
 # 显式导入 RTL 角色模块,触发 @register_agent 装饰器注册(team/__init__.py 未导入)
 import team.rtl_designer.rtl_designer
@@ -39,14 +41,17 @@ import team.rtl_verification.rtl_verification  # noqa: F401
 from graph.common import (
     NodeCallback,
     SkillInjector,
+    _build_compaction_middleware,
     arun_compiled_workflow,
+    wrap_node_with_compaction,
 )
 from graph.registry import register_workflow
 from team.base import TeamAgent
+from utils.compaction import CompactionConfig
 
 
 # 1. 定义工作流状态
-class RTLGraphState(TypedDict):
+class RTLGraphState(TypedDict, total=False):
     """RTL 芯片设计流水线工作流状态"""
 
     task: str               # 用户原始任务
@@ -64,6 +69,10 @@ class RTLGraphState(TypedDict):
     round: int              # 当前设计-验证迭代轮次
     max_rounds: int         # 最大迭代轮次(超限强制交付)
     final_answer: str       # Designer 最终交付内容
+    # 会话化消息通道:各节点产出追加为 AIMessage,经 add_messages reducer 累积;
+    # 超阈值时由 compaction 中间件压缩(摘要进 summary,旧消息清空)
+    messages: Annotated[list[AnyMessage], add_messages]
+    summary: str            # 历史消息摘要(compaction 产物,随 checkpoint 持久化)
 
 
 # 2. 节点函数(提示词模板由各角色 TeamAgent 懒加载,节点需要时调用 get_template)
@@ -71,7 +80,7 @@ async def summarize_context(state: RTLGraphState, manager: TeamAgent, injector=N
     """Manager 提炼记忆上下文,生成分发给下游节点的上下文摘要"""
     raw = state.get("raw_context", "")
     result = await asyncio.to_thread(manager.summarize_context, raw)
-    return {"context_summary": result}
+    return {"context_summary": result, "messages": [AIMessage(content=result)]}
 
 
 async def architect_plan_node(
@@ -81,7 +90,7 @@ async def architect_plan_node(
     task = state["task"]
     summary = state.get("context_summary", "")
     result = await asyncio.to_thread(architect.plan_task, task, summary, injector)
-    return {"arch_plan": result}
+    return {"arch_plan": result, "messages": [AIMessage(content=result)]}
 
 
 async def architect_design_node(
@@ -93,7 +102,7 @@ async def architect_design_node(
     summary = state.get("context_summary", "")
     prompt_task = f"{task}\n\n【架构执行计划】\n{plan}" if plan else task
     result = await asyncio.to_thread(architect.design_task, prompt_task, summary, injector)
-    return {"arch_design": result}
+    return {"arch_design": result, "messages": [AIMessage(content=result)]}
 
 
 async def architect_analyze_node(
@@ -105,7 +114,7 @@ async def architect_analyze_node(
     summary = state.get("context_summary", "")
     prompt_task = f"{task}\n\n【架构方案设计】\n{design}" if design else task
     result = await asyncio.to_thread(architect.analyze_task, prompt_task, summary, injector)
-    return {"arch_analysis": result}
+    return {"arch_analysis": result, "messages": [AIMessage(content=result)]}
 
 
 async def architect_review_node(
@@ -123,7 +132,7 @@ async def architect_review_node(
         parts.append(f"【权衡分析】\n{analysis}")
     prompt_task = "\n\n".join(parts)
     result = await asyncio.to_thread(architect.review_task, prompt_task, summary, injector)
-    return {"arch_review": result}
+    return {"arch_review": result, "messages": [AIMessage(content=result)]}
 
 
 async def architect_spec_node(
@@ -141,7 +150,7 @@ async def architect_spec_node(
         parts.append(f"【评审意见】\n{review}")
     prompt_task = "\n\n".join(parts)
     result = await asyncio.to_thread(architect.spec_task, prompt_task, summary, injector)
-    return {"arch_spec": result}
+    return {"arch_spec": result, "messages": [AIMessage(content=result)]}
 
 
 async def designer_spec_node(
@@ -152,7 +161,7 @@ async def designer_spec_node(
     arch_spec = state.get("arch_spec", "")
     prompt_task = f"{task}\n\n【架构规格文档】\n{arch_spec}" if arch_spec else task
     result = await asyncio.to_thread(designer.spec_design_task, prompt_task, injector)
-    return {"design_spec": result}
+    return {"design_spec": result, "messages": [AIMessage(content=result)]}
 
 
 async def verification_plan_node(
@@ -169,7 +178,7 @@ async def verification_plan_node(
         parts.append(f"【设计规格与Filelist】\n{design_spec}")
     prompt_task = "\n\n".join(parts)
     result = await asyncio.to_thread(verifier.spec_design_task, prompt_task, injector)
-    return {"verification_plan": result}
+    return {"verification_plan": result, "messages": [AIMessage(content=result)]}
 
 
 async def designer_verilog_node(
@@ -196,7 +205,7 @@ async def designer_verilog_node(
         parts.append(f"【第 {round_n} 轮验证报告反馈(请据此修正 RTL)】\n{report}")
     prompt_task = "\n\n".join(parts)
     result = await asyncio.to_thread(designer.verilog_design_task, prompt_task, injector)
-    return {"rtl_code": result, "round": round_n + 1}
+    return {"rtl_code": result, "round": round_n + 1, "messages": [AIMessage(content=result)]}
 
 
 async def verification_check_node(
@@ -224,7 +233,7 @@ async def verification_check_node(
     )
     prompt_task = "\n\n".join(parts)
     result = await asyncio.to_thread(verifier.verilog_design_task, prompt_task, injector)
-    return {"verification_report": result}
+    return {"verification_report": result, "messages": [AIMessage(content=result)]}
 
 
 async def designer_output_node(
@@ -245,7 +254,7 @@ async def designer_output_node(
     parts.append("请整理以上内容,输出最终交付文件清单与完整 RTL 源码(作为最终交付物)。")
     prompt_task = "\n\n".join(parts)
     result = await asyncio.to_thread(designer.verilog_design_task, prompt_task, injector)
-    return {"final_answer": result}
+    return {"final_answer": result, "messages": [AIMessage(content=result)]}
 
 
 # 3. 验证结论解析与条件路由
@@ -281,6 +290,7 @@ def build_rtl_graph_workflow(
     skills_dir: str | None = None,
     auto_match_skills: bool = True,
     max_rounds: int = 3,
+    compaction_config: CompactionConfig | None = None,
 ) -> StateGraph:
     """
     构建 RTL 芯片设计流水线工作流
@@ -293,6 +303,8 @@ def build_rtl_graph_workflow(
         skills_dir: 技能目录路径,为 None 时使用默认目录(.agents/skills)
         auto_match_skills: 是否在节点渲染 prompt 时按任务自动匹配注入技能
         max_rounds: 设计-验证多轮迭代最大轮次,超限强制进入交付节点
+        compaction_config: 消息通道压缩配置。为 None 时使用默认配置
+            （阈值 50）；agent 无 llm 时自动禁用压缩（如测试 Fake）。
 
     Returns:
         编译好的 LangGraph StateGraph
@@ -308,23 +320,26 @@ def build_rtl_graph_workflow(
         auto_match=auto_match_skills,
     )
 
+    # compaction 中间件:消息通道超阈值时节点级增量压缩(agent 无 llm 时禁用)
+    compaction_mw = _build_compaction_middleware(manager, compaction_config)
+
     builder = StateGraph(RTLGraphState)
 
     # 添加节点(使用 partial 绑定 agent 实例;提示词模板由节点内懒加载)
     # 注意:必须用 functools.partial 而非 lambda —— partial 保留 async 函数
     # 的 coroutine 特征(LangGraph 据此判定节点为异步并 await),lambda 会返回
     # 未 await 的 coroutine 导致 InvalidUpdateError
-    builder.add_node("summarize", partial(summarize_context, manager=manager, injector=injector))
-    builder.add_node("architect_plan", partial(architect_plan_node, architect=architect, injector=injector))
-    builder.add_node("architect_design", partial(architect_design_node, architect=architect, injector=injector))
-    builder.add_node("architect_analyze", partial(architect_analyze_node, architect=architect, injector=injector))
-    builder.add_node("architect_review", partial(architect_review_node, architect=architect, injector=injector))
-    builder.add_node("architect_spec", partial(architect_spec_node, architect=architect, injector=injector))
-    builder.add_node("designer_spec", partial(designer_spec_node, designer=designer, injector=injector))
-    builder.add_node("verification_plan", partial(verification_plan_node, verifier=verifier, injector=injector))
-    builder.add_node("designer_verilog", partial(designer_verilog_node, designer=designer, injector=injector))
-    builder.add_node("verification_check", partial(verification_check_node, verifier=verifier, injector=injector))
-    builder.add_node("designer_output", partial(designer_output_node, designer=designer, injector=injector))
+    builder.add_node("summarize", wrap_node_with_compaction(partial(summarize_context, manager=manager, injector=injector), compaction_mw))
+    builder.add_node("architect_plan", wrap_node_with_compaction(partial(architect_plan_node, architect=architect, injector=injector), compaction_mw))
+    builder.add_node("architect_design", wrap_node_with_compaction(partial(architect_design_node, architect=architect, injector=injector), compaction_mw))
+    builder.add_node("architect_analyze", wrap_node_with_compaction(partial(architect_analyze_node, architect=architect, injector=injector), compaction_mw))
+    builder.add_node("architect_review", wrap_node_with_compaction(partial(architect_review_node, architect=architect, injector=injector), compaction_mw))
+    builder.add_node("architect_spec", wrap_node_with_compaction(partial(architect_spec_node, architect=architect, injector=injector), compaction_mw))
+    builder.add_node("designer_spec", wrap_node_with_compaction(partial(designer_spec_node, designer=designer, injector=injector), compaction_mw))
+    builder.add_node("verification_plan", wrap_node_with_compaction(partial(verification_plan_node, verifier=verifier, injector=injector), compaction_mw))
+    builder.add_node("designer_verilog", wrap_node_with_compaction(partial(designer_verilog_node, designer=designer, injector=injector), compaction_mw))
+    builder.add_node("verification_check", wrap_node_with_compaction(partial(verification_check_node, verifier=verifier, injector=injector), compaction_mw))
+    builder.add_node("designer_output", wrap_node_with_compaction(partial(designer_output_node, designer=designer, injector=injector), compaction_mw))
 
     # 添加边: START → summarize → architect 五阶段 → designer_spec → verification_plan
     #        → designer_verilog → verification_check →(条件) designer_output → END
