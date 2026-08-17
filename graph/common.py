@@ -3,8 +3,7 @@
 
 从 graph/simple.py 提取的公共逻辑，供所有工作流复用：
 - NodeCallback 类型别名
-- NodeTrackingHandler 节点级进度回调
-- ainvoke_team_agent 异步执行团队 Agent（TeamAgent 零改动）
+- NodeTrackingHandler 节点级进度回调(TOKEN 级流式)
 - SkillInjector 节点 prompt 层技能注入（复用 tools.skills.SkillManager）
 - arun_compiled_workflow 通用异步工作流运行器（含跨轮次记忆压缩）
 - compaction 基础设施：节点级压缩 wrapper（消息通道超阈值时增量摘要）
@@ -17,7 +16,6 @@
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import uuid
 from collections.abc import Callable
@@ -98,26 +96,6 @@ class NodeTrackingHandler(BaseCallbackHandler):
         content = getattr(response, "content", None)
         if isinstance(content, str) and content:
             self.on_token(AgentEvent.token(text=content))
-
-
-async def ainvoke_team_agent(agent, prompt: str) -> str:
-    """异步执行团队 Agent（TeamAgent 零改动兼容）。
-
-    优先调用 agent.ainvoke()（若未来 TeamAgent 提供异步接口则直接使用）；
-    否则用 ``asyncio.to_thread`` 包装同步 ``invoke()``，避免阻塞事件循环，
-    同时保证多 Agent 并行执行时不会互相阻塞。
-
-    Args:
-        agent: TeamAgent（或任何具备 invoke()/ainvoke() 接口的对象）
-        prompt: 渲染后的提示词
-
-    Returns:
-        Agent 执行结果字符串
-    """
-    ainvoke = getattr(agent, "ainvoke", None)
-    if callable(ainvoke):
-        return await ainvoke(prompt)
-    return await asyncio.to_thread(agent.invoke, prompt)
 
 
 class SkillInjector:

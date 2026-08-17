@@ -33,10 +33,6 @@ class CapturingWorker:
     response: str = "done"
     received_config: dict[str, Any] | None = None
 
-    def execute_task(self, plan: str, injector=None, config: dict[str, Any] | None = None) -> str:
-        self.received_config = config
-        return self.response
-
     async def aexecute_task(self, plan: str, injector=None, config: dict[str, Any] | None = None) -> str:
         """异步版 execute_task(节点现直接 await 调用)"""
         self.received_config = config
@@ -151,49 +147,8 @@ def test_arun_compiled_workflow_no_workspace_by_default():
 
 
 # --------------------------------------------------------------------------- #
-# TeamAgent 级:工具模式最小 config + 中间件挂载
+# TeamAgent 级:工具模式中间件挂载
 # --------------------------------------------------------------------------- #
-def test_invoke_with_tools_builds_minimal_config():
-    """_invoke_with_tools 只提取 workspace_path,不转发 callbacks/thread_id 等外层运行时字段。"""
-    agent = object.__new__(TeamAgent)
-    agent.name = "test-worker"
-    agent.max_iterations = 5
-    agent.verbose = False
-    agent.agent_executor = MagicMock()
-    agent.agent_executor.invoke.return_value = {
-        "messages": [MagicMock(content="done", tool_calls=None)]
-    }
-
-    outer_config = {
-        "configurable": {"thread_id": "wf-t", "workspace_path": "C:/ws"},
-        "callbacks": [object()],  # 外层 NodeTrackingHandler 等运行时字段,严禁转发
-    }
-    agent._invoke_with_tools("任务", outer_config)
-
-    config = agent.agent_executor.invoke.call_args.kwargs["config"]
-    assert config["recursion_limit"] == 5
-    assert config["configurable"] == {"workspace_path": "C:/ws"}
-    assert "callbacks" not in config
-
-
-def test_invoke_with_tools_no_workspace_keeps_plain_config():
-    """config 无 workspace_path 时,内部 config 不含 configurable(不误注入空 workspace)。"""
-    agent = object.__new__(TeamAgent)
-    agent.name = "test-worker"
-    agent.max_iterations = 5
-    agent.verbose = False
-    agent.agent_executor = MagicMock()
-    agent.agent_executor.invoke.return_value = {
-        "messages": [MagicMock(content="done", tool_calls=None)]
-    }
-
-    agent._invoke_with_tools("任务", {"configurable": {"thread_id": "wf-t"}})
-
-    config = agent.agent_executor.invoke.call_args.kwargs["config"]
-    assert config["recursion_limit"] == 5
-    assert "configurable" not in config
-
-
 def test_create_tool_agent_mounts_workspace_middleware(monkeypatch):
     """工具模式的 create_agent 挂载 WorkspaceSecurityMiddleware。"""
     captured: dict[str, list[Any]] = {}

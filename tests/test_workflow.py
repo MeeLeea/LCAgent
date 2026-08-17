@@ -40,11 +40,6 @@ class FakeAgent:
     prompt_file: str | None = None
     default_templates: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_TEMPLATES))
     calls: list[tuple[str, str]] = field(default_factory=list)
-    
-    def invoke(self, task: str) -> str:
-        """记录调用并返回模拟结果"""
-        self.calls.append(("invoke", task))
-        return self.response
 
     async def ainvoke(self, task: str, config=None) -> str:
         """异步版 invoke:记录调用并返回模拟结果(与同步版同前缀,兼容既有断言)"""
@@ -53,11 +48,6 @@ class FakeAgent:
 
     async def asummarize_context(self, memory_text: str, config=None) -> str:
         """异步版 summarize_context:记录调用并返回模拟摘要"""
-        self.calls.append(("summarize", memory_text))
-        return self.summary_response
-
-    def summarize_context(self, memory_text: str) -> str:
-        """记录记忆提炼调用并返回模拟摘要"""
         self.calls.append(("summarize", memory_text))
         return self.summary_response
 
@@ -74,16 +64,6 @@ class FakeAgent:
         """占位符替换"""
         return TeamAgent.render_template(template, **kwargs)
 
-    def plan_task(self, task: str, context_summary: str = "", injector=None) -> str:
-        """记录计划调用并返回模拟结果"""
-        prompt = self.render_template(
-            self.get_template("manager_plan"), task=task, context_summary=context_summary
-        )
-        if injector is not None:
-            prompt = injector.inject_into_prompt(prompt, task)
-        self.calls.append(("invoke", prompt))
-        return self.response
-
     async def aplan_task(self, task: str, context_summary: str = "", injector=None, config=None) -> str:
         """异步版 plan_task:记录调用并返回模拟结果(与同步版同前缀,兼容既有断言)"""
         prompt = self.render_template(
@@ -94,40 +74,11 @@ class FakeAgent:
         self.calls.append(("invoke", prompt))
         return self.response
 
-    def execute_task(self, plan: str, injector=None, config=None) -> str:
-        """记录执行调用并返回模拟结果"""
-        prompt = self.render_template(self.get_template("worker_exec"), plan=plan)
-        if injector is not None:
-            prompt = injector.inject_into_prompt(prompt, plan)
-        self.calls.append(("invoke", prompt))
-        return self.response
-
     async def aexecute_task(self, plan: str, injector=None, config=None) -> str:
         """异步版 execute_task:记录调用并返回模拟结果(与同步版同前缀)"""
         prompt = self.render_template(self.get_template("worker_exec"), plan=plan)
         if injector is not None:
             prompt = injector.inject_into_prompt(prompt, plan)
-        self.calls.append(("invoke", prompt))
-        return self.response
-
-    def finalize(
-        self,
-        task: str,
-        plan: str,
-        worker_result: str,
-        context_summary: str = "",
-        injector=None,
-    ) -> str:
-        """记录汇总调用并返回模拟结果"""
-        prompt = self.render_template(
-            self.get_template("terminator_final"),
-            task=task,
-            plan=plan,
-            worker_result=worker_result,
-            context_summary=context_summary,
-        )
-        if injector is not None:
-            prompt = injector.inject_into_prompt(prompt, task)
         self.calls.append(("invoke", prompt))
         return self.response
 
@@ -931,54 +882,6 @@ def test_run_workflow_emits_workflow_events():
         running_idx = node_events.index({"type": "workflow_node", "node": node, "status": "running"})
         done_idx = node_events.index({"type": "workflow_node", "node": node, "status": "done"})
         assert running_idx < done_idx
-
-
-# ==================== 测试 ainvoke_team_agent 异步执行 ====================
-
-class SyncOnlyAgent:
-    """仅有同步 invoke 的 Agent(模拟 TeamAgent)"""
-    def __init__(self, response="sync result"):
-        self.response = response
-        self.calls = []
-
-    def invoke(self, task: str) -> str:
-        self.calls.append(task)
-        return self.response
-
-
-class AsyncAgent:
-    """同时具备 ainvoke 的 Agent(模拟未来 TeamAgent 异步化)"""
-    def __init__(self, response="async result"):
-        self.response = response
-        self.calls = []
-
-    def invoke(self, task: str) -> str:
-        self.calls.append(("invoke", task))
-        return "sync path"
-
-    async def ainvoke(self, task: str) -> str:
-        self.calls.append(("ainvoke", task))
-        return self.response
-
-
-def test_ainvoke_team_agent_falls_back_to_invoke():
-    """无 ainvoke 时通过 to_thread 包装同步 invoke,不阻塞事件循环"""
-    from graph.common import ainvoke_team_agent
-
-    agent = SyncOnlyAgent(response="done")
-    result = asyncio.run(ainvoke_team_agent(agent, "任务"))
-    assert result == "done"
-    assert agent.calls == ["任务"]
-
-
-def test_ainvoke_team_agent_prefers_ainvoke():
-    """有 ainvoke 时优先调用异步接口"""
-    from graph.common import ainvoke_team_agent
-
-    agent = AsyncAgent(response="async done")
-    result = asyncio.run(ainvoke_team_agent(agent, "任务"))
-    assert result == "async done"
-    assert agent.calls == [("ainvoke", "任务")]
 
 
 # ==================== 测试 TeamAgent 异步能力(ainvoke/astream) ====================

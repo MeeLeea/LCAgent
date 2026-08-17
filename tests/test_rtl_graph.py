@@ -53,34 +53,7 @@ class FakeRTLAgent:
         self.calls.append((method, prompt))
         return self._next(method)
 
-    # ---- manager ----
-    def summarize_context(self, memory_text: str) -> str:
-        return self._record("summarize_context", memory_text)
-
-    # ---- architect ----
-    def plan_task(self, task: str, context_summary: str = "", injector=None) -> str:
-        return self._record("plan_task", task)
-
-    def design_task(self, task: str, context_summary: str = "", injector=None) -> str:
-        return self._record("design_task", task)
-
-    def analyze_task(self, task: str, context_summary: str = "", injector=None) -> str:
-        return self._record("analyze_task", task)
-
-    def review_task(self, task: str, context_summary: str = "", injector=None) -> str:
-        return self._record("review_task", task)
-
-    def spec_task(self, task: str, context_summary: str = "", injector=None) -> str:
-        return self._record("spec_task", task)
-
-    # ---- rtl_designer / rtl_verification ----
-    def spec_design_task(self, task: str, injector=None) -> str:
-        return self._record("spec_design_task", task)
-
-    def verilog_design_task(self, task: str, injector=None) -> str:
-        return self._record("verilog_design_task", task)
-
-    # ---- async 对应方法(节点改调 await agent.a*_task 后的兼容) ----
+    # ---- async 业务方法(节点改调 await agent.a*_task 后的唯一入口) ----
     # calls 记录基础名(不带 a 前缀),保持既有断言兼容
     async def asummarize_context(self, memory_text: str, config=None) -> str:
         return self._record("summarize_context", memory_text)
