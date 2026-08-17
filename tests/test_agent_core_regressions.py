@@ -505,3 +505,120 @@ def test_agent_llm_is_builtin_variable():
     # Then: llm 是 Agent 的内置变量，可直接通过 agent.llm 访问。
     assert core.llm is fake_llm
     assert isinstance(core.llm, FakeLLM)
+
+
+# ============ tool_result 事件 id 桥接（Web 工具卡片"执行中"修复） ============
+
+
+class _FakeToolExecutor:
+    """模拟 agent_executor：按序产出给定 astream_events 事件。"""
+
+    def __init__(self, events):
+        self.events = events
+
+    async def astream_events(self, inputs, config=None, version=None):
+        for e in self.events:
+            yield e
+
+
+def _collect_tool_events(events) -> list:
+    """构造 AgentCore 替身并收集 _arun_graph_events 产出的全部 AgentEvent。"""
+    from agent.agent_core import AgentCore
+
+    core = object.__new__(AgentCore)
+    core.agent_executor = _FakeToolExecutor(events)
+
+    async def _run():
+        return [
+            e
+            async for e in core._arun_graph_events(
+                {"messages": [HumanMessage(content="hi")]},
+                config={},
+                thread_id="t1",
+                trace_id="trace-1",
+            )
+        ]
+
+    return asyncio.run(_run())
+
+
+def test_arun_graph_events_tool_result_id_matches_tool_call():
+    """on_tool_end 事件 data 不含 tool_call_id 时，run_id 桥接保证 tool_result id 与 tool_call 一致。
+
+    LangChain 的 on_tool_start/on_tool_end 事件 data 只含 input/output，不含
+    tool_call_id；此前 tool_result 的 id 因此为空串，前端按 id 匹配不到结果，
+    工具卡片永远显示"执行中"（需刷新后靠历史接口重建才对）。本用例验证修复后 id 正确。
+    """
+    from utils.events import EventType
+
+    events = [
+        {
+            "event": "on_chat_model_end",
+            "data": {
+                "output": AIMessage(
+                    content="",
+                    tool_calls=[{"id": "call-abc", "name": "search", "args": {"q": "ai"}}],
+                )
+            },
+        },
+        {
+            "event": "on_tool_start",
+            "name": "search",
+            "run_id": "run-1",
+            "data": {"input": {"q": "ai"}},
+        },
+        {
+            "event": "on_tool_end",
+            "name": "search",
+            "run_id": "run-1",
+            "data": {"output": "AI 最新新闻"},
+        },
+    ]
+
+    evs = _collect_tool_events(events)
+    tool_calls = [e for e in evs if e.event_type == EventType.TOOL_CALL]
+    tool_results = [e for e in evs if e.event_type == EventType.TOOL_RESULT]
+
+    # on_chat_model_end 提前发出 tool_call，on_tool_start 去重后仅 1 条
+    assert len(tool_calls) == 1
+    assert tool_calls[0].tool_call_id == "call-abc"
+    assert tool_calls[0].tool_name == "search"
+
+    # 修复点：tool_result 的 id 与 tool_call 一致，前端 find(r.id === call.id) 可匹配
+    assert len(tool_results) == 1
+    assert tool_results[0].tool_call_id == "call-abc"
+    assert tool_results[0].tool_name == "search"
+    assert tool_results[0].content == "AI 最新新闻"
+    # 序列化为前端实际收到的 SSE 载荷，id 同样一致
+    assert tool_results[0].to_sse_dict()["id"] == "call-abc"
+
+
+def test_arun_graph_events_tool_result_falls_back_to_name():
+    """on_tool_start/tool_end 均无 run_id 时，按事件顶层 name 兜底，id 仍可配对。"""
+    from utils.events import EventType
+
+    events = [
+        {
+            "event": "on_tool_start",
+            "name": "search",
+            "run_id": "",
+            "data": {"input": {"q": "ai"}},
+        },
+        {
+            "event": "on_tool_end",
+            "name": "search",
+            "run_id": "",
+            "data": {"output": "AI 新闻"},
+        },
+    ]
+
+    evs = _collect_tool_events(events)
+    tool_calls = [e for e in evs if e.event_type == EventType.TOOL_CALL]
+    tool_results = [e for e in evs if e.event_type == EventType.TOOL_RESULT]
+
+    assert len(tool_calls) == 1
+    assert tool_calls[0].tool_name == "search"
+    assert len(tool_results) == 1
+    # run_id 缺失时 id 回退为工具名，tool_call/tool_result 仍保持同一 id
+    assert tool_results[0].tool_call_id == tool_calls[0].tool_call_id
+    assert tool_results[0].content == "AI 新闻"

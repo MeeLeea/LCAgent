@@ -238,6 +238,26 @@ function markStreaming(get: StoreGet, set: StoreSet, threadId: string, streaming
   })
 }
 
+/**
+ * 流结束时补齐未匹配到结果的工具调用：若后端 tool_result 事件的 id 缺失/不匹配
+ * （tool_call 与 tool_result 无法关联），为剩余 toolCall 添加占位 result，
+ * 避免 ToolCallCard 永久停留在"执行中"。
+ */
+function fillMissingToolResults(msg: ChatMessage): ChatMessage {
+  if (!msg.toolCalls || msg.toolCalls.length === 0) return msg
+  const results = msg.toolResults ?? []
+  const have = new Set(results.map((r) => r.id))
+  const missing = msg.toolCalls.filter((c) => c.id && !have.has(c.id))
+  if (missing.length === 0) return msg
+  return {
+    ...msg,
+    toolResults: [
+      ...results,
+      ...missing.map((c) => ({ id: c.id, name: c.name, content: '' })),
+    ],
+  }
+}
+
 /** 构造某线程流的终止处理器（幂等：只执行一次） */
 function makeFinish(get: StoreGet, set: StoreSet, threadId: string) {
   return () => {
@@ -360,7 +380,7 @@ function handleStreamEvent(
     case 'cancelled':
       if (!last || last.role !== 'assistant') return threadId
       arr[lastIndex] = {
-        ...last,
+        ...fillMissingToolResults(last),
         streaming: false,
         content: last.content + (last.content ? '\n\n' : '') + `> ⚠️ ${ev.content}`,
       }
@@ -373,7 +393,7 @@ function handleStreamEvent(
       // 避免重复追加多条错误
       if (!last.error) {
         arr[lastIndex] = {
-          ...last,
+          ...fillMissingToolResults(last),
           streaming: false,
           error: true,
           content: last.content + (last.content ? '\n\n' : '') + `> ❌ ${ev.content}`,
@@ -401,7 +421,7 @@ function handleStreamEvent(
     }
     case 'done': {
       if (!last || last.role !== 'assistant') return threadId
-      arr[lastIndex] = { ...last, streaming: false }
+      arr[lastIndex] = { ...fillMissingToolResults(last), streaming: false }
       commitThreadMessages(get, set, threadId, arr)
       set((s) => {
         const pendingInterrupts = { ...s.pendingInterrupts }

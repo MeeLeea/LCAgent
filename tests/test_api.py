@@ -1155,6 +1155,83 @@ def test_chat_stop_mid_stream(client, mock_agent):
     assert not any(e.get("content") == "不应到达" for e in events)
 
 
+def test_stop_endpoint_clears_pending_memory(client, mock_agent):
+    """停止时清理该会话待处理的记忆沉淀（防抖 buffer 与定时器）"""
+    from api.server import _cancel_events
+
+    tid = "test-thread-123"
+    _cancel_events[tid] = asyncio.Event()  # 模拟进行中的流
+    cleanup_thread = AsyncMock()
+    mock_agent._memory_context = MagicMock()
+    mock_agent._memory_context.memory_manager.write_middleware.cleanup_thread = cleanup_thread
+    try:
+        response = client.post("/api/stop", json={"thread_id": tid})
+        assert response.status_code == 200
+        assert response.json()["stopped"] is True
+        cleanup_thread.assert_awaited_once_with(tid)
+    finally:
+        _cancel_events.pop(tid, None)
+        mock_agent._memory_context = None
+
+
+def test_stop_endpoint_no_stream_skips_memory_cleanup(client, mock_agent):
+    """无进行中流时 /api/stop 不触发记忆沉淀清理"""
+    cleanup_thread = AsyncMock()
+    mock_agent._memory_context = MagicMock()
+    mock_agent._memory_context.memory_manager.write_middleware.cleanup_thread = cleanup_thread
+    try:
+        response = client.post("/api/stop", json={"thread_id": "nonexistent"})
+        assert response.status_code == 200
+        assert response.json()["stopped"] is False
+        cleanup_thread.assert_not_awaited()
+    finally:
+        mock_agent._memory_context = None
+
+
+def test_chat_stop_mid_stream_cleans_pending_memory(client, mock_agent):
+    """流式生成被停止后，chat 流 finally 中清理该会话待处理的记忆沉淀"""
+    import threading
+    import time
+
+    async def hanging_stream(message: str, thread_id: str | None = None):
+        yield {"type": "token", "content": "开始"}
+        await asyncio.sleep(30)
+        yield {"type": "done"}
+
+    mock_agent.session_manager.achat_stream = hanging_stream
+    cleanup_thread = AsyncMock()
+    mock_agent._memory_context = MagicMock()
+    mock_agent._memory_context.memory_manager.write_middleware.cleanup_thread = cleanup_thread
+
+    events = []
+    errors: list[Exception] = []
+
+    def consume():
+        try:
+            with client.stream(
+                "POST",
+                "/api/chat",
+                json={"message": "你好", "thread_id": "test-thread-123"},
+            ) as resp:
+                for line in resp.iter_lines():
+                    if line.startswith("data: "):
+                        events.append(json.loads(line[6:]))
+        except Exception as e:
+            errors.append(e)
+
+    thread = threading.Thread(target=consume)
+    thread.start()
+    time.sleep(0.3)
+    client.post("/api/stop", json={"thread_id": "test-thread-123"})
+    thread.join(timeout=10)
+    assert not thread.is_alive(), f"流未在停止后结束: {errors}"
+    assert "cancelled" in [e["type"] for e in events]
+    # 双保险：/api/stop 接口与 chat 流 finally 各清理一次（幂等防抖）
+    assert cleanup_thread.await_count == 2
+    cleanup_thread.assert_awaited_with("test-thread-123")
+    mock_agent._memory_context = None
+
+
 # --------------------------------------------------------------------------- #
 # 命令执行
 # --------------------------------------------------------------------------- #

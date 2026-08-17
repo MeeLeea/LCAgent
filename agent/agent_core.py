@@ -960,6 +960,13 @@ class AgentCore:
         # 已发出 TOOL_CALL 事件的 tool_call_id 集合：
         # on_chat_model_end 检测到 tool_calls 时提前发出，on_tool_start 据此去重
         emitted_tool_call_ids: set[str] = set()
+        # run_id → tool_call_id：on_tool_start 按 run_id 登记、on_tool_end 取用。
+        # on_tool_start/on_tool_end 事件 data 不含 tool_call_id（LangChain 事件未暴露），
+        # 需借助 on_chat_model_end 拿到的 AIMessage.tool_calls id 桥接，保证前端
+        # tool_call / tool_result 事件 id 一致，避免工具卡片永远停留在"执行中"。
+        active_tool_call_ids: dict[str, str] = {}
+        # 工具名 → 本轮 tool_call id 队列：on_chat_model_end 填充，on_tool_start 按事件 name 取用
+        pending_tool_call_ids: dict[str, list[str]] = {}
 
         for attempt in range(RETRY_ATTEMPTS):
             emitted = False
@@ -988,11 +995,23 @@ class AgentCore:
                                     text, thread_id=thread_id, trace_id=trace_id
                                 )
                     elif event_name == "on_tool_start":
+                        # on_tool_start 事件 data 不含 tool_call_id，用 run_id 登记映射恢复；
+                        # 未命中时按事件 name 从本轮 AIMessage.tool_calls 队列取 id。
+                        run_id = ev.get("run_id", "")
+                        tc_id = data_dict.get("tool_call_id") or ""
+                        if not tc_id:
+                            event_name_top = ev.get("name", "")
+                            bucket = pending_tool_call_ids.get(event_name_top)
+                            if bucket:
+                                tc_id = bucket.pop(0)
+                            elif event_name_top:
+                                tc_id = event_name_top
+                        if tc_id:
+                            active_tool_call_ids[run_id] = tc_id
                         # on_chat_model_end 已提前发出 TOOL_CALL 时跳过（去重）
-                        tc_id = data_dict.get("tool_call_id") or data_dict.get("name") or ""
                         if tc_id and tc_id in emitted_tool_call_ids:
                             continue
-                        name = data_dict.get("name")
+                        name = ev.get("name") or data_dict.get("name")
                         tool_input = data_dict.get("input")
                         emitted = True
                         yield AgentEvent.tool_call(
@@ -1004,19 +1023,22 @@ class AgentCore:
                         )
                     elif event_name == "on_tool_end":
                         output = data_dict.get("output")
+                        # output 就是工具返回值：字符串直接用本身；
+                        # 若是 ToolMessage 等含 content 的对象则取其 content。
                         content = (
-                            getattr(output, "content", None)
+                            getattr(output, "content", output)
                             if output is not None
-                            else data_dict.get("output")
+                            else None
                         )
                         emitted = True
                         yield AgentEvent.tool_result(
                             tool_call_id=(
-                                data_dict.get("tool_call_id")
+                                active_tool_call_ids.pop(ev.get("run_id", ""), "")
+                                or data_dict.get("tool_call_id")
                                 or getattr(output, "tool_call_id", None)
-                                or data_dict.get("name", "")
+                                or ev.get("name", "")
                             ),
-                            name=data_dict.get("name", "") or "",
+                            name=ev.get("name") or data_dict.get("name", "") or "",
                             content=stringify_content(content),
                             thread_id=thread_id,
                             trace_id=trace_id,
@@ -1036,14 +1058,20 @@ class AgentCore:
                             # 提前发出 TOOL_CALL：LLM 回复完成时 tool_calls 已确定，
                             # 无需等待 LangGraph 路由到工具节点（on_tool_start），
                             # 前端可更早显示工具名 + "执行中"
+                            # 新一轮工具调用开始：清空上一轮遗留的 id 队列
+                            # （上一轮的 tools 已在执行完毕后进入下一轮 model 调用）
+                            pending_tool_call_ids = {}
                             for tc in getattr(output, "tool_calls", None) or []:
                                 tc_id = tc.get("id", "") if isinstance(tc, dict) else ""
+                                tc_name = tc.get("name", "") if isinstance(tc, dict) else ""
+                                if tc_id:
+                                    pending_tool_call_ids.setdefault(tc_name, []).append(tc_id)
                                 if tc_id and tc_id not in emitted_tool_call_ids:
                                     emitted_tool_call_ids.add(tc_id)
                                     emitted = True
                                     yield AgentEvent.tool_call(
                                         tool_call_id=tc_id,
-                                        name=tc.get("name", "") if isinstance(tc, dict) else "",
+                                        name=tc_name,
                                         args=tc.get("args") if isinstance(tc, dict) else None,
                                         thread_id=thread_id,
                                         trace_id=trace_id,

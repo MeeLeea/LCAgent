@@ -133,6 +133,27 @@ def _signal_cancel(thread_id: str) -> bool:
     return True
 
 
+async def _cancel_pending_memory(thread_id: str) -> None:
+    """取消指定会话待处理的记忆沉淀（防抖 buffer 与定时器）。
+
+    用户点击停止后，本次被取消对话的事件残料不应再触发后台 LLM
+    fact 抽取，否则停止生效后仍会出现 openai 重试请求（如 429）。
+    已启动的抽取线程无法中断，但能阻止新的抽取任务启动。
+    """
+    if agent is None:
+        return
+    mem_ctx = getattr(agent, "_memory_context", None)
+    if mem_ctx is None:
+        return
+    mem_manager = getattr(mem_ctx, "memory_manager", None)
+    if mem_manager is None:
+        return
+    write_middleware = getattr(mem_manager, "write_middleware", None)
+    if write_middleware is None:
+        return
+    await write_middleware.cleanup_thread(thread_id)
+
+
 def _thread_lock(thread_id: str) -> asyncio.Lock:
     """获取指定会话的专用锁（不存在则创建）。
 
@@ -780,9 +801,12 @@ async def stop(req: StopRequest):
 
     前端点击停止按钮时先调用本接口置位 per-thread 取消信号，再 abort 连接。
     取消信号会在 LLM 阻塞调用（含 SDK 内部重试）期间被感知，立即中断生成。
+    同时取消该会话待处理的记忆沉淀，避免停止后后台仍发起 LLM fact 抽取。
     """
     tid = req.thread_id or (agent.session.current_session_id if agent else "")
     signalled = _signal_cancel(tid)
+    if signalled:
+        await _cancel_pending_memory(tid)
     return {"stopped": signalled, "thread_id": tid}
 
 
@@ -958,6 +982,10 @@ async def chat(req: ChatRequest, request: Request):
                     logger.error("异常 [%s]: %s", tid, e)
                     yield _sse({"type": "error", "content": f"内部错误: {e}"})
             finally:
+                # 流因停止信号取消结束时，清理该会话待处理的记忆沉淀，
+                # 防止 20s 防抖窗口到期后仍触发后台 LLM fact 抽取（停止后不应再请求）
+                if cancel_event.is_set():
+                    await _cancel_pending_memory(tid)
                 _cancel_events.pop(tid, None)
 
     return StreamingResponse(
@@ -994,6 +1022,9 @@ async def chat_resume(req: ResumeRequest, request: Request):
                 logger.error("恢复异常 [%s]: %s", tid, e)
                 yield _sse({"type": "error", "content": f"内部错误: {e}"})
             finally:
+                # 流因停止信号取消结束时，清理该会话待处理的记忆沉淀（同 /api/chat）
+                if cancel_event.is_set():
+                    await _cancel_pending_memory(tid)
                 _cancel_events.pop(tid, None)
 
     return StreamingResponse(

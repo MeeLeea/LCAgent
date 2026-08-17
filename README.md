@@ -15,7 +15,7 @@
 - 命令模式下的会话切换会优先保持当前会话，不会因为菜单参数不兼容而失败
 - 安全护栏（危险终端命令拦截/确认、路径保护）
 - **全套异步 Public API**（`arun` / `achat` / `aresume` / `arun_structured` / `achat_structured` 等）
-- **生成停止即时生效**（`POST /api/stop` 显式取消信号，per-thread 隔离；前端点击停止后即使后端正阻塞在 LLM 调用或 SDK 内部 429/5xx 自动重试期间也能立即中断）
+- **生成停止即时生效**（`POST /api/stop` 显式取消信号，per-thread 隔离；前端点击停止后即使后端正阻塞在 LLM 调用或 SDK 内部 429/5xx 自动重试期间也能立即中断；同时取消该会话待处理的记忆沉淀，防止停止后后台仍发起 LLM fact 抽取）
 - **运行时指标收集**（LLM 调用 / 工具执行 / 压缩统计，`metrics` 命令查询）
 - **结构化日志**（trace_id / thread_id 上下文注入，asyncio 安全）
 - **工具超时保护**与**统一异常层次**（`LCAgentError` 及其子类）
@@ -944,6 +944,7 @@ HTTP API（[api/server.py](api/server.py)）同样暴露三个 RESTful 端点，
 `AgentCore.session_manager`（懒初始化）是上层流量的统一入口，封装 Agent + Memory：
 
 - **流式接口**：`achat_stream` / `aresume_stream` / `arun_stream`，产出 SSE 事件（`token` / `tool_call` / `tool_result` / `interrupt` / `cancelled` / `error` / `done`）
+  - **`tool_call` / `tool_result` id 一致性**：LangChain 的 `on_tool_start` / `on_tool_end` 事件 data 不含 `tool_call_id`，`agent_core._arun_graph_events` 借助 `on_chat_model_end` 的 `AIMessage.tool_calls` 与事件 `run_id` 建立桥接，保证两个事件的 `id` 一致（兜底回退到事件 `name`），前端按 `id` 关联工具卡片与其结果
 - **非流式接口**：`achat` / `aresume` / `arun`，收集全部 token 为最终文本
 - **会话管理委托**：`new_session` / `new_workflow_session` / `set_current_session` / `current_session_id` / `alist_sessions` / `aswitch_session` / `adelete_session` / `aget_messages` / `aexport_session` / `asummarize`
 - **记忆管理委托**：`aget_memory_summary` / `acompress_memory` / `aclear_long_term_memory`
