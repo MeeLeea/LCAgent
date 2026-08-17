@@ -243,10 +243,10 @@ LangChainAgent/
 │   ├── AGENT.md             # Agent 核心系统提示词（行为规则）
 │   ├── llm_client.py        # 统一大模型封装（多提供商 + 多模型）
 │   ├── config.py            # 运行时配置加载(agent/agent_config.json)
-│   ├── compaction.py        # 长上下文压缩中间件（增量摘要 + 工具输出 Prune）
 │   ├── message_utils.py     # LLM 异常信息提取（中文化错误提示）
 │   └── agent_core.py        # Agent 核心调度：run/chat/cot 三种模式 + HITL + 异步 API
 ├── utils/                   # 通用工具（与业务解耦，供 agent/graph/session 等共用）
+│   ├── compaction.py        # LangGraph 上下文压缩中间件（增量摘要 + 工具输出 Prune）
 │   ├── events.py            # 标准化执行事件模型（AgentEvent / EventType，含节点进度事件）
 │   ├── exceptions.py        # 统一异常层次（LCAgentError 及其子类）
 │   ├── logging_config.py    # 结构化日志（trace_id/thread_id 上下文注入）
@@ -350,7 +350,7 @@ LangChainAgent/
 | [agent/llm_client.py](agent/llm_client.py)               | 从`config/llm_config.json` 读取提供商配置，支持运行时切换提供商/模型                                                                                                                                                                     |
 | [agent/config.py](agent/config.py)                       | 加载`agent/agent_config.json`，统一运行时配置                                                                                                                                                                                            |
 | [memory/](memory/)                                       | 三层架构 Memory 层：`AgentMemory`（checkpointer + Store 基础设施）/ `MemoryContext`（统一工厂）/ `MemoryManager`（统一门面）/ `ThreadMemoryStore`（Store 业务封装）/ 读写中间件（防抖 + Fact 抽取 + prompt 注入）/ per-thread 锁池 |
-| [agent/compaction.py](agent/compaction.py)               | 长上下文压缩中间件：增量摘要 + 工具输出 Prune + 保留近期消息，摘要随 checkpoint 持久化、per-thread 隔离                                                                                                                                    |
+| [utils/compaction.py](utils/compaction.py)               | 长上下文压缩中间件：增量摘要 + 工具输出 Prune + 保留近期消息，摘要随 checkpoint 持久化、per-thread 隔离                                                                                                                                    |
 | [utils/events.py](utils/events.py)                       | 标准化执行事件模型：`AgentEvent`（frozen dataclass）+ `EventType` 枚举（含 TOKEN/TOOL_*/INTERRUPT/ERROR/DONE/NODE_*）+ SSE dict 序列化，三层架构唯一通信载体                                                        |
 | [utils/metrics.py](utils/metrics.py)                     | `MetricsCollector`：线程安全的运行时指标收集（LLM 调用 / 工具执行 / 压缩统计）                                                                                                                                                           |
 | [utils/logging_config.py](utils/logging_config.py)       | 结构化日志：`contextvars` 实现 trace_id / thread_id 异步安全注入                                                                                                                                                                         |
@@ -476,7 +476,7 @@ Agent 有三种执行模式，对应三种不同的交互入口：
 | `models.py`                   | [memory/models.py](memory/models.py)             | `MemoryCategory` / `ThreadFactItem` / `MemoryInputEvent` / `judge_long_term_memory` 分类判定                                 |
 | `config.py`                   | [memory/config.py](memory/config.py)             | 运行时参数默认值（buffer 延迟 / 上限 / fact 上限 / 召回条数）                                                                        |
 
-> 除此之外还有一层 **Compaction 压缩中间件**（[agent/compaction.py](agent/compaction.py)）负责控制**单会话内的上下文长度**：当 checkpoint 恢复的消息数超过阈值时，`before_model` 自动把旧消息增量摘要成 `state.summary`（随 checkpoint 持久化、per-thread 隔离），并 Prune 过长的历史工具输出，无需新开 thread。注意这与记忆系统的 `compress` 命令是两回事（前者压缩会话上下文，后者压缩长期记忆 facts）。详见[可观测性与可靠性 → 长上下文压缩中间件](#长上下文压缩中间件compaction)。
+> 除此之外还有一层 **Compaction 压缩中间件**（[utils/compaction.py](utils/compaction.py)）负责控制**单会话内的上下文长度**：当 checkpoint 恢复的消息数超过阈值时，`before_model` 自动把旧消息增量摘要成 `state.summary`（随 checkpoint 持久化、per-thread 隔离），并 Prune 过长的历史工具输出，无需新开 thread。注意这与记忆系统的 `compress` 命令是两回事（前者压缩会话上下文，后者压缩长期记忆 facts）。详见[可观测性与可靠性 → 长上下文压缩中间件](#长上下文压缩中间件compaction)。
 
 ### 上下文注入机制（重要）
 
@@ -1448,7 +1448,7 @@ create_tool(
 
 ### 长上下文压缩中间件（Compaction）
 
-[`agent/compaction.py`](agent/compaction.py) 实现了 `LCAgentCompactionMiddleware`，采用**三层压缩策略**，在会话过长时无损释放大量 token：
+[`utils/compaction.py`](utils/compaction.py) 实现了 `LCAgentCompactionMiddleware`，采用**三层压缩策略**，在会话过长时无损释放大量 token：
 
 1. **增量摘要**：已有 `state.summary` + 旧消息 → 更新后的 summary（避免每次全量重做摘要）
 2. **工具输出 Prune**：把保留区中过长的历史工具输出替换为占位符（`[工具输出已裁剪 N→M 字符] ...`），工具输出常占 70%+ token
@@ -1467,7 +1467,7 @@ create_tool(
 | 自动     | `before_model` / `abefore_model` 中间件         | 消息数 >`max_messages`（默认 50）时触发             |
 | 手动     | `AgentCore.manually_compact()` / `compact` 命令 | `force=True` 跳过阈值，仍需消息数 > `keep_recent` |
 
-`CompactionConfig` 关键参数（`agent/compaction.py`）：
+`CompactionConfig` 关键参数（`utils/compaction.py`）：
 
 | 参数                      | 默认 | 说明                           |
 | ------------------------- | ---- | ------------------------------ |
