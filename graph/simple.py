@@ -184,6 +184,9 @@ async def arun_simple_workflow(
     on_node_end: NodeCallback | None = None,
     on_node_error: NodeCallback | None = None,
     max_history_chars: int = 6000,
+    memory=None,
+    memory_thread_id: str | None = None,
+    is_run_mode: bool = False,
 ) -> dict:
     """
     运行监督者工作流（异步）
@@ -200,6 +203,9 @@ async def arun_simple_workflow(
         on_node_end: 节点结束回调,接收节点名
         on_node_error: 节点异常回调,接收节点名
         max_history_chars: 跨轮次记忆摘要最大字符数(超长截断)
+        memory: MemoryManager 实例（长期记忆召回与结果沉淀）；None 禁用
+        memory_thread_id: 长期记忆使用的会话线程 ID
+        is_run_mode: 是否运行模式（决定 DONE 事件是否标记为重要记忆）
 
     Returns:
         包含 final_answer 的结果字典
@@ -215,6 +221,9 @@ async def arun_simple_workflow(
         on_node_end=on_node_end,
         on_node_error=on_node_error,
         max_history_chars=max_history_chars,
+        memory=memory,
+        memory_thread_id=memory_thread_id,
+        is_run_mode=is_run_mode,
     )
 
 

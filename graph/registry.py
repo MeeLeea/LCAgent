@@ -250,6 +250,9 @@ async def arun_workflow_by_name(
     workspace_path: str | None = None,
     on_node_start: Callable | None = None,
     on_node_end: Callable | None = None,
+    memory=None,
+    memory_thread_id: str | None = None,
+    is_run_mode: bool = False,
 ) -> dict:
     """
     按名称构建并异步运行工作流(不依赖 CLI 上下文)
@@ -268,6 +271,9 @@ async def arun_workflow_by_name(
             Worker 工具调用不做 workspace 隔离（scheduler 场景默认无绑定）。
         on_node_start: 节点开始回调(可选,接收节点名)
         on_node_end: 节点结束回调(可选,接收节点名)
+        memory: MemoryManager 实例（长期记忆召回与结果沉淀）；None 禁用
+        memory_thread_id: 长期记忆使用的会话线程 ID
+        is_run_mode: 是否运行模式（决定 DONE 事件是否标记为重要记忆）
 
     Returns:
         工作流结果字典(含 "final_answer" 键)
@@ -291,4 +297,7 @@ async def arun_workflow_by_name(
         workspace_path=workspace_path,
         on_node_start=on_node_start,
         on_node_end=on_node_end,
+        memory=memory,
+        memory_thread_id=memory_thread_id,
+        is_run_mode=is_run_mode,
     )

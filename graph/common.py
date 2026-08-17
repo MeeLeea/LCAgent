@@ -264,6 +264,9 @@ async def arun_compiled_workflow(
     on_node_end: NodeCallback | None = None,
     on_node_error: NodeCallback | None = None,
     max_history_chars: int = 6000,
+    memory: Any | None = None,
+    memory_thread_id: str | None = None,
+    is_run_mode: bool = False,
 ) -> dict:
     """
     通用异步工作流运行器 - 所有工作流共享的 ainvoke 逻辑
@@ -279,6 +282,14 @@ async def arun_compiled_workflow(
         该 thread 上一轮的工作流状态（task/plan/worker_result/final_answer），
         超长时截断为摘要并拼入 raw_context，实现多轮运行间的上下文延续
         与压缩（TeamAgent 自身无状态，记忆完全由工作流图 checkpointer 承载）。
+
+    记忆接入（workflow 会话化）：
+        传入 ``memory``（MemoryManager 实例）与 ``memory_thread_id`` 时：
+        - 执行前调用 ``memory.recall_text(memory_thread_id)`` 召回长期记忆
+          拼入 raw_context（与 checkpoint 摘要并存，维度互补）；
+        - 执行后将 ``final_answer`` 构造 DONE AgentEvent 提交
+          ``memory.consume_event``（结果级记忆沉淀）。
+        两者缺一或为空时静默跳过，不影响运行。
 
     workspace 隔离：
         workspace_path 注入 config.configurable，节点经 config 透传给
@@ -299,6 +310,9 @@ async def arun_compiled_workflow(
         on_node_end: 节点结束回调，接收节点名
         on_node_error: 节点异常回调，接收节点名
         max_history_chars: 跨轮次记忆摘要的最大字符数（超长截断）
+        memory: MemoryManager 实例（用于长期记忆召回与结果沉淀）；None 禁用
+        memory_thread_id: 长期记忆使用的会话线程 ID（通常与 thread_id 相同）
+        is_run_mode: 是否运行模式（决定 DONE 事件是否标记为重要记忆）
 
     Returns:
         工作流执行结果字典
@@ -318,6 +332,9 @@ async def arun_compiled_workflow(
             on_node_end,
             on_node_error,
             max_history_chars,
+            memory,
+            memory_thread_id,
+            is_run_mode,
         )
 
 
@@ -332,6 +349,9 @@ async def _arun_with_trace(
     on_node_end: NodeCallback | None,
     on_node_error: NodeCallback | None,
     max_history_chars: int,
+    memory: Any | None,
+    memory_thread_id: str | None,
+    is_run_mode: bool,
 ) -> dict:
     """在 TraceContext 内执行工作流主体（原 arun_compiled_workflow 逻辑）。"""
     logger.info("工作流开始执行 [thread=%s]: %s", tid, task[:120])
@@ -349,6 +369,14 @@ async def _arun_with_trace(
             if raw_context
             else f"【上一轮工作流记录】\n{previous_summary}"
         )
+
+    # 长期记忆召回注入（workflow 会话化记忆源；与 checkpoint 摘要并存,维度互补）
+    if memory is not None and memory_thread_id:
+        recalled = await memory.recall_text(memory_thread_id)
+        if recalled:
+            raw_context = (
+                f"{raw_context}\n\n{recalled}".strip() if raw_context else recalled
+            )
 
     initial_state: dict[str, str] = {
         "task": task,
@@ -372,6 +400,20 @@ async def _arun_with_trace(
         ]
 
     result = await graph.ainvoke(initial_state, config=config)
+
+    # 结果级记忆沉淀:final_answer 构造 DONE 事件提交 MemoryManager
+    if memory is not None and memory_thread_id:
+        final_answer = result.get("final_answer") or ""
+        if final_answer:
+            await memory.consume_event(
+                AgentEvent.done(
+                    content=final_answer,
+                    thread_id=memory_thread_id,
+                    role="assistant",
+                    is_important=is_run_mode,
+                )
+            )
+
     logger.info("工作流执行完成 [thread=%s]", tid)
     return result
 
@@ -382,6 +424,12 @@ async def _aget_previous_workflow_summary(
     max_chars: int = 6000,
 ) -> str:
     """读取指定 thread 上一轮工作流状态并压缩为摘要。
+
+    .. deprecated::
+        该函数（checkpoint 4 字段截断摘要）在 workflow 会话化后将由
+        checkpoint messages + summary 通道取代（见 _compaction_wrapper 与
+        WorkflowAdapter 的执行前消息注入）。当前保留以兼容 CLI/scheduler
+        等既有调用路径，新接入方（WorkflowAdapter）不应再依赖它。
 
     仅当 graph 编译时带 checkpointer 且该 thread 已有历史时才返回非空；
     无 checkpointer / 无历史 / 读取失败时返回空串（静默降级）。
