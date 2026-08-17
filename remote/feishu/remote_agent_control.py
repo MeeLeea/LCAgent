@@ -535,7 +535,7 @@ def _dispatch(chat_id: str, content: str) -> None:
 # ===================== 入口 =====================
 
 def run_remote_bot() -> None:
-    from agent.logging_config import setup_logging
+    from utils.logging_config import setup_logging
     setup_logging()
     # 启动 banner（保持 print，面向用户）
     print("=" * 45, "\n  LangChainAgent 飞书远程控制", "\n" + "=" * 45)

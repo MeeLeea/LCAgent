@@ -29,9 +29,9 @@ if _PROJECT_ROOT not in sys.path:
 from agent import AgentCore
 from agent.config import load_agent_config, resolve_path
 from agent.llm_client import LLMClient, load_providers
-from agent.logging_config import setup_logging
 from memory import MemoryContext
 from scheduler import SchedulerEngine, TaskStore
+from utils.logging_config import setup_logging
 
 logger = logging.getLogger(__name__)
 

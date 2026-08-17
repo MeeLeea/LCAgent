@@ -14,7 +14,6 @@ except ImportError:
 
 from agent import AgentCore
 from agent.config import load_agent_config, resolve_path
-from agent.logging_config import setup_logging
 from cli.cli_menu import select_menu
 from cli.commands import CommandContext, dispatch_command
 from cli.commands.core import show_ready
@@ -22,6 +21,7 @@ from cli.commands.provider import create_llm, select_provider
 from cli.human_input import chat_until_completion, run_structured_until_completion
 from memory import MemoryContext
 from tools import safety as safety_module
+from utils.logging_config import setup_logging
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LLM_FILE = os.path.join(BASE_DIR, "config", "llm_config.json")

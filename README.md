@@ -245,10 +245,11 @@ LangChainAgent/
 │   ├── config.py            # 运行时配置加载(agent/agent_config.json)
 │   ├── compaction.py        # 长上下文压缩中间件（增量摘要 + 工具输出 Prune）
 │   ├── metrics.py           # 运行时指标收集（LLM/工具/压缩统计，线程安全）
-│   ├── logging_config.py    # 结构化日志（trace_id/thread_id 上下文注入）
-│   ├── exceptions.py        # 统一异常层次（LCAgentError 及其子类）
 │   ├── message_utils.py     # LLM 异常信息提取（中文化错误提示）
 │   └── agent_core.py        # Agent 核心调度：run/chat/cot 三种模式 + HITL + 异步 API
+├── utils/                   # 通用工具（与业务解耦，供 agent/graph/session 等共用）
+│   ├── logging_config.py    # 结构化日志（trace_id/thread_id 上下文注入）
+│   └── exceptions.py        # 统一异常层次（LCAgentError 及其子类）
 ├── session/                 # 会话管理模块（三层架构 Session 层）
 │   ├── context.py           # SessionContext：单会话运行时上下文（session_id + config + checkpointer）
 │   ├── store.py             # SessionStore：基于 LangGraph Store 的 per-session 瞬态状态
@@ -350,8 +351,8 @@ LangChainAgent/
 | [memory/](memory/)                                       | 三层架构 Memory 层：`AgentMemory`（checkpointer + Store 基础设施）/ `MemoryContext`（统一工厂）/ `MemoryManager`（统一门面）/ `ThreadMemoryStore`（Store 业务封装）/ 读写中间件（防抖 + Fact 抽取 + prompt 注入）/ per-thread 锁池 |
 | [agent/compaction.py](agent/compaction.py)               | 长上下文压缩中间件：增量摘要 + 工具输出 Prune + 保留近期消息，摘要随 checkpoint 持久化、per-thread 隔离                                                                                                                                    |
 | [agent/metrics.py](agent/metrics.py)                     | `MetricsCollector`：线程安全的运行时指标收集（LLM 调用 / 工具执行 / 压缩统计）                                                                                                                                                           |
-| [agent/logging_config.py](agent/logging_config.py)       | 结构化日志：`contextvars` 实现 trace_id / thread_id 异步安全注入                                                                                                                                                                         |
-| [agent/exceptions.py](agent/exceptions.py)               | 统一异常层次：`LCAgentError` 基类及 MCP/超时/压缩/中断/状态等子类                                                                                                                                                                        |
+| [utils/logging_config.py](utils/logging_config.py)       | 结构化日志：`contextvars` 实现 trace_id / thread_id 异步安全注入                                                                                                                                                                         |
+| [utils/exceptions.py](utils/exceptions.py)               | 统一异常层次：`LCAgentError` 基类及 MCP/超时/压缩/中断/状态等子类                                                                                                                                                                        |
 | [agent/agent_core.py](agent/agent_core.py)               | Agent 核心：`run()` / `chat()` / `cot()` 三种模式 + 全套异步 API + `AgentTurnResult` 结构化暂停/恢复 + 技能注入 + 压缩/裁剪                                                                                                        |
 | [session/](session/)                                     | 三层架构 Session 层：`SessionContext`（单会话运行时上下文）/ `SessionStore`（per-session 瞬态状态）/ `SessionRegistry`（生命周期管理）/ `WorkspaceStore`（工作空间映射）/ `SessionManager`（对外门面 & 会话调度）                |
 | [team/](team/)                                           | 多 Agent 团队协作：ManagerAgent（拆解）/ WorkerAgent（执行）/ TerminatorAgent（汇总）+ 工厂函数                                                                                                                                            |

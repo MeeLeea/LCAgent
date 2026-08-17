@@ -15,7 +15,7 @@ import logging
 
 import pytest
 
-from agent.logging_config import (
+from utils.logging_config import (
     LOG_LEVELS,
     StructuredFormatter,
     TraceContext,

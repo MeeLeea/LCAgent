@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from agent.exceptions import (
+from utils.exceptions import (
     AgentStateError,
     LCAgentError,
 )
