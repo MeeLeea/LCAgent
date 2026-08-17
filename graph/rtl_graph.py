@@ -26,7 +26,6 @@ RTL 芯片设计流水线工作流 - Manager 提炼 → Architect 架构 → Des
 """
 from __future__ import annotations
 
-import asyncio
 from functools import partial
 from typing import Annotated, Optional, TypedDict
 
@@ -76,49 +75,66 @@ class RTLGraphState(TypedDict, total=False):
 
 
 # 2. 节点函数(提示词模板由各角色 TeamAgent 懒加载,节点需要时调用 get_template)
-async def summarize_context(state: RTLGraphState, manager: TeamAgent, injector=None) -> RTLGraphState:
+async def summarize_context(
+    state: RTLGraphState,
+    manager: TeamAgent,
+    injector=None,
+    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
+) -> RTLGraphState:
     """Manager 提炼记忆上下文,生成分发给下游节点的上下文摘要"""
     raw = state.get("raw_context", "")
-    result = await asyncio.to_thread(manager.summarize_context, raw)
+    result = await manager.asummarize_context(raw, config)
     return {"context_summary": result, "messages": [AIMessage(content=result)]}
 
 
 async def architect_plan_node(
-    state: RTLGraphState, architect: TeamAgent, injector=None
+    state: RTLGraphState,
+    architect: TeamAgent,
+    injector=None,
+    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
     """Architect 制定架构执行计划(结合记忆上下文摘要)"""
     task = state["task"]
     summary = state.get("context_summary", "")
-    result = await asyncio.to_thread(architect.plan_task, task, summary, injector)
+    result = await architect.aplan_task(task, summary, injector, config)
     return {"arch_plan": result, "messages": [AIMessage(content=result)]}
 
 
 async def architect_design_node(
-    state: RTLGraphState, architect: TeamAgent, injector=None
+    state: RTLGraphState,
+    architect: TeamAgent,
+    injector=None,
+    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
     """Architect 输出架构方案设计(结合执行计划)"""
     task = state["task"]
     plan = state.get("arch_plan", "")
     summary = state.get("context_summary", "")
     prompt_task = f"{task}\n\n【架构执行计划】\n{plan}" if plan else task
-    result = await asyncio.to_thread(architect.design_task, prompt_task, summary, injector)
+    result = await architect.adesign_task(prompt_task, summary, injector, config)
     return {"arch_design": result, "messages": [AIMessage(content=result)]}
 
 
 async def architect_analyze_node(
-    state: RTLGraphState, architect: TeamAgent, injector=None
+    state: RTLGraphState,
+    architect: TeamAgent,
+    injector=None,
+    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
     """Architect 进行 PPA 权衡分析与瓶颈风险识别"""
     task = state["task"]
     design = state.get("arch_design", "")
     summary = state.get("context_summary", "")
     prompt_task = f"{task}\n\n【架构方案设计】\n{design}" if design else task
-    result = await asyncio.to_thread(architect.analyze_task, prompt_task, summary, injector)
+    result = await architect.aanalyze_task(prompt_task, summary, injector, config)
     return {"arch_analysis": result, "messages": [AIMessage(content=result)]}
 
 
 async def architect_review_node(
-    state: RTLGraphState, architect: TeamAgent, injector=None
+    state: RTLGraphState,
+    architect: TeamAgent,
+    injector=None,
+    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
     """Architect 从架构/RTL/后端/软件/验证多维度评审方案"""
     task = state["task"]
@@ -131,12 +147,15 @@ async def architect_review_node(
     if analysis:
         parts.append(f"【权衡分析】\n{analysis}")
     prompt_task = "\n\n".join(parts)
-    result = await asyncio.to_thread(architect.review_task, prompt_task, summary, injector)
+    result = await architect.areview_task(prompt_task, summary, injector, config)
     return {"arch_review": result, "messages": [AIMessage(content=result)]}
 
 
 async def architect_spec_node(
-    state: RTLGraphState, architect: TeamAgent, injector=None
+    state: RTLGraphState,
+    architect: TeamAgent,
+    injector=None,
+    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
     """Architect 整理可交付 RTL 开发的规格文档"""
     task = state["task"]
@@ -149,23 +168,29 @@ async def architect_spec_node(
     if review:
         parts.append(f"【评审意见】\n{review}")
     prompt_task = "\n\n".join(parts)
-    result = await asyncio.to_thread(architect.spec_task, prompt_task, summary, injector)
+    result = await architect.aspec_task(prompt_task, summary, injector, config)
     return {"arch_spec": result, "messages": [AIMessage(content=result)]}
 
 
 async def designer_spec_node(
-    state: RTLGraphState, designer: TeamAgent, injector=None
+    state: RTLGraphState,
+    designer: TeamAgent,
+    injector=None,
+    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
     """Designer 基于架构规格完成 RTL 设计前的规格梳理与 Filelist 规划"""
     task = state["task"]
     arch_spec = state.get("arch_spec", "")
     prompt_task = f"{task}\n\n【架构规格文档】\n{arch_spec}" if arch_spec else task
-    result = await asyncio.to_thread(designer.spec_design_task, prompt_task, injector)
+    result = await designer.aspec_design_task(prompt_task, injector, config)
     return {"design_spec": result, "messages": [AIMessage(content=result)]}
 
 
 async def verification_plan_node(
-    state: RTLGraphState, verifier: TeamAgent, injector=None
+    state: RTLGraphState,
+    verifier: TeamAgent,
+    injector=None,
+    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
     """Verification 基于架构规格与设计规格制定验证计划"""
     task = state["task"]
@@ -177,7 +202,7 @@ async def verification_plan_node(
     if design_spec:
         parts.append(f"【设计规格与Filelist】\n{design_spec}")
     prompt_task = "\n\n".join(parts)
-    result = await asyncio.to_thread(verifier.spec_design_task, prompt_task, injector)
+    result = await verifier.aspec_design_task(prompt_task, injector, config)
     return {"verification_plan": result, "messages": [AIMessage(content=result)]}
 
 
@@ -190,6 +215,7 @@ async def designer_verilog_node(
     """Designer 输出可综合 RTL 源码(多轮迭代时携带上轮验证反馈)。
 
     round 计数:每次进入本节点轮次 +1,供条件路由判断是否达 max_rounds 上限。
+    config 透传(含 callbacks):使 Designer LLM token 增量可流出到外层事件流。
     """
     task = state["task"]
     design_spec = state.get("design_spec", "")
@@ -204,12 +230,15 @@ async def designer_verilog_node(
     if round_n > 0 and report:
         parts.append(f"【第 {round_n} 轮验证报告反馈(请据此修正 RTL)】\n{report}")
     prompt_task = "\n\n".join(parts)
-    result = await asyncio.to_thread(designer.verilog_design_task, prompt_task, injector)
+    result = await designer.averilog_design_task(prompt_task, injector, config)
     return {"rtl_code": result, "round": round_n + 1, "messages": [AIMessage(content=result)]}
 
 
 async def verification_check_node(
-    state: RTLGraphState, verifier: TeamAgent, injector=None
+    state: RTLGraphState,
+    verifier: TeamAgent,
+    injector=None,
+    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
     """Verification 对 RTL 输出 Testbench/验证报告,并强制输出验证结论标记。
 
@@ -232,12 +261,15 @@ async def verification_check_node(
         "或 验证结论: FAIL(表示需修改,并在报告中给出具体修改建议)。"
     )
     prompt_task = "\n\n".join(parts)
-    result = await asyncio.to_thread(verifier.verilog_design_task, prompt_task, injector)
+    result = await verifier.averilog_design_task(prompt_task, injector, config)
     return {"verification_report": result, "messages": [AIMessage(content=result)]}
 
 
 async def designer_output_node(
-    state: RTLGraphState, designer: TeamAgent, injector=None
+    state: RTLGraphState,
+    designer: TeamAgent,
+    injector=None,
+    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
     """Designer 基于最终 RTL 与验证报告整理交付文件,输出最终答案。"""
     task = state["task"]
@@ -253,7 +285,7 @@ async def designer_output_node(
         parts.append(f"【验证报告】\n{report}")
     parts.append("请整理以上内容,输出最终交付文件清单与完整 RTL 源码(作为最终交付物)。")
     prompt_task = "\n\n".join(parts)
-    result = await asyncio.to_thread(designer.verilog_design_task, prompt_task, injector)
+    result = await designer.averilog_design_task(prompt_task, injector, config)
     return {"final_answer": result, "messages": [AIMessage(content=result)]}
 
 

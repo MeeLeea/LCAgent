@@ -37,6 +37,11 @@ class CapturingWorker:
         self.received_config = config
         return self.response
 
+    async def aexecute_task(self, plan: str, injector=None, config: dict[str, Any] | None = None) -> str:
+        """异步版 execute_task(节点现直接 await 调用)"""
+        self.received_config = config
+        return self.response
+
 
 def test_worker_exec_node_passes_workspace_config():
     """simple 的 worker_exec 节点:config(含 workspace_path)透传给 execute_task。"""

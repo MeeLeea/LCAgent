@@ -46,6 +46,16 @@ class FakeAgent:
         self.calls.append(("invoke", task))
         return self.response
 
+    async def ainvoke(self, task: str, config=None) -> str:
+        """异步版 invoke:记录调用并返回模拟结果(与同步版同前缀,兼容既有断言)"""
+        self.calls.append(("invoke", task))
+        return self.response
+
+    async def asummarize_context(self, memory_text: str, config=None) -> str:
+        """异步版 summarize_context:记录调用并返回模拟摘要"""
+        self.calls.append(("summarize", memory_text))
+        return self.summary_response
+
     def summarize_context(self, memory_text: str) -> str:
         """记录记忆提炼调用并返回模拟摘要"""
         self.calls.append(("summarize", memory_text))
@@ -74,8 +84,26 @@ class FakeAgent:
         self.calls.append(("invoke", prompt))
         return self.response
 
+    async def aplan_task(self, task: str, context_summary: str = "", injector=None, config=None) -> str:
+        """异步版 plan_task:记录调用并返回模拟结果(与同步版同前缀,兼容既有断言)"""
+        prompt = self.render_template(
+            self.get_template("manager_plan"), task=task, context_summary=context_summary
+        )
+        if injector is not None:
+            prompt = injector.inject_into_prompt(prompt, task)
+        self.calls.append(("invoke", prompt))
+        return self.response
+
     def execute_task(self, plan: str, injector=None, config=None) -> str:
         """记录执行调用并返回模拟结果"""
+        prompt = self.render_template(self.get_template("worker_exec"), plan=plan)
+        if injector is not None:
+            prompt = injector.inject_into_prompt(prompt, plan)
+        self.calls.append(("invoke", prompt))
+        return self.response
+
+    async def aexecute_task(self, plan: str, injector=None, config=None) -> str:
+        """异步版 execute_task:记录调用并返回模拟结果(与同步版同前缀)"""
         prompt = self.render_template(self.get_template("worker_exec"), plan=plan)
         if injector is not None:
             prompt = injector.inject_into_prompt(prompt, plan)
@@ -91,6 +119,28 @@ class FakeAgent:
         injector=None,
     ) -> str:
         """记录汇总调用并返回模拟结果"""
+        prompt = self.render_template(
+            self.get_template("terminator_final"),
+            task=task,
+            plan=plan,
+            worker_result=worker_result,
+            context_summary=context_summary,
+        )
+        if injector is not None:
+            prompt = injector.inject_into_prompt(prompt, task)
+        self.calls.append(("invoke", prompt))
+        return self.response
+
+    async def afinalize(
+        self,
+        task: str,
+        plan: str,
+        worker_result: str,
+        context_summary: str = "",
+        injector=None,
+        config=None,
+    ) -> str:
+        """异步版 finalize:记录调用并返回模拟结果(与同步版同前缀)"""
         prompt = self.render_template(
             self.get_template("terminator_final"),
             task=task,
@@ -929,6 +979,149 @@ def test_ainvoke_team_agent_prefers_ainvoke():
     result = asyncio.run(ainvoke_team_agent(agent, "任务"))
     assert result == "async done"
     assert agent.calls == [("ainvoke", "任务")]
+
+
+# ==================== 测试 TeamAgent 异步能力(ainvoke/astream) ====================
+
+
+class FakeChunk:
+    """模拟 langchain AIMessageChunk:仅含 content。"""
+
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+
+class FakeChatModel:
+    """模拟 langchain chat model:记录 astream 调用与收到的 config。"""
+
+    def __init__(self, chunks: list[str]) -> None:
+        self.chunks = chunks
+        self.received_config: dict | None = None
+
+    async def astream(self, messages, config=None):
+        self.received_config = config
+        for content in self.chunks:
+            yield FakeChunk(content)
+
+
+class FakeLLMClient:
+    """模拟 LLMClient(纯文本模式):get_chat_model 返回 FakeChatModel。"""
+
+    def __init__(self, chunks: list[str]) -> None:
+        self.model = FakeChatModel(chunks)
+
+    def get_chat_model(self):
+        return self.model
+
+
+class FakeAgentExecutor:
+    """模拟 create_agent 产物:astream_events 产出 on_chat_model_stream。"""
+
+    def __init__(self, chunks: list[str]) -> None:
+        self.chunks = chunks
+        self.received_config: dict | None = None
+
+    async def astream_events(self, inputs, config=None, version=None):
+        self.received_config = config
+        for content in self.chunks:
+            yield {"event": "on_chat_model_stream", "data": {"chunk": FakeChunk(content)}}
+        yield {"event": "on_chain_end", "data": {}}
+
+
+def _make_text_agent(chunks: list[str]) -> TeamAgent:
+    """构造纯文本模式 TeamAgent 替身(跳过 __init__,避免真实 LLMClient)。"""
+    agent = TeamAgent.__new__(TeamAgent)
+    agent.name = "test"
+    agent.system_prompt = "系统提示"
+    agent.llm = FakeLLMClient(chunks)
+    agent.agent_executor = None
+    agent.verbose = False
+    return agent
+
+
+def test_team_agent_astream_pure_text_yields_chunks():
+    """纯文本模式 astream:逐块产出 LLM 流式输出,空块被过滤。"""
+    agent = _make_text_agent(["你", "", "好"])
+
+    async def _run():
+        return [c async for c in agent.astream("任务")]
+
+    assert asyncio.run(_run()) == ["你", "好"]
+
+
+def test_team_agent_ainvoke_aggregates_stream():
+    """ainvoke = astream 聚合:返回拼接结果。"""
+    agent = _make_text_agent(["你", "好"])
+
+    async def _run():
+        return await agent.ainvoke("任务")
+
+    assert asyncio.run(_run()) == "你好"
+
+
+def test_team_agent_astream_passes_callbacks():
+    """astream 透传外层 callbacks 到 chat model(TOKEN 流式通道)。"""
+    agent = _make_text_agent(["a"])
+    sentinel = object()
+    config = {"callbacks": [sentinel]}
+
+    async def _run():
+        _ = [c async for c in agent.astream("任务", config)]
+
+    asyncio.run(_run())
+    assert agent.llm.model.received_config == {"callbacks": [sentinel]}
+
+
+def test_team_agent_astream_with_tools_yields_token_chunks():
+    """工具模式 astream:经 astream_events 过滤 on_chat_model_stream 产出 token。"""
+    agent = _make_text_agent([])
+    agent.agent_executor = FakeAgentExecutor(["工", "具"])
+    agent.max_iterations = 10
+
+    async def _run():
+        return [c async for c in agent.astream("任务")]
+
+    assert asyncio.run(_run()) == ["工", "具"]
+
+
+def test_team_agent_astream_with_tools_workspace_and_callbacks():
+    """工具模式 astream:提取 workspace_path 并透传 callbacks,thread_id 不透传。"""
+    agent = _make_text_agent([])
+    executor = FakeAgentExecutor(["x"])
+    agent.agent_executor = executor
+    agent.max_iterations = 10
+    config = {
+        "configurable": {"workspace_path": "C:/ws", "thread_id": "t1"},
+        "callbacks": [object()],
+    }
+
+    async def _run():
+        _ = [c async for c in agent.astream("任务", config)]
+
+    asyncio.run(_run())
+    assert executor.received_config["recursion_limit"] == 10
+    assert executor.received_config["configurable"] == {"workspace_path": "C:/ws"}
+    assert "callbacks" in executor.received_config
+    assert executor.received_config["configurable"].get("thread_id") is None
+
+
+def test_team_agent_astream_error_yields_error_message():
+    """LLM 流式失败时 yield 错误信息(与同步版行为一致)。"""
+
+    class BoomModel(FakeChatModel):
+        async def astream(self, messages, config=None):
+            if False:  # 保持 async generator 语义(遍历时才执行函数体)
+                yield
+            raise RuntimeError("模型挂了")
+
+    agent = _make_text_agent([])
+    agent.llm.model = BoomModel([])
+    agent.verbose = False
+
+    async def _run():
+        return [c async for c in agent.astream("任务")]
+
+    assert asyncio.run(_run()) == ["任务执行失败: 模型挂了"]
 
 
 # ==================== 测试 SkillInjector 技能注入 ====================

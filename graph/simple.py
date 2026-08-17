@@ -5,9 +5,10 @@
 工作流状态定义、节点函数与图构建逻辑。
 
 异步化说明：
-    节点函数全部为 async，通过 asyncio.to_thread 执行团队 Agent 的同步方法
-    （不阻塞事件循环）；技能注入通过 SkillInjector 在节点渲染 prompt 时
-    追加技能指引块（TeamAgent 零改动）。
+    节点函数全部为 async，直接 await 团队 Agent 的异步业务方法
+    （aplan_task/aexecute_task/afinalize/asummarize_context，内部经 TeamAgent.astream
+    流式执行 LLM，token 增量经 config["callbacks"] 流出到外层事件流）；技能注入
+    通过 SkillInjector 在节点渲染 prompt 时追加技能指引块。
 
 workspace 隔离说明：
     worker_exec 节点接收 LangGraph 注入的 config（含 configurable.workspace_path），
@@ -22,7 +23,6 @@ workspace 隔离说明：
 """
 from __future__ import annotations
 
-import asyncio
 from functools import partial
 from typing import Annotated, Optional, TypedDict
 
@@ -59,24 +59,34 @@ class WorkflowState(TypedDict, total=False):
 
 
 # 2. 节点函数(提示词模板由各角色 TeamAgent 懒加载,节点需要时调用 get_template)
-async def summarize_context(state: WorkflowState, manager, injector=None) -> WorkflowState:
+async def summarize_context(
+    state: WorkflowState,
+    manager,
+    injector=None,
+    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 见 worker_exec_node 注释
+) -> WorkflowState:
     """Manager 提炼记忆上下文,生成分发给下游节点的上下文摘要
 
-    raw_context 为空时仍调用 manager.summarize_context（其内部短路返回空串），
+    raw_context 为空时仍调用 manager.asummarize_context（其内部短路返回空串），
     保持调用链可观测性（测试依赖 summarize 总是被调用的行为）。
+
+    config 透传(含 callbacks):使 summarize 的 LLM token 增量可流出到外层事件流。
     """
     raw = state.get("raw_context", "")
-    # TeamAgent.summarize_context 为同步方法,经 to_thread 异步执行避免阻塞事件循环
-    result = await asyncio.to_thread(manager.summarize_context, raw)
+    result = await manager.asummarize_context(raw, config)
     return {"context_summary": result, "messages": [AIMessage(content=result)]}
 
 
-async def manager_plan_node(state: WorkflowState, manager, injector=None) -> WorkflowState:
+async def manager_plan_node(
+    state: WorkflowState,
+    manager,
+    injector=None,
+    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 见 worker_exec_node 注释
+) -> WorkflowState:
     """Manager 拆解任务,生成执行计划(结合记忆上下文摘要)"""
     task = state["task"]
     summary = state.get("context_summary", "")
-    # TeamAgent.plan_task 为同步方法,经 to_thread 异步执行避免阻塞事件循环
-    result = await asyncio.to_thread(manager.plan_task, task, summary, injector)
+    result = await manager.aplan_task(task, summary, injector, config)
     return {"plan": result, "messages": [AIMessage(content=result)]}
 
 
@@ -89,7 +99,8 @@ async def worker_exec_node(
     """Worker 执行计划中的子任务。
 
     config 由 LangGraph 按节点签名以关键字注入（含 configurable.workspace_path），
-    透传给 Worker.execute_task 使工具调用受 workspace 隔离约束。
+    透传给 Worker.aexecute_task 使工具调用受 workspace 隔离约束、LLM token 增量
+    经 callbacks 流出到外层事件流。
 
     注:必须用 Optional[RunnableConfig] 而非 RunnableConfig | None——模块启用
     ``from __future__ import annotations`` 后注解为字符串,仅
@@ -97,21 +108,22 @@ async def worker_exec_node(
     'RunnableConfig | None' 字符串不匹配会导致 config 静默不注入。
     """
     plan = state["plan"]
-    # TeamAgent.execute_task 为同步方法,经 to_thread 异步执行避免阻塞事件循环
-    result = await asyncio.to_thread(worker.execute_task, plan, injector, config)
+    result = await worker.aexecute_task(plan, injector, config)
     return {"worker_result": result, "messages": [AIMessage(content=result)]}
 
 
-async def terminator_final_node(state: WorkflowState, terminator, injector=None) -> WorkflowState:
+async def terminator_final_node(
+    state: WorkflowState,
+    terminator,
+    injector=None,
+    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 见 worker_exec_node 注释
+) -> WorkflowState:
     """Terminator 汇总结果并返回最终答案(结合记忆上下文摘要)"""
     task = state["task"]
     plan = state["plan"]
     worker_result = state["worker_result"]
     summary = state.get("context_summary", "")
-    # TeamAgent.finalize 为同步方法,经 to_thread 异步执行避免阻塞事件循环
-    result = await asyncio.to_thread(
-        terminator.finalize, task, plan, worker_result, summary, injector
-    )
+    result = await terminator.afinalize(task, plan, worker_result, summary, injector, config)
     return {"final_answer": result, "messages": [AIMessage(content=result)]}
 
 
