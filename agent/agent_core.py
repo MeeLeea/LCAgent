@@ -30,16 +30,16 @@ from tools.mcp_pool import MCPPool, ServerStatus
 from tools.skills import SkillManager, default_skills_dir
 from tools.terminal_tools import UserRejectedCommandError
 from tools.tool_wrapper import wrap_tools_with_timeout
+from utils.compaction import (
+    CompactionConfig,
+    LCAgentCompactionMiddleware,
+    LCAgentState,
+)
 from utils.events import AgentEvent
 from utils.exceptions import AgentStateError
 from utils.logging_config import TraceContext, generate_trace_id
 from utils.metrics import MetricsCollector
 
-from .compaction import (
-    CompactionConfig,
-    LCAgentCompactionMiddleware,
-    LCAgentState,
-)
 from .llm_client import RETRY_ATTEMPTS, RETRY_MAX_DELAY, LLMClient, should_retry
 from .message_utils import build_interrupt_event, extract_llm_error, stringify_content
 from .skill_middleware import SkillInjectionMiddleware
