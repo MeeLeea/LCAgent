@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from agent.events import AgentEvent, EventType
+from utils.events import AgentEvent, EventType
 from memory.lock_pool import ThreadMemoryLockPool
 from memory.manager import MemoryManager
 from memory.models import ThreadFactItem

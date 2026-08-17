@@ -8,7 +8,7 @@
 - 未设置时显示 "-" 占位
 
 用法:
-    from agent.logging_config import setup_logging, TraceContext
+    from utils.logging_config import setup_logging, TraceContext
 
     # 程序入口调用一次
     setup_logging(level=logging.INFO)

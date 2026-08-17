@@ -157,7 +157,7 @@ class TestSubmitAndConsume:
     def test_consume_event_skips_non_memory_worthy(self):
         """TOKEN 事件不提交记忆。"""
         async def run():
-            from agent.events import AgentEvent, EventType
+            from utils.events import AgentEvent, EventType
 
             mgr, _ = _make_manager()
             event = AgentEvent.token("hello", thread_id="t1")
@@ -169,7 +169,7 @@ class TestSubmitAndConsume:
     def test_consume_event_done_with_content(self):
         """DONE 事件（有内容）提交记忆。"""
         async def run():
-            from agent.events import AgentEvent, EventType
+            from utils.events import AgentEvent, EventType
 
             mgr, _ = _make_manager()
             event = AgentEvent(
@@ -184,7 +184,7 @@ class TestSubmitAndConsume:
 
     def test_consume_event_skips_empty_thread_id(self):
         async def run():
-            from agent.events import AgentEvent, EventType
+            from utils.events import AgentEvent, EventType
 
             mgr, _ = _make_manager()
             event = AgentEvent(

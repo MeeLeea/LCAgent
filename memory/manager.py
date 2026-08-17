@@ -35,7 +35,7 @@ from .models import MemoryCategory, ThreadFactItem
 from .store import ThreadMemoryStore
 
 if TYPE_CHECKING:
-    from agent.events import AgentEvent, EventType
+    from utils.events import AgentEvent, EventType
 
 logger = logging.getLogger(__name__)
 

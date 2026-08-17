@@ -27,8 +27,8 @@ import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
-from agent.events import AgentEvent
 from memory.manager import MemoryManager
+from utils.events import AgentEvent
 
 from .registry import SessionRegistry
 

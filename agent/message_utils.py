@@ -7,7 +7,8 @@
 import re
 from typing import Any
 
-from .events import make_interrupt_dict
+from utils.events import make_interrupt_dict
+
 from .llm_client import _RETRYABLE_KEYWORDS
 
 # ============ LLM 异常提取 ============
