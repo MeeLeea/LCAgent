@@ -58,6 +58,27 @@ class FakeGraph:
         self.update_calls.append((config, update))
 
 
+class FakeGraphToken(FakeGraph):
+    """在节点执行期间额外触发 on_chat_model_stream 的图(TOKEN 事件)。
+
+    模拟 TeamAgent.astream 透传 callbacks 后,LLM token 增量到达
+    NodeTrackingHandler.on_chat_model_stream 的场景;含一个空 content 块,
+    验证空块被过滤不产生事件。
+    """
+
+    async def ainvoke(self, state, config):
+        self.last_state = state
+        self.last_config = config
+        handler = config["callbacks"][0]
+        handler.on_chain_start(
+            {}, {}, run_id="r1", metadata={"langgraph_node": "node_a"}
+        )
+        handler.on_chat_model_stream(types.SimpleNamespace(content="增量文本"))
+        handler.on_chat_model_stream(types.SimpleNamespace(content=""))
+        handler.on_chain_end({}, run_id="r1")
+        return dict(self.result)
+
+
 class FakeStore:
     """模拟 SessionStore（执行历史按会话隔离）。"""
 
@@ -187,6 +208,34 @@ def test_arun_events_node_flow(monkeypatch):
     assert done.content == "最终完成"
     assert done.thread_id == "workflow-simple-thread-1"
     assert done.is_important is True
+
+
+def test_arun_events_emits_token_stream(monkeypatch):
+    """节点执行期间 LLM token 增量 → TOKEN 事件;空块被过滤。
+
+    模拟 TeamAgent.astream 透传 callbacks 后,LLM 的 on_chat_model_stream
+    事件被 NodeTrackingHandler 捕获转发为 TOKEN 事件。
+    """
+    fake_graph = FakeGraphToken()
+    monkeypatch.setattr(
+        "graph.registry.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
+    adapter = _make_adapter()
+
+    events = _collect(adapter, thread_id="workflow-simple-thread-1")
+
+    tokens = [ev for ev in events if ev.event_type == EventType.TOKEN]
+    assert [t.content for t in tokens] == ["增量文本"]
+    assert tokens[0].thread_id == "workflow-simple-thread-1"
+    assert tokens[0].role == "assistant"
+    # 事件顺序保持: NODE_START → TOKEN → NODE_END → DONE
+    assert [ev.event_type for ev in events] == [
+        EventType.NODE_START,
+        EventType.TOKEN,
+        EventType.NODE_END,
+        EventType.DONE,
+    ]
 
 
 def test_arun_events_not_workflow_session():

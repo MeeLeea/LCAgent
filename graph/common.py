@@ -43,6 +43,10 @@ class NodeTrackingHandler(BaseCallbackHandler):
     写入的 ``metadata["langgraph_node"]`` 字段识别业务节点（子图/内部 agent 的节点
     不在 known_nodes 中会被过滤），在节点开始/结束/异常时构造 AgentEvent
     （NODE_START / NODE_END / NODE_ERROR）并转发给外部回调。
+
+    此外捕获 ``on_chat_model_stream``：节点内 TeamAgent.astream 透传 callbacks
+    后，LLM token 增量事件到达本 handler，构造 AgentEvent.token 转发给外部回调，
+    实现 workflow 节点执行期间的前端 TOKEN 级流式。
     """
 
     def __init__(
@@ -51,11 +55,13 @@ class NodeTrackingHandler(BaseCallbackHandler):
         on_node_start: NodeCallback | None = None,
         on_node_end: NodeCallback | None = None,
         on_node_error: NodeCallback | None = None,
+        on_token: NodeCallback | None = None,
     ) -> None:
         self.known_nodes = known_nodes
         self.on_node_start = on_node_start
         self.on_node_end = on_node_end
         self.on_node_error = on_node_error
+        self.on_token = on_token
         # run_id -> 节点名：on_chain_end/on_chain_error 无节点名参数，需按 run_id 反查
         self._active: dict[str, str] = {}
         # ainvoke 期间同步回调默认经 run_in_executor 在线程池执行；置为 True 使回调
@@ -79,6 +85,19 @@ class NodeTrackingHandler(BaseCallbackHandler):
         node = self._active.pop(run_id, None)
         if node and self.on_node_error:
             self.on_node_error(AgentEvent.node_error(node=node))
+
+    def on_chat_model_stream(self, response: Any, **kwargs: Any) -> None:
+        """LLM token 增量 → TOKEN 事件转发。
+
+        节点内 TeamAgent.astream 透传 callbacks 后,LLM 的 on_chat_model_stream
+        事件到达此处。仅转发非空文本块(空块/工具调用参数块无展示价值)。
+        thread_id/trace_id 由外层闭包补充。
+        """
+        if not self.on_token:
+            return
+        content = getattr(response, "content", None)
+        if isinstance(content, str) and content:
+            self.on_token(AgentEvent.token(text=content))
 
 
 async def ainvoke_team_agent(agent, prompt: str) -> str:

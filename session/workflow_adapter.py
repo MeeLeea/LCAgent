@@ -272,12 +272,25 @@ class WorkflowAdapter:
         known_nodes = {
             n.id for n in graph.get_graph().nodes.values() if not n.id.startswith("__")
         }
+
+        def _on_token(ev: AgentEvent) -> None:
+            """LLM token 增量 → TOKEN 事件入队(补充会话元数据)"""
+            node_queue.put_nowait(
+                AgentEvent.token(
+                    text=ev.content,
+                    thread_id=tid,
+                    role="assistant",
+                    trace_id=trace_id,
+                )
+            )
+
         config["callbacks"] = [
             NodeTrackingHandler(
                 known_nodes,
                 on_node_start=node_queue.put_nowait,
                 on_node_end=node_queue.put_nowait,
                 on_node_error=node_queue.put_nowait,
+                on_token=_on_token,
             )
         ]
 
