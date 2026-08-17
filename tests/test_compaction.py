@@ -9,7 +9,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from agent.compaction import (
+from utils.compaction import (
     CompactionConfig,
     LCAgentCompactionMiddleware,
     LCAgentState,

@@ -382,7 +382,7 @@ class TestCompactionCallback:
 
     def test_sync_callback_called(self):
         """同步压缩时回调被调用"""
-        from agent.compaction import CompactionConfig, LCAgentCompactionMiddleware
+        from utils.compaction import CompactionConfig, LCAgentCompactionMiddleware
 
         calls = []
 
@@ -411,7 +411,7 @@ class TestCompactionCallback:
         """异步压缩时回调被调用"""
         import asyncio
 
-        from agent.compaction import CompactionConfig, LCAgentCompactionMiddleware
+        from utils.compaction import CompactionConfig, LCAgentCompactionMiddleware
 
         calls = []
 
@@ -440,7 +440,7 @@ class TestCompactionCallback:
 
     def test_no_callback_when_not_set(self):
         """未设置回调时不报错"""
-        from agent.compaction import CompactionConfig, LCAgentCompactionMiddleware
+        from utils.compaction import CompactionConfig, LCAgentCompactionMiddleware
 
         model = SimpleNamespace(
             invoke=lambda prompt: SimpleNamespace(text="摘要内容"),
@@ -457,7 +457,7 @@ class TestCompactionCallback:
 
     def test_callback_exception_swallowed(self):
         """回调抛异常时不影响压缩结果"""
-        from agent.compaction import CompactionConfig, LCAgentCompactionMiddleware
+        from utils.compaction import CompactionConfig, LCAgentCompactionMiddleware
 
         def bad_callback(trigger, before, after, summary_len, duration_ms):
             raise RuntimeError("callback error")
