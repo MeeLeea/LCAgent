@@ -53,6 +53,15 @@ class EventType(str, Enum):
     DONE = "done"
     """本轮执行结束"""
 
+    NODE_START = "node_start"
+    """LangGraph 业务节点开始执行"""
+
+    NODE_END = "node_end"
+    """LangGraph 业务节点正常结束"""
+
+    NODE_ERROR = "node_error"
+    """LangGraph 业务节点执行异常"""
+
 
 def _naive_now_iso() -> str:
     """返回本地 naive ISO 时间字符串（兼容历史数据格式）。"""
@@ -87,6 +96,7 @@ class AgentEvent:
         interrupt_choices: 中断可选项列表（INTERRUPT 事件）
         timestamp: 事件产生时间（naive ISO 字符串）
         trace_id: 追踪 ID（用于日志关联）
+        node: 业务节点名（仅 NODE_START / NODE_END / NODE_ERROR 事件有意义）
     """
 
     event_type: EventType
@@ -101,6 +111,7 @@ class AgentEvent:
     interrupt_choices: list[Any] = field(default_factory=list)
     timestamp: str = field(default_factory=_naive_now_iso)
     trace_id: str = ""
+    node: str = ""
 
     # ============ 工厂方法 ============
 
@@ -232,6 +243,54 @@ class AgentEvent:
             trace_id=trace_id,
         )
 
+    @classmethod
+    def node_start(
+        cls,
+        *,
+        node: str,
+        thread_id: str = "",
+        trace_id: str = "",
+    ) -> AgentEvent:
+        """创建业务节点开始执行事件。"""
+        return cls(
+            event_type=EventType.NODE_START,
+            node=node,
+            thread_id=thread_id,
+            trace_id=trace_id,
+        )
+
+    @classmethod
+    def node_end(
+        cls,
+        *,
+        node: str,
+        thread_id: str = "",
+        trace_id: str = "",
+    ) -> AgentEvent:
+        """创建业务节点正常结束事件。"""
+        return cls(
+            event_type=EventType.NODE_END,
+            node=node,
+            thread_id=thread_id,
+            trace_id=trace_id,
+        )
+
+    @classmethod
+    def node_error(
+        cls,
+        *,
+        node: str,
+        thread_id: str = "",
+        trace_id: str = "",
+    ) -> AgentEvent:
+        """创建业务节点执行异常事件。"""
+        return cls(
+            event_type=EventType.NODE_ERROR,
+            node=node,
+            thread_id=thread_id,
+            trace_id=trace_id,
+        )
+
     # ============ 查询方法 ============
 
     @property
@@ -270,6 +329,8 @@ class AgentEvent:
         - cancelled: {"type": "cancelled", "content"}
         - error: {"type": "error", "content"}
         - done: {"type": "done"}
+        - node_start/node_end/node_error: {"type": "workflow_node", "node", "status"}
+          其中 status 分别为 running / done / error（兼容前端 workflow_node 协议）
         """
         if self.event_type == EventType.TOKEN:
             return {"type": "token", "content": self.content}
@@ -295,7 +356,13 @@ class AgentEvent:
             return {"type": "error", "content": self.content}
         elif self.event_type == EventType.DONE:
             return {"type": "done"}
-        return {"type": "unknown"}
+        elif self.event_type == EventType.NODE_START:
+            return {"type": "workflow_node", "node": self.node, "status": "running"}
+        elif self.event_type == EventType.NODE_END:
+            return {"type": "workflow_node", "node": self.node, "status": "done"}
+        elif self.event_type == EventType.NODE_ERROR:
+            return {"type": "workflow_node", "node": self.node, "status": "error"}
+        return {"type": "unknown", "event_type": str(self.event_type)}
 
 
 __all__ = [

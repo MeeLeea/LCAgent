@@ -913,8 +913,8 @@ def test_run_simple_workflow_node_callbacks():
     asyncio.run(arun_simple_workflow(
         graph,
         "测试任务",
-        on_node_start=lambda n: events.append(("start", n)),
-        on_node_end=lambda n: events.append(("end", n)),
+        on_node_start=lambda e: events.append(("start", e.node)),
+        on_node_end=lambda e: events.append(("end", e.node)),
     ))
 
     expected = ["summarize", "manager_plan", "worker_exec", "terminator_final"]
@@ -949,11 +949,13 @@ def test_run_workflow_emits_workflow_events(monkeypatch):
 
     async def fake_run(graph, task, raw_context="", thread_id=None, workspace_path=None, on_node_start=None, on_node_end=None):
         # 模拟 4 个业务节点依次执行:每个节点 start → end
+        from utils.events import AgentEvent
+
         for node in ("summarize", "manager_plan", "worker_exec", "terminator_final"):
             if on_node_start:
-                on_node_start(node)
+                on_node_start(AgentEvent.node_start(node=node))
             if on_node_end:
-                on_node_end(node)
+                on_node_end(AgentEvent.node_end(node=node))
         return {"final_answer": "答案"}
 
     monkeypatch.setattr("graph.registry.build_workflow", fake_build)

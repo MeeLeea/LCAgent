@@ -24,12 +24,13 @@ from typing import Any
 
 from langchain_core.callbacks import BaseCallbackHandler
 
+from utils.events import AgentEvent
 from utils.logging_config import TraceContext
 
 logger = logging.getLogger(__name__)
 
-# 节点进度回调类型:接收节点名
-NodeCallback = Callable[[str], None]
+# 节点进度回调类型:接收 AgentEvent（NODE_START / NODE_END / NODE_ERROR 事件）
+NodeCallback = Callable[[AgentEvent], None]
 
 
 class NodeTrackingHandler(BaseCallbackHandler):
@@ -37,7 +38,8 @@ class NodeTrackingHandler(BaseCallbackHandler):
 
     通过 ``config["callbacks"]`` 注入 ``graph.invoke``，利用 LangGraph 节点执行时
     写入的 ``metadata["langgraph_node"]`` 字段识别业务节点（子图/内部 agent 的节点
-    不在 known_nodes 中会被过滤），在节点开始/结束/异常时转发给外部回调。
+    不在 known_nodes 中会被过滤），在节点开始/结束/异常时构造 AgentEvent
+    （NODE_START / NODE_END / NODE_ERROR）并转发给外部回调。
     """
 
     def __init__(
@@ -63,17 +65,17 @@ class NodeTrackingHandler(BaseCallbackHandler):
         if node in self.known_nodes:
             self._active[run_id] = node
             if self.on_node_start:
-                self.on_node_start(node)
+                self.on_node_start(AgentEvent.node_start(node=node))
 
     def on_chain_end(self, output: Any, *, run_id: str, **kwargs: Any) -> None:
         node = self._active.pop(run_id, None)
         if node and self.on_node_end:
-            self.on_node_end(node)
+            self.on_node_end(AgentEvent.node_end(node=node))
 
     def on_chain_error(self, error: BaseException, *, run_id: str, **kwargs: Any) -> None:
         node = self._active.pop(run_id, None)
         if node and self.on_node_error:
-            self.on_node_error(node)
+            self.on_node_error(AgentEvent.node_error(node=node))
 
 
 async def ainvoke_team_agent(agent, prompt: str) -> str:

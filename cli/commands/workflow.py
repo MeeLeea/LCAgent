@@ -7,6 +7,8 @@ import logging
 
 from langchain_core.messages import AIMessage, HumanMessage
 
+from utils.events import AgentEvent
+
 from .types import HANDLED, CommandContext, CommandOutcome
 
 logger = logging.getLogger(__name__)
@@ -124,13 +126,13 @@ async def run_workflow(context: CommandContext, name: str, task: str) -> dict:
         if context.workflow_event_cb:
             context.workflow_event_cb(event)
 
-    def _on_node_start(node: str) -> None:
-        context.print(f"▸ 节点开始: {node}")
-        _emit({"type": "workflow_node", "node": node, "status": "running"})
+    def _on_node_start(event: AgentEvent) -> None:
+        context.print(f"▸ 节点开始: {event.node}")
+        _emit(event.to_sse_dict())
 
-    def _on_node_end(node: str) -> None:
-        context.print(f"✓ 节点完成: {node}")
-        _emit({"type": "workflow_node", "node": node, "status": "done"})
+    def _on_node_end(event: AgentEvent) -> None:
+        context.print(f"✓ 节点完成: {event.node}")
+        _emit(event.to_sse_dict())
 
     # 从会话上下文获取 workspace_path,使工作流内 Worker 工具调用受
     # WorkspaceSecurityMiddleware 约束(与 Agent 路径一致的隔离语义)。
