@@ -1,199 +1,86 @@
 """
-监督者模式工作流 - Manager 拆解 → Worker 执行 → Terminator 汇总
+监督者模式工作流（别名模块）- Manager 拆解 → Worker 执行 → Terminator 汇总
 
-与 graph/simple.py 结构相同(独立保留状态/节点/图定义),通过
-register_workflow 在模块被 import 时自注册(方式二)。
+本模块是 graph/simple.py 的别名/兼容层：pipline 与 simple 在历史上是
+逐字重复的同一套工作流定义（状态、节点、图结构完全一致），现已去重为
+对 graph/simple 符号的惰性 re-export，并保留 pipline 专属的
+build_pipline_workflow / arun_pipline_workflow 名称与 "pipline" 注册名，
+确保既有调用方（CLI、scheduler、测试、前端 workflow 名）零改动。
 
-异步化说明：
-    节点函数全部为 async，通过 asyncio.to_thread 执行团队 Agent 的同步方法
-    （不阻塞事件循环）；技能注入通过 SkillInjector 在节点渲染 prompt 时
-    追加技能指引块（TeamAgent 零改动）。
-
-workspace 隔离说明：
-    worker_exec 节点接收 LangGraph 注入的 config（含 configurable.workspace_path），
-    透传给 Worker.execute_task → self.invoke，使 Worker 工具调用受
-    WorkspaceSecurityMiddleware 约束（见 graph/common.arun_compiled_workflow）。
+循环导入说明：
+    graph.registry 初始化时（文件底部 _load_builtin_workflows）会扫描并
+    import 本模块，而本模块的符号来自 graph.simple；若 simple 正处于
+    部分初始化状态（它 import registry 后未执行完），顶层直接 import
+    simple 会触发 ImportError。因此：
+    - 节点函数/WorkflowState 通过 PEP 562 模块级 __getattr__ 惰性导出，
+      首次属性访问时才 import graph.simple（彼时必然已初始化完毕）；
+    - build/arun 以惰性委托 wrapper 提供（register_workflow 需要真实
+      可调用对象，执行时才解析 simple）。
 """
 from __future__ import annotations
 
-import asyncio
-from functools import partial
-from typing import Optional, TypedDict
+from typing import TYPE_CHECKING
 
-from langchain_core.runnables import RunnableConfig
-from langgraph.graph import END, START, StateGraph
-
-from graph.common import (
-    NodeCallback,
-    SkillInjector,
-    arun_compiled_workflow,
-)
 from graph.registry import register_workflow
 
-
-# 1. 定义工作流状态
-class WorkflowState(TypedDict):
-    """监督者工作流状态"""
-    task: str             # 用户原始任务
-    raw_context: str      # 原始记忆文本(当前会话+长期记忆,仅 summarize 节点消费)
-    context_summary: str  # Manager 提炼后的上下文摘要(注入 plan/final 节点)
-    plan: str             # Manager 拆解的执行计划
-    worker_result: str    # Worker 执行结果
-    final_answer: str     # Terminator 最终答案
-
-
-# 2. 节点函数(提示词模板由各角色 TeamAgent 懒加载,节点需要时调用 get_template)
-async def summarize_context(state: WorkflowState, manager, injector=None) -> WorkflowState:
-    """Manager 提炼记忆上下文,生成分发给下游节点的上下文摘要
-
-    raw_context 为空时仍调用 manager.summarize_context（其内部短路返回空串），
-    保持调用链可观测性（测试依赖 summarize 总是被调用的行为）。
-    """
-    raw = state.get("raw_context", "")
-    # TeamAgent.summarize_context 为同步方法,经 to_thread 异步执行避免阻塞事件循环
-    result = await asyncio.to_thread(manager.summarize_context, raw)
-    return {"context_summary": result}
-
-
-async def manager_plan_node(state: WorkflowState, manager, injector=None) -> WorkflowState:
-    """Manager 拆解任务,生成执行计划(结合记忆上下文摘要)"""
-    task = state["task"]
-    summary = state.get("context_summary", "")
-    # TeamAgent.plan_task 为同步方法,经 to_thread 异步执行避免阻塞事件循环
-    result = await asyncio.to_thread(manager.plan_task, task, summary, injector)
-    return {"plan": result}
-
-
-async def worker_exec_node(
-    state: WorkflowState,
-    worker,
-    injector=None,
-    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 见下文:须用 Optional 写法,LangGraph 注解判定仅接受该字符串形态
-) -> WorkflowState:
-    """Worker 执行计划中的子任务。
-
-    config 由 LangGraph 按节点签名以关键字注入（含 configurable.workspace_path），
-    透传给 Worker.execute_task 使工具调用受 workspace 隔离约束。
-
-    注:必须用 Optional[RunnableConfig] 而非 RunnableConfig | None——模块启用
-    ``from __future__ import annotations`` 后注解为字符串,仅
-    'Optional[RunnableConfig]'/'RunnableConfig' 在 LangGraph 判定中被接受,
-    'RunnableConfig | None' 字符串不匹配会导致 config 静默不注入。
-    """
-    plan = state["plan"]
-    # TeamAgent.execute_task 为同步方法,经 to_thread 异步执行避免阻塞事件循环
-    result = await asyncio.to_thread(worker.execute_task, plan, injector, config)
-    return {"worker_result": result}
-
-
-async def terminator_final_node(state: WorkflowState, terminator, injector=None) -> WorkflowState:
-    """Terminator 汇总结果并返回最终答案(结合记忆上下文摘要)"""
-    task = state["task"]
-    plan = state["plan"]
-    worker_result = state["worker_result"]
-    summary = state.get("context_summary", "")
-    # TeamAgent.finalize 为同步方法,经 to_thread 异步执行避免阻塞事件循环
-    result = await asyncio.to_thread(
-        terminator.finalize, task, plan, worker_result, summary, injector
-    )
-    return {"final_answer": result}
-
-
-# 3. 构建工作流图
-def build_pipline_workflow(
-    agents: dict,
-    checkpointer=None,
-    skills_dir: str | None = None,
-    auto_match_skills: bool = True,
-) -> StateGraph:
-    """
-    构建监督者模式工作流
-
-    Args:
-        agents: 角色字典,需包含 manager/worker/terminator 三个键,
-            分别对应管理者/执行者/终结者 Agent 实例
-        checkpointer: LangGraph checkpointer 实例。传入时图编译带持久化，
-            工作流状态按 thread_id 保存/恢复；为 None 时无持久化（测试/临时运行）。
-        skills_dir: 技能目录路径,为 None 时使用默认目录(.agents/skills)
-        auto_match_skills: 是否在节点渲染 prompt 时按任务自动匹配注入技能
-
-    Returns:
-        编译好的 LangGraph StateGraph
-    """
-    manager = agents["manager"]
-    worker = agents["worker"]
-    terminator = agents["terminator"]
-
-    # 技能注入器:节点渲染 prompt 时追加匹配的技能指引块
-    injector = SkillInjector(
-        skills_dir=skills_dir,
-        auto_match=auto_match_skills,
+if TYPE_CHECKING:
+    # 惰性 re-export 符号的类型占位:仅供静态检查(F822)解析,运行时经
+    # 模块级 __getattr__ 延迟导入,避免 registry 初始化扫描期的循环导入。
+    from graph.simple import (
+        WorkflowState,
+        manager_plan_node,
+        summarize_context,
+        terminator_final_node,
+        worker_exec_node,
     )
 
-    builder = StateGraph(WorkflowState)
-
-    # 添加节点(使用 partial 绑定 agent 实例;提示词模板由节点内懒加载)
-    # 注意:必须用 functools.partial 而非 lambda —— partial 保留 async 函数
-    # 的 coroutine 特征(LangGraph 据此判定节点为异步并 await),lambda 会返回
-    # 未 await 的 coroutine 导致 InvalidUpdateError
-    builder.add_node("summarize", partial(summarize_context, manager=manager, injector=injector))
-    builder.add_node("manager_plan", partial(manager_plan_node, manager=manager, injector=injector))
-    builder.add_node("worker_exec", partial(worker_exec_node, worker=worker, injector=injector))
-    builder.add_node("terminator_final", partial(terminator_final_node, terminator=terminator, injector=injector))
-
-    # 添加边: START → summarize → manager_plan → worker_exec → terminator_final → END
-    builder.add_edge(START, "summarize")
-    builder.add_edge("summarize", "manager_plan")
-    builder.add_edge("manager_plan", "worker_exec")
-    builder.add_edge("worker_exec", "terminator_final")
-    builder.add_edge("terminator_final", END)
-
-    return builder.compile(checkpointer=checkpointer)
+# simple 的惰性导入符号集:属性首次访问时 graph.simple 已完全初始化
+_LAZY_SYMBOLS = frozenset(
+    {
+        "WorkflowState",
+        "summarize_context",
+        "manager_plan_node",
+        "worker_exec_node",
+        "terminator_final_node",
+    }
+)
 
 
-# 4. 运行工作流
-async def arun_pipline_workflow(
-    graph: StateGraph,
-    task: str,
-    raw_context: str = "",
-    thread_id: str | None = None,
-    workspace_path: str | None = None,
-    on_node_start: NodeCallback | None = None,
-    on_node_end: NodeCallback | None = None,
-    on_node_error: NodeCallback | None = None,
-    max_history_chars: int = 6000,
-) -> dict:
+def __getattr__(name: str):
+    """PEP 562 模块级惰性属性:延迟 re-export graph.simple 的符号。"""
+    if name in _LAZY_SYMBOLS:
+        from graph import simple as _simple
+
+        return getattr(_simple, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def build_pipline_workflow(*args, **kwargs):
+    """构建监督者模式工作流（惰性委托 graph.simple.build_simple_workflow）。
+
+    保留 pipline 专属名称以兼容既有调用方;实际图构建逻辑与 simple 完全一致。
     """
-    运行监督者工作流（异步）
+    from graph import simple as _simple
 
-    Args:
-        graph: 编译好的工作流图
-        task: 用户任务
-        raw_context: 原始记忆文本(当前会话+长期记忆),为空则不注入记忆
-        thread_id: 会话线程 ID。为 None 时自动生成；传入显式值时配合
-            checkpointer 编译的图可实现状态持久化。
-        workspace_path: 会话绑定的工作空间绝对路径。为 None 时工作流内
-            Worker 工具调用不做 workspace 隔离（兼容旧场景）。
-        on_node_start: 节点开始回调,接收节点名(用于运行进度跟踪)
-        on_node_end: 节点结束回调,接收节点名
-        on_node_error: 节点异常回调,接收节点名
-        max_history_chars: 跨轮次记忆摘要最大字符数(超长截断)
+    return _simple.build_simple_workflow(*args, **kwargs)
 
-    Returns:
-        包含 final_answer 的结果字典
-    """
-    return await arun_compiled_workflow(
-        graph,
-        task,
-        state_fields={"plan": "", "worker_result": "", "final_answer": ""},
-        raw_context=raw_context,
-        thread_id=thread_id,
-        workspace_path=workspace_path,
-        on_node_start=on_node_start,
-        on_node_end=on_node_end,
-        on_node_error=on_node_error,
-        max_history_chars=max_history_chars,
-    )
+
+async def arun_pipline_workflow(*args, **kwargs) -> dict:
+    """运行监督者工作流（惰性委托 graph.simple.arun_simple_workflow）。"""
+    from graph import simple as _simple
+
+    return await _simple.arun_simple_workflow(*args, **kwargs)
+
+
+__all__ = [
+    "WorkflowState",
+    "arun_pipline_workflow",
+    "build_pipline_workflow",
+    "manager_plan_node",
+    "summarize_context",
+    "terminator_final_node",
+    "worker_exec_node",
+]
 
 
 # 注: import 置于模块顶部、调用置于文件末尾——register_workflow 与 WORKFLOWS
