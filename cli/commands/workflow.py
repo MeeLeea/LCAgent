@@ -1,167 +1,81 @@
 """
 Workflow 命令处理 - 多 Agent 工作流执行
+
+通过统一 SessionManager 门面（workflow_sm，绑定 WorkflowAdapter）执行：
+锁 / 记忆提交与沉淀 / checkpoint 跨轮次上下文 / 节点事件流全部由门面承载，
+命令层只负责输出渲染与事件转发。
 """
 from __future__ import annotations
 
 import logging
 
-from langchain_core.messages import AIMessage, HumanMessage
-
-from utils.events import AgentEvent
-
 from .types import HANDLED, CommandContext, CommandOutcome
 
 logger = logging.getLogger(__name__)
-
-# 注入工作流的原始记忆文本上限,防止超长上下文撑爆 summarize 的 LLM 调用
-MAX_RAW_CONTEXT_CHARS = 6000
-
-
-async def abuild_memory_context(agent) -> str:
-    """从 Agent 提取当前会话短期记忆与长期记忆，拼装为文本并截断。
-
-    短期记忆从 SessionRegistry 读取（checkpoint 消息），
-    长期记忆通过 SessionManager → MemoryManager.recall_text() 召回。
-
-    Args:
-        agent: AgentCore 实例（需有 session 和 _session_manager 属性）
-
-    Returns:
-        记忆文本;无记忆时返回空串
-    """
-    blocks = []
-
-    short_term = await agent.session.aget_short_term() or []
-    if short_term:
-        lines = [f"{item.get('role', 'user')}: {item.get('content', '')}" for item in short_term]
-        blocks.append("【当前会话】\n" + "\n".join(lines))
-
-    # 通过 SessionManager → MemoryManager 召回长期记忆
-    sm = getattr(agent, "_session_manager", None)
-    if sm is not None:
-        memory = getattr(sm, "memory", None)
-        if memory is not None:
-            long_term_text = await memory.recall_text(agent.session.current_session_id)
-            if long_term_text:
-                blocks.append(long_term_text.strip())
-
-    text = "\n\n".join(blocks).strip()
-    if len(text) > MAX_RAW_CONTEXT_CHARS:
-        text = text[:MAX_RAW_CONTEXT_CHARS] + "\n...(记忆文本过长,已截断)"
-    return text
-
-
-async def _arecord_workflow_result(
-    context: CommandContext, name: str, task: str, result: dict
-) -> None:
-    """把工作流任务与最终答案写回当前会话记忆,形成记忆闭环。
-
-    必须使用 LangGraph 的异步接口 ``aupdate_state``：会话层 checkpointer 为
-    ``AsyncSqliteSaver``,在主线程(事件循环所在线程)同步调用 ``update_state``
-    会抛 ``Synchronous calls to AsyncSqliteSaver are only allowed from a
-    different thread``。同仓库 ``agent_core.py`` 各处亦统一使用 ``aupdate_state``。
-    """
-    final_answer = result.get("final_answer", "")
-    if not final_answer:
-        return
-    executor = getattr(context.agent, "agent_executor", None)
-    if executor is None:
-        return
-    try:
-        await executor.aupdate_state(
-            context.agent._invoke_config(),
-            {"messages": [
-                HumanMessage(content=f"workflow:{name} {task}"),
-                AIMessage(content=final_answer),
-            ]},
-        )
-    except Exception as error:
-        # 写回失败不影响工作流主流程,记录后跳过
-        logger.warning("工作流记忆写回失败: %s", error)
 
 
 async def run_workflow(context: CommandContext, name: str, task: str) -> dict:
     """
     运行指定工作流 - 异步版本
 
-    从会话层注入 checkpointer，使工作流图编译带持久化：
-    工作流在专属 thread_id 下运行，状态自动保存到 checkpointer，
-    后续可通过同一 thread_id 恢复工作流进度。
+    经 ``context.workflow_sm.arun_stream`` 执行：workflow 专属会话在共享
+    SessionRegistry 下持久化（checkpoint），记忆提交/沉淀由门面自动完成。
 
     Args:
-        context: 命令上下文
+        context: 命令上下文（需注入 workflow_sm）
         name: 工作流名称
         task: 用户任务
 
     Returns:
         工作流执行结果字典(包含 final_answer)
     """
-    # 函数内延迟导入,避免循环依赖
-    from graph.registry import build_workflow, get_workflow_runner
-    from graph.simple import arun_simple_workflow
+    sm = context.workflow_sm
+    if sm is None:
+        raise RuntimeError("CommandContext 未注入 workflow_sm，无法执行工作流")
 
     context.print(f"\n构建工作流: {name}")
 
-    # 从会话层获取 checkpointer + 确定工作流 thread_id
-    # 若当前会话已是工作流专属会话（API 层通过 /api/session?type=workflow 创建），
-    # 复用其 thread_id 实现持久化绑定；否则生成新的工作流 thread_id（CLI 场景）。
-    checkpointer = getattr(context.agent.session, "checkpointer", None)
+    # 确定工作流 thread_id：当前会话已是 workflow 专属会话（API 层通过
+    # /api/session?type=workflow 创建）则复用其 thread_id 实现持久化绑定；
+    # 否则生成新的工作流 thread_id（CLI 场景）。
     current_sid = context.agent.session.current_session_id
     if context.agent.session.is_workflow_session(current_sid):
         workflow_thread_id = current_sid
     else:
         workflow_thread_id = context.agent.session.generate_session_id(name)
 
-    graph, agents = build_workflow(name, checkpointer=checkpointer)
-
-    # 从构建结果动态获取角色名,避免写死
-    role_names = "、".join(agents.keys())
-    context.print(f"初始化团队 Agent({role_names})...")
-    context.print(f"工作流 {name} 构建完成")
     context.print(f"\n执行任务: {task}")
     context.print("-" * 50)
 
-    # 节点进度跟踪:打印节点状态 + 转发结构化事件(供 SSE 等实时通道更新前端节点高亮)
+    # 节点/整体状态事件转发(供 SSE 等实时通道更新前端节点高亮)
     def _emit(event: dict[str, str]) -> None:
         if context.workflow_event_cb:
             context.workflow_event_cb(event)
 
-    def _on_node_start(event: AgentEvent) -> None:
-        context.print(f"▸ 节点开始: {event.node}")
-        _emit(event.to_sse_dict())
-
-    def _on_node_end(event: AgentEvent) -> None:
-        context.print(f"✓ 节点完成: {event.node}")
-        _emit(event.to_sse_dict())
-
-    # 从会话上下文获取 workspace_path,使工作流内 Worker 工具调用受
-    # WorkspaceSecurityMiddleware 约束(与 Agent 路径一致的隔离语义)。
-    # 未绑定工作空间的会话取到 None → 不注入 → 工具调用不做隔离(兼容旧会话)。
-    workspace_path = None
-    try:
-        session_ctx = context.agent.session.get_context(current_sid).config
-        workspace_path = session_ctx.get("configurable", {}).get("workspace_path")
-    except Exception:
-        workspace_path = None
-
     _emit({"type": "workflow_status", "status": "running"})
+    final_answer = ""
     try:
-        # 获取工作流专用异步运行器,缺失则回退到通用异步运行器
-        runner = get_workflow_runner(name) or arun_simple_workflow
-        result = await runner(
-            graph,
-            task,
-            raw_context=await abuild_memory_context(context.agent),
-            thread_id=workflow_thread_id,
-            workspace_path=workspace_path,
-            on_node_start=_on_node_start,
-            on_node_end=_on_node_end,
-        )
+        async for ev_dict in sm.arun_stream(task, thread_id=workflow_thread_id):
+            ev_type = ev_dict.get("type")
+            if ev_type == "workflow_node":
+                node = ev_dict.get("node", "")
+                status = ev_dict.get("status", "")
+                if status == "running":
+                    context.print(f"▸ 节点开始: {node}")
+                elif status == "done":
+                    context.print(f"✓ 节点完成: {node}")
+                elif status == "error":
+                    context.print(f"✗ 节点失败: {node}")
+                _emit(ev_dict)
+            elif ev_type == "done":
+                final_answer = ev_dict.get("content", "")
+            elif ev_type == "error":
+                context.print(f"\n工作流执行错误: {ev_dict.get('content', '')}")
+                _emit(ev_dict)
     finally:
         # 无论成功失败都复位整体状态,避免前端 UI 停留在"运行中"
         _emit({"type": "workflow_status", "status": "done"})
-    await _arecord_workflow_result(context, name, task, result)
-    return result
+    return {"final_answer": final_answer}
 
 
 async def workflow_command(context: CommandContext, user_input: str) -> CommandOutcome:

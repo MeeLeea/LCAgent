@@ -328,7 +328,7 @@ class AgentEvent:
         - interrupt: {"type": "interrupt", "prompt", "choices"}
         - cancelled: {"type": "cancelled", "content"}
         - error: {"type": "error", "content"}
-        - done: {"type": "done"}
+        - done: {"type": "done", "content": str}
         - node_start/node_end/node_error: {"type": "workflow_node", "node", "status"}
           其中 status 分别为 running / done / error（兼容前端 workflow_node 协议）
         """
@@ -355,7 +355,7 @@ class AgentEvent:
         elif self.event_type == EventType.ERROR:
             return {"type": "error", "content": self.content}
         elif self.event_type == EventType.DONE:
-            return {"type": "done"}
+            return {"type": "done", "content": self.content}
         elif self.event_type == EventType.NODE_START:
             return {"type": "workflow_node", "node": self.node, "status": "running"}
         elif self.event_type == EventType.NODE_END:

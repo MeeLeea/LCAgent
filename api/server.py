@@ -89,6 +89,9 @@ def load_server_config() -> dict[str, Any]:
 agent: AgentCore | None = None
 llm: LLMClient | None = None
 _startup_provider: str | None = None
+# workflow 链路统一门面（绑定 WorkflowAdapter）：全局单例保证 per-thread 锁
+# 跨请求共享；不主动 aclose（SessionManager.aclose 会 shutdown 共享 MemoryManager）
+workflow_sm: Any = None
 # 串行化对话轮次：AgentCore 是有状态单例，同一时刻只能跑一轮。
 # 全局管理锁：管理型命令/管理接口串行（dispatch_command 会操作共享管理状态）
 chat_lock = asyncio.Lock()
@@ -176,10 +179,16 @@ async def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     """在 FastAPI 生命周期内创建和释放 Agent 资源。"""
-    global agent, llm
+    global agent, llm, workflow_sm
     provider = _startup_provider or pick_default_provider()
     logger.info("初始化提供商: %s", provider)
     agent, llm = await build_agent(provider)
+    # workflow 链路统一门面：与 chat 门面共享 SessionRegistry / MemoryManager
+    from session.manager import create_workflow_session_manager
+
+    workflow_sm = create_workflow_session_manager(
+        agent.session, memory=agent.session_manager.memory
+    )
     safety_module.set_confirm_backend(safety_module.interrupt_confirm)
     info = llm.get_info()
     logger.info("模型: %s / %s", info["provider_name"], info["model"])
@@ -195,6 +204,7 @@ async def lifespan(_: FastAPI):
                 await mem_ctx.aclose()
         agent = None
         llm = None
+        workflow_sm = None
 
 
 def pick_default_provider() -> str:
@@ -723,6 +733,7 @@ async def chat(req: ChatRequest, request: Request):
                         config_file=AGENT_CONFIG_FILE,
                         mcp_config_file=MCP_CONFIG_FILE,
                         workflow_event_cb=emit_workflow_event,
+                        workflow_sm=workflow_sm,
                     )
                     
                     # 执行型命令（json:/react:/cot:/skill:<task>）走流式通道

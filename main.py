@@ -99,7 +99,13 @@ async def build_agent(provider: str, process_type: str | None = None) -> tuple[A
 def make_context(agent: AgentCore) -> CommandContext:
     """组装命令分发器所需的运行时依赖。"""
     from agent.llm_client import load_providers as list_providers
-    
+    from session.manager import create_workflow_session_manager
+
+    # workflow 链路统一门面：与 chat 门面共享 SessionRegistry / MemoryManager，
+    # 使 workflow 命令经同一套锁/记忆/事件流设施执行。
+    mm = getattr(agent.session_manager, "memory", None)
+    workflow_sm = create_workflow_session_manager(agent.session, memory=mm)
+
     # 命令模块只依赖该上下文，便于在测试中替换输入、菜单、LLM 和安全后端。
     return CommandContext(
         agent=agent,
@@ -114,6 +120,7 @@ def make_context(agent: AgentCore) -> CommandContext:
         run_structured_until_completion=run_structured_until_completion,
         chat_until_completion=chat_until_completion,
         safety_backend=safety_module,
+        workflow_sm=workflow_sm,
     )
 
 

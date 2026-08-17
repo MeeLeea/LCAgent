@@ -162,6 +162,9 @@ class CommandContext:
     mcp_backend: McpBackend | None = None
     # 工作流运行跟踪回调:推送节点/整体状态事件(SSE 等实时通道);None 时仅靠 print 输出
     workflow_event_cb: WorkflowEventFn | None = None
+    # workflow 链路的统一 SessionManager 门面(绑定 WorkflowAdapter)。
+    # 提供 arun_stream 等接口;为 None 时 workflow 命令不可用。
+    workflow_sm: Any = None
 
     def print(self, value: str = "") -> None:
         self.print_fn(value)
