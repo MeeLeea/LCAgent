@@ -1069,6 +1069,93 @@ def test_chat_resume_without_thread(client, mock_agent):
 
 
 # --------------------------------------------------------------------------- #
+# 停止生成（/api/stop）
+# --------------------------------------------------------------------------- #
+def test_stop_endpoint_marks_cancel(client, mock_agent):
+    """测试 /api/stop 置位 per-thread 取消信号并返回结果"""
+    from api.server import _cancel_events
+
+    tid = "test-thread-123"
+    _cancel_events[tid] = asyncio.Event()  # 模拟进行中的流
+    try:
+        response = client.post("/api/stop", json={"thread_id": tid})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["stopped"] is True
+        assert data["thread_id"] == tid
+        assert _cancel_events[tid].is_set() is True
+    finally:
+        _cancel_events.pop(tid, None)
+
+
+def test_stop_endpoint_uses_current_thread(client, mock_agent):
+    """测试未传 thread_id 时停止当前会话"""
+    from api.server import _cancel_events
+
+    tid = "test-thread-123"
+    _cancel_events[tid] = asyncio.Event()
+    try:
+        response = client.post("/api/stop", json={})
+        assert response.status_code == 200
+        assert response.json()["thread_id"] == tid
+        assert _cancel_events[tid].is_set() is True
+    finally:
+        _cancel_events.pop(tid, None)
+
+
+def test_stop_endpoint_idempotent_when_no_stream(client, mock_agent):
+    """测试无进行中流时 /api/stop 幂等返回 stopped=False"""
+    response = client.post("/api/stop", json={"thread_id": "nonexistent"})
+    assert response.status_code == 200
+    assert response.json()["stopped"] is False
+
+
+def test_chat_stop_mid_stream(client, mock_agent):
+    """流式生成中收到 /api/stop 应立即中止并返回 cancelled 事件"""
+    import threading
+    import time
+
+    # 挂起流：产出首个 token 后阻塞，模拟 LLM 长时间调用/SDK 内部重试
+    async def hanging_stream(message: str, thread_id: str | None = None):
+        yield {"type": "token", "content": "开始"}
+        await asyncio.sleep(30)
+        yield {"type": "token", "content": "不应到达"}
+        yield {"type": "done"}
+
+    mock_agent.session_manager.achat_stream = hanging_stream
+
+    events = []
+    errors: list[Exception] = []
+
+    def consume():
+        try:
+            with client.stream(
+                "POST",
+                "/api/chat",
+                json={"message": "你好", "thread_id": "test-thread-123"},
+            ) as resp:
+                for line in resp.iter_lines():
+                    if line.startswith("data: "):
+                        events.append(json.loads(line[6:]))
+        except Exception as e:
+            errors.append(e)
+
+    thread = threading.Thread(target=consume)
+    thread.start()
+    time.sleep(0.3)  # 等待首个事件产出后触发停止
+    response = client.post("/api/stop", json={"thread_id": "test-thread-123"})
+    assert response.status_code == 200
+    assert response.json()["stopped"] is True
+    thread.join(timeout=10)
+    assert not thread.is_alive(), f"流未在停止后结束: {errors}"
+    types = [e["type"] for e in events]
+    assert types[0] == "token"
+    assert "cancelled" in types
+    assert "done" not in types
+    assert not any(e.get("content") == "不应到达" for e in events)
+
+
+# --------------------------------------------------------------------------- #
 # 命令执行
 # --------------------------------------------------------------------------- #
 def test_execute_command_help(client, mock_agent):

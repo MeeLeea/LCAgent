@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import sys
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Any
@@ -100,6 +101,36 @@ chat_lock = asyncio.Lock()
 # 不同会话各自持有独立锁，互不阻塞；同一会话的请求仍严格排队
 _thread_locks: dict[str, asyncio.Lock] = {}
 _THREAD_LOCKS_MAX = 200
+
+# per-thread 停止信号：前端 POST /api/stop 置位对应 Event，
+# 流式生成器在 LLM 阻塞调用期间也能感知取消，立即中断执行（含 openai 内部重试）。
+# 流结束时在生成器 finally 中移除，防止长期运行后内存无限增长。
+_cancel_events: dict[str, asyncio.Event] = {}
+
+
+def _cancel_event_for(thread_id: str) -> asyncio.Event:
+    """获取指定会话的停止信号 Event（不存在则创建并清空）。
+
+    同一会话的请求受 per-thread 锁串行化，因此同 thread 不会并发持有
+    两个流，get-or-create + 流结束清理即可保证信号状态正确。
+    """
+    ev = _cancel_events.get(thread_id)
+    if ev is None:
+        ev = asyncio.Event()
+        _cancel_events[thread_id] = ev
+    else:
+        ev.clear()
+    return ev
+
+
+def _signal_cancel(thread_id: str) -> bool:
+    """置位指定会话的停止信号；无进行中流时返回 False（幂等）。"""
+    ev = _cancel_events.get(thread_id)
+    if ev is None:
+        return False
+    ev.set()
+    logger.info("收到停止 [%s]，请求中止生成", thread_id)
+    return True
 
 
 def _thread_lock(thread_id: str) -> asyncio.Lock:
@@ -298,6 +329,10 @@ class SwitchModelRequest(BaseModel):
 
 class CommandRequest(BaseModel):
     command: str
+    thread_id: str | None = None
+
+
+class StopRequest(BaseModel):
     thread_id: str | None = None
 
 
@@ -567,6 +602,82 @@ def _sse(data: dict[str, Any]) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+async def _drain_events(
+    source: AsyncIterator[dict[str, Any]],
+    queue: asyncio.Queue[dict[str, Any] | None],
+    thread_id: str,
+) -> None:
+    """消费事件源并把事件放入队列；流结束或异常时放入 None 哨兵。
+
+    单独跑在 asyncio.Task 中，使外层主循环能用取消信号竞速等待，
+    从而在 LLM 阻塞调用（含 SDK 内部重试）期间也能立即中断。
+    """
+    try:
+        async for ev in source:
+            queue.put_nowait(ev)
+    except asyncio.CancelledError:
+        queue.put_nowait(None)
+        raise
+    except Exception as e:
+        logger.error("异常 [%s]: %s", thread_id, e)
+        queue.put_nowait({"type": "error", "content": f"内部错误: {e}"})
+    finally:
+        queue.put_nowait(None)
+
+
+async def _forward_stream_with_cancel(
+    source: AsyncIterator[dict[str, Any]],
+    cancel_event: asyncio.Event,
+    request: Request,
+    thread_id: str,
+    enrich_done: bool = True,
+) -> AsyncIterator[str]:
+    """把事件源转为 SSE 字符串，支持停止信号 / 客户端断开即时中断。
+
+    - 停止信号（前端 POST /api/stop 置位 cancel_event）优先竞速响应，
+      即使事件源正阻塞在 LLM 调用中也能立即取消（runner.cancel 传播
+      CancelledError），随后返回 cancelled 事件。
+    - 客户端断开（request.is_disconnected）在每个事件产出后检查，
+      保留原有语义。
+    """
+    queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+    runner = asyncio.create_task(_drain_events(source, queue, thread_id))
+    cancel_waiter = asyncio.create_task(cancel_event.wait())
+    try:
+        while True:
+            getter = asyncio.create_task(queue.get())
+            done, _ = await asyncio.wait(
+                {getter, cancel_waiter},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if cancel_waiter in done and cancel_event.is_set():
+                getter.cancel()
+                logger.info("客户端停止 [%s]，中止流式输出", thread_id)
+                yield _sse({"type": "cancelled", "content": "用户已停止生成。"})
+                break
+            ev = getter.result()
+            if ev is None:
+                logger.info("完成 [%s]", thread_id)
+                break
+            if cancel_event.is_set() or await request.is_disconnected():
+                if cancel_event.is_set():
+                    logger.info("客户端停止 [%s]，中止流式输出", thread_id)
+                    yield _sse({"type": "cancelled", "content": "用户已停止生成。"})
+                else:
+                    logger.info("客户端断开 [%s]，中止流式输出", thread_id)
+                break
+            yield _sse(_enrich_done(ev)) if enrich_done else _sse(ev)
+    finally:
+        if not cancel_waiter.done():
+            cancel_waiter.cancel()
+        if not runner.done():
+            runner.cancel()
+            try:
+                await runner
+            except asyncio.CancelledError:
+                pass
+
+
 def _get_total_tokens() -> int:
     """获取当前 LLM 累计 total_tokens（供前端输入栏实时展示）"""
     metrics = getattr(agent, "metrics", None) if agent else None
@@ -663,6 +774,18 @@ def _unsupported_runner(agent_obj: object, text: str) -> str:
 
 
 # 双方共用：捕获执行型命令统一走流式，其余走管理型 dispatch_command
+@app.post("/api/stop")
+async def stop(req: StopRequest):
+    """请求停止指定会话的生成（幂等）。
+
+    前端点击停止按钮时先调用本接口置位 per-thread 取消信号，再 abort 连接。
+    取消信号会在 LLM 阻塞调用（含 SDK 内部重试）期间被感知，立即中断生成。
+    """
+    tid = req.thread_id or (agent.session.current_session_id if agent else "")
+    signalled = _signal_cancel(tid)
+    return {"stopped": signalled, "thread_id": tid}
+
+
 @app.post("/api/chat")
 async def chat(req: ChatRequest, request: Request):
     """SSE 流式聊天。支持普通对话和命令执行（如 /skill:pptx <task>、/json:、/react: 等）。"""
@@ -694,128 +817,148 @@ async def chat(req: ChatRequest, request: Request):
         logger.info("收到聊天 [%s]: %s", tid, preview)
 
         async with lock:
-            if is_new_thread:
-                yield _sse({"type": "thread_created", "thread_id": tid})
-
-            if command_mode:
-                # 命令模式：通过 dispatch_command 处理
-                logger.info("检测到命令 [%s]: %s", tid, command)
-                
-                # 文本输出包装器：管理型命令的输出包成 token 事件
-                output_buffer = []
-                # 管理型命令实时输出队列：print 输出与工作流结构化事件入队，主循环边收边推，
-                # 避免 dispatch_command 长耗时（如工作流）运行期间前端收不到任何进度
-                output_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
-                # help 命令需要全量输出做表格转换，禁用实时推送，最后统一推送表格
-                is_help = command.lower() == "help"
-
-                def capture_output(text: str):
-                    output_buffer.append(text)
-                    if not is_help:
-                        output_queue.put_nowait(("print", text))
-
-                def emit_workflow_event(event: dict[str, str]):
-                    """工作流节点/整体状态事件：实时转发给前端 SSE"""
-                    output_queue.put_nowait(("event", event))
-
-                try:
-                    context = CommandContext(
-                        agent=agent,
-                        print_fn=capture_output,
-                        input_fn=lambda prompt="": "",  # 不支持交互输入
-                        select_menu=lambda title, choices: choices[0] if choices else "",
-                        create_llm=lambda provider: create_llm(provider, LLM_FILE),
-                        list_providers=lambda: load_providers(LLM_FILE),
-                        run_structured_until_completion=_unsupported_runner,  # 嵌套执行返回明确提示,不静默 None
-                        chat_until_completion=_unsupported_runner,  # 同上
-                        safety_backend=safety_module,
-                        base_dir=BASE_DIR,
-                        config_file=AGENT_CONFIG_FILE,
-                        mcp_config_file=MCP_CONFIG_FILE,
-                        workflow_event_cb=emit_workflow_event,
-                        workflow_sm=workflow_sm,
-                    )
-                    
-                    # 执行型命令（json:/react:/cot:/skill:<task>）走流式通道
-                    if _is_execution_command(command):
-                        # 执行型命令：走流式 runner，显式传 thread_id 保证多会话隔离
-                        logger.info("执行型命令 [%s]，走流式通道", tid)
-                        # 把命令原文传给 achat_stream（它会自动匹配技能）
-                        async for ev in agent.session_manager.achat_stream(command, thread_id=tid):
-                            yield _sse(_enrich_done(ev))
-                        logger.info("完成 [%s]", tid)
-                        return
-                    else:
-                        # 管理型命令：dispatch_command 在当前事件循环执行，print 输出/工作流事件
-                        # 经队列实时推送，保证长耗时命令（如 workflow）运行期间前端持续收到进度
-                        logger.info("管理型命令 [%s]", tid)
-
-                        async def _run_dispatch() -> None:
-                            """执行 dispatch_command，结果/异常经队列送回主循环"""
-                            try:
-                                outcome = await dispatch_command(context, command)
-                                output_queue.put_nowait(("outcome", outcome))
-                            except Exception as e:
-                                logger.error("命令执行异常 [%s]: %s", tid, e)
-                                output_queue.put_nowait(("error", e))
-
-                        dispatch_task = asyncio.create_task(_run_dispatch())
-
-                        # 实时消费队列：print → token 事件；workflow 事件 → 结构化 SSE 事件
-                        outcome = None
-                        while True:
-                            # 客户端断开检测：前端 abort 后及时释放锁，避免新请求被阻塞
-                            if await request.is_disconnected():
-                                logger.info("客户端断开 [%s]，中止命令输出", tid)
-                                dispatch_task.cancel()
-                                try:
-                                    await dispatch_task
-                                except asyncio.CancelledError:
-                                    pass
-                                return
-                            try:
-                                kind, payload = await asyncio.wait_for(output_queue.get(), timeout=2.0)
-                            except asyncio.TimeoutError:
-                                continue
-                            if kind == "print":
-                                yield _sse({"type": "token", "content": payload})
-                            elif kind == "event":
-                                yield _sse(payload)
-                            elif kind == "outcome":
-                                outcome = payload
-                                break
-                            else:  # error
-                                yield _sse({"type": "error", "content": f"命令执行失败: {payload}"})
-                                return
-
-                        await dispatch_task  # 确保命令任务完全退出
-
-                        # help 命令：全量输出统一转表格后推送（实时通道已跳过）
-                        if is_help:
-                            output = _format_help_as_table("\n".join(output_buffer))
-                            if output:
-                                yield _sse({"type": "token", "content": output})
-
-                        yield _sse({"type": "done", "total_tokens": _get_total_tokens()})
-                        logger.info("命令完成 [%s]: %s", tid, outcome)
-                        return
-                        
-                except Exception as e:
-                    logger.error("命令执行异常 [%s]: %s", tid, e)
-                    yield _sse({"type": "error", "content": f"命令执行失败: {e}"})
-                    return
-            
-            # 普通对话模式（显式传 thread_id 实现多会话隔离）
+            # per-thread 停止信号：POST /api/stop 置位后在 LLM 阻塞期间也能感知
+            cancel_event = _cancel_event_for(tid)
             try:
-                async for event in agent.session_manager.achat_stream(message, thread_id=tid):
-                    if await request.is_disconnected():
-                        logger.info("客户端断开 [%s]，中止流式输出", tid)
-                        break
-                    yield _sse(_enrich_done(event))
-                logger.info("完成 [%s]", tid)
-            except Exception as e:
-                logger.error("异常 [%s]: %s", tid, e)
-                yield _sse({"type": "error", "content": f"内部错误: {e}"})
+                if is_new_thread:
+                    yield _sse({"type": "thread_created", "thread_id": tid})
+
+                if command_mode:
+                    # 命令模式：通过 dispatch_command 处理
+                    logger.info("检测到命令 [%s]: %s", tid, command)
+                    
+                    # 文本输出包装器：管理型命令的输出包成 token 事件
+                    output_buffer = []
+                    # 管理型命令实时输出队列：print 输出与工作流结构化事件入队，主循环边收边推，
+                    # 避免 dispatch_command 长耗时（如工作流）运行期间前端收不到任何进度
+                    output_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+                    # help 命令需要全量输出做表格转换，禁用实时推送，最后统一推送表格
+                    is_help = command.lower() == "help"
+
+                    def capture_output(text: str):
+                        output_buffer.append(text)
+                        if not is_help:
+                            output_queue.put_nowait(("print", text))
+
+                    def emit_workflow_event(event: dict[str, str]):
+                        """工作流节点/整体状态事件：实时转发给前端 SSE"""
+                        output_queue.put_nowait(("event", event))
+
+                    try:
+                        context = CommandContext(
+                            agent=agent,
+                            print_fn=capture_output,
+                            input_fn=lambda prompt="": "",  # 不支持交互输入
+                            select_menu=lambda title, choices: choices[0] if choices else "",
+                            create_llm=lambda provider: create_llm(provider, LLM_FILE),
+                            list_providers=lambda: load_providers(LLM_FILE),
+                            run_structured_until_completion=_unsupported_runner,  # 嵌套执行返回明确提示,不静默 None
+                            chat_until_completion=_unsupported_runner,  # 同上
+                            safety_backend=safety_module,
+                            base_dir=BASE_DIR,
+                            config_file=AGENT_CONFIG_FILE,
+                            mcp_config_file=MCP_CONFIG_FILE,
+                            workflow_event_cb=emit_workflow_event,
+                            workflow_sm=workflow_sm,
+                        )
+                        
+                        # 执行型命令（json:/react:/cot:/skill:<task>）走流式通道
+                        if _is_execution_command(command):
+                            # 执行型命令：走流式 runner，显式传 thread_id 保证多会话隔离
+                            logger.info("执行型命令 [%s]，走流式通道", tid)
+                            # 把命令原文传给 achat_stream（它会自动匹配技能）
+                            async for sse in _forward_stream_with_cancel(
+                                agent.session_manager.achat_stream(command, thread_id=tid),
+                                cancel_event,
+                                request,
+                                tid,
+                            ):
+                                yield sse
+                            return
+                        else:
+                            # 管理型命令：dispatch_command 在当前事件循环执行，print 输出/工作流事件
+                            # 经队列实时推送，保证长耗时命令（如 workflow）运行期间前端持续收到进度
+                            logger.info("管理型命令 [%s]", tid)
+
+                            async def _run_dispatch() -> None:
+                                """执行 dispatch_command，结果/异常经队列送回主循环"""
+                                try:
+                                    outcome = await dispatch_command(context, command)
+                                    output_queue.put_nowait(("outcome", outcome))
+                                except Exception as e:
+                                    logger.error("命令执行异常 [%s]: %s", tid, e)
+                                    output_queue.put_nowait(("error", e))
+
+                            dispatch_task = asyncio.create_task(_run_dispatch())
+
+                            # 实时消费队列：print → token 事件；workflow 事件 → 结构化 SSE 事件
+                            outcome = None
+                            while True:
+                                # 停止信号：前端 POST /api/stop 置位后及时中止命令执行
+                                if cancel_event.is_set():
+                                    logger.info("客户端停止 [%s]，中止命令输出", tid)
+                                    dispatch_task.cancel()
+                                    try:
+                                        await dispatch_task
+                                    except asyncio.CancelledError:
+                                        pass
+                                    yield _sse({"type": "cancelled", "content": "用户已停止生成。"})
+                                    return
+                                # 客户端断开检测：前端 abort 后及时释放锁，避免新请求被阻塞
+                                if await request.is_disconnected():
+                                    logger.info("客户端断开 [%s]，中止命令输出", tid)
+                                    dispatch_task.cancel()
+                                    try:
+                                        await dispatch_task
+                                    except asyncio.CancelledError:
+                                        pass
+                                    return
+                                try:
+                                    kind, payload = await asyncio.wait_for(output_queue.get(), timeout=2.0)
+                                except TimeoutError:
+                                    continue
+                                if kind == "print":
+                                    yield _sse({"type": "token", "content": payload})
+                                elif kind == "event":
+                                    yield _sse(payload)
+                                elif kind == "outcome":
+                                    outcome = payload
+                                    break
+                                else:  # error
+                                    yield _sse({"type": "error", "content": f"命令执行失败: {payload}"})
+                                    return
+
+                            await dispatch_task  # 确保命令任务完全退出
+
+                            # help 命令：全量输出统一转表格后推送（实时通道已跳过）
+                            if is_help:
+                                output = _format_help_as_table("\n".join(output_buffer))
+                                if output:
+                                    yield _sse({"type": "token", "content": output})
+
+                            yield _sse({"type": "done", "total_tokens": _get_total_tokens()})
+                            logger.info("命令完成 [%s]: %s", tid, outcome)
+                            return
+                            
+                    except Exception as e:
+                        logger.error("命令执行异常 [%s]: %s", tid, e)
+                        yield _sse({"type": "error", "content": f"命令执行失败: {e}"})
+                        return
+                
+                # 普通对话模式（显式传 thread_id 实现多会话隔离）
+                try:
+                    async for sse in _forward_stream_with_cancel(
+                        agent.session_manager.achat_stream(message, thread_id=tid),
+                        cancel_event,
+                        request,
+                        tid,
+                    ):
+                        yield sse
+                except Exception as e:
+                    logger.error("异常 [%s]: %s", tid, e)
+                    yield _sse({"type": "error", "content": f"内部错误: {e}"})
+            finally:
+                _cancel_events.pop(tid, None)
 
     return StreamingResponse(
         event_stream(),
@@ -837,16 +980,21 @@ async def chat_resume(req: ResumeRequest, request: Request):
         tid = req.thread_id or agent.session.current_session_id
         logger.info("恢复会话 [%s]", tid)
         async with _thread_lock(tid):
+            cancel_event = _cancel_event_for(tid)
             try:
-                async for event in agent.session_manager.aresume_stream(req.payload, thread_id=tid):
-                    if await request.is_disconnected():
-                        logger.info("客户端断开 [%s]，中止恢复流", tid)
-                        break
-                    yield _sse(event)
-                logger.info("恢复完成 [%s]", tid)
+                async for sse in _forward_stream_with_cancel(
+                    agent.session_manager.aresume_stream(req.payload, thread_id=tid),
+                    cancel_event,
+                    request,
+                    tid,
+                    enrich_done=False,
+                ):
+                    yield sse
             except Exception as e:
                 logger.error("恢复异常 [%s]: %s", tid, e)
                 yield _sse({"type": "error", "content": f"内部错误: {e}"})
+            finally:
+                _cancel_events.pop(tid, None)
 
     return StreamingResponse(
         event_stream(),

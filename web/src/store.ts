@@ -826,6 +826,10 @@ export const useStore = create<AppState>((set, get) => ({
 
   stopStreaming: () => {
     const key = normKey(get().currentThreadId)
+    // 先向后端发送显式停止信号：即使 abort 连接后后端仍在 LLM 阻塞调用
+    // （含 SDK 内部重试）期间，也能立即感知取消并中断生成。
+    const threadId = get().currentThreadId
+    if (threadId) void api.stop(threadId).catch(() => {})
     clearWatchdog(key)
     if (abortFns[key]) abortFns[key]!()
     delete abortFns[key]

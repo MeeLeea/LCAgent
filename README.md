@@ -15,6 +15,7 @@
 - 命令模式下的会话切换会优先保持当前会话，不会因为菜单参数不兼容而失败
 - 安全护栏（危险终端命令拦截/确认、路径保护）
 - **全套异步 Public API**（`arun` / `achat` / `aresume` / `arun_structured` / `achat_structured` 等）
+- **生成停止即时生效**（`POST /api/stop` 显式取消信号，per-thread 隔离；前端点击停止后即使后端正阻塞在 LLM 调用或 SDK 内部 429/5xx 自动重试期间也能立即中断）
 - **运行时指标收集**（LLM 调用 / 工具执行 / 压缩统计，`metrics` 命令查询）
 - **结构化日志**（trace_id / thread_id 上下文注入，asyncio 安全）
 - **工具超时保护**与**统一异常层次**（`LCAgentError` 及其子类）

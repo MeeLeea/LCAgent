@@ -190,6 +190,18 @@ export const api = {
     onEvent: (ev: StreamEvent) => void,
   ): (() => void) => streamRequest(`${BASE}/chat/resume`, body, onEvent),
 
+  /**
+   * 请求停止指定会话的生成（幂等）。
+   * 后端收到后置位 per-thread 取消信号，立即中断 LLM 阻塞调用与重试，
+   * 并返回 cancelled 事件。前端点击停止按钮时应先调用本接口再 abort 连接。
+   */
+  stop: (thread_id?: string | null) =>
+    jsonFetch<{ stopped: boolean; thread_id: string }>(`${BASE}/stop`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ thread_id: thread_id ?? null }),
+    }),
+
   executeCommand: (command: string, thread_id?: string | null) =>
     jsonFetch<{ success: boolean; outcome: string; output: string; thread_id: string }>(
       `${BASE}/command`,
