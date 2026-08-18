@@ -325,18 +325,29 @@ function handleStreamEvent(
   ev: StreamEvent,
   ctx: { finish: () => void },
 ): string {
-  if (terminatedThreads.has(threadId)) return threadId
+  // terminatedThreads 仅阻止终止事件重复处理（done/error/cancelled/interrupt），
+  // 不阻止 tool_result 等迟到事件——代理缓冲可能导致 done 先于 tool_result 到达。
+  const isTerminalEv = ev.type === 'done' || ev.type === 'error' || ev.type === 'cancelled' || ev.type === 'interrupt'
+  if (isTerminalEv && terminatedThreads.has(threadId)) return threadId
   const arr = [...(get().messagesByThread[threadId] ?? [])]
   const lastIndex = arr.length - 1
   const last = arr[lastIndex]
   // 流式操作目标：最后一条 streaming 的 assistant 消息。
-  // workflow 场景下节点结果块会追加为最后一条消息（无 streaming），
-  // 若仍按 lastIndex 操作会把后续 token 拼进节点块、且流式气泡永不复位。
+  // 流已结束（done 已处理）时回退到最后一条带 toolCalls 的 assistant 消息，
+  // 使迟到的 tool_result 仍能配对到正确的回合。
   let streamIdx = lastIndex
   for (let i = lastIndex; i >= 0; i--) {
     if (arr[i].role === 'assistant' && arr[i].streaming) {
       streamIdx = i
       break
+    }
+  }
+  if (!arr[streamIdx]?.streaming) {
+    for (let i = lastIndex; i >= 0; i--) {
+      if (arr[i].role === 'assistant' && (arr[i].toolCalls?.length || arr[i].content)) {
+        streamIdx = i
+        break
+      }
     }
   }
   const streamLast = arr[streamIdx]
@@ -365,12 +376,29 @@ function handleStreamEvent(
       if (!streamLast || streamLast.role !== 'assistant') return threadId
       // ask_human 的结果不渲染为 ToolCallCard（避免孤儿 toolResult）
       if (ev.name === 'ask_human') return threadId
-      arr[streamIdx] = {
-        ...streamLast,
-        toolResults: [
-          ...(streamLast.toolResults ?? []),
-          { id: ev.id, name: ev.name, content: ev.content },
-        ],
+      {
+        // ID 桥接兜底：后端 tool_result.id 可能因 LangChain 事件
+        // 不含 tool_call_id 而回退为工具名，导致与 tool_call.id 不匹配。
+        // 按 ID 精确匹配 → 按 name+顺序兜底，确保结果能配对到正确的工具卡片。
+        const calls = streamLast.toolCalls ?? []
+        const results = streamLast.toolResults ?? []
+        const hasResult = (cid: string) => results.some((r) => r.id === cid)
+        let matchId = ev.id
+        if (!calls.some((c) => c.id === ev.id)) {
+          const fallback = calls.find(
+            (c) => c.name === ev.name && !hasResult(c.id),
+          )
+          if (fallback) matchId = fallback.id
+        }
+        // 已存在同 ID 结果则替换（迟到的正确结果覆盖空占位）
+        const filtered = results.filter((r) => r.id !== matchId)
+        arr[streamIdx] = {
+          ...streamLast,
+          toolResults: [
+            ...filtered,
+            { id: matchId, name: ev.name, content: ev.content },
+          ],
+        }
       }
       commitThreadMessages(get, set, threadId, arr)
       break

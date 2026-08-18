@@ -94,6 +94,7 @@ class AgentCore:
         agent_prompt_file: str | None,
         max_execution_history: int,
         tool_timeout: float,
+        short_term_size: int,
         checkpointer: Any | None = None,
         store: Any | None = None,
         extra_middleware: list | None = None,
@@ -107,6 +108,7 @@ class AgentCore:
         self.max_context_messages = max_context_messages
         self.context_trim_keep = context_trim_keep
         self.tool_timeout = tool_timeout if tool_timeout > 0 else None
+        self._short_term_size = short_term_size
         self._closed = False
 
         # 压缩配置：before_model 中间件自动触发 + manually_compact 手动触发
@@ -193,6 +195,7 @@ class AgentCore:
         agent_prompt_file: str | None = None,
         max_execution_history: int = 100,
         tool_timeout: float = 60.0,
+        short_term_size: int = 10,
         checkpointer: Any | None = None,
         store: Any | None = None,
         extra_middleware: list | None = None,
@@ -216,6 +219,8 @@ class AgentCore:
             agent_prompt_file: Agent核心提示词文件路径(为 None 时使用配置默认值)
             max_execution_history: 执行历史最大条数(防止内存泄漏)
             tool_timeout: 工具执行默认超时秒数(0=禁用超时)
+            short_term_size: 短期上下文窗口消息条数（对应配置键 latest_msg_cnt，
+                             传给 SessionRegistry.aget_short_term 兜底）
             checkpointer: LangGraph checkpointer 原语（由入口程序 / MemoryContext 注入）
             store: LangGraph store 原语（长期记忆 Store）
             extra_middleware: 额外中间件列表（如记忆读写中间件）
@@ -237,6 +242,7 @@ class AgentCore:
             agent_prompt_file=agent_prompt_file,
             max_execution_history=max_execution_history,
             tool_timeout=tool_timeout,
+            short_term_size=short_term_size,
             checkpointer=checkpointer,
             store=store,
             extra_middleware=extra_middleware,
@@ -267,6 +273,7 @@ class AgentCore:
         agent_prompt_file: str | None = None,
         max_execution_history: int = 100,
         tool_timeout: float = 60.0,
+        short_term_size: int = 10,
         checkpointer: Any | None = None,
         store: Any | None = None,
         extra_middleware: list | None = None,
@@ -290,6 +297,7 @@ class AgentCore:
             agent_prompt_file=agent_prompt_file,
             max_execution_history=max_execution_history,
             tool_timeout=tool_timeout,
+            short_term_size=short_term_size,
             checkpointer=checkpointer,
             store=store,
             extra_middleware=extra_middleware,
@@ -326,6 +334,7 @@ class AgentCore:
             process_type=self._process_type,
             recursion_limit=self.max_iterations,
             async_conn=self._async_conn,
+            short_term_size=self._short_term_size,
         )
         # 同步当前会话指针
         self._session_registry.current_session_id = self._initial_thread_id or self._session_registry.current_session_id
@@ -1028,14 +1037,24 @@ class AgentCore:
                             if output is not None
                             else None
                         )
-                        emitted = True
-                        yield AgentEvent.tool_result(
-                            tool_call_id=(
-                                active_tool_call_ids.pop(ev.get("run_id", ""), "")
-                                or data_dict.get("tool_call_id")
+                        # ID 桥接：优先 run_id 映射 → pending 队列按名匹配 →
+                        # ToolMessage.tool_call_id → 工具名兜底
+                        run_id = ev.get("run_id", "")
+                        tc_id = active_tool_call_ids.pop(run_id, "")
+                        if not tc_id:
+                            event_name_top = ev.get("name", "")
+                            bucket = pending_tool_call_ids.get(event_name_top)
+                            if bucket:
+                                tc_id = bucket.pop(0)
+                        if not tc_id:
+                            tc_id = (
+                                data_dict.get("tool_call_id")
                                 or getattr(output, "tool_call_id", None)
                                 or ev.get("name", "")
-                            ),
+                            )
+                        emitted = True
+                        yield AgentEvent.tool_result(
+                            tool_call_id=tc_id,
                             name=ev.get("name") or data_dict.get("name", "") or "",
                             content=stringify_content(content),
                             thread_id=thread_id,
@@ -1365,7 +1384,9 @@ class AgentCore:
             "请用中文回答。"
         )
 
-        short_term = await self.session.aget_short_term()
+        short_term = await self.session.aget_short_term(
+            short_term_size=self._short_term_size
+        )
         response = self.llm.chat_with_history(
             user_input=task,
             history=short_term,

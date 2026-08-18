@@ -272,6 +272,35 @@ class TestWriteMiddlewareLifecycle:
 # ════════════════════════════════════════════════════════════════════════
 
 
+class _FakeRuntime:
+    """带 ``context`` 属性的 runtime 替身（对应 ModelRequest.runtime.context）。"""
+
+    def __init__(self, context):
+        self.context = context
+
+
+class _FakeModelRequest:
+    """最小化 ModelRequest 替身：override() 返回携带真实 SystemMessage 的新实例。"""
+
+    def __init__(self, context, system_message=None):
+        self.runtime = _FakeRuntime(context)
+        self.system_message = system_message
+
+    def override(self, system_message=None):
+        return _FakeModelRequest(self.runtime.context, system_message=system_message)
+
+
+def _sys_content_text(system_message) -> str:
+    """从 SystemMessage 提取纯文本（content 可能为 text block 列表）。"""
+    content = system_message.content
+    if isinstance(content, list):
+        return "".join(
+            str(block.get("text", "")) if isinstance(block, dict) else str(block)
+            for block in content
+        )
+    return str(content)
+
+
 class TestReadMiddleware:
     def test_format_facts_with_content(self):
         store = ThreadMemoryStore()
@@ -355,6 +384,68 @@ class TestReadMiddleware:
 
             result = await mw.awrap_model_call(request, handler)
             assert result == "no-facts"
+
+        asyncio.run(run())
+
+    def test_awrap_model_call_respects_recall_limit(self):
+        """recall_limit 约束注入的 fact 条数（取最近 N 条）。"""
+
+        async def run():
+            store = ThreadMemoryStore()
+            # 显式递增 create_time，保证 query_facts 升序确定
+            for i in range(3):
+                await store.save_fact(
+                    "t1",
+                    ThreadFactItem(
+                        content=f"fact-{i}",
+                        category="user_fact",
+                        create_time=f"2026-01-01T00:00:00.{i:03d}",
+                    ),
+                )
+            mw = ThreadMemoryReadMiddleware(store, recall_limit=2)
+
+            request = _FakeModelRequest(context={"configurable": {"thread_id": "t1"}})
+            captured = []
+
+            async def handler(req):
+                captured.append(req)
+                return "ok"
+
+            result = await mw.awrap_model_call(request, handler)
+            assert result == "ok"
+            assert len(captured) == 1
+            text = _sys_content_text(captured[0].system_message)
+            assert "fact-1" in text and "fact-2" in text
+            assert "fact-0" not in text
+
+        asyncio.run(run())
+
+    def test_awrap_model_call_without_limit_injects_all(self):
+        """未配置 recall_limit 时注入全部 facts（保持原行为）。"""
+
+        async def run():
+            store = ThreadMemoryStore()
+            for i in range(3):
+                await store.save_fact(
+                    "t1",
+                    ThreadFactItem(
+                        content=f"fact-{i}",
+                        category="user_fact",
+                        create_time=f"2026-01-01T00:00:00.{i:03d}",
+                    ),
+                )
+            mw = ThreadMemoryReadMiddleware(store)  # recall_limit=None
+
+            request = _FakeModelRequest(context={"configurable": {"thread_id": "t1"}})
+            captured = []
+
+            async def handler(req):
+                captured.append(req)
+                return "ok"
+
+            await mw.awrap_model_call(request, handler)
+            text = _sys_content_text(captured[0].system_message)
+            assert "fact-0" in text and "fact-1" in text and "fact-2" in text
 
         asyncio.run(run())
 

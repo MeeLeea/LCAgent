@@ -104,14 +104,11 @@ def make_agent_factory(provider: str):
         # 三层架构：先创建 MemoryContext（记忆基础设施），再创建 AgentCore（纯执行内核）
         memory_ctx = await MemoryContext.acreate(
             checkpoint_file=CHECKPOINT_FILE,
-            short_term_size=agent_config["memory_size"],
+            short_term_size=agent_config["latest_msg_cnt"],
             use_sqlite=True,
             process_type="scheduler",
             llm_getter=lambda: llm,
-            buffer_delay_seconds=agent_config.get("memory_buffer_delay_seconds", 20),
-            max_buffer_messages=agent_config.get("memory_max_buffer_messages", 30),
-            max_facts_per_thread=agent_config.get("memory_max_facts_per_thread", 50),
-            recall_limit=agent_config.get("memory_recall_limit", 10),
+            # 记忆链路参数由 memory/config.py 统一管理，不再经 agent_config.json 配置
         )
         agent = await AgentCore.acreate(
             llm_client=llm,
@@ -128,6 +125,7 @@ def make_agent_factory(provider: str):
             agent_prompt_file=agent_prompt_file,
             max_execution_history=agent_config.get("max_execution_history", 100),
             tool_timeout=agent_config.get("tool_timeout", 120),
+            short_term_size=agent_config.get("latest_msg_cnt", 10),
             checkpointer=memory_ctx.checkpointer,
             store=memory_ctx.store,
             extra_middleware=[memory_ctx.read_middleware],

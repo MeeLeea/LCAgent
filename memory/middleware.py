@@ -389,12 +389,17 @@ class ThreadMemoryReadMiddleware(AgentMiddleware):
 
     Args:
         memory_store: ThreadMemoryStore 实例
+        recall_limit: 注入时最多使用的 fact 条数（取最近 N 条）；
+                      为 None 时注入全部 facts（对应配置键 memory_recall_limit）
     """
 
     FACTS_HEADER = "【长期记忆】\n"
 
-    def __init__(self, memory_store: ThreadMemoryStore) -> None:
+    def __init__(
+        self, memory_store: ThreadMemoryStore, recall_limit: int | None = None
+    ) -> None:
         self._store = memory_store
+        self._recall_limit = recall_limit
 
     async def awrap_model_call(
         self,
@@ -415,6 +420,10 @@ class ThreadMemoryReadMiddleware(AgentMiddleware):
 
         if not facts:
             return await handler(request)
+
+        # 按 recall_limit 截取最近 N 条（对应配置键 memory_recall_limit）
+        if self._recall_limit and len(facts) > self._recall_limit:
+            facts = facts[-self._recall_limit:]
 
         # 组装 facts 文本
         fact_text = self._format_facts(facts)

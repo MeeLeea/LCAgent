@@ -76,12 +76,14 @@ class SessionRegistry:
         process_type: str | None = None,
         recursion_limit: int = 25,
         async_conn: Any | None = None,
+        short_term_size: int = 10,
     ) -> None:
         self._checkpointer = checkpointer
         self._store = store
         self._process_type = process_type
         self._recursion_limit = recursion_limit
         self._async_conn = async_conn
+        self._short_term_size = short_term_size
         # 工作空间持久存储（复用 async_conn，内存模式降级为纯缓存）
         self._workspace_store = WorkspaceStore(async_conn)
         # CLI 单会话当前指针（并发场景必须传显式 session_id，不依赖此值）
@@ -458,14 +460,24 @@ class SessionRegistry:
 
     async def aget_short_term(
         self, session_id: str | None = None, limit: int | None = None,
-        short_term_size: int = 10,
+        short_term_size: int | None = None,
     ) -> list[dict[str, str]]:
-        """从 checkpoint 取消息转为 dict 格式（兼容旧 API）。"""
+        """从 checkpoint 取消息转为 dict 格式（兼容旧 API）。
+
+        未显式传入 ``short_term_size`` 时，使用构造时设定的窗口大小
+        （对应配置键 ``latest_msg_cnt``）。
+        """
         msgs = await self.aget_messages(session_id)
         if limit:
             msgs = msgs[-limit:]
-        elif short_term_size:
-            msgs = msgs[-short_term_size:]
+        else:
+            size = (
+                short_term_size
+                if short_term_size is not None
+                else self._short_term_size
+            )
+            if size:
+                msgs = msgs[-size:]
         result: list[dict[str, str]] = []
         for m in msgs:
             role = _message_role(m)

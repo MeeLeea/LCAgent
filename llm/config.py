@@ -7,7 +7,7 @@
     skills_dir                 str    技能目录(相对项目根或绝对路径)
     auto_match_skills          bool   任务自动匹配并注入技能
     enable_mcp                 bool   是否加载 MCP 工具
-    memory_size                int    短期消息窗口大小（传递给 SessionRegistry.aget_short_term）
+    latest_msg_cnt             int    短期上下文窗口消息条数（最近 N 条消息，传递给 SessionRegistry.aget_short_term）
     verbose                    bool   是否打印详细过程
     mcp_config_file            str    MCP 配置文件(相对项目根或绝对路径)
     max_context_messages       int    长上下文裁剪阈值(0=关闭)
@@ -19,7 +19,7 @@
                                       缺省回退 DEFAULTS，不读取全局自定义值)
     max_tokens                 int    LLM 最大生成 token 数(来源规则同 temperature)
 
-Memory 层配置（默认值见 memory/config.py，JSON 中同名键自动透传）:
+Memory 层配置（由 memory/config.py 统一管理，不写入 agent_config.json）:
     memory_buffer_delay_seconds   int  记忆写入防抖延迟(秒)
     memory_max_buffer_messages    int  防抖 buffer 最大消息数(超出强制刷新)
     memory_max_facts_per_thread   int  单线程最大 fact 条数(超出 LRU 淘汰)
@@ -73,7 +73,7 @@ DEFAULTS: dict[str, Any] = {
     "skills_dir": ".agents/skills",
     "auto_match_skills": True,
     "enable_mcp": True,
-    "memory_size": 10,
+    "latest_msg_cnt": 10,
     "verbose": True,
     "mcp_config_file": "config/mcp_servers.json",
     "max_context_messages": 0,
@@ -110,7 +110,7 @@ def load_agent_config(config_file: str) -> dict[str, Any]:
         try:
             with open(config_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            # 透传 JSON 中所有键（含 memory 层配置），默认值仅覆盖 DEFAULTS 中定义的键
+            # 透传 JSON 中所有键，默认值仅覆盖 DEFAULTS 中定义的键
             cfg.update(data)
         except (OSError, json.JSONDecodeError):
             pass

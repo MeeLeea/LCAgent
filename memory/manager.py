@@ -90,7 +90,10 @@ class MemoryManager:
         )
 
         # 读中间件：awrap_model_call 时注入 thread facts 到 SystemMessage
-        self._read_middleware = ThreadMemoryReadMiddleware(memory_store)
+        # （recall_limit 约束每次注入的 fact 条数，与显式召回 recall() 一致）
+        self._read_middleware = ThreadMemoryReadMiddleware(
+            memory_store, recall_limit=recall_limit
+        )
 
     # ============ 属性暴露 ============
 

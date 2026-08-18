@@ -2505,30 +2505,28 @@ asyncio.run(main())
 | `skills_dir`            | str  | `.agents/skills`          | 技能目录（相对项目根或绝对路径）                              |
 | `auto_match_skills`     | bool | true                        | 任务自动匹配并注入相关技能                                    |
 | `enable_mcp`            | bool | true                        | 是否加载 MCP 工具                                             |
-| `memory_size`           | int  | 10                          | 短期消息窗口大小（传递给`SessionRegistry.aget_short_term`） |
 | `verbose`               | bool | true                        | 是否打印详细过程                                              |
 | `mcp_config_file`       | str  | `config/mcp_servers.json` | MCP 配置文件（相对项目根或绝对路径）                          |
+| `agent_prompt_file`     | str  | `agent/AGENT.md`          | Agent 核心提示词文件路径（相对项目根或绝对路径）              |
+| `max_execution_history` | int  | 100                         | 执行历史最大条数                                              |
 | `max_context_messages`  | int  | 0                           | 长上下文裁剪阈值（0 = 关闭）                                  |
 | `context_trim_keep`     | int  | 12                          | 裁剪时保留的最近消息条数                                      |
-| `max_execution_history` | int  | 100                         | 执行历史最大条数                                              |
-| `agent_prompt_file`     | str  | `agent/AGENT.md`          | Agent 核心提示词文件路径（相对项目根或绝对路径）              |
 | `tool_timeout`          | int  | 120                         | 工具调用超时（秒）                                            |
 | `temperature`           | float | 0.7                        | LLM 采样温度（主对话/调度器/API 默认；团队角色分层配置于自身 `agent_config.json`，缺省回退 DEFAULTS） |
 | `max_tokens`            | int  | 8192                        | LLM 最大生成 token 数（覆盖来源同 `temperature`）             |
+| `latest_msg_cnt`        | int  | 10                          | 短期上下文窗口消息条数：取最近 N 条消息（传递给`SessionRegistry.aget_short_term`） |
 
 > **采样参数分层隔离**：团队场景只用 `team/<角色>/agent_config.json`（`temperature`/`max_tokens` 经 `build_team_agent` 解析后作为显式参数传入，未配置时回退 `llm/config.py` 的 `DEFAULTS`，**不读取全局自定义值**）；非团队场景（主对话/调度器/API/飞书）由 `LLMClient` 内部自动读取全局 `agent/agent_config.json`（含 DEFAULTS 兜底），外部无需传参。显式构造参数（`LLMClient(..., temperature=...)` / `build_team_agent(..., temperature=...)`）始终优先。
 
-**Memory 层配置**（同文件同名键透传，默认值见 [memory/config.py](memory/config.py)）：
+**Memory 层配置**（由 [memory/config.py](memory/config.py) 统一管理，**不写入** `agent_config.json`，修改后重启 `main.py` 生效）：
 
 | 键                              | 类型 | 默认值 | 说明                                   |
 | ------------------------------- | ---- | ------ | -------------------------------------- |
 | `memory_buffer_delay_seconds` | int  | 20     | 记忆写入防抖延迟（秒）                 |
 | `memory_max_buffer_messages`  | int  | 30     | 防抖 buffer 最大消息数（超出强制刷新） |
 | `memory_max_facts_per_thread` | int  | 50     | 单线程最大 fact 条数（超出 LRU 淘汰）  |
-| `memory_recall_limit`         | int  | 10     | 召回长期记忆时的默认条数上限           |
+| `memory_recall_limit`         | int  | 10     | 召回长期记忆时的默认条数上限（同时约束每次 LLM 调用注入的 fact 条数） |
 | `session_enable_memory`       | bool | true   | SessionManager 是否启用长期记忆处理    |
-
-修改后重启 `main.py` 即可生效。
 
 #### Agent 核心提示词（`agent/AGENT.md`）
 

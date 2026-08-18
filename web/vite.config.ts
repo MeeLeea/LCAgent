@@ -48,6 +48,14 @@ export default defineConfig(({ mode }) => {
         '/api': {
           target: apiTarget,
           changeOrigin: true,
+          // SSE 流式响应必须禁用缓冲，否则事件会被攒到连接关闭才一次性到达
+          configure: (proxy) => {
+            proxy.on('proxyRes', (proxyRes) => {
+              // 禁用压缩，避免 gzip 缓冲导致 SSE 事件不实时到达
+              proxyRes.headers['x-accel-buffering'] = 'no'
+              proxyRes.headers['cache-control'] = 'no-cache'
+            })
+          },
         },
       },
     },

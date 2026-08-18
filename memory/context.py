@@ -180,8 +180,10 @@ class MemoryContext:
         # 3. 创建 per-thread 并发锁池
         lock_pool = ThreadMemoryLockPool()
 
-        # 4. 创建读中间件
-        read_middleware = ThreadMemoryReadMiddleware(memory_store)
+        # 4. 创建读中间件（recall_limit 约束每次 LLM 调用注入的 fact 条数）
+        read_middleware = ThreadMemoryReadMiddleware(
+            memory_store, recall_limit=recall_limit
+        )
 
         # 5. 创建 MemoryManager（内部自建写中间件）
         memory_manager = MemoryManager(
