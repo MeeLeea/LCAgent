@@ -18,7 +18,6 @@ from typing import Any
 from unittest.mock import MagicMock
 
 from agent.workspace_middleware import WorkspaceSecurityMiddleware
-from graph.pipline import worker_exec_node as pipline_worker_exec_node
 from graph.simple import arun_compiled_workflow, worker_exec_node
 from team.base import TeamAgent
 
@@ -46,18 +45,6 @@ def test_worker_exec_node_passes_workspace_config():
     config = {"configurable": {"thread_id": "t1", "workspace_path": "C:/ws"}}
 
     result = asyncio.run(worker_exec_node(state, worker, config=config))
-
-    assert result["worker_result"] == "done"
-    assert worker.received_config == config
-
-
-def test_pipline_worker_exec_node_passes_workspace_config():
-    """pipline 的 worker_exec 节点:config 透传给 execute_task。"""
-    worker = CapturingWorker()
-    state = {"plan": "计划: 步骤1"}
-    config = {"configurable": {"workspace_path": "C:/ws"}}
-
-    result = asyncio.run(pipline_worker_exec_node(state, worker, injector=None, config=config))
 
     assert result["worker_result"] == "done"
     assert worker.received_config == config

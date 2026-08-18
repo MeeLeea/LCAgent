@@ -329,6 +329,17 @@ function handleStreamEvent(
   const arr = [...(get().messagesByThread[threadId] ?? [])]
   const lastIndex = arr.length - 1
   const last = arr[lastIndex]
+  // 流式操作目标：最后一条 streaming 的 assistant 消息。
+  // workflow 场景下节点结果块会追加为最后一条消息（无 streaming），
+  // 若仍按 lastIndex 操作会把后续 token 拼进节点块、且流式气泡永不复位。
+  let streamIdx = lastIndex
+  for (let i = lastIndex; i >= 0; i--) {
+    if (arr[i].role === 'assistant' && arr[i].streaming) {
+      streamIdx = i
+      break
+    }
+  }
+  const streamLast = arr[streamIdx]
 
   switch (ev.type) {
     case 'thread_created':
@@ -336,36 +347,36 @@ function handleStreamEvent(
       get().fetchThreads()
       return ev.thread_id
     case 'token':
-      if (!last || last.role !== 'assistant') return threadId
-      arr[lastIndex] = { ...last, content: last.content + ev.content }
+      if (!streamLast || streamLast.role !== 'assistant') return threadId
+      arr[streamIdx] = { ...streamLast, content: streamLast.content + ev.content }
       commitThreadMessages(get, set, threadId, arr)
       break
     case 'tool_call':
-      if (!last || last.role !== 'assistant') return threadId
+      if (!streamLast || streamLast.role !== 'assistant') return threadId
       // ask_human 的 UI 由 INTERRUPT 事件渲染，不添加到 toolCalls 避免重复显示
       if (ev.name === 'ask_human') return threadId
-      arr[lastIndex] = {
-        ...last,
-        toolCalls: [...(last.toolCalls ?? []), { id: ev.id, name: ev.name, args: ev.args }],
+      arr[streamIdx] = {
+        ...streamLast,
+        toolCalls: [...(streamLast.toolCalls ?? []), { id: ev.id, name: ev.name, args: ev.args }],
       }
       commitThreadMessages(get, set, threadId, arr)
       break
     case 'tool_result':
-      if (!last || last.role !== 'assistant') return threadId
+      if (!streamLast || streamLast.role !== 'assistant') return threadId
       // ask_human 的结果不渲染为 ToolCallCard（避免孤儿 toolResult）
       if (ev.name === 'ask_human') return threadId
-      arr[lastIndex] = {
-        ...last,
+      arr[streamIdx] = {
+        ...streamLast,
         toolResults: [
-          ...(last.toolResults ?? []),
+          ...(streamLast.toolResults ?? []),
           { id: ev.id, name: ev.name, content: ev.content },
         ],
       }
       commitThreadMessages(get, set, threadId, arr)
       break
     case 'interrupt': {
-      if (!last || last.role !== 'assistant') return threadId
-      arr[lastIndex] = { ...last, streaming: false, interrupted: true }
+      if (!streamLast || streamLast.role !== 'assistant') return threadId
+      arr[streamIdx] = { ...streamLast, streaming: false, interrupted: true }
       const info: InterruptInfo = { prompt: ev.prompt, choices: ev.choices }
       set((s) => {
         const pendingInterrupts = { ...s.pendingInterrupts, [threadId]: info }
@@ -378,25 +389,25 @@ function handleStreamEvent(
       break
     }
     case 'cancelled':
-      if (!last || last.role !== 'assistant') return threadId
-      arr[lastIndex] = {
-        ...fillMissingToolResults(last),
+      if (!streamLast || streamLast.role !== 'assistant') return threadId
+      arr[streamIdx] = {
+        ...fillMissingToolResults(streamLast),
         streaming: false,
-        content: last.content + (last.content ? '\n\n' : '') + `> ⚠️ ${ev.content}`,
+        content: streamLast.content + (streamLast.content ? '\n\n' : '') + `> ⚠️ ${ev.content}`,
       }
       commitThreadMessages(get, set, threadId, arr)
       ctx.finish()
       get().fetchThreads()
       break
     case 'error':
-      if (!last || last.role !== 'assistant') return threadId
+      if (!streamLast || streamLast.role !== 'assistant') return threadId
       // 避免重复追加多条错误
-      if (!last.error) {
-        arr[lastIndex] = {
-          ...fillMissingToolResults(last),
+      if (!streamLast.error) {
+        arr[streamIdx] = {
+          ...fillMissingToolResults(streamLast),
           streaming: false,
           error: true,
-          content: last.content + (last.content ? '\n\n' : '') + `> ❌ ${ev.content}`,
+          content: streamLast.content + (streamLast.content ? '\n\n' : '') + `> ❌ ${ev.content}`,
         }
         commitThreadMessages(get, set, threadId, arr)
       }
@@ -412,6 +423,19 @@ function handleStreamEvent(
           },
         })
       }
+      // 节点正常结束且携带产出：在消息区追加节点结果块（与 token 实时流并存）
+      if (ev.status === 'done' && ev.content) {
+        const nodeMsg: ChatMessage = {
+          id: nextId(),
+          role: 'assistant',
+          content: ev.content,
+          nodeName: ev.node,
+          toolCalls: [],
+          toolResults: [],
+          timestamp: Date.now(),
+        }
+        commitThreadMessages(get, set, threadId, [...arr, nodeMsg])
+      }
       break
     }
     case 'workflow_status': {
@@ -420,8 +444,8 @@ function handleStreamEvent(
       break
     }
     case 'done': {
-      if (!last || last.role !== 'assistant') return threadId
-      arr[lastIndex] = { ...fillMissingToolResults(last), streaming: false }
+      if (!streamLast || streamLast.role !== 'assistant') return threadId
+      arr[streamIdx] = { ...fillMissingToolResults(streamLast), streaming: false }
       commitThreadMessages(get, set, threadId, arr)
       set((s) => {
         const pendingInterrupts = { ...s.pendingInterrupts }

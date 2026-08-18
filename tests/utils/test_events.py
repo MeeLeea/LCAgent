@@ -26,6 +26,14 @@ class TestNodeEvents:
         event = AgentEvent.node_end(node="worker_exec")
         assert event.event_type == EventType.NODE_END
         assert event.node == "worker_exec"
+        assert event.content == ""
+
+    def test_node_end_factory_with_content(self):
+        """node_end 携带节点产出 content（供前端渲染节点结果块）"""
+        event = AgentEvent.node_end(node="worker_exec", content="执行结果文本")
+        assert event.event_type == EventType.NODE_END
+        assert event.node == "worker_exec"
+        assert event.content == "执行结果文本"
 
     def test_node_error_factory(self):
         event = AgentEvent.node_error(node="terminator_final")
@@ -55,6 +63,16 @@ class TestNodeEventSseDict:
             "type": "workflow_node",
             "node": "manager_plan",
             "status": "done",
+        }
+
+    def test_node_end_sse_with_content(self):
+        """node_end 携带产出时，to_sse_dict 附带 content 键（向后兼容扩展）"""
+        event = AgentEvent.node_end(node="manager_plan", content="计划内容")
+        assert event.to_sse_dict() == {
+            "type": "workflow_node",
+            "node": "manager_plan",
+            "status": "done",
+            "content": "计划内容",
         }
 
     def test_node_error_sse(self):

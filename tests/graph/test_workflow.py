@@ -179,73 +179,6 @@ def test_manager_plan_node_with_summary():
     assert "用户偏好中文" in prompt
 
 
-def test_pipline_manager_plan_node_uses_plan_task():
-    """测试 pipline 的 Manager 节点:委托给 Manager.plan_task,带技能注入"""
-    from graph.pipline import manager_plan_node as pipline_manager_plan_node
-
-    class FakeInjector:
-        def inject_into_prompt(self, prompt: str, task: str) -> str:
-            return f"{prompt}\n\n【技能指引:{task}】"
-
-    manager = FakeAgent(name="manager", response="计划")
-    state = {"task": "任务", "context_summary": "用户偏好中文"}
-
-    result = asyncio.run(pipline_manager_plan_node(state, manager, injector=FakeInjector()))
-
-    assert result["plan"] == "计划"
-    prompt = manager.calls[0][1]
-    assert "记忆上下文摘要:" in prompt
-    assert "用户偏好中文" in prompt
-    assert "【技能指引:任务】" in prompt
-
-
-def test_pipline_worker_exec_node_uses_execute_task():
-    """测试 pipline 的 Worker 节点:委托给 Worker.execute_task,带技能注入"""
-    from graph.pipline import worker_exec_node as pipline_worker_exec_node
-
-    class FakeInjector:
-        def inject_into_prompt(self, prompt: str, task: str) -> str:
-            return f"{prompt}\n\n【技能指引:{task}】"
-
-    worker = FakeAgent(name="worker", response="已完成")
-    state = {"plan": "计划: 步骤1"}
-
-    result = asyncio.run(pipline_worker_exec_node(state, worker, injector=FakeInjector()))
-
-    assert result["worker_result"] == "已完成"
-    prompt = worker.calls[0][1]
-    assert "请执行以下计划" in prompt
-    assert "步骤1" in prompt
-    assert "【技能指引:计划: 步骤1】" in prompt
-
-
-def test_pipline_terminator_final_node_uses_finalize():
-    """测试 pipline 的 Terminator 节点:委托给 Terminator.finalize,带技能注入"""
-    from graph.pipline import terminator_final_node as pipline_terminator_final_node
-
-    class FakeInjector:
-        def inject_into_prompt(self, prompt: str, task: str) -> str:
-            return f"{prompt}\n\n【技能指引:{task}】"
-
-    terminator = FakeAgent(name="terminator", response="最终答案")
-    state = {
-        "task": "任务",
-        "plan": "计划",
-        "worker_result": "结果",
-        "context_summary": "用户偏好中文",
-    }
-
-    result = asyncio.run(pipline_terminator_final_node(state, terminator, injector=FakeInjector()))
-
-    assert result["final_answer"] == "最终答案"
-    prompt = terminator.calls[0][1]
-    assert "原始任务" in prompt
-    assert "执行计划" in prompt
-    assert "执行结果" in prompt
-    assert "用户偏好中文" in prompt
-    assert "【技能指引:任务】" in prompt
-
-
 def test_terminator_final_node_with_summary():
     """测试 Terminator 节点:有记忆摘要时注入摘要块"""
     terminator = FakeAgent(name="terminator", response="最终答案")
@@ -1179,3 +1112,87 @@ def test_workflow_cross_round_no_checkpointer():
     result = asyncio.run(arun_simple_workflow(graph, "任务", thread_id="wf-t3"))
     assert result["final_answer"] == "答案"
     assert manager.calls[0][1] == ""  # 无历史,summarize 收到空 raw_context
+
+
+# ==================== 节点产出提取（NODE_END content） ====================
+
+
+def _make_tracking_handler():
+    """构造 NodeTrackingHandler：收集 NODE_END 事件。"""
+    from langchain_core.messages import AIMessage
+
+    from graph.common import NodeTrackingHandler
+    from utils.events import EventType
+
+    return NodeTrackingHandler, AIMessage, EventType
+
+
+def test_node_end_carries_node_output():
+    """on_chain_end 从 output.messages 提取节点产出 → NODE_END.content"""
+    NodeTrackingHandler, AIMessage, EventType = _make_tracking_handler()
+    events: list = []
+    handler = NodeTrackingHandler({"node_a"}, on_node_end=events.append)
+    handler.on_chain_start({}, {}, run_id="r1", metadata={"langgraph_node": "node_a"})
+    handler.on_chain_end(
+        {"messages": [AIMessage(content="节点产出内容")]}, run_id="r1"
+    )
+    assert len(events) == 1
+    assert events[0].event_type == EventType.NODE_END
+    assert events[0].node == "node_a"
+    assert events[0].content == "节点产出内容"
+
+
+def test_node_end_content_empty_without_messages():
+    """output 无 messages 通道时 content 为空串（静默降级，不阻塞事件流）"""
+    NodeTrackingHandler, _, _ = _make_tracking_handler()
+    events: list = []
+    handler = NodeTrackingHandler({"node_a"}, on_node_end=events.append)
+    handler.on_chain_start({}, {}, run_id="r1", metadata={"langgraph_node": "node_a"})
+    handler.on_chain_end({}, run_id="r1")
+    assert len(events) == 1
+    assert events[0].content == ""
+
+
+def test_node_end_joins_text_content_blocks():
+    """content blocks（list[dict]）仅拼接 text 类型块，忽略 tool_use 等"""
+    NodeTrackingHandler, AIMessage, _ = _make_tracking_handler()
+    events: list = []
+    handler = NodeTrackingHandler({"node_a"}, on_node_end=events.append)
+    handler.on_chain_start({}, {}, run_id="r1", metadata={"langgraph_node": "node_a"})
+    handler.on_chain_end(
+        {
+            "messages": [
+                AIMessage(
+                    content=[
+                        {"type": "text", "text": "块A"},
+                        {"type": "tool_use", "text": "忽略"},
+                        {"type": "text", "text": "块B"},
+                    ]
+                )
+            ]
+        },
+        run_id="r1",
+    )
+    assert events[0].content == "块A块B"
+
+
+def test_node_end_ignores_non_aimessage_output():
+    """messages 最后一条非 AIMessage（如 HumanMessage）不算节点产出"""
+    NodeTrackingHandler, _, _ = _make_tracking_handler()
+    from langchain_core.messages import HumanMessage
+
+    events: list = []
+    handler = NodeTrackingHandler({"node_a"}, on_node_end=events.append)
+    handler.on_chain_start({}, {}, run_id="r1", metadata={"langgraph_node": "node_a"})
+    handler.on_chain_end({"messages": [HumanMessage(content="用户输入")]}, run_id="r1")
+    assert events[0].content == ""
+
+
+def test_node_end_output_not_dict_is_empty():
+    """output 非 dict（None/标量）时 content 为空串"""
+    NodeTrackingHandler, _, _ = _make_tracking_handler()
+    events: list = []
+    handler = NodeTrackingHandler({"node_a"}, on_node_end=events.append)
+    handler.on_chain_start({}, {}, run_id="r1", metadata={"langgraph_node": "node_a"})
+    handler.on_chain_end(None, run_id="r1")
+    assert events[0].content == ""

@@ -1,6 +1,6 @@
 // 消息气泡组件
 import { memo, useState, useRef, useEffect } from 'react'
-import { Bot, User, Copy, Check, RotateCcw, Pencil, Send } from 'lucide-react'
+import { Bot, User, Copy, Check, RotateCcw, Pencil, Send, ChevronDown, ChevronUp } from 'lucide-react'
 import { Markdown } from './Markdown'
 import { ToolCallCard } from './ToolCallCard'
 import { stripWorkflowPrefix } from '../store'
@@ -25,6 +25,8 @@ export const Message = memo(function Message({ message, onRegenerate, onEdit }: 
   const [copied, setCopied] = useState(false)
   const [editing, setEditing] = useState(false)
   const [editText, setEditText] = useState(message.content)
+  // 节点结果块默认折叠（内容与 token 实时流重复，折叠降低视觉噪音）
+  const [nodeOpen, setNodeOpen] = useState(false)
   const editRef = useRef<HTMLTextAreaElement>(null)
   const isUser = message.role === 'user'
 
@@ -88,7 +90,27 @@ export const Message = memo(function Message({ message, onRegenerate, onEdit }: 
           </div>
         )}
 
-        {(message.content || message.streaming) && !editing && (
+        {/* 节点结果块：workflow 会话中某节点的产出，默认折叠 */}
+        {message.nodeName && (
+          <div className="msg-node">
+            <button
+              className="node-header"
+              onClick={() => setNodeOpen((o) => !o)}
+              title={nodeOpen ? '收起' : '展开'}
+            >
+              <span className="node-dot done" />
+              <span className="node-label">{message.nodeName}</span>
+              {nodeOpen ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+            </button>
+            {nodeOpen && (
+              <div className="node-content">
+                <Markdown content={message.content} />
+              </div>
+            )}
+          </div>
+        )}
+
+        {(message.content || message.streaming) && !editing && !message.nodeName && (
           <div className={`bubble ${message.error ? 'error' : ''}`}>
             {message.content ? (
               <Markdown
@@ -156,7 +178,7 @@ export const Message = memo(function Message({ message, onRegenerate, onEdit }: 
                     {copied ? '已复制' : '复制'}
                   </button>
                 )}
-                {onRegenerate && (
+                {onRegenerate && !message.nodeName && (
                   <button className="msg-action-btn" onClick={onRegenerate}>
                     <RotateCcw size={12} />
                     重新生成

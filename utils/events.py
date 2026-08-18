@@ -11,6 +11,8 @@ AgentCore 产生 ``AgentEvent`` 事件流 → SessionManager 和 MemoryManager
 - CANCELLED: 用户拒绝执行危险命令
 - ERROR: 执行异常
 - DONE: 本轮执行结束
+- NODE_START / NODE_END / NODE_ERROR: workflow 业务节点开始/结束/异常
+  （NODE_END 携带节点产出 content，供前端在会话窗口渲染节点结果块）
 
 每个事件携带记忆判定字段（role / is_important / thread_id），
 MemoryManager 可直接从事件流中提取需要沉淀的长期记忆，
@@ -264,13 +266,21 @@ class AgentEvent:
         cls,
         *,
         node: str,
+        content: str = "",
         thread_id: str = "",
         trace_id: str = "",
     ) -> AgentEvent:
-        """创建业务节点正常结束事件。"""
+        """创建业务节点正常结束事件。
+
+        Args:
+            node: 业务节点名
+            content: 节点产出文本（从节点返回值 messages 通道提取；
+                为空表示无产出，前端不渲染节点结果块）
+        """
         return cls(
             event_type=EventType.NODE_END,
             node=node,
+            content=content,
             thread_id=thread_id,
             trace_id=trace_id,
         )
@@ -331,6 +341,7 @@ class AgentEvent:
         - done: {"type": "done", "content": str}
         - node_start/node_end/node_error: {"type": "workflow_node", "node", "status"}
           其中 status 分别为 running / done / error（兼容前端 workflow_node 协议）
+          node_end 且 content 非空时附带 "content"（节点产出文本）
         """
         if self.event_type == EventType.TOKEN:
             return {"type": "token", "content": self.content}
@@ -359,7 +370,11 @@ class AgentEvent:
         elif self.event_type == EventType.NODE_START:
             return {"type": "workflow_node", "node": self.node, "status": "running"}
         elif self.event_type == EventType.NODE_END:
-            return {"type": "workflow_node", "node": self.node, "status": "done"}
+            sse: dict[str, Any] = {"type": "workflow_node", "node": self.node, "status": "done"}
+            # 节点产出（可选）：非空时附带，供前端在会话窗口渲染节点结果块
+            if self.content:
+                sse["content"] = self.content
+            return sse
         elif self.event_type == EventType.NODE_ERROR:
             return {"type": "workflow_node", "node": self.node, "status": "error"}
         return {"type": "unknown", "event_type": str(self.event_type)}

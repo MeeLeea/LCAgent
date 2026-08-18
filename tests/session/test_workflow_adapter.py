@@ -51,7 +51,10 @@ class FakeGraph:
         handler.on_chain_start(
             {}, {}, run_id="r1", metadata={"langgraph_node": "node_a"}
         )
-        handler.on_chain_end({}, run_id="r1")
+        # 模拟节点返回值 messages 通道（节点产出经 NODE_END.content 携带）
+        handler.on_chain_end(
+            {"messages": [AIMessage(content="节点产出文本")]}, run_id="r1"
+        )
         return dict(self.result)
 
     async def aupdate_state(self, config, update) -> None:
@@ -75,7 +78,9 @@ class FakeGraphToken(FakeGraph):
         )
         handler.on_chat_model_stream(types.SimpleNamespace(content="增量文本"))
         handler.on_chat_model_stream(types.SimpleNamespace(content=""))
-        handler.on_chain_end({}, run_id="r1")
+        handler.on_chain_end(
+            {"messages": [AIMessage(content="节点产出文本")]}, run_id="r1"
+        )
         return dict(self.result)
 
 
@@ -151,7 +156,7 @@ def test_current_sid_explicit_beats_default():
     reg = _make_registry()
     adapter = _make_adapter(reg)
     assert adapter._current_sid() == "workflow-simple-thread-1"
-    assert adapter._current_sid("workflow-pipline-thread-9") == "workflow-pipline-thread-9"
+    assert adapter._current_sid("workflow-simple-thread-9") == "workflow-simple-thread-9"
 
 
 def test_set_current_session_delegates_to_registry():
@@ -204,6 +209,8 @@ def test_arun_events_node_flow(monkeypatch):
     ]
     assert events[0].node == "node_a"
     assert events[1].node == "node_a"
+    # NODE_END 携带节点产出（供前端渲染节点结果块）
+    assert events[1].content == "节点产出文本"
     done = events[-1]
     assert done.content == "最终完成"
     assert done.thread_id == "workflow-simple-thread-1"
