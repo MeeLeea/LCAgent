@@ -386,7 +386,7 @@ LangChainAgent/
 | `qwen`     | 通义千问        | `DASHSCOPE_API_KEY` | `Qwen2.5-7B-Instruct` |
 | `deepseek` | DeepSeek        | `DEEPSEEK_API_KEY`  | `deepseek-chat`       |
 | `kimi`     | Kimi (Moonshot) | `MOONSHOT_API_KEY`  | `kimi-k3`             |
-| `yunwu`    | 云雾            | `YUNWU_API_KEY`     | `gpt-5.5`             |
+| `yunwu`    | 云雾            | `YUNWU_API_KEY`     | `glm-5.2`             |
 
 ---
 
@@ -2060,6 +2060,8 @@ Designer (输出最终交付文件)
 | **TerminatorAgent** | 汇总结果并返回 | 纯文本推理(无工具)         | `team/terminator/` |
 | **DesignerAgent**     | RTL 设计：规格梳理/模块拆分/Filelist/RTL 编码 | 纯文本推理(无工具) | `team/rtl_designer/` |
 | **VerificationAgent** | RTL 验证：验证计划/TB·UVM 框架/覆盖率/bug 定位 | 纯文本推理(无工具) | `team/rtl_verification/` |
+
+> **RTL 团队角色模型配置**：`manager`/`architect`/`rtl_designer`/`rtl_verification` 均配置为云雾提供商 `qwen3.7-max`、`max_tokens=4096`。原因：云雾网关对 `max_completion_tokens` 参数的处理存在缺陷——思考型模型（`glm-5.2`/`qwen3.7-max`）的 reasoning token 会计入该预算，复杂设计任务（RTL 编码/验证方案）思考消耗远超 `max_tokens`，触发 `finish=length` 且 `content` 为空，导致工作流节点输出空字符串。`llm/llm_client.py` 中 `CloudmistChatOpenAI` 子类将 `max_completion_tokens` 还原为 `max_tokens` 规避该缺陷（仅 `provider="yunwu"` 生效），详见该文件类文档。
 
 > **固定技能注入**：`VerificationAgent` 每次节点调用都会强制注入 `.agents/skills/vivado-2025.2` 技能指引（验证环境固定使用 Vivado Xsim，不依赖任务关键词自动匹配），见 `team/rtl_verification/rtl_verification.py::_inject_vivado_skill`。
 

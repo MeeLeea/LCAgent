@@ -8,8 +8,10 @@ import re
 from typing import Any
 
 from langchain.chat_models import init_chat_model
+from langchain_core.language_models import LanguageModelInput
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 from tenacity import (
     Retrying,
     retry_if_exception,
@@ -137,6 +139,45 @@ def _make_retryer() -> Retrying:
     )
 
 
+class CloudmistChatOpenAI(ChatOpenAI):
+    """云雾网关专用 ChatOpenAI 子类，规避其 max_completion_tokens 缺陷。
+
+    背景: langchain-openai >= 1.0 在 _get_request_payload 中无条件把 max_tokens
+    改名为 max_completion_tokens 发送。云雾网关(api.cloudmist.cloud)对
+    max_completion_tokens 的处理有缺陷: 思考型模型(glm-5.2/qwen3.7-max)的
+    reasoning token 会计入该预算, 复杂设计任务思考消耗远超 max_tokens,
+    触发 finish=length 且 content 为空, 导致工作流节点输出空字符串。
+
+    实测: 同一复杂任务下
+      - httpx 直调 max_tokens=4096  → 6525~8410B 输出正常
+      - langchain max_completion_tokens=4096 → 0B 空输出
+    本子类覆写 _get_request_payload, 把 max_completion_tokens 改回 max_tokens,
+    从而绕过网关缺陷。仅用于 provider="yunwu" 的客户端。
+    """
+
+    def _get_request_payload(
+        self,
+        input_: LanguageModelInput,
+        *,
+        stop: list[str] | None = None,
+        **kwargs: Any,
+    ) -> dict:
+        """构造请求负载，将 max_completion_tokens 还原为 max_tokens。
+
+        Args:
+            input_: 输入消息列表
+            stop: 停止序列
+            **kwargs: 额外请求参数
+
+        Returns:
+            请求负载字典
+        """
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        if "max_completion_tokens" in payload:
+            payload["max_tokens"] = payload.pop("max_completion_tokens")
+        return payload
+
+
 class LLMClient:
     """统一的大模型调用接口，基于LangChain，支持多提供商"""
 
@@ -215,7 +256,11 @@ class LLMClient:
         self.client = self._create_chat_model()
 
     def _create_chat_model(self) -> BaseChatModel:
-        """创建统一聊天模型(init_chat_model, OpenAI 兼容接口)"""
+        """创建统一聊天模型(init_chat_model, OpenAI 兼容接口)
+
+        云雾网关(yunwu)使用 CloudmistChatOpenAI 子类，规避其
+        max_completion_tokens 把思考 token 计入预算导致空输出的缺陷。
+        """
         kwargs: dict[str, Any] = {
             "model": self.model,
             "model_provider": "openai",
@@ -226,6 +271,10 @@ class LLMClient:
         base_url = self.provider_config.get("base_url")
         if base_url:  # base_url 可选:仅当配置中提供时才传入
             kwargs["base_url"] = base_url
+        if self.provider == "yunwu":
+            # 云雾网关缺陷规避: 还原 max_tokens 参数(见 CloudmistChatOpenAI 类文档)
+            kwargs.pop("model_provider")
+            return CloudmistChatOpenAI(**kwargs)
         return init_chat_model(**kwargs)
 
     def chat(
