@@ -917,7 +917,8 @@ class AgentCore:
             mode = "chat"  # 默认 chat 模式（无追踪记录时尝试恢复）
 
         try:
-            result = await self.agent_executor.ainvoke(Command(resume=payload), config=config)
+            resume_command = await self._abuild_resume_command(config, payload)
+            result = await self.agent_executor.ainvoke(resume_command, config=config)
         except UserRejectedCommandError:
             return await self._ahandle_rejected_command(config)
 
@@ -1099,23 +1100,100 @@ class AgentCore:
         thread_id: str,
         trace_id: str,
     ) -> AgentEvent | None:
-        """流结束后检查是否被 ask_human 中断，返回 INTERRUPT 事件或 None。"""
+        """流结束后检查是否被中断，返回 INTERRUPT 事件或 None。
+
+        并行工具调用（如多个危险命令）可能产生多个 pending interrupts。
+        相同 kind（dangerous_command）的中断合并为单个事件，prompt 列出
+        所有待确认命令，用户一次确认即可批量恢复。
+        """
         graph = self.agent_executor
         try:
             state = await graph.aget_state(config)
-            if state is not None:
-                for task in getattr(state, "tasks", []) or []:
-                    for intr in getattr(task, "interrupts", []) or []:
-                        ev_dict = build_interrupt_event(getattr(intr, "value", None))
-                        return AgentEvent.interrupt(
-                            prompt=ev_dict.get("prompt", ""),
-                            choices=ev_dict.get("choices"),
-                            thread_id=thread_id,
-                            trace_id=trace_id,
-                        )
+            if state is None:
+                return None
+
+            interrupts = [
+                intr
+                for task in getattr(state, "tasks", []) or []
+                for intr in getattr(task, "interrupts", []) or []
+            ]
+            if not interrupts:
+                return None
+
+            ev_dicts = [
+                build_interrupt_event(getattr(intr, "value", None))
+                for intr in interrupts
+            ]
+
+            # 判断是否全部为 dangerous_command（并行工具调用的典型场景）
+            kinds = {
+                getattr(intr, "value", {}).get("kind", "")
+                if isinstance(getattr(intr, "value", None), dict)
+                else ""
+                for intr in interrupts
+            }
+
+            if len(interrupts) > 1 and kinds == {"dangerous_command"}:
+                combined_prompt = "\n\n".join(
+                    f"({i + 1}/{len(ev_dicts)}) {ev_dicts[i].get('prompt', '')}"
+                    for i in range(len(ev_dicts))
+                )
+                return AgentEvent.interrupt(
+                    prompt=combined_prompt,
+                    choices=ev_dicts[0].get("choices"),
+                    thread_id=thread_id,
+                    trace_id=trace_id,
+                )
+
+            return AgentEvent.interrupt(
+                prompt=ev_dicts[0].get("prompt", ""),
+                choices=ev_dicts[0].get("choices"),
+                thread_id=thread_id,
+                trace_id=trace_id,
+            )
         except Exception as error:
             logger.warning("检查 interrupt 失败: %s", error, exc_info=True)
         return None
+
+    async def _abuild_resume_command(
+        self,
+        config: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> Command:
+        """构造恢复命令：多个 pending interrupts 时批量恢复。
+
+        并行工具调用可能产生多个 pending interrupts（如多个危险命令确认）。
+        将同一答案应用到所有 pending interrupts，避免用户逐个确认。
+
+        Args:
+            config: LangGraph 配置（用于读取当前 state 的挂起中断）
+            payload: 调用方传入的恢复数据
+
+        Returns:
+            可直接传给图执行的 ``Command(resume=...)``
+        """
+        graph = self.agent_executor
+        try:
+            state = await graph.aget_state(config)
+        except Exception as error:
+            logger.warning("读取 pending interrupts 失败: %s", error, exc_info=True)
+            return Command(resume=payload)
+
+        interrupts = [
+            intr
+            for task in getattr(state, "tasks", []) or []
+            for intr in getattr(task, "interrupts", []) or []
+        ]
+        if len(interrupts) <= 1:
+            return Command(resume=payload)
+
+        # payload 已是 {interrupt_id: value} 映射
+        pending_ids = {intr.id for intr in interrupts}
+        if isinstance(payload, dict) and payload and pending_ids.issuperset(payload.keys()):
+            return Command(resume=payload)
+
+        # 多中断 + 裸值：将同一答案应用到所有 pending interrupts
+        return Command(resume={intr.id: payload for intr in interrupts})
 
     async def arun_events(
         self,
@@ -1233,9 +1311,11 @@ class AgentCore:
 
             collected_output: list[str] = []
 
+            resume_command = await self._abuild_resume_command(config, payload)
+
             with self._temp_verbose(False):
                 async for ev in self._arun_graph_events(
-                    Command(resume=payload),
+                    resume_command,
                     config,
                     tid,
                     trace_id,

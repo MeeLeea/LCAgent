@@ -161,6 +161,152 @@ def test_resume_structured_invokes_command_resume_with_same_thread_config():
     assert config == {"configurable": {"thread_id": "thread-123"}, "recursion_limit": 25}
 
 
+def test_abuild_resume_command_maps_to_first_interrupt_id_when_multiple_pending():
+    # Given: 图上同时挂起两个并行 interrupt（LangGraph 要求恢复时按 id 映射）。
+    from agent.agent_core import AgentCore
+
+    class FakeState:
+        def __init__(self):
+            self.tasks = [
+                SimpleNamespace(
+                    interrupts=[Interrupt(value={"kind": "human_choice"}, id="interrupt-a")]
+                ),
+                SimpleNamespace(
+                    interrupts=[Interrupt(value={"kind": "dangerous_command"}, id="interrupt-b")]
+                ),
+            ]
+
+    class FakeExecutor:
+        async def aget_state(self, config):
+            return FakeState()
+
+    core = object.__new__(AgentCore)
+    core.agent_executor = FakeExecutor()
+
+    # When: 裸值 payload 恢复多中断会话。
+    command = asyncio.run(
+        core._abuild_resume_command(
+            {"configurable": {"thread_id": "thread-multi"}}, {"choice_id": "approve"}
+        )
+    )
+
+    # Then: 恢复值按第一个 pending interrupt 的 id 映射，避免 LangGraph 报错。
+    assert isinstance(command, Command)
+    assert command.resume == {"interrupt-a": {"choice_id": "approve"}}
+
+
+def test_abuild_resume_command_keeps_raw_payload_for_single_interrupt():
+    # Given: 只有一个 pending interrupt（最常见场景）。
+    from agent.agent_core import AgentCore
+
+    class FakeState:
+        def __init__(self):
+            self.tasks = [
+                SimpleNamespace(
+                    interrupts=[Interrupt(value={"kind": "human_choice"}, id="interrupt-a")]
+                ),
+            ]
+
+    class FakeExecutor:
+        async def aget_state(self, config):
+            return FakeState()
+
+    core = object.__new__(AgentCore)
+    core.agent_executor = FakeExecutor()
+
+    # When: 恢复单中断会话。
+    command = asyncio.run(
+        core._abuild_resume_command(
+            {"configurable": {"thread_id": "thread-single"}}, {"choice_id": "approve"}
+        )
+    )
+
+    # Then: 保持裸值形式，向后兼容。
+    assert command.resume == {"choice_id": "approve"}
+
+
+def test_abuild_resume_command_passes_through_id_keyed_payload():
+    # Given: 调用方已按 id 构造映射（CLI 的 _resume_payload_for_interrupts 形式）。
+    from agent.agent_core import AgentCore
+
+    class FakeState:
+        def __init__(self):
+            self.tasks = [
+                SimpleNamespace(
+                    interrupts=[Interrupt(value={"kind": "human_choice"}, id="interrupt-a")]
+                ),
+                SimpleNamespace(
+                    interrupts=[Interrupt(value={"kind": "human_choice"}, id="interrupt-b")]
+                ),
+            ]
+
+    class FakeExecutor:
+        async def aget_state(self, config):
+            return FakeState()
+
+    core = object.__new__(AgentCore)
+    core.agent_executor = FakeExecutor()
+
+    # When: payload 已是 {interrupt_id: value} 映射。
+    payload = {"interrupt-a": {"choice_id": "yes"}, "interrupt-b": {"choice_id": "no"}}
+    command = asyncio.run(
+        core._abuild_resume_command({"configurable": {"thread_id": "thread-multi"}}, payload)
+    )
+
+    # Then: 原样透传，不重复包一层。
+    assert command.resume == payload
+
+
+def test_aresume_structured_resumes_with_interrupt_id_mapping():
+    # Given: AgentCore + 真实 aget_state 模拟多个 pending interrupts。
+    from agent.agent_core import AgentCore
+
+    calls = []
+
+    class FakeState:
+        def __init__(self):
+            self.tasks = [
+                SimpleNamespace(
+                    interrupts=[Interrupt(value={"kind": "human_choice"}, id="interrupt-a")]
+                ),
+                SimpleNamespace(
+                    interrupts=[Interrupt(value={"kind": "human_choice"}, id="interrupt-b")]
+                ),
+            ]
+
+    class FakeExecutor:
+        async def aget_state(self, config):
+            return FakeState()
+
+        def invoke(self, command, config):
+            calls.append((command, config))
+            return {"messages": [AIMessage(content="resumed")]}
+
+        async def ainvoke(self, command, config):
+            calls.append((command, config))
+            return {"messages": [AIMessage(content="resumed")]}
+
+    async def no_compact() -> None:
+        return None
+
+    core = object.__new__(AgentCore)
+    core.agent_executor = FakeExecutor()
+    core._initial_thread_id = "thread-multi"
+    core.max_iterations = 25
+    core._state_lock = asyncio.Lock()
+    core._acompact_if_needed = no_compact
+
+    # When: 裸值 payload 恢复多中断会话。
+    turn = asyncio.run(core.aresume_structured({"choice_id": "approve"}))
+
+    # Then: resume 按第一个 interrupt id 映射，图正常恢复执行。
+    assert turn.status == "completed"
+    assert turn.output == "resumed"
+    command, _config = calls[0]
+    assert isinstance(command, Command)
+    assert command.resume == {"interrupt-a": {"choice_id": "approve"}}
+
+
 def test_cli_helper_renders_and_resumes_until_completion():
     # Given: an agent that interrupts twice before completing.
     from cli import human_input
