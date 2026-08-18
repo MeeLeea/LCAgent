@@ -928,7 +928,7 @@ HTTP API（[api/server.py](api/server.py)）同样暴露三个 RESTful 端点，
 
 `AgentCore.session_manager`（懒初始化）是上层流量的统一入口，封装 Agent + Memory：
 
-- **流式接口**：`achat_stream` / `aresume_stream` / `arun_stream`，产出 SSE 事件（`token` / `tool_call` / `tool_result` / `interrupt` / `cancelled` / `error` / `done`）
+- **流式接口**：`achat_stream` / `aresume_stream` / `arun_stream`，产出 SSE 事件（`token` / `tool_call` / `tool_result` / `interrupt` / `cancelled` / `error` / `done` / `workflow_node` / `workflow_status`）。其中 `workflow_node`（NODE_START/END/ERROR → status `running`/`done`/`error`）在 `done` 时携带该节点产出 `content`，前端在会话窗口渲染节点结果块
   - **`tool_call` / `tool_result` id 一致性**：LangChain 的 `on_tool_start` / `on_tool_end` 事件 data 不含 `tool_call_id`，`agent_core._arun_graph_events` 借助 `on_chat_model_end` 的 `AIMessage.tool_calls` 与事件 `run_id` 建立桥接，保证两个事件的 `id` 一致（兜底回退到事件 `name`），前端按 `id` 关联工具卡片与其结果
 - **非流式接口**：`achat` / `aresume` / `arun`，收集全部 token 为最终文本
 - **会话管理委托**：`new_session` / `new_workflow_session` / `set_current_session` / `current_session_id` / `alist_sessions` / `aswitch_session` / `adelete_session` / `aget_messages` / `aexport_session` / `asummarize`
@@ -1790,6 +1790,8 @@ resume = {
 
 `_resume_payload_for_interrupts` 会自动区分这两种情况：单 interrupt 直接传值，多 interrupt 按 `interrupt.id` 映射，避免答案错配。
 
+**服务端/Web 异步路径同样自动处理多中断**：`aresume_events`（`/api/chat/resume`）与 `aresume_structured` 在构造 `Command(resume=...)` 前会先调用 `_abuild_resume_command` 读取当前 checkpoint 的挂起中断列表——若存在多个 pending interrupt，会把裸值 payload 自动映射为 `{interrupt.id: payload}`，避免 LangGraph 抛出 "When there are multiple pending interrupts, you must specify the interrupt id when resuming"；若调用方已传入 `{interrupt_id: value}` 映射（如 CLI 的 `_resume_payload_for_interrupts`），则原样透传。单个 interrupt 时保持裸值形式，向后兼容。
+
 **多轮暂停**也支持：恢复后若又遇到新的 `ask_human`，`complete_human_input_turn` 会继续循环处理，直到 `status == "completed"`。例如一个图节点里连续两次 `ask_human`，需要两次 resume 才能完成。
 
 ### 线程隔离
@@ -1979,7 +1981,7 @@ Designer (输出最终交付文件)
 - **快速构建**:不加载 MCP Server、不扫描技能目录、不创建 SQLite checkpointer
 - **能力边界清晰**:规划/汇总角色不暴露危险工具(如 `run_shell`),Worker 才拥有工具执行能力
 - **自带 LLM 配置**:每个 agent 的 `agent_config.json` 里配置 `provider` + `model`,TeamAgent 内部创建 LLMClient
-- **可定制 LLM 采样参数**:子类可通过类属性或 `__init__` 参数覆盖 `temperature`/`max_tokens`(如 WorkerAgent 用 `temperature=0.3` 提升执行确定性、`max_tokens=4096` 放宽输出上限)
+- **可定制 LLM 采样参数**:`temperature`/`max_tokens` 采用**分层隔离**配置——非团队场景（主对话/调度器/API）默认值统一在 `llm/config.py` 的 `DEFAULTS` 管理，`LLMClient` 内部自动读取全局 `agent/agent_config.json`（含 DEFAULTS 兜底），外部无需传参；团队角色在其自身 `team/<角色>/agent_config.json` 中配置（如 WorkerAgent 用 `temperature=0.3` 提升执行确定性、`max_tokens=4096` 放宽输出上限），角色未配置时回退 DEFAULTS，**不读取全局自定义值**；子类也可通过类属性或 `__init__` 参数覆盖
 
 ### 异步化与跨轮次压缩
 
@@ -1998,9 +2000,9 @@ Designer (输出最终交付文件)
 
 工作流运行期间可实时感知节点执行进度（CLI 打印 + Web 前端节点高亮）：
 
-- **节点级回调**：`arun_simple_workflow` 接受可选 `on_node_start` / `on_node_end` / `on_node_error` 回调（接收 `AgentEvent`，其中 NODE_START / NODE_END / NODE_ERROR 事件携带 `node` 节点名）。内部通过 LangGraph 的 `config["callbacks"]` 注入 `NodeTrackingHandler`（位于 `graph/common.py`），利用节点执行时 `metadata["langgraph_node"]` 字段识别业务节点（哨兵节点与内部 agent 子图会被过滤），在节点开始/结束/异常时构造 `AgentEvent` 并触发回调。不传回调时零额外开销。
+- **节点级回调**：`arun_simple_workflow` 接受可选 `on_node_start` / `on_node_end` / `on_node_error` 回调（接收 `AgentEvent`，其中 NODE_START / NODE_END / NODE_ERROR 事件携带 `node` 节点名；NODE_END 额外携带 `content` —— 该节点的产出文本，从节点返回值的 `messages` 通道提取，供前端渲染节点结果块）。内部通过 LangGraph 的 `config["callbacks"]` 注入 `NodeTrackingHandler`（位于 `graph/common.py`），利用节点执行时 `metadata["langgraph_node"]` 字段识别业务节点（哨兵节点与内部 agent 子图会被过滤），在节点开始/结束/异常时构造 `AgentEvent` 并触发回调。不传回调时零额外开销。
 - **CLI 场景**：`run_workflow` 把节点状态打印到终端（`▸ 节点开始: manager_plan` / `✓ 节点完成: manager_plan`）。
-- **Web 场景**：`CommandContext.workflow_event_cb` 把结构化事件（`workflow_node` / `workflow_status`）经 `/api/chat` 的 SSE 流实时推送；服务端将管理型命令的 `dispatch_command` 放到后台线程执行、输出经 `asyncio.Queue` 实时转发，前端 `WorkflowView` 据此高亮节点卡片与流程图。
+- **Web 场景**：`CommandContext.workflow_event_cb` 把结构化事件（`workflow_node` / `workflow_status`）经 `/api/chat` 的 SSE 流实时推送；服务端将管理型命令的 `dispatch_command` 放到后台线程执行、输出经 `asyncio.Queue` 实时转发，前端 `WorkflowView` 据此高亮节点卡片与流程图。`workflow_node` 的 `done` 状态携带该节点产出（`content` 字段）时，前端在**会话窗口**追加一条带节点名标签的可折叠节点结果块（`web/src/components/Message.tsx` 的 `nodeName` 分支），使节点间的 message/result 可见；节点内 LLM 增量仍经 `token` 事件实时流式展示。
 
 ### 记忆注入机制
 
@@ -2122,14 +2124,25 @@ from tools import all_tools
 
 @register_agent("my_agent", "team/my_agent/agent_config.json", tools=all_tools)
 class MyAgent(TeamAgent):
-    temperature = 0.3
-    max_tokens = 4096
     default_templates = {"my_node": "模板..."}
 ```
 
 ```
 # team/my_agent/AGENT.md        — 角色系统提示词 + ## workflow:小节
-# team/my_agent/agent_config.json — LLM 配置(provider/model/prompt_file 等)
+# team/my_agent/agent_config.json — LLM 配置(provider/model/temperature/max_tokens/prompt_file 等)
+# 采样参数建议配置在 agent_config.json(角色级,缺省回退 DEFAULTS),无需改代码类属性
+```
+
+```
+// team/my_agent/agent_config.json
+{
+    "name": "my_agent",
+    "provider": "zhipu",
+    "model": "glm-4-flash",
+    "temperature": 0.3,
+    "max_tokens": 4096,
+    "agent_prompt_file": "team/my_agent/AGENT.md"
+}
 ```
 
 然后在 `team/__init__.py` 中添加导入即可,`@register_agent` 装饰器会在模块加载时自动注册。
@@ -2500,6 +2513,10 @@ asyncio.run(main())
 | `max_execution_history` | int  | 100                         | 执行历史最大条数                                              |
 | `agent_prompt_file`     | str  | `agent/AGENT.md`          | Agent 核心提示词文件路径（相对项目根或绝对路径）              |
 | `tool_timeout`          | int  | 120                         | 工具调用超时（秒）                                            |
+| `temperature`           | float | 0.7                        | LLM 采样温度（主对话/调度器/API 默认；团队角色分层配置于自身 `agent_config.json`，缺省回退 DEFAULTS） |
+| `max_tokens`            | int  | 8192                        | LLM 最大生成 token 数（覆盖来源同 `temperature`）             |
+
+> **采样参数分层隔离**：团队场景只用 `team/<角色>/agent_config.json`（`temperature`/`max_tokens` 经 `build_team_agent` 解析后作为显式参数传入，未配置时回退 `llm/config.py` 的 `DEFAULTS`，**不读取全局自定义值**）；非团队场景（主对话/调度器/API/飞书）由 `LLMClient` 内部自动读取全局 `agent/agent_config.json`（含 DEFAULTS 兜底），外部无需传参。显式构造参数（`LLMClient(..., temperature=...)` / `build_team_agent(..., temperature=...)`）始终优先。
 
 **Memory 层配置**（同文件同名键透传，默认值见 [memory/config.py](memory/config.py)）：
 
@@ -2716,12 +2733,14 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 | `tests/api/test_api.py`                | API Server：端点路由、流式聊天、命令执行（FastAPI TestClient）                          |
 | `tests/llm/test_message_utils.py`      | LLM 异常信息提取：429/5xx/鉴权/未知错误的中文提示                                       |
 | `tests/llm/test_llm_client.py`         | 瞬时错误自动重试：should_retry 判定与重试行为                                           |
+| `tests/llm/test_llm_client_config.py`  | LLMClient 采样参数默认值来源：显式参数 > 全局配置 > DEFAULTS 兜底                      |
 | `tests/utils/test_compaction.py`       | 长上下文压缩中间件：增量摘要、工具输出 Prune、安全切割                                  |
 | `tests/tools/test_create_tool.py`      | `create_tool` 动态生成工具代码并自动注册到 `tools/__init__.py`                       |
 | `tests/agent/test_graph_rebuild.py`    | Graph 重建：MCP 工具变化触发重建、技能变化不重建                                        |
 | `tests/tools/test_mcp_pool.py`         | `MCPPool` 连接池：连接管理、健康探测、重连（mock 注入）                                |
 | `tests/cli/test_threads_preview.py`    | 会话菜单预览：首条用户消息提取与截断                                                    |
 | `tests/graph/test_workflow.py`         | 监督者模式工作流编排：Manager→Worker→Terminator 模板                                  |
+| `tests/team/test_sampling_config.py`   | 团队 Agent 采样参数：角色级/全局优先级与显式参数覆盖                                   |
 | `tests/utils/test_metrics.py`          | `MetricsCollector`：LLM/工具/压缩指标记录、token 提取与汇总                           |
 | `tests/tools/test_tool_wrapper.py`     | 工具超时包装：超时返回 JSON、按工具名覆盖、无限等待排除                                 |
 | `tests/utils/test_logging_config.py`   | 结构化日志：trace_id/thread_id 上下文注入、TraceContext 恢复                            |
