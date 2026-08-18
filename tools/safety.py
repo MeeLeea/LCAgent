@@ -56,7 +56,8 @@ BUILTIN_CONFIRM = [
     r"\bmv\b", r"\bkill\b", r"\btaskkill\b", r"\bschtasks\b",
     # 解释器可隐藏任意副作用，脚本、内联代码和命令包装器统一要求人工确认
     # ["']? 容忍带引号的完整路径（如 "C:\...\python.exe" -c "..."）
-    r'\b(?:python(?:3)?|py)(?:\.exe)?\b["\']?\s+(?:-[cmo]\b|[^\s;&|]+\.py\b)',
+    # (?<![\w.]) 替代 \b：防止 config.py 末尾的 py 被误匹配为 py 命令
+    r'(?<![\w.])(?:python(?:3)?|py)(?:\.exe)?\b["\']?\s+(?:-[cmo]\b|[^\s;&|]+\.py\b)',
     r'\b(?:powershell|pwsh)(?:\.exe)?\b["\']?[^\r\n]*\s-(?:command|file)\b',
     r'\bcmd(?:\.exe)?\b["\']?\s+/(?:c|k)\b',
     r'\b(?:bash|sh)\b["\']?\s+-c\b',
