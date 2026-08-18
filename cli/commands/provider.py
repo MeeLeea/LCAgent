@@ -30,6 +30,7 @@ def create_llm(provider: str, config_file: str) -> LlmLike:
     from llm.llm_client import LLMClient
 
     try:
+        # 采样参数由 LLMClient 内部从全局 agent_config.json 读取，无需外部传参
         return LLMClient(provider=provider, config_file=config_file)
     except ValueError as error:
         print(f"\n错误: {error}")

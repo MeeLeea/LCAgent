@@ -47,6 +47,7 @@ async def build_agent(provider: str, process_type: str | None = None) -> tuple[A
     from llm.llm_client import load_providers as list_providers
     
     print(f"\n初始化 {list_providers(LLM_FILE)[provider]['name']} 客户端...")
+    # 采样参数由 LLMClient 内部从全局 agent_config.json 读取，无需外部传参
     llm = create_llm(provider, LLM_FILE)
     print("加载运行时配置...")
     config = load_agent_config(AGENT_CONFIG_FILE)

@@ -46,6 +46,34 @@ def test_load_real(tmp_path):
     assert cfg["verbose"] is True
 
 
+def test_sampling_params_passthrough(tmp_path):
+    """temperature/max_tokens 经 agent_config.json 透传（DEFAULTS 不含这两键，未配置时为 None）"""
+    p = tmp_path / "agent_config.json"
+    p.write_text('{"temperature": 0.3, "max_tokens": 4096}', encoding="utf-8")
+    cfg = load_agent_config(str(p))
+    assert cfg["temperature"] == 0.3
+    assert cfg["max_tokens"] == 4096
+
+
+def test_sampling_params_default_from_defaults():
+    """未配置采样参数时，由 DEFAULTS 兜底（0.7/8192），供 LLMClient 内部读取"""
+    cfg = load_agent_config("this_file_does_not_exist.json")
+    assert cfg["temperature"] == 0.7
+    assert cfg["max_tokens"] == 8192
+    assert DEFAULTS["temperature"] == 0.7
+    assert DEFAULTS["max_tokens"] == 8192
+
+
+def test_load_global_config_has_sampling_params():
+    """真实全局 agent/agent_config.json 应包含采样参数（供 main/scheduler/api 使用）"""
+    import os
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    cfg = load_agent_config(os.path.join(root, "agent", "agent_config.json"))
+    assert isinstance(cfg.get("temperature"), float)
+    assert isinstance(cfg.get("max_tokens"), int)
+
+
 def test_resolve_path_absolute():
     assert resolve_path("C:\\x", "D:\\base") == "C:\\x"
 

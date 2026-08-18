@@ -146,8 +146,8 @@ class LLMClient:
         api_key: str | None = None,
         model: str | None = None,
         config_file: str | None = None,
-        temperature: float = 0.7,
-        max_tokens: int = 2048
+        temperature: float | None = None,
+        max_tokens: int | None = None
     ):
         """
         初始化LLM客户端
@@ -157,8 +157,16 @@ class LLMClient:
             api_key: API密钥，不提供则从环境变量或配置文件获取
             model: 模型名称，不提供则使用提供商默认模型
             config_file: 配置文件路径，用于读取API密钥
-            temperature: 温度参数
-            max_tokens: 最大生成token数
+            temperature: 温度参数（None 时从 agent/agent_config.json 全局配置读取，
+                DEFAULTS 兜底为 0.7）
+            max_tokens: 最大生成token数（None 时从 agent/agent_config.json 全局配置读取，
+                DEFAULTS 兜底为 8192）
+
+        采样参数来源（高→低）:
+            1. 本构造函数的显式参数
+            2. agent/agent_config.json 全局配置（含 llm/config.py 的 DEFAULTS 兜底）
+            团队角色温度由 team/factory.py 从角色 agent_config.json 解析后作为显式参数传入；
+            角色未配置时回退 DEFAULTS（0.7/8192），不读取全局自定义值。
         """
         provider = (provider or "openai").lower()
         self.config_file = config_file or DEFAULT_CONFIG_FILE
@@ -172,6 +180,16 @@ class LLMClient:
 
         self.provider = provider
         self.provider_config = providers[provider]
+
+        # 采样参数：显式参数 > 全局 agent_config.json（DEFAULTS 兜底）。
+        # load_agent_config 的 DEFAULTS 已含 temperature/max_tokens，故此处必然有值。
+        if temperature is None or max_tokens is None:
+            from llm.config import DEFAULT_AGENT_CONFIG_FILE, load_agent_config
+            agent_config = load_agent_config(DEFAULT_AGENT_CONFIG_FILE)
+            if temperature is None:
+                temperature = agent_config["temperature"]
+            if max_tokens is None:
+                max_tokens = agent_config["max_tokens"]
         self.temperature = temperature
         self.max_tokens = max_tokens
 

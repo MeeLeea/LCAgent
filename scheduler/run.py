@@ -96,6 +96,7 @@ def make_agent_factory(provider: str):
     mcp_config_file = resolve_path(agent_config["mcp_config_file"], BASE_DIR)
 
     # 预创建 LLM 客户端（创建 chat model 是最重的部分，只做一次）
+    # 采样参数由 LLMClient 内部从全局 agent_config.json 读取，无需外部传参
     llm = LLMClient(provider=provider, config_file=LLM_CONFIG_FILE)
     logger.info("LLM 已就绪: %s / %s", llm.get_info()["provider_name"], llm.model)
 

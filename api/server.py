@@ -181,6 +181,7 @@ def _prune_thread_locks() -> None:
 
 async def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
     """根据提供商初始化 LLM 与 Agent（逻辑与 main.py 一致，去掉 CLI 打印）。"""
+    # 采样参数由 LLMClient 内部从全局 agent_config.json 读取，无需外部传参
     new_llm = LLMClient(provider=provider, config_file=LLM_FILE)
     cfg = load_agent_config(AGENT_CONFIG_FILE)
     agent_prompt_file = cfg.get("agent_prompt_file")
@@ -423,6 +424,7 @@ async def switch_provider(req: SwitchProviderRequest):
     async with chat_lock:
         global llm
         try:
+            # 采样参数由 LLMClient 内部从全局 agent_config.json 读取，无需外部传参
             new_llm = LLMClient(provider=req.provider, config_file=LLM_FILE)
         except Exception as e:
             logger.error("切换失败: %s", e)

@@ -14,6 +14,10 @@
     context_trim_keep          int    裁剪时保留的最近消息条数
     max_execution_history      int    执行历史最大条数
     tool_timeout               int    工具调用超时(秒)
+    temperature                float  LLM 采样温度(全局默认，非团队场景生效；
+                                      团队角色分层配置于自身 agent_config.json，
+                                      缺省回退 DEFAULTS，不读取全局自定义值)
+    max_tokens                 int    LLM 最大生成 token 数(来源规则同 temperature)
 
 Memory 层配置（默认值见 memory/config.py，JSON 中同名键自动透传）:
     memory_buffer_delay_seconds   int  记忆写入防抖延迟(秒)
@@ -77,7 +81,17 @@ DEFAULTS: dict[str, Any] = {
     "max_execution_history": 100,
     "agent_prompt_file": "agent/AGENT.md",
     "tool_timeout": 120,
+    "temperature": 0.7,
+    "max_tokens": 8192,
 }
+
+
+# 全局 agent 配置路径(供 LLMClient 等模块内部读取采样参数默认值)
+DEFAULT_AGENT_CONFIG_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "agent",
+    "agent_config.json",
+)
 
 
 def load_agent_config(config_file: str) -> dict[str, Any]:
