@@ -136,9 +136,13 @@ class TestFactExtractionPipeline:
             await mw.submit_event("t1", "user", "我偏好 Python")
             await mw._aflush_thread("t1")
 
-            facts = await store.query_facts("t1")
-            assert len(facts) == 1
-            assert facts[0].content == "用户偏好 Python"
+            # user_fact 走 agent 级（跨会话共享），thread 级应为空
+            thread_facts = await store.query_facts("t1")
+            assert thread_facts == []
+            agent_facts = await store.query_agent_facts()
+            assert len(agent_facts) == 1
+            assert agent_facts[0].content == "用户偏好 Python"
+            assert agent_facts[0].scope == "agent"
 
         asyncio.run(run())
 
@@ -149,16 +153,20 @@ class TestFactExtractionPipeline:
                 {"content": "new-fact", "category": "lesson", "confidence": 0.9},
             ]))
             mw, store = _make_write_middleware(llm_getter=lambda: llm)
-            # 预写入一条
+            # 预写入一条 thread 级 fact（conv 类）
             await store.save_fact("t1", ThreadFactItem(content="duplicate"))
             await mw.submit_event("t1", "user", "some message")
             await mw._aflush_thread("t1")
 
-            facts = await store.query_facts("t1")
-            assert len(facts) == 2
-            contents = {f.content for f in facts}
-            assert "duplicate" in contents
-            assert "new-fact" in contents
+            # conv 类走 thread 级：duplicate 已存在应被去重，保留预写入的那条
+            thread_facts = await store.query_facts("t1")
+            assert len(thread_facts) == 1
+            assert thread_facts[0].content == "duplicate"
+            # lesson 类走 agent 级：new-fact 应写入 agent namespace
+            agent_facts = await store.query_agent_facts()
+            assert len(agent_facts) == 1
+            assert agent_facts[0].content == "new-fact"
+            assert agent_facts[0].scope == "agent"
 
         asyncio.run(run())
 
@@ -510,3 +518,218 @@ class TestConfigConstants:
 
     def test_default_max_buffer_messages(self):
         assert MAX_BUFFER_MESSAGE_COUNT == 30
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  Agent 级 / Thread 级 分层路由与读聚合
+# ════════════════════════════════════════════════════════════════════════
+
+
+class TestAgentScopeRouting:
+    """LLM 返回不同 category 的 fact 时按 scope 路由写入对应 namespace。"""
+
+    def test_user_fact_routed_to_agent_namespace(self):
+        """user_fact 类 fact → 写入 agent namespace，thread 级为空。"""
+        async def run():
+            llm = _FakeLLM(response=json.dumps([
+                {"content": "用户偏好深色主题", "category": "user_fact", "confidence": 0.9}
+            ]))
+            mw, store = _make_write_middleware(llm_getter=lambda: llm)
+            await mw.submit_event("t1", "user", "我喜欢深色主题")
+            await mw._aflush_thread("t1")
+
+            thread_facts = await store.query_facts("t1")
+            assert thread_facts == []
+            agent_facts = await store.query_agent_facts()
+            assert len(agent_facts) == 1
+            assert agent_facts[0].content == "用户偏好深色主题"
+            assert agent_facts[0].scope == "agent"
+
+        asyncio.run(run())
+
+    def test_lesson_routed_to_agent_namespace(self):
+        """lesson 类 fact → 写入 agent namespace。"""
+        async def run():
+            llm = _FakeLLM(response=json.dumps([
+                {"content": "踩坑：API 限流", "category": "lesson", "confidence": 0.9}
+            ]))
+            mw, store = _make_write_middleware(llm_getter=lambda: llm)
+            await mw.submit_event("t1", "user", "API 限流了")
+            await mw._aflush_thread("t1")
+
+            assert await store.query_facts("t1") == []
+            agent_facts = await store.query_agent_facts()
+            assert len(agent_facts) == 1
+            assert agent_facts[0].category == "lesson"
+
+        asyncio.run(run())
+
+    def test_conv_routed_to_thread_namespace(self):
+        """conv 类 fact → 写入 thread namespace，agent 级为空。"""
+        async def run():
+            llm = _FakeLLM(response=json.dumps([
+                {"content": "本次对话要点", "category": "conv", "confidence": 0.8}
+            ]))
+            mw, store = _make_write_middleware(llm_getter=lambda: llm)
+            await mw.submit_event("t1", "user", "讨论要点")
+            await mw._aflush_thread("t1")
+
+            agent_facts = await store.query_agent_facts()
+            assert agent_facts == []
+            thread_facts = await store.query_facts("t1")
+            assert len(thread_facts) == 1
+            assert thread_facts[0].content == "本次对话要点"
+            assert thread_facts[0].scope == "thread"
+
+        asyncio.run(run())
+
+    def test_business_routed_to_thread_namespace(self):
+        """business 类 fact → 写入 thread namespace。"""
+        async def run():
+            llm = _FakeLLM(response=json.dumps([
+                {"content": "项目配置 X", "category": "business", "confidence": 0.9}
+            ]))
+            mw, store = _make_write_middleware(llm_getter=lambda: llm)
+            await mw.submit_event("t1", "user", "配置 X")
+            await mw._aflush_thread("t1")
+
+            assert await store.query_agent_facts() == []
+            thread_facts = await store.query_facts("t1")
+            assert len(thread_facts) == 1
+            assert thread_facts[0].category == "business"
+
+        asyncio.run(run())
+
+    def test_read_aggregates_agent_and_thread_facts(self):
+        """agent namespace 预置 1 条 + thread 预置 1 条 → SystemMessage 同时含两者。"""
+        async def run():
+            store = ThreadMemoryStore()
+            await store.save_agent_fact(
+                ThreadFactItem(content="agent-fact-shared", category="user_fact")
+            )
+            await store.save_fact(
+                "t1", ThreadFactItem(content="thread-fact-local", category="conv")
+            )
+            mw = ThreadMemoryReadMiddleware(store)
+
+            request = _FakeModelRequest(context={"configurable": {"thread_id": "t1"}})
+            captured = []
+
+            async def handler(req):
+                captured.append(req)
+                return "ok"
+
+            await mw.awrap_model_call(request, handler)
+            text = _sys_content_text(captured[0].system_message)
+            assert "agent-fact-shared" in text
+            assert "thread-fact-local" in text
+
+        asyncio.run(run())
+
+    def test_read_merge_agent_priority_on_duplicate_content(self):
+        """content 重复时 agent 版本优先（保留 agent 级版本）。"""
+        async def run():
+            store = ThreadMemoryStore()
+            same_content = "重复内容"
+            # 两级 namespace 预置相同 content
+            await store.save_agent_fact(
+                ThreadFactItem(content=same_content, category="user_fact", scope="agent")
+            )
+            await store.save_fact(
+                "t1",
+                ThreadFactItem(content=same_content, category="conv", scope="thread"),
+            )
+            mw = ThreadMemoryReadMiddleware(store)
+
+            request = _FakeModelRequest(context={"configurable": {"thread_id": "t1"}})
+            captured = []
+
+            async def handler(req):
+                captured.append(req)
+                return "ok"
+
+            await mw.awrap_model_call(request, handler)
+            text = _sys_content_text(captured[0].system_message)
+            # 注入文本只应出现一次（去重后保留 agent 版本）
+            assert text.count(same_content) == 1
+            # agent 版本 category 为 user_fact → "用户事实" 标签
+            assert "用户事实" in text
+
+        asyncio.run(run())
+
+    def test_read_recall_limit_applies_to_merged_list(self):
+        """recall_limit 截取对合并后的列表生效（agent 3 + thread 5, limit=5 → 5 条）。"""
+        async def run():
+            store = ThreadMemoryStore()
+            # agent 级 3 条（create_time 较早）
+            for i in range(3):
+                await store.save_agent_fact(
+                    ThreadFactItem(
+                        content=f"agent-{i}",
+                        category="user_fact",
+                        create_time=f"2026-01-01T00:00:0{i}",
+                    )
+                )
+            # thread 级 5 条（create_time 较晚）
+            for i in range(5):
+                await store.save_fact(
+                    "t1",
+                    ThreadFactItem(
+                        content=f"thread-{i}",
+                        category="conv",
+                        create_time=f"2026-01-02T00:00:0{i}",
+                    ),
+                )
+            mw = ThreadMemoryReadMiddleware(store, recall_limit=5)
+
+            request = _FakeModelRequest(context={"configurable": {"thread_id": "t1"}})
+            captured = []
+
+            async def handler(req):
+                captured.append(req)
+                return "ok"
+
+            await mw.awrap_model_call(request, handler)
+            text = _sys_content_text(captured[0].system_message)
+            # 合并 8 条按 create_time 升序，取最近 5 条 → 应为 thread-0..thread-4
+            # （create_time 较晚的 5 条 thread facts）
+            for i in range(5):
+                assert f"thread-{i}" in text
+            # agent-* 较早，应被截掉
+            for i in range(3):
+                assert f"agent-{i}" not in text
+
+        asyncio.run(run())
+
+    def test_read_touch_dispatches_by_scope(self):
+        """awrap_model_call 触发 touch 时按 scope 分发：
+        agent 级调 touch_agent_fact，thread 级调 touch_fact。"""
+        async def run():
+            store = ThreadMemoryStore()
+            agent_item = ThreadFactItem(
+                content="agent-touch-target", category="user_fact", scope="agent"
+            )
+            thread_item = ThreadFactItem(
+                content="thread-touch-target", category="conv", scope="thread"
+            )
+            agent_item.last_used_at = "2026-01-01T00:00:00"
+            thread_item.last_used_at = "2026-01-01T00:00:00"
+            await store.save_agent_fact(agent_item)
+            await store.save_fact("t1", thread_item)
+
+            mw = ThreadMemoryReadMiddleware(store)
+            request = _FakeModelRequest(context={"configurable": {"thread_id": "t1"}})
+
+            async def handler(req):
+                return "ok"
+
+            await mw.awrap_model_call(request, handler)
+            # 等待 asyncio.create_task 调度的 touch 完成
+            await asyncio.sleep(0.05)
+
+            agent_facts = await store.query_agent_facts()
+            thread_facts = await store.query_facts("t1")
+            assert agent_facts[0].last_used_at != "2026-01-01T00:00:00"
+            assert thread_facts[0].last_used_at != "2026-01-01T00:00:00"
+
+        asyncio.run(run())

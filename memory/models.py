@@ -47,7 +47,8 @@ class ThreadFactItem:
 
     Attributes:
         fact_id: 唯一标识（uuid hex）
-        thread_id: 所属会话线程 ID
+        thread_id: 所属会话线程 ID。agent 作用域下自动设为 agent_key（process_type 或 "default"），用于溯源
+        scope: 记忆作用域。``"thread"`` 表示按 thread 隔离（conv/business 类），``"agent"`` 表示跨会话共享（user_fact/lesson 类）。默认 ``"thread"``
         content: 记忆文本内容
         category: 记忆分类（MemoryCategory 值）
         confidence: 置信度 0.0-1.0
@@ -57,6 +58,7 @@ class ThreadFactItem:
 
     fact_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     thread_id: str = ""
+    scope: str = "thread"
     content: str = ""
     category: str = MemoryCategory.IMPORTANT_CONVERSATION.value
     confidence: float = 0.8
@@ -168,8 +170,8 @@ def judge_long_term_memory(event: MemoryInputEvent) -> MemoryCategory:
 
 
 __all__ = [
-    "MemoryInputEvent",
     "MemoryCategory",
+    "MemoryInputEvent",
     "ThreadFactItem",
     "judge_long_term_memory",
 ]

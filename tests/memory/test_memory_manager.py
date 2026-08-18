@@ -285,10 +285,12 @@ class TestLifecycle:
             await mgr.submit_user_message("t1", "我喜欢 Rust 语言")
             # flush_all 立即处理
             await mgr.flush_all()
-            # 应写入 1 条 fact
-            facts = await store.query_facts("t1")
-            assert len(facts) == 1
-            assert facts[0].content == "用户喜欢 Rust"
+            # user_fact 走 agent 级（跨会话共享），thread 级应为空
+            thread_facts = await store.query_facts("t1")
+            assert thread_facts == []
+            agent_facts = await store.query_agent_facts()
+            assert len(agent_facts) == 1
+            assert agent_facts[0].content == "用户喜欢 Rust"
 
         asyncio.run(run())
 
@@ -365,9 +367,12 @@ class TestBindLlm:
         # 旧 LLM 未被调用，新 LLM 完成抽取并落库
         assert old_llm.calls == []
         assert new_llm.calls != []
-        facts = asyncio.run(store.query_facts("t1"))
-        assert len(facts) == 1
-        assert facts[0].content == "切换后抽取的事实"
+        # user_fact 走 agent 级（跨会话共享），thread 级应为空
+        thread_facts = asyncio.run(store.query_facts("t1"))
+        assert thread_facts == []
+        agent_facts = asyncio.run(store.query_agent_facts())
+        assert len(agent_facts) == 1
+        assert agent_facts[0].content == "切换后抽取的事实"
 
     def test_memory_context_bind_llm_forwards_to_manager(self):
         """MemoryContext.bind_llm 应透传到内部 MemoryManager。"""
@@ -388,3 +393,97 @@ class TestBindLlm:
 
         assert ctx.memory_manager._llm_getter() is new_llm
         assert ctx.memory_manager.write_middleware._llm_getter() is new_llm
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  Agent 级长期记忆接口（recall_agent / recall_agent_text / count / clear）
+# ════════════════════════════════════════════════════════════════════════
+
+
+class TestAgentInterfaces:
+    """MemoryManager 暴露的 agent 级长期记忆接口测试。"""
+
+    def test_recall_agent_returns_facts(self):
+        """预置 agent facts → recall_agent 返回。"""
+        async def run():
+            mgr, store = _make_manager()
+            await store.save_agent_fact(
+                ThreadFactItem(content="agent-fact-1", category="user_fact")
+            )
+            await store.save_agent_fact(
+                ThreadFactItem(content="agent-fact-2", category="lesson")
+            )
+
+            facts = await mgr.recall_agent()
+            assert len(facts) == 2
+            assert {f.content for f in facts} == {"agent-fact-1", "agent-fact-2"}
+
+        asyncio.run(run())
+
+    def test_recall_agent_empty(self):
+        """无 agent facts → 返回 []。"""
+        async def run():
+            mgr, _ = _make_manager()
+            facts = await mgr.recall_agent()
+            assert facts == []
+
+        asyncio.run(run())
+
+    def test_recall_agent_text_format(self):
+        """非空 → 含"【长期记忆】"前缀和类别标签；空 → ""。"""
+        async def run():
+            mgr, store = _make_manager()
+            await store.save_agent_fact(
+                ThreadFactItem(content="跨会话偏好", category="user_fact")
+            )
+            await store.save_agent_fact(
+                ThreadFactItem(content="踩坑教训", category="lesson")
+            )
+
+            text = await mgr.recall_agent_text()
+            assert "【长期记忆】" in text
+            assert "用户事实" in text
+            assert "跨会话偏好" in text
+            assert "经验教训" in text
+            assert "踩坑教训" in text
+
+            # 空场景
+            mgr_empty, _ = _make_manager()
+            assert await mgr_empty.recall_agent_text() == ""
+
+        asyncio.run(run())
+
+    def test_recall_agent_respects_limit(self):
+        """recall_agent 受 limit 约束（取最近 N 条）。"""
+        async def run():
+            mgr, store = _make_manager()
+            for i in range(5):
+                item = ThreadFactItem(content=f"agent-{i}", category="user_fact")
+                item.create_time = f"2026-01-0{i+1}T00:00:00"
+                await store.save_agent_fact(item)
+
+            facts = await mgr.recall_agent(limit=2)
+            assert len(facts) == 2
+            # 返回最近创建的
+            assert facts[-1].content == "agent-4"
+
+        asyncio.run(run())
+
+    def test_count_and_clear_agent_facts(self):
+        """count_agent_facts 统计，clear_agent_facts 清空返回计数。"""
+        async def run():
+            mgr, store = _make_manager()
+            await store.save_agent_fact(
+                ThreadFactItem(content="a", category="user_fact")
+            )
+            await store.save_agent_fact(
+                ThreadFactItem(content="b", category="user_fact")
+            )
+
+            assert await mgr.count_agent_facts() == 2
+
+            cleared = await mgr.clear_agent_facts()
+            assert cleared == 2
+            assert await mgr.count_agent_facts() == 0
+
+        asyncio.run(run())

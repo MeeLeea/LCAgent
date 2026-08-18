@@ -175,12 +175,23 @@ class ThreadMemoryWriteMiddleware:
                     exc_info=True,
                 )
 
+    # 路由到 agent 级作用域的 category 集合（user_fact / lesson 跨会话共享）
+    _AGENT_CATEGORIES: frozenset[str] = frozenset({
+        MemoryCategory.USER_FACT.value,
+        MemoryCategory.LESSON_EXPERIENCE.value,
+    })
+
     async def _a_run_pipeline(
         self,
         thread_id: str,
         messages: list[tuple[str, str, bool]],
     ) -> None:
-        """执行完整 Fact 处理流水线。"""
+        """执行完整 Fact 处理流水线。
+
+        步骤 ④⑤⑥ 按 category 分流：
+        - ``user_fact`` / ``lesson`` → agent 级（跨会话共享）
+        - ``conv`` / ``business`` / 兜底 → thread 级（会话隔离，保持原行为）
+        """
 
         # ① 构造 MemoryInputEvent 并分类
         events: list[tuple[MemoryInputEvent, MemoryCategory]] = []
@@ -208,43 +219,86 @@ class ThreadMemoryWriteMiddleware:
         if not facts_raw:
             return
 
-        # ④ thread 内本地去重
-        existing = await self._store.query_facts(thread_id)
-        existing_contents = {f.content for f in existing}
+        # ④ 读取两级 existing 作为去重基准（agent 级别优先，避免跨作用域重复）
+        existing_thread = await self._store.query_facts(thread_id)
+        existing_agent = await self._store.query_agent_facts()
 
-        # ⑤ 组装 ThreadFactItem 并批量写入
-        new_items: list[ThreadFactItem] = []
+        # ⑤ 按 category 分流组装 ThreadFactItem
+        agent_seen: set[str] = {f.content for f in existing_agent}
+        thread_seen: set[str] = {f.content for f in existing_thread}
+
+        agent_items: list[ThreadFactItem] = []
+        thread_items: list[ThreadFactItem] = []
+
         for fact_data in facts_raw:
             content = fact_data["content"]
-            if content in existing_contents:
-                continue
-            existing_contents.add(content)  # 防止本批次内部重复
-
+            # 合法性校验 + 兜底（兜底为 conv，走 thread 分支）
             category = fact_data.get("category", "conv")
-            # 验证 category 合法性
             valid_categories = {c.value for c in MemoryCategory if c != MemoryCategory.SKIP}
             if category not in valid_categories:
                 category = MemoryCategory.IMPORTANT_CONVERSATION.value
 
-            item = ThreadFactItem(
-                fact_id=uuid.uuid4().hex,
-                thread_id=thread_id,
-                content=content,
-                category=category,
-                confidence=fact_data.get("confidence", 0.8),
-            )
-            new_items.append(item)
+            if category in self._AGENT_CATEGORIES:
+                if content in agent_seen or content in thread_seen:
+                    continue
+                agent_seen.add(content)
+                agent_items.append(
+                    self._build_fact_item(content, category, fact_data, scope="agent")
+                )
+            else:
+                if content in thread_seen or content in agent_seen:
+                    continue
+                thread_seen.add(content)
+                thread_items.append(
+                    self._build_fact_item(content, category, fact_data, scope="thread")
+                )
 
-        if new_items:
-            await self._store.save_facts_batch(thread_id, new_items)
+        # ⑥ 分流批量写入 + LRU 淘汰
+        if agent_items:
+            await self._store.save_agent_facts_batch(agent_items)
+            logger.info(
+                "agent %s: 写入 %d 条长期记忆",
+                thread_id,
+                len(agent_items),
+            )
+        await self._store.prune_agent_facts()
+
+        if thread_items:
+            await self._store.save_facts_batch(thread_id, thread_items)
             logger.info(
                 "thread %s: 写入 %d 条长期记忆",
                 thread_id,
-                len(new_items),
+                len(thread_items),
             )
-
-        # ⑥ LRU 淘汰
         await self._store.prune_facts(thread_id)
+
+    @staticmethod
+    def _build_fact_item(
+        content: str,
+        category: str,
+        fact_data: dict[str, Any],
+        scope: str,
+    ) -> ThreadFactItem:
+        """组装单条 ThreadFactItem（含 category 合法性校验后的字段）。
+
+        两分支（agent / thread）复用，避免重复组装逻辑。
+
+        Args:
+            content: fact 文本内容（已 strip）
+            category: 经合法性校验后的 category 值
+            fact_data: LLM 返回的原始 fact 字典（取 confidence 等附加字段）
+            scope: ``"agent"`` 或 ``"thread"``
+
+        Returns:
+            新构建的 ThreadFactItem（thread_id 由 store 层按 scope 自动覆写）
+        """
+        return ThreadFactItem(
+            fact_id=uuid.uuid4().hex,
+            content=content,
+            category=category,
+            confidence=fact_data.get("confidence", 0.8),
+            scope=scope,
+        )
 
     async def _a_extract_facts(
         self,
@@ -376,13 +430,14 @@ class ThreadMemoryWriteMiddleware:
 
 
 class ThreadMemoryReadMiddleware(AgentMiddleware):
-    """长期记忆读取中间件 — 在 model 调用前注入 thread facts 到 SystemMessage。
+    """长期记忆读取中间件 — 在 model 调用前注入 facts 到 SystemMessage。
 
     在 ``awrap_model_call`` 中：
     1. 从 runtime context 提取 thread_id
-    2. 调用 ``ThreadMemoryStore.query_facts(thread_id)`` 读取 facts
-    3. 将 facts 组装为文本片段，追加到 SystemMessage
-    4. 非阻塞更新 ``last_used_at``（用于 LRU 淘汰）
+    2. 并行读取 agent 级 + thread 级 facts
+    3. 按 content 精确去重归并（agent 优先），按 ``create_time`` 升序排序
+    4. 将 facts 组装为文本片段，追加到 SystemMessage
+    5. 非阻塞更新 thread 级 facts 的 ``last_used_at``（用于 LRU 淘汰）
 
     长期记忆只注入 prompt，不修改原始 messages 列表。
     原始对话保留在 checkpointer。
@@ -406,17 +461,29 @@ class ThreadMemoryReadMiddleware(AgentMiddleware):
         request: ModelRequest[ContextT],
         handler: Callable[[ModelRequest[ContextT]], Awaitable[Any]],
     ) -> Any:
-        """注入长期记忆到 system message，然后调用 handler。"""
+        """注入长期记忆到 system message，然后调用 handler。
+
+        并行读取 agent 级 + thread 级 facts，按 content 精确去重归并
+        （agent 级优先，保留 agent 级版本），按 ``create_time`` 升序排序，
+        截取 ``recall_limit`` 条注入 SystemMessage。对合并后的全部 facts
+        非阻塞 touch：agent 级调 ``touch_agent_fact``，thread 级调 ``touch_fact``。
+        """
         thread_id = self._extract_thread_id(request)
         if not thread_id:
             return await handler(request)
 
-        # 读取 facts
+        # 并行读取 agent 级 + thread 级 facts
         try:
-            facts = await self._store.query_facts(thread_id)
+            agent_facts, thread_facts = await asyncio.gather(
+                self._store.query_agent_facts(),
+                self._store.query_facts(thread_id),
+            )
         except Exception as error:
             logger.debug("读取长期记忆失败 [thread=%s]: %s", thread_id, error)
             return await handler(request)
+
+        # 合并 + 去重（agent 优先）+ 按 create_time 升序
+        facts = self._merge_facts(agent_facts, thread_facts)
 
         if not facts:
             return await handler(request)
@@ -431,11 +498,52 @@ class ThreadMemoryReadMiddleware(AgentMiddleware):
         # 注入到 SystemMessage
         new_request = self._inject_facts(request, fact_text)
 
-        # 非阻塞更新 last_used_at
+        # 非阻塞更新 last_used_at：按 scope 分发
+        # - agent 级 facts 调 touch_agent_fact（作用于 agent namespace）
+        # - thread 级 facts 调 touch_fact（作用于 thread namespace）
         for fact in facts:
-            asyncio.create_task(self._store.touch_fact(thread_id, fact.fact_id))
+            if fact.scope == "agent":
+                asyncio.create_task(self._store.touch_agent_fact(fact.fact_id))
+            else:
+                asyncio.create_task(self._store.touch_fact(thread_id, fact.fact_id))
 
         return await handler(new_request)
+
+    @staticmethod
+    def _merge_facts(
+        agent_facts: list[ThreadFactItem],
+        thread_facts: list[ThreadFactItem],
+    ) -> list[ThreadFactItem]:
+        """合并 agent 级 + thread 级 facts。
+
+        agent 级优先遍历，按 content 精确去重（保留 agent 级版本），
+        合并后按 ``create_time`` 升序排序。
+
+        Args:
+            agent_facts: agent 级 facts 列表
+            thread_facts: thread 级 facts 列表
+
+        Returns:
+            去重合并后的 facts 列表（按 ``create_time`` 升序）
+        """
+        seen: set[str] = set()
+        merged: list[ThreadFactItem] = []
+
+        # agent 级优先：同 content 时保留 agent 级版本
+        for fact in agent_facts:
+            if fact.content in seen:
+                continue
+            seen.add(fact.content)
+            merged.append(fact)
+
+        for fact in thread_facts:
+            if fact.content in seen:
+                continue
+            seen.add(fact.content)
+            merged.append(fact)
+
+        merged.sort(key=lambda f: f.create_time)
+        return merged
 
     # ============ 内部方法 ============
 

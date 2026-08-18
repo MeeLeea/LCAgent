@@ -318,3 +318,165 @@ class TestProperties:
     def test_default_max_facts(self):
         store = ThreadMemoryStore()
         assert store.max_facts == 50
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  Agent 级长期记忆（跨会话共享）
+# ════════════════════════════════════════════════════════════════════════
+
+
+class TestAgentScope:
+    """agent 级 facts 测试：跨会话共享 / 写路由 / 读聚合 / 隔离 / LRU / touch。"""
+
+    def test_save_and_query_agent_facts(self):
+        """save_agent_fact → query_agent_facts 可读回；thread_id 被强制设为 "default"。"""
+        async def run():
+            store = ThreadMemoryStore()  # process_type=None → _agent_key="default"
+            item = _make_fact("跨会话偏好", "user_fact")
+            await store.save_agent_fact(item)
+
+            facts = await store.query_agent_facts()
+            assert len(facts) == 1
+            assert facts[0].content == "跨会话偏好"
+            assert facts[0].thread_id == "default"
+
+        asyncio.run(run())
+
+    def test_agent_facts_isolated_from_thread(self):
+        """agent 级与 thread 级 namespace 完全隔离。"""
+        async def run():
+            store = ThreadMemoryStore()
+            # agent 写入后 thread 不可见
+            await store.save_agent_fact(_make_fact("agent-fact", "user_fact"))
+            assert await store.query_facts("t1") == []
+
+            # thread 写入后 agent 不可见
+            await store.save_fact("t1", _make_fact("thread-fact", "conv"))
+            assert await store.query_agent_facts() == [] or all(
+                f.content != "thread-fact"
+                for f in await store.query_agent_facts()
+            )
+            # 强化断言：agent 级只有 1 条 agent-fact
+            agent_facts = await store.query_agent_facts()
+            assert len(agent_facts) == 1
+            assert agent_facts[0].content == "agent-fact"
+            # thread 级只有 1 条 thread-fact
+            thread_facts = await store.query_facts("t1")
+            assert len(thread_facts) == 1
+            assert thread_facts[0].content == "thread-fact"
+
+        asyncio.run(run())
+
+    def test_agent_facts_batch(self):
+        """save_agent_facts_batch 多条 + count_agent_facts。"""
+        async def run():
+            store = ThreadMemoryStore()
+            items = [_make_fact(f"agent-{i}", "user_fact") for i in range(3)]
+            await store.save_agent_facts_batch(items)
+
+            assert await store.count_agent_facts() == 3
+            facts = await store.query_agent_facts()
+            contents = {f.content for f in facts}
+            assert contents == {"agent-0", "agent-1", "agent-2"}
+            # thread_id 被统一设为 agent_key="default"
+            assert all(f.thread_id == "default" for f in facts)
+
+        asyncio.run(run())
+
+    def test_clear_agent_facts(self):
+        """清空 agent 级返回计数，且不影响 thread 级。"""
+        async def run():
+            store = ThreadMemoryStore()
+            await store.save_agent_fact(_make_fact("a1", "user_fact"))
+            await store.save_agent_fact(_make_fact("a2", "user_fact"))
+            await store.save_fact("t1", _make_fact("t1-fact", "conv"))
+
+            cleared = await store.clear_agent_facts()
+            assert cleared == 2
+            assert await store.count_agent_facts() == 0
+            # thread 级不受影响
+            assert await store.count_facts("t1") == 1
+
+        asyncio.run(run())
+
+    def test_prune_agent_facts(self):
+        """超过 max_agent_facts 时按 last_used_at 淘汰最久未使用。"""
+        async def run():
+            store = ThreadMemoryStore(max_agent_facts=2)
+            for i in range(3):
+                item = _make_fact(f"agent-{i}", "user_fact")
+                item.last_used_at = f"2026-01-0{i+1}T00:00:00"
+                item.create_time = f"2026-01-0{i+1}T00:00:00"
+                await store.save_agent_fact(item)
+
+            pruned = await store.prune_agent_facts()
+            assert pruned == 1
+            facts = await store.query_agent_facts()
+            assert len(facts) == 2
+            contents = {f.content for f in facts}
+            # last_used_at 最旧的 agent-0 被淘汰
+            assert "agent-0" not in contents
+            assert "agent-2" in contents
+
+        asyncio.run(run())
+
+    def test_touch_agent_fact_updates_last_used_at(self):
+        """touch 后 last_used_at 变化。"""
+        async def run():
+            store = ThreadMemoryStore()
+            item = _make_fact("touch-agent", "user_fact")
+            old_time = "2026-01-01T00:00:00"
+            item.last_used_at = old_time
+            await store.save_agent_fact(item)
+
+            await asyncio.sleep(0.01)
+            await store.touch_agent_fact(item.fact_id)
+
+            facts = await store.query_agent_facts()
+            assert len(facts) == 1
+            assert facts[0].last_used_at != old_time
+
+        asyncio.run(run())
+
+    def test_touch_agent_fact_nonexistent_no_error(self):
+        """touch 不存在的 agent fact 不报错。"""
+        async def run():
+            store = ThreadMemoryStore()
+            await store.touch_agent_fact("nonexistent")
+
+        asyncio.run(run())
+
+    def test_agent_key_uses_process_type(self):
+        """process_type="server" 时 agent namespace 的 _agent_key="server"。"""
+        async def run():
+            store = ThreadMemoryStore(process_type="server")
+            # 直接验证 namespace 构造
+            ns = store._facts_namespace("", scope="agent")
+            assert ns == ("server", "global_facts")
+            # 写入后 thread_id 字段应为 "server"
+            await store.save_agent_fact(_make_fact("server-fact", "user_fact"))
+            facts = await store.query_agent_facts()
+            assert len(facts) == 1
+            assert facts[0].thread_id == "server"
+
+        asyncio.run(run())
+
+    def test_agent_facts_shared_across_threads(self):
+        """agent 级跨会话共享：不同 thread_id 的 store 实例共享同一 backend 时可见。"""
+        async def run():
+            from langgraph.store.memory import InMemoryStore
+
+            backend = InMemoryStore()
+            store = ThreadMemoryStore(backend=backend)
+            # thread "t1" 的视角写入 agent fact
+            await store.save_agent_fact(_make_fact("shared-fact", "user_fact"))
+            # 同 backend、不同 process_type 的 store 读不到（隔离）
+            store_other = ThreadMemoryStore(backend=backend, process_type="other")
+            assert await store_other.query_agent_facts() == []
+            # 同 backend、同 process_type 的 store 可读（共享）
+            store_same = ThreadMemoryStore(backend=backend)  # process_type=None → "default"
+            facts = await store_same.query_agent_facts()
+            assert len(facts) == 1
+            assert facts[0].content == "shared-fact"
+
+        asyncio.run(run())

@@ -7,7 +7,7 @@
 - **MCP Server 工具动态加载**（可扩展任意 MCP 服务）
 - **LangGraph Checkpoint 持久化**（服务器异步运行时使用 `data/checkpoints_async.sqlite`，程序重启可恢复对话）
 - **LangGraph Human-in-the-loop**（`ask_human` 暂停图执行，CLI 结构化选择后 `Command(resume)` 继续）
-- 长期记忆管理（compress 压缩摘要）与长上下文自动裁剪
+- 长期记忆管理（两级作用域：agent 级跨会话共享 user_fact/lesson，thread 级会话隔离 conv/business；compress 压缩摘要）与长上下文自动裁剪
 - **长上下文压缩中间件**（增量摘要 + 工具输出 Prune，摘要随 checkpoint 持久化、per-thread 隔离；`before_model` 自动触发或 `compact` 命令手动触发）
 - **MCP 连接池**（per-server 隔离、健康探测、单 server 自动重连，替代全量重载）
 - 多会话隔离（thread_id 机制，方向键菜单切换/删除/导出）
@@ -38,6 +38,7 @@
   - [核心概念：三种模式](#核心概念三种模式)
   - [记忆系统（Memory）](#记忆系统memory)
     - [设计架构](#设计架构)
+    - [两级作用域（agent 级 / thread 级）](#两级作用域agent-级--thread-级)
     - [上下文注入机制（重要）](#上下文注入机制重要)
       - [`react:` 和 `chat()` → 事件驱动写入 + prompt 注入读取](#react-和-chat--事件驱动写入--prompt-注入读取)
       - [`cot:` → 仅短期记忆](#cot--仅短期记忆)
@@ -236,8 +237,8 @@ LangChainAgent/
 │   ├── lock_pool.py        # ThreadMemoryLockPool：per-thread 并发锁池
 │   ├── manager.py          # MemoryManager：统一门面（召回/消费/压缩/清理）
 │   ├── middleware.py       # 读写中间件（防抖 buffer + Fact 抽取 + prompt 注入）
-│   ├── models.py           # 数据模型与事件分类判定（MemoryCategory / ThreadFactItem）
-│   └── store.py            # ThreadMemoryStore：Store 业务封装（per-thread 隔离）
+│   ├── models.py           # 数据模型与事件分类判定（MemoryCategory / ThreadFactItem，含 scope 字段）
+│   └── store.py            # ThreadMemoryStore：Store 业务封装（agent 级 + thread 级两级 namespace）
 ├── agent/
 │   ├── __init__.py
 │   ├── agent_config.json    # Agent 运行时参数
@@ -335,7 +336,7 @@ LangChainAgent/
 | [main.py](main.py)                                       | 交互式命令行入口 + Agent 构建接口                                                                                                                                                                                                          |
 | [agent/llm_client.py](agent/llm_client.py)               | 从`config/llm_config.json` 读取提供商配置，支持运行时切换提供商/模型                                                                                                                                                                     |
 | [agent/config.py](agent/config.py)                       | 加载`agent/agent_config.json`，统一运行时配置                                                                                                                                                                                            |
-| [memory/](memory/)                                       | 三层架构 Memory 层：`AgentMemory`（checkpointer + Store 基础设施）/ `MemoryContext`（统一工厂）/ `MemoryManager`（统一门面）/ `ThreadMemoryStore`（Store 业务封装）/ 读写中间件（防抖 + Fact 抽取 + prompt 注入）/ per-thread 锁池 |
+| [memory/](memory/)                                       | 三层架构 Memory 层：`AgentMemory`（checkpointer + Store 基础设施）/ `MemoryContext`（统一工厂，透传 `process_type` / `max_agent_facts`）/ `MemoryManager`（统一门面，含 agent 级召回接口）/ `ThreadMemoryStore`（Store 业务封装，agent 级 + thread 级两级 namespace）/ 读写中间件（防抖 + Fact 抽取 + 两级路由 + prompt 注入）/ per-thread 锁池 |
 | [utils/compaction.py](utils/compaction.py)               | 长上下文压缩中间件：增量摘要 + 工具输出 Prune + 保留近期消息，摘要随 checkpoint 持久化、per-thread 隔离                                                                                                                                    |
 | [utils/events.py](utils/events.py)                       | 标准化执行事件模型：`AgentEvent`（frozen dataclass）+ `EventType` 枚举（含 TOKEN/TOOL_*/INTERRUPT/ERROR/DONE/NODE_*）+ SSE dict 序列化，三层架构唯一通信载体                                                        |
 | [utils/metrics.py](utils/metrics.py)                     | `MetricsCollector`：线程安全的运行时指标收集（LLM 调用 / 工具执行 / 压缩统计）                                                                                                                                                           |
@@ -413,19 +414,23 @@ Agent 有三种执行模式，对应三种不同的交互入口：
 ┌──────────────────────────────────────────────────────────────────┐
 │            memory/ 包（三层架构 Memory 层，与 agent 平级）         │
 │                                                                  │
-│  统一门面  MemoryManager  ── recall / consume_event / compress   │
+│  统一门面  MemoryManager  ── recall / recall_agent / consume_event│
 │                                                                  │
 │  ┌────────────────────────┐  ┌──────────────────────────────┐   │
 │  │  Checkpoint (自动)      │  │  长期记忆 Store (事件驱动)    │   │
 │  │  AsyncSqliteSaver      │  │  AsyncSqliteStore             │   │
-│  │  checkpoints_async.sql │  │  namespace=(thread_id,        │   │
-│  │  (MemoryContext 注入)  │  │   "thread_facts")             │   │
-│  │                        │  │                              │   │
-│  │  • Agent 每步执行后自动写│  │  • 写: ThreadMemoryWrite     │   │
-│  │  • 完整状态(消息+工具调用)│  │    Middleware 防抖→LLM 抽取  │   │
-│  │  • 按 thread_id 隔离    │  │  • 读: ThreadMemoryRead      │   │
-│  │  • 程序重启可恢复       │  │    Middleware 注入 SystemMsg │   │
-│  │                        │  │  • 去重 + LRU 淘汰(50条)     │   │
+│  │  checkpoints_async.sql │  │  两级 namespace：             │   │
+│  │  (MemoryContext 注入)  │  │  • agent 级                   │   │
+│  │                        │  │    (agent_key,"global_facts") │   │
+│  │  • Agent 每步执行后自动写│  │    user_fact / lesson         │   │
+│  │  • 完整状态(消息+工具调用)│  │    跨会话共享                 │   │
+│  │  • 按 thread_id 隔离    │  │  • thread 级                  │   │
+│  │  • 程序重启可恢复       │  │    (thread_id,"thread_facts") │   │
+│  │                        │  │    conv / business            │   │
+│  │                        │  │    仅当前会话可见              │   │
+│  │                        │  │  • 写: 防抖→分类路由→LLM 抽取 │   │
+│  │                        │  │  • 读: 两级聚合注入 SystemMsg │   │
+│  │                        │  │  • 去重(agent 优先)+LRU 淘汰  │   │
 │  └────────────────────────┘  └──────────────────────────────┘   │
 │                                                                  │
 │  基础设施: AgentMemory(checkpointer+Store) / MemoryContext(工厂)  │
@@ -433,36 +438,75 @@ Agent 有三种执行模式，对应三种不同的交互入口：
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-**数据流**（读写分离）：
+> **agent_key**：`process_type or "default"`，由 `MemoryContext` 经 `ThreadMemoryStore` 构造参数透传，用于隔离不同进程（server / scheduler / feishu）的 agent 级记忆，防止多进程同库串号。
+
+**数据流**（读写分离，两级作用域）：
 
 ```
 写: SessionManager 消费 AgentEvent 流（submit_user_message / consume_event）
      → 非阻塞投递到 WriteMiddleware 防抖 buffer（20s 窗口）
-     → LLM Fact 抽取（格式化事实 + 分类 + 置信度）
-     → 无效过滤 / 本地去重 → 批量写入 ThreadMemoryStore
-     → LRU 淘汰（单 thread 超 50 条时）
+     → LLM Fact 抽取（content + category + confidence）
+     → 无效过滤 / 两级 existing 去重（agent 优先）
+     → 按 category 路由作用域：
+         • user_fact / lesson → agent namespace（跨会话共享）
+         • conv / business    → thread namespace（会话隔离）
+     → 分流批量写入 → 分流 LRU 淘汰
+         • agent 级超 200 条（memory_max_agent_facts）淘汰
+         • thread 级超 50 条（memory_max_facts_per_thread）淘汰
 
 读: ThreadMemoryReadMiddleware.awrap_model_call（每个 model 调用前）
-     → query_facts(thread_id) 读取该 thread 全部 facts
+     → 并行 query_agent_facts() + query_facts(thread_id)
+     → 合并 + content 精确去重（agent 优先，保留 agent 级版本）
+     → 按 create_time 升序，截取 recall_limit（默认 10）条
      → 格式化为文本追加到 SystemMessage（【长期记忆】块）
-     → 非阻塞更新 last_used_at（供 LRU 淘汰）
+     → 非阻塞 touch 更新 last_used_at（按 scope 分发到两级 namespace）
 ```
 
 **组件职责**：
 
 | 组件                            | 文件                                            | 职责                                                                                                                                 |
 | ------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `MemoryManager`               | [memory/manager.py](memory/manager.py)           | 统一门面：`recall` / `recall_text` / `submit_user_message` / `consume_event` / `compress` / `clear` / `flush_all`      |
-| `MemoryContext`               | [memory/context.py](memory/context.py)           | 统一工厂：入口程序（main/api/scheduler）调用`acreate()` 组装全部组件，暴露 checkpointer / store / read_middleware / memory_manager |
-| `AgentMemory`                 | [memory/agent_memory.py](memory/agent_memory.py) | checkpointer（`AsyncSqliteSaver`）+ 长期记忆 Store（`AsyncSqliteStore`）基础设施                                                 |
-| `ThreadMemoryStore`           | [memory/store.py](memory/store.py)               | Store 业务封装：facts 的增/查/批量写/LRU 淘汰/摘要替换/会话级清空                                                                    |
-| `ThreadMemoryWriteMiddleware` | [memory/middleware.py](memory/middleware.py)     | 写服务：事件接收 + 防抖 buffer + Fact 抽取流水线（非 AgentMiddleware）                                                               |
-| `ThreadMemoryReadMiddleware`  | [memory/middleware.py](memory/middleware.py)     | 读中间件（AgentMiddleware）：`awrap_model_call` 注入 facts 到 SystemMessage                                                        |
+| `MemoryManager`               | [memory/manager.py](memory/manager.py)           | 统一门面：`recall` / `recall_text`（thread 级）+ `recall_agent` / `recall_agent_text` / `count_agent_facts` / `clear_agent_facts`（agent 级）+ `submit_user_message` / `consume_event` / `compress` / `clear` / `flush_all` |
+| `MemoryContext`               | [memory/context.py](memory/context.py)           | 统一工厂：入口程序（main/api/scheduler）调用`acreate()` 组装全部组件，透传 `process_type` / `max_agent_facts`，暴露 checkpointer / store / read_middleware / memory_manager |
+| `AgentMemory`                 | [memory/agent_memory.py](memory/agent_memory.py) | checkpointer（`AsyncSqliteSaver`）+ 长期记忆 Store（`AsyncSqliteStore`）基础设施；`process_type` 用于 thread_id 前缀与 agent 级记忆多进程隔离 |
+| `ThreadMemoryStore`           | [memory/store.py](memory/store.py)               | Store 业务封装：thread 级 facts 增/查/批量写/LRU 淘汰/摘要替换/会话级清空；新增 agent 级方法族（`query_agent_facts` / `save_agent_facts_batch` / `count_agent_facts` / `clear_agent_facts` / `prune_agent_facts` / `touch_agent_fact`），构造参数含 `max_agent_facts` / `process_type` |
+| `ThreadMemoryWriteMiddleware` | [memory/middleware.py](memory/middleware.py)     | 写服务：事件接收 + 防抖 buffer + Fact 抽取流水线（非 AgentMiddleware）；按 `category` 路由到 agent / thread 两级作用域 |
+| `ThreadMemoryReadMiddleware`  | [memory/middleware.py](memory/middleware.py)     | 读中间件（AgentMiddleware）：`awrap_model_call` 并行读取两级 facts，合并去重（agent 优先）后注入 SystemMessage |
 | `ThreadMemoryLockPool`        | [memory/lock_pool.py](memory/lock_pool.py)       | per-thread`asyncio.Lock` 池：串行化同一 thread 的写入，不同 thread 并行                                                            |
-| `models.py`                   | [memory/models.py](memory/models.py)             | `MemoryCategory` / `ThreadFactItem` / `MemoryInputEvent` / `judge_long_term_memory` 分类判定                                 |
-| `config.py`                   | [memory/config.py](memory/config.py)             | 运行时参数默认值（buffer 延迟 / 上限 / fact 上限 / 召回条数）                                                                        |
+| `models.py`                   | [memory/models.py](memory/models.py)             | `MemoryCategory` / `ThreadFactItem`（含 `scope` 字段：`thread` / `agent`）/ `MemoryInputEvent` / `judge_long_term_memory` 分类判定 |
+| `config.py`                   | [memory/config.py](memory/config.py)             | 运行时参数默认值（buffer 延迟 / 上限 / thread 级 fact 上限 / agent 级 fact 上限 / 召回条数） |
 
 > 除此之外还有一层 **Compaction 压缩中间件**（[utils/compaction.py](utils/compaction.py)）负责控制**单会话内的上下文长度**：当 checkpoint 恢复的消息数超过阈值时，`before_model` 自动把旧消息增量摘要成 `state.summary`（随 checkpoint 持久化、per-thread 隔离），并 Prune 过长的历史工具输出，无需新开 thread。注意这与记忆系统的 `compress` 命令是两回事（前者压缩会话上下文，后者压缩长期记忆 facts）。详见[可观测性与可靠性 → 长上下文压缩中间件](#长上下文压缩中间件compaction)。
+
+### 两级作用域（agent 级 / thread 级）
+
+长期记忆 facts 按 `category` 自动分流到两级 Store namespace，既保留会话隔离，又让"用户事实 / 经验教训"跨会话沉淀：
+
+| 作用域 | namespace | 写入的 category | 可见范围 | LRU 上限（配置键） |
+| ------ | --------- | --------------- | -------- | ------------------ |
+| **agent 级** | `(agent_key, "global_facts")` | `user_fact` / `lesson` | 同一 `agent_key` 下的所有会话共享 | `memory_max_agent_facts`（默认 200） |
+| **thread 级** | `(thread_id, "thread_facts")` | `conv` / `business` / 兜底 | 仅当前 `thread_id` 可见 | `memory_max_facts_per_thread`（默认 50） |
+
+**`agent_key` 来源**：`agent_key = process_type or "default"`。`process_type` 由 `MemoryContext.acreate(..., process_type=...)` → `ThreadMemoryStore(process_type=...)` 透传，用于隔离不同进程（CLI / API / 调度器 / 飞书）的 agent 级记忆，避免多进程同库串号。
+
+**读取侧聚合**（每次 LLM 调用前）：
+
+```
+awrap_model_call
+   ↓ asyncio.gather(query_agent_facts(), query_facts(thread_id))
+   ↓ 合并 + content 精确去重（agent 级优先，保留 agent 级版本）
+   ↓ 按 create_time 升序，截取 recall_limit（默认 10）条
+   ↓ 注入 SystemMessage（【长期记忆】块）
+   ↓ 非阻塞 touch：agent 级调 touch_agent_fact，thread 级调 touch_fact
+```
+
+**写入侧路由**（防抖 + LLM 抽取后）：
+
+- 抽取结果中 `category ∈ {user_fact, lesson}` → 组装 `scope="agent"` 的 `ThreadFactItem`，写入 agent namespace，触发 `prune_agent_facts()`；
+- 抽取结果中 `category ∈ {conv, business}` 或非法回退为 `conv` → 组装 `scope="thread"` 的 `ThreadFactItem`，写入 thread namespace，触发 `prune_facts(thread_id)`；
+- 去重基准同时读取两级 existing，按 `content` 精确比对，agent 级优先（避免同一条 fact 跨作用域重复）。
+
+> **写入路径不变**：事件筛选（`is_memory_worthy`：DONE / TOOL_RESULT 且 content 非空）→ 防抖 20s → `judge_long_term_memory` 规则分类 → LLM 抽取 → 按分类路由到 agent / thread 作用域 → 去重 → 写入 → LRU 淘汰。本次分层只改变了"写到哪一级 namespace"和"读时如何聚合"，未改变前置流水线。
 
 ### 上下文注入机制（重要）
 
@@ -479,8 +523,8 @@ async for ev in self._arun_graph_events({"messages": [HumanMessage(content=messa
 ```
 
 - **历史消息**：LangGraph 从 checkpoint 自动恢复（按 thread_id 取出该会话所有历史消息，拼到新消息前面）
-- **长期记忆**：`ThreadMemoryReadMiddleware` 在每个 model 调用前（`awrap_model_call`）从 Store 读取该 thread 的 facts，格式化为文本追加到 SystemMessage，随请求一起发给 LLM
-- **写入路径**：SessionManager 在事件流消费时调用 `submit_user_message()` / `consume_event()` 非阻塞投递，经防抖 + LLM 抽取后写入 Store
+- **长期记忆**：`ThreadMemoryReadMiddleware` 在每个 model 调用前（`awrap_model_call`）并行读取 **agent 级 + thread 级** facts，合并去重（agent 优先）后格式化为文本追加到 SystemMessage，随请求一起发给 LLM
+- **写入路径**：SessionManager 在事件流消费时调用 `submit_user_message()` / `consume_event()` 非阻塞投递，经防抖 + LLM 抽取后按 `category` 路由到 agent / thread 两级 Store namespace
 
 ```
 invoke(新消息, thread_id)
@@ -489,7 +533,7 @@ invoke(新消息, thread_id)
    ↓
 LLM 回复 → 写回 checkpoint
    ↓
-DONE / TOOL_RESULT 事件 → SessionManager.consume_event() → 防抖 → LLM 抽取 → 写 Store
+DONE / TOOL_RESULT 事件 → SessionManager.consume_event() → 防抖 → LLM 抽取 → 按 category 路由 agent/thread 两级 Store
 ```
 
 #### `cot:` → 仅短期记忆
@@ -536,14 +580,18 @@ self.agent_executor = self._create_agent_executor(
 | 普通对话   | ✅ 自动恢复 | ✅ 自动注入 | ✅ 可注入 | ✅ 中间件触发 | 不标记重要，写入照常（事件驱动）        |
 | `cot:`   | ✅ 手动取   | ❌ 不参与   | ❌ 不注入 | ❌ 不触发     | 绕过 Agent，纯 LLM 推理，不写长期       |
 
-> ⚠️ **重要副作用**：`react:` / 普通对话的记忆只按 **thread_id** 隔离（namespace `(thread_id, "thread_facts")`）。切到新的 thread（会话 B）后，ReadMiddleware 只注入会话 B 自己的 facts，**看不到**会话 A 沉淀的长期记忆。跨会话共享记忆目前不支持——长期记忆与 checkpoint 一样按会话隔离。
+> ⚠️ **作用域分层（重要）**：长期记忆按 `category` 自动分流到两级 namespace：
+> - **agent 级**（`namespace=(agent_key, "global_facts")`，跨会话共享）：`user_fact`（用户事实偏好）/ `lesson`（经验教训）。`agent_key = process_type or "default"`，同一进程的所有会话共享，体现长期记忆跨会话价值；切到新 thread 后这部分 facts 仍会被 ReadMiddleware 召回。
+> - **thread 级**（`namespace=(thread_id, "thread_facts")`，会话隔离）：`conv`（重要对话）/ `business`（业务实体）。仅当前会话可见，切到新 thread 后不再注入。
+>
+> 读取侧每次 LLM 调用前聚合两级 facts，按 `content` 精确去重（agent 优先保留），按 `create_time` 升序截取 `recall_limit`（默认 10）条注入 SystemMessage。
 
 ### 两层存储对比
 
-| 类型                 | 存储方式                                   | 触发时机                               | 保存内容                                 | 持久化  | 用途                                      |
-| -------------------- | ------------------------------------------ | -------------------------------------- | ---------------------------------------- | ------- | ----------------------------------------- |
-| **Checkpoint** | `data/checkpoints_async.sqlite` (SQLite) | Agent 每步执行后自动                   | 完整状态(消息+工具调用链+中间变量)       | ✅ 永久 | 程序重启恢复对话、多会话隔离              |
-| **长期记忆**   | 同一 SQLite 文件（`AsyncSqliteStore`）   | 事件驱动 + LLM 抽取（防抖 20s 后批量） | facts（content + category + confidence） | ✅ 永久 | 跨会话保留关键信息、注入 prompt、compress |
+| 类型                 | 存储方式                                   | 触发时机                               | 保存内容                                 | 作用域（namespace）                                                              | 持久化  | 用途                                      |
+| -------------------- | ------------------------------------------ | -------------------------------------- | ---------------------------------------- | -------------------------------------------------------------------------------- | ------- | ----------------------------------------- |
+| **Checkpoint** | `data/checkpoints_async.sqlite` (SQLite) | Agent 每步执行后自动                   | 完整状态(消息+工具调用链+中间变量)       | per-thread（按 `thread_id`）                                                     | ✅ 永久 | 程序重启恢复对话、多会话隔离              |
+| **长期记忆**   | 同一 SQLite 文件（`AsyncSqliteStore`）   | 事件驱动 + LLM 抽取（防抖 20s 后批量） | facts（content + category + confidence） | 两级：agent 级 `(agent_key, "global_facts")`（user_fact/lesson）+ thread 级 `(thread_id, "thread_facts")`（conv/business） | ✅ 永久 | 跨会话共享关键信息 + 会话隔离业务事实、注入 prompt、compress |
 
 ### 三种模式的记忆行为
 
@@ -553,7 +601,7 @@ self.agent_executor = self._create_agent_executor(
 | `cot:任务`   | `acot()`                        | ❌ 不写         | ❌ 不写                               | CoT 绕过 Agent，纯 LLM 推理，无事件流      |
 | 普通输入       | `achat_stream()`                | ✅ 自动         | ✅ 事件驱动（不标记 important）       | 对话同样参与记忆抽取，只是不强调重要       |
 
-> **关键区别**：Checkpoint 由 LangGraph 自动管理，无需手动干预；长期记忆由**事件驱动流水线**自动沉淀（分类判定 + LLM 抽取 + 去重），`important` 标记只是提高"值得评估"的优先级，不再决定是否写入。
+> **关键区别**：Checkpoint 由 LangGraph 自动管理，无需手动干预；长期记忆由**事件驱动流水线**自动沉淀（分类判定 + LLM 抽取 + 两级去重 + 按 `category` 路由到 agent / thread 作用域），`important` 标记只是提高"值得评估"的优先级，不再决定是否写入。
 
 ### Checkpoint 持久化原理
 
@@ -613,10 +661,18 @@ _a_run_pipeline()  （buffer 超时后批量处理）
 ② LLM Fact 抽取  _a_extract_facts()
    ↓ 从原始消息提取 {"content", "category", "confidence"} JSON 列表
 ③ 无效内容过滤（空 content 丢弃）
-④ 本地去重（与 Store 已存在的 fact content 比对，批次内去重）
-⑤ 批量写入  save_facts_batch() → ThreadMemoryStore
+④ 两级 existing 去重（同时读 query_agent_facts + query_facts(thread_id)，
+   按 content 精确比对，agent 级优先，避免跨作用域重复）
+⑤ 按 category 路由作用域并分流组装 ThreadFactItem：
+     • user_fact / lesson → scope="agent"，写入 agent namespace
+     • conv / business / 兜底 → scope="thread"，写入 thread namespace
+⑥ 分流批量写入：
+     • save_agent_facts_batch(agent_items) → ThreadMemoryStore（agent namespace）
+     • save_facts_batch(thread_id, thread_items) → ThreadMemoryStore（thread namespace）
    ↓
-⑥ LRU 淘汰  prune_facts()（单 thread 超 50 条时淘汰最久未使用）
+⑦ 分流 LRU 淘汰：
+     • prune_agent_facts()：agent 级超 memory_max_agent_facts（默认 200）时淘汰
+     • prune_facts(thread_id)：thread 级超 memory_max_facts_per_thread（默认 50）时淘汰
 ```
 
 **事件来源**：SessionManager 消费 AgentEvent 流时调用：
@@ -636,15 +692,15 @@ if self._memory is not None:
 
 **分类判定**（[memory/models.py](memory/models.py) 的 `judge_long_term_memory`）：
 
-| 分类                       | 取值          | 判定条件                                                  |
-| -------------------------- | ------------- | --------------------------------------------------------- |
-| `USER_FACT`              | `user_fact` | 用户告知的个人信息、习惯、偏好                            |
-| `LESSON_EXPERIENCE`      | `lesson`    | 工具踩坑、稳定推理结论、不可行方案（同类失败 ≥2 次）     |
-| `BUSINESS_ENTITY`        | `business`  | 项目配置、关键路径、接口、长期目标                        |
-| `IMPORTANT_CONVERSATION` | `conv`      | 用户显式说"记住"、重要技术决策                            |
-| `SKIP`                   | `skip`      | 临时资源 / 未确认猜想 / 一次性子任务 / 单次失败 → 不写入 |
+| 分类                       | 取值          | 作用域           | 判定条件                                                  |
+| -------------------------- | ------------- | ---------------- | --------------------------------------------------------- |
+| `USER_FACT`              | `user_fact` | **agent 级**（跨会话共享） | 用户告知的个人信息、习惯、偏好                            |
+| `LESSON_EXPERIENCE`      | `lesson`    | **agent 级**（跨会话共享） | 工具踩坑、稳定推理结论、不可行方案（同类失败 ≥2 次）     |
+| `BUSINESS_ENTITY`        | `business`  | **thread 级**（会话隔离） | 项目配置、关键路径、接口、长期目标                        |
+| `IMPORTANT_CONVERSATION` | `conv`      | **thread 级**（会话隔离） | 用户显式说"记住"、重要技术决策                            |
+| `SKIP`                   | `skip`      | 不写入            | 临时资源 / 未确认猜想 / 一次性子任务 / 单次失败 → 不写入 |
 
-> **LLM 抽取是第二道闸门**：分类判定只决定"值得评估"，最终是否入库由 LLM 从原始对话中抽取结构化事实决定，并附带 `category` 与 `confidence`（置信度），无效分类回退为 `conv`。
+> **LLM 抽取是第二道闸门**：分类判定只决定"值得评估"，最终是否入库由 LLM 从原始对话中抽取结构化事实决定，并附带 `category` 与 `confidence`（置信度），无效分类回退为 `conv`（走 thread 级）。
 
 ### 为什么 cot 不写入 checkpoint
 
@@ -670,10 +726,14 @@ CHECKPOINT_FILE = os.path.join(BASE_DIR, "data", "checkpoints_async.sqlite")
 | 表 / 数据                    | 管理者               | 内容                                                               |
 | ---------------------------- | -------------------- | ------------------------------------------------------------------ |
 | `checkpoints` / `writes` | `AsyncSqliteSaver` | Agent 执行状态（消息 + 工具调用链，按`thread_id` 隔离）          |
-| LangGraph Store 表           | `AsyncSqliteStore` | 长期记忆 facts（per-thread namespace 隔离，替代旧`memory.json`） |
+| LangGraph Store 表           | `AsyncSqliteStore` | 长期记忆 facts（两级 namespace：agent 级 `(agent_key, "global_facts")` 跨会话共享 + thread 级 `(thread_id, "thread_facts")` 会话隔离，替代旧`memory.json`） |
 | `session_workspaces`       | `WorkspaceStore`   | `session_id ↔ workspace_path` 映射（多会话工作目录隔离）        |
 
-> **长期记忆存储**：长期记忆由 LangGraph `BaseStore`（`AsyncSqliteStore`，见 [memory/store.py](memory/store.py) 的 `ThreadMemoryStore`）管理，与 checkpoint 复用同一 SQLite 文件，按 `(thread_id, "thread_facts")` namespace 天然实现 per-thread 隔离。`compress` 命令现改为对该 Store 中的 facts 做摘要替换（`replace_with_summary`）。
+> **长期记忆存储**：长期记忆由 LangGraph `BaseStore`（`AsyncSqliteStore`，见 [memory/store.py](memory/store.py) 的 `ThreadMemoryStore`）管理，与 checkpoint 复用同一 SQLite 文件，按**两级 namespace**天然实现分层隔离：
+> - **agent 级**：`(agent_key, "global_facts")`，存放 `user_fact` / `lesson`，跨会话共享；`agent_key = process_type or "default"`，多进程隔离防串号。
+> - **thread 级**：`(thread_id, "thread_facts")`，存放 `conv` / `business`，仅当前会话可见。
+>
+> `compress` 命令现改为对 thread 级 Store 中的 facts 做摘要替换（`replace_with_summary`），不影响 agent 级记忆。
 
 > checkpoint 与 Store 各持有**独立的 `aiosqlite` 连接**（均启用 WAL 模式 + `busy_timeout=10000`），支持多进程（CLI / API / 调度器 / 飞书）并发读写。
 
@@ -705,15 +765,16 @@ API地址:    https://api.deepseek.com
 当前会话:   thread-a4d099d2
 Checkpoint: sqlite → D:\work\LangChainAgent\data\checkpoints_async.sqlite
 已存消息:   8 条
-长期记忆:   5 条
+长期记忆:   5 条 (thread 级，会话隔离)
+agent 级记忆: 12 条 (跨会话共享)
 总会话数:   2
 ```
 
 ### 压缩长期记忆（compress）
 
-随着对话不断积累，Store 中的 facts 会越来越多（单 thread 上限 50 条，超出 LRU 淘汰）。`compress` 命令通过 LLM 把所有 facts 压缩成一份摘要，再替换为**单条摘要 fact**。
+随着对话不断积累，thread 级 Store 中的 facts 会越来越多（单 thread 上限 `memory_max_facts_per_thread` 默认 50 条，超出 LRU 淘汰；agent 级另有 `memory_max_agent_facts` 默认 200 条上限）。`compress` 命令通过 LLM 把当前 thread 的 facts 压缩成一份摘要，再替换为**单条摘要 fact**。
 
-> **注意**：compress 只压缩**长期记忆 facts**，不影响 checkpoint（完整对话历史保留在 `checkpoints_async.sqlite`）。
+> **注意**：compress 只压缩**当前 thread 级长期记忆 facts**（`conv` / `business`），不影响 checkpoint（完整对话历史保留在 `checkpoints_async.sqlite`），也不影响 agent 级记忆（`user_fact` / `lesson` 跨会话共享，需通过 `MemoryManager.clear_agent_facts` 单独清空）。
 
 #### 工作流程
 
@@ -761,13 +822,14 @@ ThreadMemoryStore.replace_with_summary(thread_id, summary)
 
 #### 压缩后的 Store 格式
 
-摘要作为单条 `ThreadFactItem` 写入 Store（namespace `(thread_id, "thread_facts")`）：
+摘要作为单条 `ThreadFactItem` 写入 thread 级 Store（namespace `(thread_id, "thread_facts")`，`scope="thread"`）：
 
 | 字段           | 值                            |
 | -------------- | ----------------------------- |
 | `content`    | `[历史记忆摘要]\n{summary}` |
 | `category`   | `conv`（重要对话）          |
 | `confidence` | `1.0`                       |
+| `scope`      | `thread`（会话隔离）         |
 | `fact_id`    | 新生成的 uuid hex             |
 
 `MemoryManager.compress()` 返回 `{"success", "original_count", "original_chars", "compressed_chars", "summary"}`，其中保留压缩前的条数与字符数，便于追溯。
@@ -782,9 +844,10 @@ ThreadMemoryStore.replace_with_summary(thread_id, summary)
 | 可多次压缩        | 再次`compress` 会对已有摘要 fact 再压缩                          |
 | LLM 失败不丢数据  | 调用失败则原 facts 不变，不会替换                                  |
 | **不可逆**  | 压缩后原 facts 无法恢复，重要数据可先用`export` 备份             |
-| 不影响 checkpoint | 只压缩 Store facts，checkpoints_async.sqlite 保留完整历史          |
+| 不影响 checkpoint | 只压缩 thread 级 Store facts，checkpoints_async.sqlite 保留完整历史          |
+| 不影响 agent 级记忆 | 只压缩 thread 级（`conv` / `business`），agent 级（`user_fact` / `lesson`）跨会话共享，不参与压缩 |
 
-> 💡 **建议**：在长期记忆较多时（如 50 条上限附近）使用，平时少量记忆无需压缩。
+> 💡 **建议**：在 thread 级长期记忆较多时（如 `memory_max_facts_per_thread` 默认 50 条上限附近）使用，平时少量记忆无需压缩。
 
 ### 记忆相关 API
 
@@ -805,17 +868,28 @@ ThreadMemoryStore.replace_with_summary(thread_id, summary)
 
 #### MemoryManager（统一门面，SessionManager 使用）
 
+**thread 级**（会话隔离）：
+
 | 方法                                                               | 说明                                                                                    |
 | ------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
 | `await recall(thread_id, limit=None)`                            | 召回该 thread 的长期记忆 facts（按创建时间升序，截取最近 limit 条，默认 10）            |
 | `await recall_text(thread_id, limit=None)`                       | 召回并格式化为文本片段（`【长期记忆】` 块，供注入 prompt）                            |
 | `await submit_user_message(thread_id, content, important=False)` | 提交用户消息到写中间件（非阻塞，防抖）                                                  |
 | `await consume_event(event)`                                     | 消费 AgentEvent（`is_memory_worthy` 的 DONE / TOOL_RESULT），提交到写中间件（非阻塞） |
-| `await compress(thread_id)`                                      | 压缩该 thread 长期记忆（LLM 摘要替换为单条 fact）                                       |
+| `await compress(thread_id)`                                      | 压缩该 thread 长期记忆（LLM 摘要替换为单条 fact，仅作用于 thread 级）                                       |
 | `await clear(thread_id)`                                         | 清空该 thread 全部 facts，返回清除数量                                                  |
 | `await count_facts(thread_id)`                                   | 统计该 thread 的 fact 条数                                                              |
 | `await flush_all()`                                              | 立即处理所有 buffer 事件（Agent 关闭前调用）                                            |
 | `await shutdown()`                                               | 关闭写中间件（取消定时器、清理 buffer）                                                 |
+
+**agent 级**（跨会话共享，`user_fact` / `lesson`）：
+
+| 方法                                          | 说明                                                                                                          |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `await recall_agent(limit=None)`            | 召回 agent 级长期记忆 facts（跨会话共享，按 `create_time` 升序，截取最近 `limit` 条；不进行 touch 更新，LRU 依赖 `prune_agent_facts`） |
+| `await recall_agent_text(limit=None)`       | 召回 agent 级记忆并格式化为文本片段（`【长期记忆】` 块）                                                       |
+| `await count_agent_facts()`                 | 统计 agent 级长期记忆条数                                                                                      |
+| `await clear_agent_facts()`                 | 清空 agent 级全部长期记忆，返回清除数量                                                                        |
 
 #### ThreadMemoryReadMiddleware（读，LangGraph 中间件）
 
@@ -824,6 +898,10 @@ ThreadMemoryStore.replace_with_summary(thread_id, summary)
 | `awrap_model_call(request, handler)` | 每个 model 调用前从 Store 读取该 thread facts，组装为`【长期记忆】` 文本块追加到 SystemMessage，再调用 handler |
 
 #### ThreadMemoryStore（存储封装，底层）
+
+构造参数：`max_facts`（thread 级 LRU 上限，默认 `memory_max_facts_per_thread=50`）/ `max_agent_facts`（agent 级 LRU 上限，默认 `memory_max_agent_facts=200`）/ `process_type`（进程类型标识，决定 `agent_key`，`None` 时取 `"default"`）。
+
+**thread 级方法**：
 
 | 方法                                                     | 说明                                            |
 | -------------------------------------------------------- | ----------------------------------------------- |
@@ -834,13 +912,24 @@ ThreadMemoryStore.replace_with_summary(thread_id, summary)
 | `await clear_thread_memory(thread_id)`                 | 清空该 thread 全部 facts                        |
 | `await replace_with_summary(thread_id, summary)`       | 删除全部 facts 后写入单条摘要 fact              |
 
+**agent 级方法族**（跨会话共享，namespace `(agent_key, "global_facts")`）：
+
+| 方法                                          | 说明                                                          |
+| --------------------------------------------- | ------------------------------------------------------------- |
+| `await query_agent_facts()`                 | 读取 agent 级全部 facts（按 create_time 升序）                |
+| `await save_agent_facts_batch(items)`       | 批量写入 agent 级 facts（按 fact_id 幂等覆盖）                |
+| `await prune_agent_facts()`                 | agent 级 LRU 淘汰（超 `max_agent_facts` 后删除最久未使用）    |
+| `await touch_agent_fact(fact_id)`           | 更新 agent 级 fact 的 last_used_at                            |
+| `await count_agent_facts()`                 | 统计 agent 级 fact 条数                                       |
+| `await clear_agent_facts()`                 | 清空 agent 级全部 facts                                       |
+
 #### SessionManager 委托接口（对外推荐入口）
 
 | 方法                                | 说明                                                                    |
 | ----------------------------------- | ----------------------------------------------------------------------- |
-| `await aget_memory_summary()`     | 记忆状态统计（thread_id / checkpoint 消息数 / 长期记忆条数 / 总会话数） |
-| `await acompress_memory()`        | 压缩当前线程长期记忆（阻塞 LLM 调用放入`asyncio.to_thread`）          |
-| `await aclear_long_term_memory()` | 清空当前线程长期记忆                                                    |
+| `await aget_memory_summary()`     | 记忆状态统计（thread_id / checkpoint 消息数 / 长期记忆条数 `long_term_count` / **agent 级长期记忆条数 `agent_fact_count`** / 总会话数） |
+| `await acompress_memory()`        | 压缩当前线程长期记忆（阻塞 LLM 调用放入`asyncio.to_thread`，仅作用于 thread 级）          |
+| `await aclear_long_term_memory()` | 清空当前线程长期记忆（仅 thread 级；agent 级需调 `MemoryManager.clear_agent_facts`） |
 
 ---
 
@@ -2400,8 +2489,10 @@ async def main() -> None:
         short_term_size=10,
         buffer_delay_seconds=20,                           # 记忆防抖窗口（秒）
         max_buffer_messages=30,                            # 单 thread 防抖 buffer 上限
-        max_facts_per_thread=50,                           # 单 thread 最大 fact 条数（LRU 淘汰）
-        recall_limit=10,                                   # 召回默认条数上限
+        max_facts_per_thread=50,                           # 单 thread 最大 fact 条数（thread 级 LRU 淘汰）
+        max_agent_facts=200,                               # agent 级（跨会话共享）最大 fact 条数（agent 级 LRU 淘汰）
+        process_type=None,                                 # 进程类型标识（None→"default"；server/scheduler/feishu 多进程隔离 agent 级记忆）
+        recall_limit=10,                                   # 召回默认条数上限（聚合 agent 级 + thread 级后截取）
     )
 
     agent = await AgentCore.acreate(
@@ -2524,8 +2615,9 @@ asyncio.run(main())
 | ------------------------------- | ---- | ------ | -------------------------------------- |
 | `memory_buffer_delay_seconds` | int  | 20     | 记忆写入防抖延迟（秒）                 |
 | `memory_max_buffer_messages`  | int  | 30     | 防抖 buffer 最大消息数（超出强制刷新） |
-| `memory_max_facts_per_thread` | int  | 50     | 单线程最大 fact 条数（超出 LRU 淘汰）  |
-| `memory_recall_limit`         | int  | 10     | 召回长期记忆时的默认条数上限（同时约束每次 LLM 调用注入的 fact 条数） |
+| `memory_max_facts_per_thread` | int  | 50     | 单线程最大 fact 条数（thread 级 LRU 淘汰上限；对应 `conv` / `business` 类） |
+| `memory_max_agent_facts`      | int  | 200    | agent 级（跨会话共享）最大 fact 条数（agent 级 LRU 淘汰上限；对应 `user_fact` / `lesson` 类） |
+| `memory_recall_limit`         | int  | 10     | 召回长期记忆时的默认条数上限（聚合 agent 级 + thread 级去重后截取，同时约束每次 LLM 调用注入的 fact 条数） |
 | `session_enable_memory`       | bool | true   | SessionManager 是否启用长期记忆处理    |
 
 #### Agent 核心提示词（`agent/AGENT.md`）

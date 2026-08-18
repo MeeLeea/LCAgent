@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any
 from .agent_memory import AgentMemory
 from .config import (
     MEMORY_BUFFER_DELAY_SECONDS,
+    MEMORY_MAX_AGENT_FACTS,
     MEMORY_MAX_BUFFER_MESSAGES,
     MEMORY_MAX_FACTS_PER_THREAD,
     MEMORY_RECALL_LIMIT,
@@ -144,6 +145,7 @@ class MemoryContext:
         buffer_delay_seconds: int = MEMORY_BUFFER_DELAY_SECONDS,
         max_buffer_messages: int = MEMORY_MAX_BUFFER_MESSAGES,
         max_facts_per_thread: int = MEMORY_MAX_FACTS_PER_THREAD,
+        max_agent_facts: int = MEMORY_MAX_AGENT_FACTS,
         recall_limit: int = MEMORY_RECALL_LIMIT,
     ) -> MemoryContext:
         """异步创建 MemoryContext。
@@ -160,6 +162,7 @@ class MemoryContext:
             buffer_delay_seconds: 防抖缓冲窗口
             max_buffer_messages: 缓冲区上限
             max_facts_per_thread: 单线程最大 fact 条数
+            max_agent_facts: agent 级（跨会话共享）最大 fact 条数
             recall_limit: 召回条数上限
         """
         # 1. 创建 AgentMemory
@@ -172,9 +175,13 @@ class MemoryContext:
         )
 
         # 2. 创建 ThreadMemoryStore（复用 AgentMemory 的 Store backend）
+        #    process_type 用于隔离 agent 级记忆的多进程防串号；
+        #    max_facts 限单 thread 容量，max_agent_facts 限 agent 级容量。
         memory_store = ThreadMemoryStore(
             backend=agent_memory.get_long_term_store(),
             max_facts=max_facts_per_thread,
+            max_agent_facts=max_agent_facts,
+            process_type=process_type,
         )
 
         # 3. 创建 per-thread 并发锁池
