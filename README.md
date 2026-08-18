@@ -2389,7 +2389,7 @@ MCP Servers:
 import asyncio
 from memory import MemoryContext
 from agent import AgentCore
-from agent.llm_client import LLMClient
+from llm.llm_client import LLMClient
 
 async def main() -> None:
     # 创建客户端

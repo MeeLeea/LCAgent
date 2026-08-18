@@ -10,7 +10,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 from langchain.agents import create_agent
 from langchain_core.messages import (
@@ -22,8 +22,9 @@ from langchain_core.messages import (
 )
 from langchain_core.tools import BaseTool
 from langgraph.types import Command, Interrupt
-from typing_extensions import Self
 
+from llm.llm_client import RETRY_ATTEMPTS, RETRY_MAX_DELAY, LLMClient, should_retry
+from llm.message_utils import build_interrupt_event, extract_llm_error, stringify_content
 from session import SessionManager, SessionRegistry, SessionStore
 from tools.mcp_loader import DEFAULT_CONFIG_FILE
 from tools.mcp_pool import MCPPool, ServerStatus
@@ -40,8 +41,6 @@ from utils.exceptions import AgentStateError
 from utils.logging_config import TraceContext, generate_trace_id
 from utils.metrics import MetricsCollector
 
-from .llm_client import RETRY_ATTEMPTS, RETRY_MAX_DELAY, LLMClient, should_retry
-from .message_utils import build_interrupt_event, extract_llm_error, stringify_content
 from .skill_middleware import SkillInjectionMiddleware
 from .workspace_middleware import WorkspaceSecurityMiddleware
 
@@ -118,7 +117,7 @@ class AgentCore:
         )
 
         # 存储核心提示词（从配置加载或使用默认值）
-        from .config import _load_agent_prompt
+        from llm.config import _load_agent_prompt
 
         self.agent_core_prompt = _load_agent_prompt(agent_prompt_file)
 
@@ -449,10 +448,8 @@ class AgentCore:
                 self.tools = list(self.local_tools) + list(self.mcp_tools)
                 new_signature = frozenset(t.name for t in self.tools)
 
-                if getattr(self, "agent_executor", None) is not None:
-                    if new_signature != old_signature:
-                        # 工具列表变化，必须重建 Graph
-                        await self._arebuild_agent_executor()
+                if getattr(self, "agent_executor", None) is not None and new_signature != old_signature:
+                    await self._arebuild_agent_executor()
                 return count
             except Exception:
                 logger.exception("MCP 重新加载失败")

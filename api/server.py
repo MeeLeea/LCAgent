@@ -45,11 +45,11 @@ if BASE_DIR not in sys.path:
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from agent import AgentCore
-from agent.config import load_agent_config, resolve_path
-from agent.llm_client import LLMClient, load_providers
-from agent.message_utils import stringify_content  # 消息内容序列化
 from cli.commands import CommandContext, dispatch_command
 from cli.commands.provider import create_llm
+from llm.config import load_agent_config, resolve_path
+from llm.llm_client import LLMClient, load_providers
+from llm.message_utils import stringify_content  # 消息内容序列化
 from memory import MemoryContext
 from tools import safety as safety_module
 

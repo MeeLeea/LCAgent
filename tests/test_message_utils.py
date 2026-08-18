@@ -1,6 +1,6 @@
-"""agent.message_utils.extract_llm_error 的单元测试。"""
+"""llm.message_utils.extract_llm_error 的单元测试。"""
 
-from agent.message_utils import extract_llm_error
+from llm.message_utils import extract_llm_error
 
 
 def test_extract_429_json_message():

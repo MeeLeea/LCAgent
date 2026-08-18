@@ -158,7 +158,7 @@ def _send_file(chat_id: str, path: str) -> bool:
 # ===================== Agent 生命周期 =====================
 
 def _auto_detect_provider() -> str:
-    from agent.llm_client import load_providers
+    from llm.llm_client import load_providers
     providers = load_providers(LLM_FILE)
     if not providers:
         logger.warning("无 provider，回退 zhipu")
@@ -383,7 +383,7 @@ def _handle_model_menu(chat_id: str, inp: str = "") -> None:
     agent = get_agent()
     if not agent: return _send_text(chat_id, "⚠️ 请先启动agent")
     if not inp:  # 列出菜单
-        from agent.llm_client import load_providers
+        from llm.llm_client import load_providers
         try: providers = load_providers(LLM_FILE)
         except Exception as e: return _send_text(chat_id, f"❌ {e}")
         flat = [(k, m) for k, v in providers.items() for m in v.get("models", [])]

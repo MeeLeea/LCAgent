@@ -5,7 +5,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from agent.config import (
+from llm.config import (
     _DEFAULT_AGENT_CORE_PROMPT,
     DEFAULTS,
     _load_agent_prompt,

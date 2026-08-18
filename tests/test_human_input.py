@@ -436,7 +436,7 @@ def test_run_shell_dangerous_command_deny_raises_rejection_via_real_tool(monkeyp
 
 
 def test_build_interrupt_event_dangerous_command_renders_prompt_and_choices():
-    from agent.message_utils import build_interrupt_event
+    from llm.message_utils import build_interrupt_event
 
     ev = build_interrupt_event(
         {

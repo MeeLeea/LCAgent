@@ -13,12 +13,12 @@ except ImportError:
     pass
 
 from agent import AgentCore
-from agent.config import load_agent_config, resolve_path
 from cli.cli_menu import select_menu
 from cli.commands import CommandContext, dispatch_command
 from cli.commands.core import show_ready
 from cli.commands.provider import create_llm, select_provider
 from cli.human_input import chat_until_completion, run_structured_until_completion
+from llm.config import load_agent_config, resolve_path
 from memory import MemoryContext
 from tools import safety as safety_module
 from utils.logging_config import setup_logging
@@ -44,7 +44,7 @@ async def build_agent(provider: str, process_type: str | None = None) -> tuple[A
         process_type: 进程类型标识(feishu/None)，用于多进程隔离。
                       CLI 模式传 None(单进程不需要隔离)
     """
-    from agent.llm_client import load_providers as list_providers
+    from llm.llm_client import load_providers as list_providers
     
     print(f"\n初始化 {list_providers(LLM_FILE)[provider]['name']} 客户端...")
     llm = create_llm(provider, LLM_FILE)
@@ -98,7 +98,7 @@ async def build_agent(provider: str, process_type: str | None = None) -> tuple[A
 
 def make_context(agent: AgentCore) -> CommandContext:
     """组装命令分发器所需的运行时依赖。"""
-    from agent.llm_client import load_providers as list_providers
+    from llm.llm_client import load_providers as list_providers
     from session.manager import create_workflow_session_manager
 
     # workflow 链路统一门面：与 chat 门面共享 SessionRegistry / MemoryManager，

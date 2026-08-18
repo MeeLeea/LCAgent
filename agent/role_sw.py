@@ -13,7 +13,7 @@ import logging
 import os
 from typing import TYPE_CHECKING
 
-from agent.llm_client import LLMClient
+from llm.llm_client import LLMClient
 
 if TYPE_CHECKING:
     from agent.agent_core import AgentCore
@@ -111,7 +111,7 @@ async def arebuild_agent_from_team_dir(
     prompt_path = os.path.join(role_dir, "AGENT.md")
 
     # 2. 读取角色配置与提示词(复用现有能力)
-    from agent.config import load_agent_config
+    from llm.config import load_agent_config
     from team.base import TeamAgent
 
     config = load_agent_config(config_path)

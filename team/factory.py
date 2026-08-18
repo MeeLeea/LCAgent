@@ -7,7 +7,7 @@ import os
 
 from langchain_core.tools import BaseTool
 
-from agent.config import load_agent_config, resolve_path
+from llm.config import load_agent_config, resolve_path
 from team.base import TeamAgent
 
 

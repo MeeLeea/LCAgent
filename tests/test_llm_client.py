@@ -1,8 +1,8 @@
-"""agent.llm_client.should_retry / 瞬时错误自动重试 的单元测试。"""
+"""llm.llm_client.should_retry / 瞬时错误自动重试 的单元测试。"""
 import pytest
 
-from agent import llm_client
-from agent.llm_client import RETRY_ATTEMPTS, _make_retryer, should_retry
+from llm import llm_client
+from llm.llm_client import RETRY_ATTEMPTS, _make_retryer, should_retry
 
 
 class _RetryableStatusError(Exception):

@@ -14,7 +14,7 @@ from typing import ClassVar, Protocol
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool
 
-from agent.llm_client import LLMClient
+from llm.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
 
