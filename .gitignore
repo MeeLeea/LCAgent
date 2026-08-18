@@ -68,8 +68,6 @@ docs/
 !web/tsconfig.json
 !web/tsconfig.node.json
 !src-tauri/capabilities/*.json
-/tests/*
-!tests/test_*
 
 # Rust / Cargo
 src-tauri/target/
