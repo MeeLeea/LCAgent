@@ -16,13 +16,18 @@ from typing import ClassVar, Protocol
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool
 
+from agent.turn_types import AgentTurnResult
 from llm.llm_client import LLMClient
 from tools.skills import SkillManager, default_skills_dir
+from utils.metrics import MetricsCollector
 
 logger = logging.getLogger(__name__)
 
 # AGENT.md 中工作流提示词小节的标题前缀(角色系统提示词加载时会被剥离)
 WORKFLOW_SECTION_PREFIX = "## workflow:"
+
+# 任务执行失败时 astream 产出的错误文本前缀(arun_structured 据此判定 cancelled)
+TASK_ERROR_PREFIX = "任务执行失败"
 
 
 class PromptInjector(Protocol):
@@ -261,6 +266,20 @@ class TeamAgent:
             return prompt
         return f"{prompt}\n\n{skill_block}"
     
+    @property
+    def metrics(self) -> MetricsCollector:
+        """运行时指标收集器(惰性初始化,兼容 object.__new__ 创建的测试实例)
+
+        与 AgentCore.metrics 同构:记录 LLM 调用(tokens/耗时)、工具执行
+        (次数/失败/超时)与 turn 计数;经 astream 的流式事件与纯文本通道
+        自动收集,调用方经 get_summary() 汇总。
+        """
+        mc = getattr(self, "_metrics", None)
+        if mc is None:
+            mc = MetricsCollector()
+            self._metrics = mc
+        return mc
+    
     def _create_tool_agent(self) -> None:
         """创建轻量工具 agent(仅当有 tools 时调用)"""
         from langchain.agents import create_agent
@@ -321,6 +340,8 @@ class TeamAgent:
             生成文本增量块(工具模式为 ReAct 循环内各 LLM 调用的流式输出;
             纯文本模式为单次 LLM 调用的流式输出)
         """
+        # 每次 astream 视为一次 Agent turn(ainvoke/arun_structured 均经此入口)
+        self.metrics.increment_turn()
         if self.agent_executor:
             async for chunk in self._astream_with_tools(task, config):
                 yield chunk
@@ -328,11 +349,44 @@ class TeamAgent:
             async for chunk in self._astream_pure_text(task, config):
                 yield chunk
     
+    async def arun_structured(self, task: str, config: dict | None = None) -> AgentTurnResult:
+        """异步执行单轮任务并返回类型化结果(对齐 agent.TurnRunners.arun_structured)
+
+        与 ainvoke 的区别:返回 ``AgentTurnResult``(completed / cancelled),
+        调用方可区分"正常完成"与"LLM 调用失败/执行异常",工作流节点可据此
+        走重试或降级路径,而非把错误文本当正常结果消费。
+
+        Args:
+            task: 任务描述
+            config: 外层运行配置(RunnableConfig),透传 workspace_path 与 callbacks
+
+        Returns:
+            AgentTurnResult:
+                - completed: 正常完成,output 为生成文本
+                - cancelled: LLM 调用失败/执行异常,output 为错误信息
+        """
+        try:
+            chunks: list[str] = []
+            async for chunk in self.astream(task, config):
+                chunks.append(chunk)
+            output = "".join(chunks)
+            if output.startswith(TASK_ERROR_PREFIX):
+                return AgentTurnResult.cancelled(output)
+            return AgentTurnResult.completed(output)
+        except Exception as e:
+            return AgentTurnResult.cancelled(f"{TASK_ERROR_PREFIX}: {e!s}")
+    
     async def _astream_with_tools(self, task: str, config: dict | None = None) -> AsyncIterator[str]:
-        """工具模式异步流式执行(经 agent_executor.astream_events)"""
+        """工具模式异步流式执行(经 agent_executor.astream_events)
+
+        除产出 LLM token 增量外,顺带收集运行时指标:
+        - on_chat_model_end → 记录 LLM 调用(token 用量,msg id 去重)
+        - on_tool_end / on_tool_error → 记录工具执行(失败/超时)
+        """
         if self.verbose:
             logger.info("[%s] 执行任务(工具模式·异步): %s", self.name, task[:100])
         
+        recorded_msg_ids: set[str] = set()
         try:
             run_config: dict = {"recursion_limit": self.max_iterations}
             # 仅提取 workspace_path 构造最小 config,严禁转发外层 config 的
@@ -350,14 +404,45 @@ class TeamAgent:
                 config=run_config,
                 version="v2",
             ):
-                if ev["event"] != "on_chat_model_stream":
-                    continue
-                chunk = ev["data"].get("chunk")
-                content = getattr(chunk, "content", None)
-                if isinstance(content, str) and content:
-                    yield content
+                event_name = ev["event"]
+                data_dict = ev.get("data", {}) if isinstance(ev.get("data"), dict) else {}
+                if event_name == "on_chat_model_stream":
+                    chunk = data_dict.get("chunk")
+                    content = getattr(chunk, "content", None)
+                    if isinstance(content, str) and content:
+                        yield content
+                elif event_name == "on_chat_model_end":
+                    # 记录 LLM 指标(与 agent/streaming.py 同构,msg id 去重)
+                    output = data_dict.get("output")
+                    if output is not None:
+                        msg_id = getattr(output, "id", None) or str(id(output))
+                        if msg_id not in recorded_msg_ids:
+                            recorded_msg_ids.add(msg_id)
+                            llm = getattr(self, "llm", None)
+                            self.metrics.extract_and_record_llm_usage(
+                                output,
+                                provider=getattr(llm, "provider", ""),
+                                model=getattr(llm, "model", "") or "",
+                            )
+                elif event_name == "on_tool_end":
+                    # 记录工具指标:超时(wrap 层转 JSON 错误串)/失败(status="error")
+                    output = data_dict.get("output")
+                    content_str = str(getattr(output, "content", ""))
+                    timed_out = '"error": "tool_timeout"' in content_str
+                    success = not timed_out and getattr(output, "status", "success") != "error"
+                    self.metrics.record_tool_call(
+                        name=ev.get("name") or "",
+                        success=success,
+                        timed_out=timed_out,
+                    )
+                elif event_name == "on_tool_error":
+                    # 工具内部抛异常(LangGraph 不发 on_tool_end 而发 on_tool_error)
+                    self.metrics.record_tool_call(
+                        name=ev.get("name") or "",
+                        success=False,
+                    )
         except Exception as e:
-            error_msg = f"任务执行失败: {e!s}"
+            error_msg = f"{TASK_ERROR_PREFIX}: {e!s}"
             if self.verbose:
                 logger.error("[%s] %s", self.name, error_msg)
             yield error_msg
@@ -395,12 +480,23 @@ class TeamAgent:
             if config and config.get("callbacks"):
                 run_config["callbacks"] = config["callbacks"]
             model = self.llm.get_chat_model()
+            last_chunk = None
             async for chunk in model.astream(messages, config=run_config):
+                last_chunk = chunk
                 content = getattr(chunk, "content", None)
                 if isinstance(content, str) and content:
                     yield content
+            # 记录 LLM 指标:从最后一个 chunk 提取 usage_metadata
+            # (对齐 agent.turn_runners 的提取逻辑,无 usage 时字符粗估)
+            if last_chunk is not None:
+                llm = getattr(self, "llm", None)
+                self.metrics.extract_and_record_llm_usage(
+                    last_chunk,
+                    provider=getattr(llm, "provider", ""),
+                    model=getattr(llm, "model", "") or "",
+                )
         except Exception as e:
-            error_msg = f"任务执行失败: {e!s}"
+            error_msg = f"{TASK_ERROR_PREFIX}: {e!s}"
             if self.verbose:
                 logger.error("[%s] %s", self.name, error_msg)
             yield error_msg
