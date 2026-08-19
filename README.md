@@ -272,6 +272,7 @@ LangChainAgent/
 │   ├── workspace_store.py   # WorkspaceStore：session_id ↔ workspace_path 映射
 │   └── manager.py           # SessionManager：对外门面 & 会话调度（封装 Agent + Memory）
 ├── team/                    # 多 Agent 团队协作模块
+│   ├── base.py              # TeamAgent 轻量基类(工具模式挂错误纠错+workspace 中间件+超时;内建技能注入)
 │   ├── __init__.py          # 导出 ManagerAgent/WorkerAgent/TerminatorAgent
 │   ├── factory.py           # 团队 Agent 工厂函数
 │   ├── manager/             # Manager Agent（任务拆解）
@@ -2103,7 +2104,9 @@ Designer (输出最终交付文件)
 
 - **无会话记忆/checkpoint**:TeamAgent 自身单轮执行、不管理历史(但工作流会在外层注入当前会话记忆,见「记忆注入机制」;跨轮次记忆由工作流图 checkpointer 承载,见「异步化与跨轮次压缩」)
 - **按需工具注入**:Manager/Terminator 纯 LLM 推理,Worker 注入工具列表后用 `create_agent` 构建轻量 ReAct 循环
-- **快速构建**:不加载 MCP Server、不扫描技能目录、不创建 SQLite checkpointer
+- **工具超时 + 错误纠错**:工具经 `tools.tool_wrapper.wrap_tools_with_timeout` 包裹超时保护(防卡死,默认 60 秒+工具级覆盖如 `ask_human` 600 秒);executor 挂载 `ToolExecutionErrorMW`(工具异常转 `ToolMessage(status="error")` + 反思指令,LLM 可读到报错修正重试)与 `WorkspaceSecurityMW`(workspace 路径解析 + 逃逸校验),与主 Agent 的工具执行质量对齐
+- **快速构建**:不加载 MCP Server、不创建 SQLite checkpointer
+- **内建技能注入**:持有 `SkillManager`(`skills_dir` 参数指定目录,默认 `.agents/skills`),提供 `build_skill_block`/`inject_into_prompt` 方法(满足 `PromptInjector` 协议),工作流节点可直接以角色实例为注入器,无需外部构造
 - **能力边界清晰**:规划/汇总角色不暴露危险工具(如 `run_shell`),Worker 才拥有工具执行能力
 - **自带 LLM 配置**:每个 agent 的 `agent_config.json` 里配置 `provider` + `model`,TeamAgent 内部创建 LLMClient
 - **可定制 LLM 采样参数**:`temperature`/`max_tokens` 采用**分层隔离**配置——非团队场景（主对话/调度器/API）默认值统一在 `llm/config.py` 的 `DEFAULTS` 管理，`LLMClient` 内部自动读取全局 `agent/agent_config.json`（含 DEFAULTS 兜底），外部无需传参；团队角色在其自身 `team/<角色>/agent_config.json` 中配置（如 WorkerAgent 用 `temperature=0.3` 提升执行确定性、`max_tokens=4096` 放宽输出上限），角色未配置时回退 DEFAULTS，**不读取全局自定义值**；子类也可通过类属性或 `__init__` 参数覆盖
@@ -2113,7 +2116,7 @@ Designer (输出最终交付文件)
 工作流节点已全面异步化,`TeamAgent` 提供 `ainvoke`/`astream` 异步能力,节点直接 `await` 角色类 async 业务方法并透传 LangGraph `config`(callbacks 通道)实现 TOKEN 级流式;同时具备技能注入与跨轮次记忆压缩能力:
 
 - **异步节点执行 + TOKEN 流式**:`simple.py` / `rtl_graph.py` 的业务节点(`summarize`/`manager_plan`/`worker_exec`/`terminator_final` 及 RTL 各节点)全部为 `async`,直接 `await` 角色类 async 业务方法(`asummarize_context`/`aplan_task`/`aexecute_task`/`afinalize` 等)并透传 LangGraph 注入的 `config: Optional[RunnableConfig]`。`TeamAgent`(`team/base.py`)提供 `ainvoke`(`astream` 聚合)/`astream` 异步能力:`_astream_with_tools` 经 `agent_executor.astream_events(version="v2")` 过滤 `on_chat_model_stream`;`_astream_pure_text` 经 chat model `astream`。因同事件循环执行,callbacks 自然透传——`NodeTrackingHandler.on_chat_model_stream` 捕获 LLM token 增量转发为 `AgentEvent.token`,`WorkflowAdapter._on_token` 闭包补 `thread_id`/`role="assistant"`/`trace_id` 后注入事件流,实现节点执行期间的 TOKEN 级流式(空块自动过滤)。同步业务方法与 `ainvoke_team_agent()` 兼容辅助已移除,统一走 async 链路。
-- **技能注入(SkillInjector)**:`build_simple_workflow` 接受 `skills_dir` / `auto_match_skills` 参数,构建时创建 `SkillInjector`(复用 `tools.skills.SkillManager` 的确定性打分匹配 + 指引块渲染)。节点渲染 prompt 后调用 `inject_into_prompt()` 把命中技能(`match_skills(task)`)的指引块追加到 prompt 末尾,已含技能块时跳过(防重复)。
+- **技能注入(SkillInjector)**:`build_simple_workflow` 接受 `skills_dir` / `auto_match_skills` 参数,构建时创建 `SkillInjector`(复用 `tools.skills.SkillManager` 的确定性打分匹配 + 指引块渲染)。节点渲染 prompt 后调用 `inject_into_prompt()` 把命中技能(`match_skills(task)`)的指引块追加到 prompt 末尾,已含技能块时跳过(防重复)。`TeamAgent` 亦内建同等能力(`build_skill_block` / `inject_into_prompt`,满足 `PromptInjector` 协议)——节点可直接以角色实例为注入器,无需外部构造;`team/factory.py` 会把角色 `agent_config.json` 的 `skills_dir` / `auto_match_skills` / `tool_timeout` 透传给 TeamAgent。
 - **消息通道压缩(compaction)**:`simple.py` / `rtl_graph.py` / `pipline.py` 的 `WorkflowState` / `RTLGraphState` 新增 `messages`(LangGraph `add_messages` 通道)与 `summary` 字段,每个业务节点产出追加一条 `AIMessage`。`build_*_workflow` 接受 `compaction_config` 参数,经 `graph/common.py` 的 `_build_compaction_middleware` + `wrap_node_with_compaction` 包装节点:消息累计超过阈值(默认 50)时调用 `arun_compaction(force=True)` 把历史消息压缩为增量摘要并入 `summary`,防止长会话撑爆上下文。`compaction_config=None` 且 agent 无 LLM 时静默禁用。
 - **跨轮次上下文延续**:统一入口(CLI/API)经 `WorkflowAdapter`(`session/workflow_adapter.py`)执行——运行前从 workflow 专属会话的 checkpoint `messages` 通道读取历史节点产出(预览最多 5 条、每条截断 200 字符,拼为 `【历史执行记录】` 块),叠加 `MemoryManager.recall_text` 的长期记忆,合并注入 `raw_context`,实现多轮运行间的上下文延续。直接调用 `arun_simple_workflow` + `thread_id` 时,旧的 `_aget_previous_workflow_summary()`(checkpoint 摘要)仍可用(已标记 deprecated,待消息通道完全接管后移除)。
 
@@ -2867,6 +2870,8 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 | `tests/cli/test_threads_preview.py`    | 会话菜单预览：首条用户消息提取与截断                                                    |
 | `tests/graph/test_workflow.py`         | 监督者模式工作流编排：Manager→Worker→Terminator 模板                                  |
 | `tests/team/test_sampling_config.py`   | 团队 Agent 采样参数：角色级/全局优先级与显式参数覆盖                                   |
+| `tests/team/test_team_tools.py`        | TeamAgent 工具模式：超时参数归一、中间件链挂载(ToolExecutionErrorMW + WorkspaceSecurityMW) |
+| `tests/team/test_team_skills.py`       | TeamAgent 技能内建：build_skill_block/inject_into_prompt、PromptInjector 协议兼容       |
 | `tests/utils/test_metrics.py`          | `MetricsCollector`：LLM/工具/压缩指标记录、token 提取与汇总                           |
 | `tests/tools/test_tool_wrapper.py`     | 工具超时包装：超时返回 JSON、按工具名覆盖、无限等待排除                                 |
 | `tests/utils/test_logging_config.py`   | 结构化日志：trace_id/thread_id 上下文注入、TraceContext 恢复                            |
