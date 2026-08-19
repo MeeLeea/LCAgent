@@ -1348,6 +1348,29 @@ LLM 决定是否调用工具
 
 若调用的是 `ask_human`，工具不会立即返回普通观察结果，而是通过 LangGraph interrupt 暂停图执行。CLI 收集选择后调用 `resume_structured()`，用 `Command(resume=...)` 把选择送回同一图状态，再继续后续工具调用或生成最终回复。
 
+#### 工具异常处理
+
+工具内部抛异常时（MCP 崩溃、路径解析 bug、权限错误等），分两层处理：
+
+**Layer 4：`ToolExecutionErrorMiddleware`（工具执行层，LLM 反思纠错）**
+
+基于 langchain 内置 `ToolErrorMiddleware`，挂载在 `create_agent` 中间件链最外层（`agent/tool_error_middleware.py`）。在 `wrap_tool_call`/`awrap_tool_call` 拦截层捕获工具执行异常，转换为 `ToolMessage(status="error")` **进入图状态**——这是 LLM 下一轮 ReAct 循环真正读到的内容：
+
+- **所有工具异常统一转换**：任意异常类型（`FileNotFoundError` / `OSError` / `PermissionError` / MCP 错误等）都不再逃逸终止流，而是成为错误 `ToolMessage`，图继续执行，LLM 有机会反思后重试
+- **点名异常类型**：按 langchain 官方建议，错误内容包含异常类型名 + 安全消息（而非裸异常细节），避免泄露内部信息
+- **动态 workspace 提示**：从 `request.runtime.config` 读取当前会话 workspace 根目录，附加"基于工作空间根目录使用相对路径、去除重复目录前缀"的提示（未绑定 workspace 时省略）
+- **反思指令**：末尾固定附加"请反思失败原因（参数是否正确、路径是否有效、前置条件是否满足），修正后重试"，触发 ReAct 反思-修正循环
+- 不捕获 `GraphBubbleUp` 控制流信号（interrupt / 父命令必须继续传播）；`max_iterations`（默认 25）兜底防止无限重试
+
+**事件流层（前端展示）**
+
+`AgentCore._arun_graph_events` 的事件循环处理 `on_tool_error` 事件（LangGraph 在工具异常时不发射 `on_tool_end`，改发射 `on_tool_error`）：
+
+- **单工具异常**：`on_tool_error` → 映射为 `TOOL_RESULT` 事件（content 以 `[工具执行失败]` 前缀标记），前端工具卡片显示失败状态；异常逃逸到 `except Exception` → 发 `ERROR` 事件终止流
+- **并行工具异常**：第一个工具崩后 Pregel 立即 `raise`，其余已 `on_tool_start` 但未 `on_tool_end`/`on_tool_error` 的 tool_call（孤儿）在 `except` 块中补发失败 `TOOL_RESULT`，避免前端工具卡片永远卡在"执行中"
+
+设计决策：工具失败发 `TOOL_RESULT`（携带错误信息）而非 `ERROR`——`ERROR` 是终止事件会中断整个流，而工具失败应让 LLM 看到错误并调整策略（ReAct 模式标准行为）。异常最终仍会逃逸到 `except Exception` 发 `ERROR` 终止流（因 Pregel 的 `_panic_or_proceed` 在第一个工具崩后立即 raise，无法继续执行后续节点）。
+
 ### 6. System Prompt 强化
 
 为确保 LLM 主动调用工具而非拒绝，system prompt 中明确要求：
@@ -1364,7 +1387,6 @@ LLM 决定是否调用工具
 9. 专业任务应优先用 read_skill 读取相关技能指引
 10. 需要人工确认、选择或补充信息时，应调用 ask_human 并提供结构化 choices
 ```
-
 ### 7. 扩展工具
 
 #### 方式 1：添加本地工具

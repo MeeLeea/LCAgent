@@ -42,6 +42,7 @@ from utils.logging_config import TraceContext, generate_trace_id
 from utils.metrics import MetricsCollector
 
 from .skill_middleware import SkillInjectionMiddleware
+from .tool_error_middleware import ToolExecutionErrorMiddleware
 from .workspace_middleware import WorkspaceSecurityMiddleware
 
 logger = logging.getLogger(__name__)
@@ -547,6 +548,11 @@ class AgentCore:
         # 工作空间安全中间件：拦截文件/执行类工具，注入 workspace 路径 + 逃逸校验
         workspace_middleware = WorkspaceSecurityMiddleware()
 
+        # 工具错误纠错中间件：捕获工具执行异常 → 转 ToolMessage(status="error")，
+        # 附加异常类型 + workspace 提示 + 反思指令，使 LLM 能读到报错并修正重试
+        # （放在 middleware 列表最前 = 最外层，包住 workspace 中间件，捕获所有工具异常）
+        tool_error_middleware = ToolExecutionErrorMiddleware()
+
         # create_agent 直接返回可调用的agent
         wrapped_tools = wrap_tools_with_timeout(self.tools, self.tool_timeout)
         agent = create_agent(
@@ -557,6 +563,7 @@ class AgentCore:
             store=self._store,
             state_schema=LCAgentState,
             middleware=[
+                tool_error_middleware,
                 compaction_middleware,
                 skill_middleware,
                 workspace_middleware,
@@ -1063,6 +1070,38 @@ class AgentCore:
                             thread_id=thread_id,
                             trace_id=trace_id,
                         )
+                    elif event_name == "on_tool_error":
+                        # 工具内部抛异常（MCP 崩溃 / 路径解析 bug / 权限错误等），
+                        # LangGraph 不发射 on_tool_end，而是发射 on_tool_error。
+                        # 发 tool_result 携带错误信息（而非 error 终止事件），
+                        # 让前端工具卡片显示失败 + LLM 能看到错误并调整策略。
+                        error_obj = data_dict.get("error")
+                        error_msg = (
+                            str(error_obj) if error_obj is not None
+                            else "工具执行异常（未知错误）"
+                        )
+                        # on_tool_error 的 data 直接含 tool_call_id（复现验证），
+                        # 但仍走 ID 桥接兜底，与 on_tool_end 保持一致
+                        run_id = ev.get("run_id", "")
+                        tc_id = active_tool_call_ids.pop(run_id, "")
+                        if not tc_id:
+                            tc_id = data_dict.get("tool_call_id", "")
+                        if not tc_id:
+                            event_name_top = ev.get("name", "")
+                            bucket = pending_tool_call_ids.get(event_name_top)
+                            if bucket:
+                                tc_id = bucket.pop(0)
+                        if not tc_id:
+                            tc_id = ev.get("name", "")
+                        name = ev.get("name") or data_dict.get("name", "") or ""
+                        emitted = True
+                        yield AgentEvent.tool_result(
+                            tool_call_id=tc_id,
+                            name=name,
+                            content=f"[工具执行失败] {error_msg}",
+                            thread_id=thread_id,
+                            trace_id=trace_id,
+                        )
                     elif event_name == "on_chat_model_end":
                         output = data_dict.get("output")
                         if isinstance(output, AIMessage):
@@ -1107,6 +1146,20 @@ class AgentCore:
                 )
                 return
             except Exception as error:
+                # 并行工具调用场景：第一个工具崩后 Pregel 立即 raise，
+                # 其余已 on_tool_start 但未 on_tool_end/on_tool_error 的 tool_call
+                # 残留在 active_tool_call_ids。补发失败 tool_result，
+                # 避免前端工具卡片永远卡在"执行中"。
+                orphan_tc_ids = list(active_tool_call_ids.values())
+                active_tool_call_ids.clear()
+                for orphan_tc_id in orphan_tc_ids:
+                    yield AgentEvent.tool_result(
+                        tool_call_id=orphan_tc_id,
+                        name="",
+                        content=f"[工具执行失败] 并行任务因其他工具异常被中断: {error}",
+                        thread_id=thread_id,
+                        trace_id=trace_id,
+                    )
                 if emitted or not should_retry(error) or attempt == RETRY_ATTEMPTS - 1:
                     yield AgentEvent.error(
                         extract_llm_error(error),
@@ -1235,14 +1288,17 @@ class AgentCore:
         - 监听 graph 内部 astream_events
         - 统一输出标准化 AgentEvent 事件流
 
-        不做：
-        - 不读写存储（checkpoint 由 graph 自动管理）
-        - 不管理会话（new/switch/list/delete）
-        - 不处理记忆（recall/submit/compress）
-        - 不处理锁、并发
-
         事件流顺序：
         TOKEN* → (TOOL_CALL → TOOL_RESULT)* → INTERRUPT | CANCELLED | ERROR | DONE
+
+        工具异常处理：
+        - 工具内部抛异常时，LangGraph 发射 on_tool_error 事件（非 on_tool_end），
+          本方法将其映射为 TOOL_RESULT 事件（content 以 "[工具执行失败]" 前缀标记），
+          让前端工具卡片显示失败 + LLM 能看到错误并调整策略。
+        - 并行工具调用场景下，第一个工具崩后 Pregel 立即 raise，其余已 on_tool_start
+          但未 on_tool_end/on_tool_error 的 tool_call（孤儿）在 except 块中补发
+          失败 TOOL_RESULT，避免前端工具卡片永远卡在"执行中"。
+        - 异常最终逃逸到 except Exception，发 ERROR 事件终止流。
 
         Args:
             message: 用户消息

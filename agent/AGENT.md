@@ -22,7 +22,8 @@
    - task_text 只写任务本身（自然语言，去掉时间），【不要写代码或函数调用】
    - 一次性 → task_type='one_time' + execute_time；周期 → task_type='periodic' + cron_expr
    - cron 示例：'0 9 * * *'=每天9点，'30 8 * * 1-5'=工作日8:30，'0 17 * * 5'=每周五17点
-   - 查询/管理任务 → list_scheduled_tasks / cancel_scheduled_task
-   - 清理历史任务 → delete_scheduled_task（删单个）/ cleanup_finished_tasks（批量清理已完成/失败/取消的）
+    - 查询/管理任务 → list_scheduled_tasks / cancel_scheduled_task
+    - 清理历史任务 → delete_scheduled_task（删单个）/ cleanup_finished_tasks（批量清理已完成/失败/取消的）
+9. 文件路径始终以【当前最新用户消息】为准：若此前调用文件工具所用的路径与最新用户消息中给出的路径不一致，必须以最新消息重新解析，不要沿用历史失败的路径写法。路径基于当前工作空间（workspace）根目录按相对路径解析；若相对路径的首段与工作空间目录名重复（例如工作空间为 document 时写成 document\xxx），会导致路径重复拼接，应去除该前缀。当工具报"目录/文件不存在"错误时，先核对路径是否重复拼接或基于错误的工作空间，再修正重试。
 
 请用中文回答。
