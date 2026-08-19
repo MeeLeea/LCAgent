@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -303,3 +304,92 @@ class TestPassthroughCases:
 
         assert handler.called
         assert handler.call_args[0][0].tool_call["args"]["expression"] == "1+1"
+
+
+# --------------------------------------------------------------------------- #
+# list_allowed_directories 拦截：返回 workspace 路径而非 MCP 的 allowed_directories
+# --------------------------------------------------------------------------- #
+class TestListAllowedDirectoriesInterception:
+    """拦截 list_allowed_directories，返回当前 workspace 路径。
+
+    场景：MCP filesystem server 的 allowed_directories 配置为粗粒度（如 D:/），
+    若直接暴露给 LLM，LLM 会误以为整盘可用，构造 D:\\packages 等绝对路径。
+    中间件应拦截此工具，返回当前会话的 workspace 路径作为唯一 allowed_directory。
+    """
+
+    def test_sync_returns_workspace_path(self, tmp_path):
+        """同步版本：list_allowed_directories 返回 workspace 路径。"""
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+
+        mw = WorkspaceSecurityMiddleware()
+        handler = MagicMock(return_value="should_not_be_called")
+        request = _make_request(
+            "list_allowed_directories", {}, _make_config(str(ws)),
+        )
+
+        result = mw.wrap_tool_call(request, handler)
+
+        # handler 不应被调用（不透传给 MCP）
+        assert not handler.called
+        # 返回 ToolMessage，content 含 workspace 路径
+        ws_real = os.path.realpath(str(ws))
+        assert "Allowed directories:" in result.content
+        assert ws_real in result.content
+        assert result.name == "list_allowed_directories"
+
+    def test_async_returns_workspace_path(self, tmp_path):
+        """异步版本：list_allowed_directories 返回 workspace 路径。"""
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+
+        mw = WorkspaceSecurityMiddleware()
+        handler = MagicMock(return_value="should_not_be_called")
+        request = _make_request(
+            "list_allowed_directories", {}, _make_config(str(ws)),
+        )
+
+        async def _run():
+            return await mw.awrap_tool_call(request, handler)
+
+        result = asyncio.run(_run())
+
+        assert not handler.called
+        ws_real = os.path.realpath(str(ws))
+        assert "Allowed directories:" in result.content
+        assert ws_real in result.content
+        assert result.name == "list_allowed_directories"
+
+    def test_no_workspace_passes_through_to_mcp(self, tmp_path):
+        """无 workspace 绑定时，list_allowed_directories 直接放行给 MCP。"""
+        mw = WorkspaceSecurityMiddleware()
+        handler = MagicMock(return_value="mcp_result")
+        request = _make_request(
+            "list_allowed_directories", {}, _make_config(None),
+        )
+
+        result = mw.wrap_tool_call(request, handler)
+
+        # workspace 未绑定，直接放行
+        assert handler.called
+        assert result == "mcp_result"
+
+    def test_does_not_leak_mcp_allowed_directories(self, tmp_path):
+        """验证返回内容不含 MCP 的 D:/ 配置，只有 workspace 路径。"""
+        ws = tmp_path / "deepseek-harness"
+        ws.mkdir()
+
+        mw = WorkspaceSecurityMiddleware()
+        handler = MagicMock(return_value="should_not_be_called")
+        request = _make_request(
+            "list_allowed_directories", {}, _make_config(str(ws)),
+        )
+
+        result = mw.wrap_tool_call(request, handler)
+
+        # 不应包含盘根路径（MCP 配置的 allowed_directories）
+        assert "D:\\" not in result.content
+        assert "D:/" not in result.content
+        # 应包含 workspace 路径
+        ws_real = os.path.realpath(str(ws))
+        assert ws_real in result.content

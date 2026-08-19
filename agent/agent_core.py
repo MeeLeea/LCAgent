@@ -629,7 +629,10 @@ class AgentCore:
         reg = getattr(self, "_session_registry", None)
         if reg is not None:
             sid = self._current_sid(thread_id)
-            return reg.get_context(sid).config
+            ctx = reg.get_context(sid)
+            ws = ctx.config.get("configurable", {}).get("workspace_path")
+            logger.info("_invoke_config: sid=%s workspace_path=%s", sid, ws)
+            return ctx.config
         # Fallback：测试中通过 object.__new__ 创建的实例无 session_registry
         sid = self._current_sid(thread_id)
         return {

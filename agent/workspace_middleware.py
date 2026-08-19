@@ -128,6 +128,12 @@ class WorkspaceSecurityMiddleware(AgentMiddleware):
         if workspace is None:
             return handler(request)
 
+        # list_allowed_directories：返回当前 workspace 路径，而非 MCP 配置的粗粒度 allowed_directories。
+        # 否则 LLM 会看到 MCP 的 allowed_directories（如 D:\），误以为整盘可用，
+        # 构造 D:\packages 等绝对路径调用其他工具，触发路径逃逸或目录不存在错误。
+        if tool_name == "list_allowed_directories":
+            return self._build_allowed_directories_message(request, workspace)
+
         # 文件类工具：解析路径参数 + 逃逸校验
         if tool_name in _FILESYSTEM_TOOLS:
             return self._handle_filesystem_tool(request, handler, workspace)
@@ -147,9 +153,24 @@ class WorkspaceSecurityMiddleware(AgentMiddleware):
         """异步版本：拦截工具调用，注入 workspace 路径 + 校验逃逸。"""
         tool_name = request.tool_call["name"]
         workspace = _get_workspace(request.runtime.config)
+        logger.info(
+            "awrap_tool_call: tool=%s workspace=%s args=%s",
+            tool_name,
+            workspace,
+            request.tool_call.get("args"),
+        )
 
         if workspace is None:
+            logger.warning(
+                "工作空间未绑定，工具 %s 直接放行（无路径解析）", tool_name
+            )
             return await handler(request)
+
+        # list_allowed_directories：返回当前 workspace 路径，而非 MCP 配置的粗粒度 allowed_directories。
+        # 否则 LLM 会看到 MCP 的 allowed_directories（如 D:\），误以为整盘可用，
+        # 构造 D:\packages 等绝对路径调用其他工具，触发路径逃逸或目录不存在错误。
+        if tool_name == "list_allowed_directories":
+            return self._build_allowed_directories_message(request, workspace)
 
         if tool_name in _FILESYSTEM_TOOLS:
             return await self._ahandle_filesystem_tool(request, handler, workspace)
@@ -219,7 +240,7 @@ class WorkspaceSecurityMiddleware(AgentMiddleware):
             if field in new_args and isinstance(new_args[field], str):
                 new_args[field] = _resolve_in_workspace(new_args[field], workspace)
         # read_multiple_files 的路径列表
-        if "paths" in new_args and isinstance(new_args[field], list):
+        if "paths" in new_args and isinstance(new_args["paths"], list):
             new_args["paths"] = [
                 _resolve_in_workspace(p, workspace) if isinstance(p, str) else p
                 for p in new_args["paths"]
@@ -309,6 +330,38 @@ class WorkspaceSecurityMiddleware(AgentMiddleware):
             content=f"操作被拒绝：{error}",
             tool_call_id=tool_call_id,
             name=tool_name,
+        )
+
+    @staticmethod
+    def _build_allowed_directories_message(
+        request: ToolCallRequest,
+        workspace: str,
+    ) -> ToolMessage:
+        """拦截 list_allowed_directories，返回当前 workspace 路径。
+
+        MCP filesystem server 的 allowed_directories 配置为粗粒度（如 D:/），
+        若直接暴露给 LLM，LLM 会误以为整盘可用，构造 D:\\packages 等绝对路径
+        调用其他工具，触发路径逃逸或目录不存在错误。
+
+        本方法用当前会话的 workspace 路径替代 MCP 的 allowed_directories，
+        使 LLM 看到的可用范围与中间件的安全边界一致。
+
+        Args:
+            request: 工具调用请求
+            workspace: 当前会话的 workspace 绝对路径
+
+        Returns:
+            返回格式与 MCP list_allowed_directories 一致的 ToolMessage
+        """
+        tool_call_id = request.tool_call.get("id", "")
+        text = f"Allowed directories:\n{workspace}"
+        logger.info(
+            "list_allowed_directories 拦截: 返回 workspace 路径 %s", workspace
+        )
+        return ToolMessage(
+            content=text,
+            tool_call_id=tool_call_id,
+            name="list_allowed_directories",
         )
 
 
