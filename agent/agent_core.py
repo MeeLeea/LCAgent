@@ -62,7 +62,7 @@ class AgentCore(
 ):
     """基于LangChain 1.x 的Agent核心调度器
 
-    方法按职责拆分到各 mixin（见模块 docstring），本类仅保留：
+    本类仅保留：
     - 构造/生命周期（_init_common / __init__ / acreate / aclose）
     - 跨 mixin 共享的私有工具方法（_invoke_config / _thread_id_from_config / _temp_verbose）
     - 独立方法（acot / 历史查询）

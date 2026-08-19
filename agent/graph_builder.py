@@ -3,7 +3,7 @@
 从 agent_core.py 抽离，职责：
 - 创建 / 重建 LangGraph ReAct Agent（create_agent）
 - 组装中间件链（工具错误纠错 + 压缩 + 技能注入 + 工作空间安全 + 外部扩展）
-- 系统提示词读取、LLM 切换、团队角色切换委托
+- 系统提示词读取、LLM 切换
 
 依赖 AgentCore 实例属性：llm / tools / tool_timeout / _checkpointer /
 _store / _extra_middleware / compaction_config / metrics / skill_manager /
@@ -132,23 +132,3 @@ class GraphBuilder:
         async with self._state_lock:
             self.llm = llm_client
             await self._arebuild_agent_executor()
-
-    # ============ 团队角色切换(Team Role Switch) ============
-
-    async def arebuild_from_team_dir(self, agent_name: str, *, task: str = "") -> None:
-        """按 team/ 角色文件夹名重建主对话 Agent 的角色(唯一对外入口)
-
-        具体实现委托给 agent.role_sw.arebuild_agent_from_team_dir,
-        就地把当前 AgentCore 切换为目标角色的提示词/LLM。
-
-        Args:
-            agent_name: team/ 下的角色文件夹名(如 "manager"/"worker")
-            task: 可选任务描述,用于切换后自动匹配注入技能
-
-        Raises:
-            KeyError: 角色文件夹不存在或缺少必需文件
-            FileNotFoundError: AGENT.md 读取失败(内容为空)
-        """
-        from agent.role_sw import arebuild_agent_from_team_dir
-
-        await arebuild_agent_from_team_dir(self, agent_name, task=task)

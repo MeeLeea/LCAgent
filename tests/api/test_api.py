@@ -415,41 +415,42 @@ def test_get_roles(client, mock_agent):
 
 
 def test_switch_role(client, mock_agent):
-    """测试切换团队角色：调用 arebuild_from_team_dir 并返回新角色"""
+    """测试切换团队角色：调用 role_sw.arebuild_agent_from_team_dir 并返回新角色"""
     mock_agent.name = "worker"
-    mock_agent.arebuild_from_team_dir = AsyncMock()
-
-    response = client.post("/api/roles/switch", json={"role": "worker"})
+    with patch(
+        "agent.role_sw.arebuild_agent_from_team_dir", new_callable=AsyncMock
+    ) as mock_rebuild:
+        response = client.post("/api/roles/switch", json={"role": "worker"})
 
     assert response.status_code == 200
     data = response.json()
     assert data["role"] == "worker"
     assert data["current"] == "worker"
-    mock_agent.arebuild_from_team_dir.assert_awaited_once_with("worker", task="")
+    mock_rebuild.assert_awaited_once_with(mock_agent, "worker", task="")
 
 
 def test_switch_role_with_task(client, mock_agent):
-    """测试切换角色时携带 task，task 透传给 arebuild_from_team_dir"""
+    """测试切换角色时携带 task，task 透传给 role_sw.arebuild_agent_from_team_dir"""
     mock_agent.name = "manager"
-    mock_agent.arebuild_from_team_dir = AsyncMock()
-
-    response = client.post(
-        "/api/roles/switch",
-        json={"role": "manager", "task": "分析项目结构"},
-    )
+    with patch(
+        "agent.role_sw.arebuild_agent_from_team_dir", new_callable=AsyncMock
+    ) as mock_rebuild:
+        response = client.post(
+            "/api/roles/switch",
+            json={"role": "manager", "task": "分析项目结构"},
+        )
 
     assert response.status_code == 200
-    mock_agent.arebuild_from_team_dir.assert_awaited_once_with(
-        "manager", task="分析项目结构"
-    )
+    mock_rebuild.assert_awaited_once_with(mock_agent, "manager", task="分析项目结构")
 
 
 def test_switch_role_unknown(client, mock_agent):
     """测试切换到未知角色返回 404"""
-    mock_agent.arebuild_from_team_dir = AsyncMock(
-        side_effect=KeyError("未找到 team 角色: ghost。可用角色: manager, worker")
-    )
     with patch(
+        "agent.role_sw.arebuild_agent_from_team_dir",
+        new_callable=AsyncMock,
+        side_effect=KeyError("未找到 team 角色: ghost。可用角色: manager, worker"),
+    ), patch(
         "agent.role_sw.get_available_team_roles",
         return_value=["manager", "worker"],
     ):
@@ -461,10 +462,12 @@ def test_switch_role_unknown(client, mock_agent):
 
 def test_switch_role_empty_prompt(client, mock_agent):
     """测试角色提示词文件为空返回 400"""
-    mock_agent.arebuild_from_team_dir = AsyncMock(
-        side_effect=FileNotFoundError("角色提示词文件为空或无法读取: team/broken/AGENT.md")
-    )
-    response = client.post("/api/roles/switch", json={"role": "broken"})
+    with patch(
+        "agent.role_sw.arebuild_agent_from_team_dir",
+        new_callable=AsyncMock,
+        side_effect=FileNotFoundError("角色提示词文件为空或无法读取: team/broken/AGENT.md"),
+    ):
+        response = client.post("/api/roles/switch", json={"role": "broken"})
 
     assert response.status_code == 400
     assert "提示词" in response.json()["detail"]

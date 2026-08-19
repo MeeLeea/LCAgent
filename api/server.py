@@ -477,7 +477,10 @@ async def switch_role(req: SwitchRoleRequest):
     logger.info("切换团队角色: %s", req.role)
     async with chat_lock:
         try:
-            await agent.arebuild_from_team_dir(req.role, task=req.task or "")
+            # 直接调用 role_sw 模块入口,就地把 AgentCore 切换为目标角色
+            from agent.role_sw import arebuild_agent_from_team_dir
+
+            await arebuild_agent_from_team_dir(agent, req.role, task=req.task or "")
         except KeyError as e:
             from agent.role_sw import get_available_team_roles
 

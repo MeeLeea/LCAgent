@@ -53,8 +53,10 @@ async def _choose_role(context: CommandContext) -> CommandOutcome:
 async def _switch_role(context: CommandContext, role_name: str, task_text: str) -> CommandOutcome:
     """按角色名重建主 Agent,可选地在切换后立即执行任务。"""
     try:
-        # arebuild_from_team_dir 为异步入口,就地把 AgentCore 切换为目标角色
-        await context.agent.arebuild_from_team_dir(role_name, task=task_text)
+        # role_sw.arebuild_agent_from_team_dir 为异步入口,就地把 AgentCore 切换为目标角色
+        from agent.role_sw import arebuild_agent_from_team_dir
+
+        await arebuild_agent_from_team_dir(context.agent, role_name, task=task_text)
     except KeyError as error:
         # 角色不存在:补充展示可用角色,便于用户重试
         from agent.role_sw import get_available_team_roles
