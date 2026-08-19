@@ -42,6 +42,7 @@ from utils.logging_config import TraceContext, generate_trace_id
 from utils.metrics import MetricsCollector
 
 from .skill_middleware import SkillInjectionMiddleware
+from .tool_error_middleware import ToolExecutionErrorMiddleware
 from .workspace_middleware import WorkspaceSecurityMiddleware
 
 logger = logging.getLogger(__name__)
@@ -94,6 +95,7 @@ class AgentCore:
         agent_prompt_file: str | None,
         max_execution_history: int,
         tool_timeout: float,
+        short_term_size: int,
         checkpointer: Any | None = None,
         store: Any | None = None,
         extra_middleware: list | None = None,
@@ -107,6 +109,7 @@ class AgentCore:
         self.max_context_messages = max_context_messages
         self.context_trim_keep = context_trim_keep
         self.tool_timeout = tool_timeout if tool_timeout > 0 else None
+        self._short_term_size = short_term_size
         self._closed = False
 
         # 压缩配置：before_model 中间件自动触发 + manually_compact 手动触发
@@ -193,6 +196,7 @@ class AgentCore:
         agent_prompt_file: str | None = None,
         max_execution_history: int = 100,
         tool_timeout: float = 60.0,
+        short_term_size: int = 10,
         checkpointer: Any | None = None,
         store: Any | None = None,
         extra_middleware: list | None = None,
@@ -216,6 +220,8 @@ class AgentCore:
             agent_prompt_file: Agent核心提示词文件路径(为 None 时使用配置默认值)
             max_execution_history: 执行历史最大条数(防止内存泄漏)
             tool_timeout: 工具执行默认超时秒数(0=禁用超时)
+            short_term_size: 短期上下文窗口消息条数（对应配置键 latest_msg_cnt，
+                             传给 SessionRegistry.aget_short_term 兜底）
             checkpointer: LangGraph checkpointer 原语（由入口程序 / MemoryContext 注入）
             store: LangGraph store 原语（长期记忆 Store）
             extra_middleware: 额外中间件列表（如记忆读写中间件）
@@ -237,6 +243,7 @@ class AgentCore:
             agent_prompt_file=agent_prompt_file,
             max_execution_history=max_execution_history,
             tool_timeout=tool_timeout,
+            short_term_size=short_term_size,
             checkpointer=checkpointer,
             store=store,
             extra_middleware=extra_middleware,
@@ -267,6 +274,7 @@ class AgentCore:
         agent_prompt_file: str | None = None,
         max_execution_history: int = 100,
         tool_timeout: float = 60.0,
+        short_term_size: int = 10,
         checkpointer: Any | None = None,
         store: Any | None = None,
         extra_middleware: list | None = None,
@@ -290,6 +298,7 @@ class AgentCore:
             agent_prompt_file=agent_prompt_file,
             max_execution_history=max_execution_history,
             tool_timeout=tool_timeout,
+            short_term_size=short_term_size,
             checkpointer=checkpointer,
             store=store,
             extra_middleware=extra_middleware,
@@ -326,6 +335,7 @@ class AgentCore:
             process_type=self._process_type,
             recursion_limit=self.max_iterations,
             async_conn=self._async_conn,
+            short_term_size=self._short_term_size,
         )
         # 同步当前会话指针
         self._session_registry.current_session_id = self._initial_thread_id or self._session_registry.current_session_id
@@ -538,6 +548,11 @@ class AgentCore:
         # 工作空间安全中间件：拦截文件/执行类工具，注入 workspace 路径 + 逃逸校验
         workspace_middleware = WorkspaceSecurityMiddleware()
 
+        # 工具错误纠错中间件：捕获工具执行异常 → 转 ToolMessage(status="error")，
+        # 附加异常类型 + workspace 提示 + 反思指令，使 LLM 能读到报错并修正重试
+        # （放在 middleware 列表最前 = 最外层，包住 workspace 中间件，捕获所有工具异常）
+        tool_error_middleware = ToolExecutionErrorMiddleware()
+
         # create_agent 直接返回可调用的agent
         wrapped_tools = wrap_tools_with_timeout(self.tools, self.tool_timeout)
         agent = create_agent(
@@ -548,6 +563,7 @@ class AgentCore:
             store=self._store,
             state_schema=LCAgentState,
             middleware=[
+                tool_error_middleware,
                 compaction_middleware,
                 skill_middleware,
                 workspace_middleware,
@@ -620,7 +636,10 @@ class AgentCore:
         reg = getattr(self, "_session_registry", None)
         if reg is not None:
             sid = self._current_sid(thread_id)
-            return reg.get_context(sid).config
+            ctx = reg.get_context(sid)
+            ws = ctx.config.get("configurable", {}).get("workspace_path")
+            logger.info("_invoke_config: sid=%s workspace_path=%s", sid, ws)
+            return ctx.config
         # Fallback：测试中通过 object.__new__ 创建的实例无 session_registry
         sid = self._current_sid(thread_id)
         return {
@@ -917,7 +936,8 @@ class AgentCore:
             mode = "chat"  # 默认 chat 模式（无追踪记录时尝试恢复）
 
         try:
-            result = await self.agent_executor.ainvoke(Command(resume=payload), config=config)
+            resume_command = await self._abuild_resume_command(config, payload)
+            result = await self.agent_executor.ainvoke(resume_command, config=config)
         except UserRejectedCommandError:
             return await self._ahandle_rejected_command(config)
 
@@ -1027,16 +1047,58 @@ class AgentCore:
                             if output is not None
                             else None
                         )
-                        emitted = True
-                        yield AgentEvent.tool_result(
-                            tool_call_id=(
-                                active_tool_call_ids.pop(ev.get("run_id", ""), "")
-                                or data_dict.get("tool_call_id")
+                        # ID 桥接：优先 run_id 映射 → pending 队列按名匹配 →
+                        # ToolMessage.tool_call_id → 工具名兜底
+                        run_id = ev.get("run_id", "")
+                        tc_id = active_tool_call_ids.pop(run_id, "")
+                        if not tc_id:
+                            event_name_top = ev.get("name", "")
+                            bucket = pending_tool_call_ids.get(event_name_top)
+                            if bucket:
+                                tc_id = bucket.pop(0)
+                        if not tc_id:
+                            tc_id = (
+                                data_dict.get("tool_call_id")
                                 or getattr(output, "tool_call_id", None)
                                 or ev.get("name", "")
-                            ),
+                            )
+                        emitted = True
+                        yield AgentEvent.tool_result(
+                            tool_call_id=tc_id,
                             name=ev.get("name") or data_dict.get("name", "") or "",
                             content=stringify_content(content),
+                            thread_id=thread_id,
+                            trace_id=trace_id,
+                        )
+                    elif event_name == "on_tool_error":
+                        # 工具内部抛异常（MCP 崩溃 / 路径解析 bug / 权限错误等），
+                        # LangGraph 不发射 on_tool_end，而是发射 on_tool_error。
+                        # 发 tool_result 携带错误信息（而非 error 终止事件），
+                        # 让前端工具卡片显示失败 + LLM 能看到错误并调整策略。
+                        error_obj = data_dict.get("error")
+                        error_msg = (
+                            str(error_obj) if error_obj is not None
+                            else "工具执行异常（未知错误）"
+                        )
+                        # on_tool_error 的 data 直接含 tool_call_id（复现验证），
+                        # 但仍走 ID 桥接兜底，与 on_tool_end 保持一致
+                        run_id = ev.get("run_id", "")
+                        tc_id = active_tool_call_ids.pop(run_id, "")
+                        if not tc_id:
+                            tc_id = data_dict.get("tool_call_id", "")
+                        if not tc_id:
+                            event_name_top = ev.get("name", "")
+                            bucket = pending_tool_call_ids.get(event_name_top)
+                            if bucket:
+                                tc_id = bucket.pop(0)
+                        if not tc_id:
+                            tc_id = ev.get("name", "")
+                        name = ev.get("name") or data_dict.get("name", "") or ""
+                        emitted = True
+                        yield AgentEvent.tool_result(
+                            tool_call_id=tc_id,
+                            name=name,
+                            content=f"[工具执行失败] {error_msg}",
                             thread_id=thread_id,
                             trace_id=trace_id,
                         )
@@ -1084,6 +1146,20 @@ class AgentCore:
                 )
                 return
             except Exception as error:
+                # 并行工具调用场景：第一个工具崩后 Pregel 立即 raise，
+                # 其余已 on_tool_start 但未 on_tool_end/on_tool_error 的 tool_call
+                # 残留在 active_tool_call_ids。补发失败 tool_result，
+                # 避免前端工具卡片永远卡在"执行中"。
+                orphan_tc_ids = list(active_tool_call_ids.values())
+                active_tool_call_ids.clear()
+                for orphan_tc_id in orphan_tc_ids:
+                    yield AgentEvent.tool_result(
+                        tool_call_id=orphan_tc_id,
+                        name="",
+                        content=f"[工具执行失败] 并行任务因其他工具异常被中断: {error}",
+                        thread_id=thread_id,
+                        trace_id=trace_id,
+                    )
                 if emitted or not should_retry(error) or attempt == RETRY_ATTEMPTS - 1:
                     yield AgentEvent.error(
                         extract_llm_error(error),
@@ -1099,23 +1175,100 @@ class AgentCore:
         thread_id: str,
         trace_id: str,
     ) -> AgentEvent | None:
-        """流结束后检查是否被 ask_human 中断，返回 INTERRUPT 事件或 None。"""
+        """流结束后检查是否被中断，返回 INTERRUPT 事件或 None。
+
+        并行工具调用（如多个危险命令）可能产生多个 pending interrupts。
+        相同 kind（dangerous_command）的中断合并为单个事件，prompt 列出
+        所有待确认命令，用户一次确认即可批量恢复。
+        """
         graph = self.agent_executor
         try:
             state = await graph.aget_state(config)
-            if state is not None:
-                for task in getattr(state, "tasks", []) or []:
-                    for intr in getattr(task, "interrupts", []) or []:
-                        ev_dict = build_interrupt_event(getattr(intr, "value", None))
-                        return AgentEvent.interrupt(
-                            prompt=ev_dict.get("prompt", ""),
-                            choices=ev_dict.get("choices"),
-                            thread_id=thread_id,
-                            trace_id=trace_id,
-                        )
+            if state is None:
+                return None
+
+            interrupts = [
+                intr
+                for task in getattr(state, "tasks", []) or []
+                for intr in getattr(task, "interrupts", []) or []
+            ]
+            if not interrupts:
+                return None
+
+            ev_dicts = [
+                build_interrupt_event(getattr(intr, "value", None))
+                for intr in interrupts
+            ]
+
+            # 判断是否全部为 dangerous_command（并行工具调用的典型场景）
+            kinds = {
+                getattr(intr, "value", {}).get("kind", "")
+                if isinstance(getattr(intr, "value", None), dict)
+                else ""
+                for intr in interrupts
+            }
+
+            if len(interrupts) > 1 and kinds == {"dangerous_command"}:
+                combined_prompt = "\n\n".join(
+                    f"({i + 1}/{len(ev_dicts)}) {ev_dicts[i].get('prompt', '')}"
+                    for i in range(len(ev_dicts))
+                )
+                return AgentEvent.interrupt(
+                    prompt=combined_prompt,
+                    choices=ev_dicts[0].get("choices"),
+                    thread_id=thread_id,
+                    trace_id=trace_id,
+                )
+
+            return AgentEvent.interrupt(
+                prompt=ev_dicts[0].get("prompt", ""),
+                choices=ev_dicts[0].get("choices"),
+                thread_id=thread_id,
+                trace_id=trace_id,
+            )
         except Exception as error:
             logger.warning("检查 interrupt 失败: %s", error, exc_info=True)
         return None
+
+    async def _abuild_resume_command(
+        self,
+        config: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> Command:
+        """构造恢复命令：多个 pending interrupts 时批量恢复。
+
+        并行工具调用可能产生多个 pending interrupts（如多个危险命令确认）。
+        将同一答案应用到所有 pending interrupts，避免用户逐个确认。
+
+        Args:
+            config: LangGraph 配置（用于读取当前 state 的挂起中断）
+            payload: 调用方传入的恢复数据
+
+        Returns:
+            可直接传给图执行的 ``Command(resume=...)``
+        """
+        graph = self.agent_executor
+        try:
+            state = await graph.aget_state(config)
+        except Exception as error:
+            logger.warning("读取 pending interrupts 失败: %s", error, exc_info=True)
+            return Command(resume=payload)
+
+        interrupts = [
+            intr
+            for task in getattr(state, "tasks", []) or []
+            for intr in getattr(task, "interrupts", []) or []
+        ]
+        if len(interrupts) <= 1:
+            return Command(resume=payload)
+
+        # payload 已是 {interrupt_id: value} 映射
+        pending_ids = {intr.id for intr in interrupts}
+        if isinstance(payload, dict) and payload and pending_ids.issuperset(payload.keys()):
+            return Command(resume=payload)
+
+        # 多中断 + 裸值：将同一答案应用到所有 pending interrupts
+        return Command(resume={intr.id: payload for intr in interrupts})
 
     async def arun_events(
         self,
@@ -1135,14 +1288,17 @@ class AgentCore:
         - 监听 graph 内部 astream_events
         - 统一输出标准化 AgentEvent 事件流
 
-        不做：
-        - 不读写存储（checkpoint 由 graph 自动管理）
-        - 不管理会话（new/switch/list/delete）
-        - 不处理记忆（recall/submit/compress）
-        - 不处理锁、并发
-
         事件流顺序：
         TOKEN* → (TOOL_CALL → TOOL_RESULT)* → INTERRUPT | CANCELLED | ERROR | DONE
+
+        工具异常处理：
+        - 工具内部抛异常时，LangGraph 发射 on_tool_error 事件（非 on_tool_end），
+          本方法将其映射为 TOOL_RESULT 事件（content 以 "[工具执行失败]" 前缀标记），
+          让前端工具卡片显示失败 + LLM 能看到错误并调整策略。
+        - 并行工具调用场景下，第一个工具崩后 Pregel 立即 raise，其余已 on_tool_start
+          但未 on_tool_end/on_tool_error 的 tool_call（孤儿）在 except 块中补发
+          失败 TOOL_RESULT，避免前端工具卡片永远卡在"执行中"。
+        - 异常最终逃逸到 except Exception，发 ERROR 事件终止流。
 
         Args:
             message: 用户消息
@@ -1233,9 +1389,11 @@ class AgentCore:
 
             collected_output: list[str] = []
 
+            resume_command = await self._abuild_resume_command(config, payload)
+
             with self._temp_verbose(False):
                 async for ev in self._arun_graph_events(
-                    Command(resume=payload),
+                    resume_command,
                     config,
                     tid,
                     trace_id,
@@ -1285,7 +1443,9 @@ class AgentCore:
             "请用中文回答。"
         )
 
-        short_term = await self.session.aget_short_term()
+        short_term = await self.session.aget_short_term(
+            short_term_size=self._short_term_size
+        )
         response = self.llm.chat_with_history(
             user_input=task,
             history=short_term,

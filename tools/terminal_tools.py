@@ -17,6 +17,7 @@ from .safety import check_command, check_exec, confirm
 
 # Windows 默认超时（秒），防止命令卡死
 DEFAULT_TIMEOUT = 60
+MAX_OUTPUT_CHARS = 10000  # 超长输出截断，避免回传给 LLM 时占用过多 token
 
 # 覆盖常见命令行参数、环境变量和 Authorization Bearer 形式；只替换值，保留命令结构供用户判断。
 SENSITIVE_COMMAND_PATTERNS = (
@@ -40,7 +41,7 @@ class UserRejectedCommandError(RuntimeError):
         super().__init__("用户拒绝执行危险命令")
 
 
-def _truncate(text: str, max_chars: int = 4000) -> str:
+def _truncate(text: str, max_chars: int = MAX_OUTPUT_CHARS) -> str:
     """截断超长输出，避免回传给 LLM 时占用过多 token"""
     if not text:
         return text

@@ -23,6 +23,7 @@ from functools import partial
 from typing import Any
 
 from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.messages import AIMessage
 
 from utils.compaction import CompactionConfig, LCAgentCompactionMiddleware
 from utils.events import AgentEvent
@@ -32,6 +33,45 @@ logger = logging.getLogger(__name__)
 
 # 节点进度回调类型:接收 AgentEvent（NODE_START / NODE_END / NODE_ERROR 事件）
 NodeCallback = Callable[[AgentEvent], None]
+
+
+def _extract_node_output(output: Any) -> str:
+    """从节点返回值提取该节点的产出文本（供 NODE_END 事件携带）。
+
+    节点函数统一返回 ``{"xxx": result, "messages": [AIMessage(content=result)]}``
+    （见 graph/simple.py / graph/rtl_graph.py 等），本函数取 ``output["messages"]``
+    最后一条消息的文本作为节点产出。
+
+    Args:
+        output: 节点返回值（LangGraph on_chain_end 的 output 参数）
+
+    Returns:
+        节点产出文本；无法提取时返回空串（静默降级，不阻塞节点事件流）
+    """
+    if not isinstance(output, dict):
+        return ""
+    try:
+        messages = output.get("messages")
+        if not messages:
+            return ""
+        last = messages[-1]
+        # 仅提取节点追加的 AIMessage 产出（HumanMessage/ToolMessage 非节点产出）
+        if not isinstance(last, AIMessage):
+            return ""
+        content = last.content
+        if isinstance(content, str):
+            return content
+        # content blocks 形式（list[dict]）:仅拼接 text 类型块
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(str(block.get("text", "")))
+            return "".join(parts)
+        return str(content)
+    except Exception as error:
+        logger.debug("提取节点产出失败: %s", error)
+        return ""
 
 
 class NodeTrackingHandler(BaseCallbackHandler):
@@ -77,7 +117,10 @@ class NodeTrackingHandler(BaseCallbackHandler):
     def on_chain_end(self, output: Any, *, run_id: str, **kwargs: Any) -> None:
         node = self._active.pop(run_id, None)
         if node and self.on_node_end:
-            self.on_node_end(AgentEvent.node_end(node=node))
+            # 携带节点产出（从返回值 messages 通道提取），供前端渲染节点结果块
+            self.on_node_end(
+                AgentEvent.node_end(node=node, content=_extract_node_output(output))
+            )
 
     def on_chain_error(self, error: BaseException, *, run_id: str, **kwargs: Any) -> None:
         node = self._active.pop(run_id, None)

@@ -139,12 +139,16 @@ async def arebuild_agent_from_team_dir(
 
         if llm_changed:
             # LLM 变化:重建 LLMClient + 重建 executor
+            # 采样参数来源：角色级 agent_config.json（load_agent_config 已合并 DEFAULTS，
+            # 未显式配置时自动落到 DEFAULTS 默认值）
+            temperature = config.get("temperature")
+            max_tokens = config.get("max_tokens")
             agent.llm = LLMClient(
                 provider=target_provider,
                 model=target_model,
                 config_file=agent.llm.config_file,
-                temperature=agent.llm.temperature,
-                max_tokens=agent.llm.max_tokens,
+                temperature=temperature,
+                max_tokens=max_tokens,
             )
             await agent._arebuild_agent_executor()
         else:

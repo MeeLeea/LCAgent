@@ -412,6 +412,7 @@ def _do_switch(chat_id: str, agent, pk: str, mn: str) -> None:
         def _switch() -> None:
             if agent.llm.provider != pk:
                 from cli.commands.provider import create_llm
+                # 采样参数由 LLMClient 内部从全局 agent_config.json 读取，无需外部传参
                 agent.llm = create_llm(pk, LLM_FILE)
                 if agent.llm.model != mn: agent.llm.switch_model(mn)
             else:

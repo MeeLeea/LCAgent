@@ -327,12 +327,17 @@ class SessionManager:
         session_info = await self.session.asummarize()
         cp_info = self._agent.checkpoint_info
         long_term_count = await self._memory.count_facts(sid) if self._memory else 0
+        # agent 级（跨会话共享）长期记忆条数：与 thread 级计数并列展示
+        agent_fact_count = (
+            await self._memory.count_agent_facts() if self._memory else 0
+        )
         return {
             "thread_id": sid,
             "checkpoint_messages": session_info["checkpoint_messages"],
             "checkpoint_backend": cp_info["checkpoint_backend"],
             "checkpoint_file": cp_info["checkpoint_file"],
             "long_term_count": long_term_count,
+            "agent_fact_count": agent_fact_count,
             "total_threads": session_info["total_sessions"],
         }
 

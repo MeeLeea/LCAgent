@@ -28,7 +28,7 @@ export interface ThreadSummary {
 export interface WorkflowNode {
   id: string
   label: string
-  status: 'pending' | 'running' | 'done'
+  status: 'pending' | 'running' | 'done' | 'error'
 }
 
 export interface WorkflowEdge {
@@ -76,6 +76,8 @@ export interface ChatMessage {
   interrupted?: boolean
   /** 消息创建时间戳（ms） */
   timestamp?: number
+  /** 节点结果块标记：workflow 会话中某节点的产出消息（非空时按节点块渲染） */
+  nodeName?: string
 }
 
 export interface InterruptInfo {
@@ -207,6 +209,6 @@ export type StreamEvent =
   | { type: 'interrupt'; prompt: string; choices: { id: string; label: string }[] }
   | { type: 'cancelled'; content: string }
   | { type: 'error'; content: string }
-  | { type: 'workflow_node'; node: string; status: 'running' | 'done' }
+  | { type: 'workflow_node'; node: string; status: 'running' | 'done' | 'error'; content?: string }
   | { type: 'workflow_status'; status: 'idle' | 'running' | 'done' }
-  | { type: 'done'; total_tokens?: number }
+  | { type: 'done'; content?: string; total_tokens?: number }

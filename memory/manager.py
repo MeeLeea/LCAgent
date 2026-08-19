@@ -90,7 +90,10 @@ class MemoryManager:
         )
 
         # 读中间件：awrap_model_call 时注入 thread facts 到 SystemMessage
-        self._read_middleware = ThreadMemoryReadMiddleware(memory_store)
+        # （recall_limit 约束每次注入的 fact 条数，与显式召回 recall() 一致）
+        self._read_middleware = ThreadMemoryReadMiddleware(
+            memory_store, recall_limit=recall_limit
+        )
 
     # ============ 属性暴露 ============
 
@@ -176,6 +179,72 @@ class MemoryManager:
             lines.append(f"- [{label}] {fact.content}")
 
         return "【长期记忆】\n" + "\n".join(lines) + "\n"
+
+    # ============ 召回（读） — agent 级（跨会话共享） ============
+
+    async def recall_agent(
+        self, limit: int | None = None
+    ) -> list[ThreadFactItem]:
+        """召回 agent 级长期记忆 facts（跨会话共享）。
+
+        读取 ``user_fact`` / ``lesson`` 类的 agent 级记忆，按 ``create_time``
+        升序返回，截取最近 ``limit`` 条。与 thread 级 :meth:`recall` 不同，
+        agent 级记忆跨会话共享且无 thread 上下文，因此 **不进行 touch 更新**
+        （store 未提供 agent 级 touch 方法），LRU 淘汰依赖
+        :meth:`ThreadMemoryStore.prune_agent_facts`。
+
+        Args:
+            limit: 返回条数上限（为 None 时使用构造时设定的 recall_limit）
+
+        Returns:
+            agent 级 facts 列表（可能为空）；异常仅记日志返回 ``[]``
+        """
+        effective_limit = limit if limit is not None else self._recall_limit
+        try:
+            facts = await self._store.query_agent_facts()
+        except Exception as error:
+            logger.debug("召回 agent 级长期记忆失败: %s", error)
+            return []
+
+        return (
+            facts[-effective_limit:]
+            if effective_limit and len(facts) > effective_limit
+            else facts
+        )
+
+    async def recall_agent_text(self, limit: int | None = None) -> str:
+        """召回 agent 级长期记忆并格式化为文本片段（供注入 prompt）。
+
+        复用 :data:`_CATEGORY_LABELS` 标签，输出形如 ``【长期记忆】\\n- [用户事实] ...``。
+
+        Args:
+            limit: 返回条数上限
+
+        Returns:
+            格式化的记忆文本；无记忆时返回空字符串
+        """
+        facts = await self.recall_agent(limit)
+        if not facts:
+            return ""
+
+        lines: list[str] = []
+        for fact in facts:
+            label = _CATEGORY_LABELS.get(fact.category, "记忆")
+            lines.append(f"- [{label}] {fact.content}")
+
+        return "【长期记忆】\n" + "\n".join(lines) + "\n"
+
+    async def count_agent_facts(self) -> int:
+        """统计 agent 级长期记忆条数。"""
+        return await self._store.count_agent_facts()
+
+    async def clear_agent_facts(self) -> int:
+        """清空 agent 级全部长期记忆。
+
+        Returns:
+            被清除的 fact 数量
+        """
+        return await self._store.clear_agent_facts()
 
     # ============ 事件消费（写） ============
 

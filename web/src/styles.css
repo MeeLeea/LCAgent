@@ -880,6 +880,61 @@ tool-group,
   color: var(--accent);
 }
 
+/* ---------- 工作流节点结果块 ---------- */
+.msg-node {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-elevated);
+  overflow: hidden;
+  margin-bottom: 8px;
+}
+
+.node-header {
+  width: 100%;
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  text-align: left;
+}
+
+.node-header:hover {
+  background: var(--bg-hover);
+}
+
+.node-label {
+  font-weight: 600;
+  color: var(--accent);
+  font-family: 'JetBrains Mono', 'SF Mono', Consolas, monospace;
+}
+
+.node-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  flex-shrink: 0;
+}
+
+.node-dot.done {
+  background: var(--accent);
+}
+
+.node-content {
+  padding: 10px 12px;
+  font-size: 13px;
+  color: var(--text);
+  border-top: 1px solid var(--border-soft);
+  max-height: 320px;
+  overflow-y: auto;
+}
+
 .spin {
   animation: spin 1s linear infinite;
 }

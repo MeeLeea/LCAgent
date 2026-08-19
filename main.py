@@ -47,6 +47,7 @@ async def build_agent(provider: str, process_type: str | None = None) -> tuple[A
     from llm.llm_client import load_providers as list_providers
     
     print(f"\n初始化 {list_providers(LLM_FILE)[provider]['name']} 客户端...")
+    # 采样参数由 LLMClient 内部从全局 agent_config.json 读取，无需外部传参
     llm = create_llm(provider, LLM_FILE)
     print("加载运行时配置...")
     config = load_agent_config(AGENT_CONFIG_FILE)
@@ -58,14 +59,11 @@ async def build_agent(provider: str, process_type: str | None = None) -> tuple[A
     # 三层架构：先创建 MemoryContext（记忆基础设施），再创建 AgentCore（纯执行内核）
     memory_ctx = await MemoryContext.acreate(
         checkpoint_file=CHECKPOINT_FILE,
-        short_term_size=config["memory_size"],
+        short_term_size=config["latest_msg_cnt"],
         use_sqlite=True,
         process_type=process_type,
         llm_getter=lambda: llm,
-        buffer_delay_seconds=config.get("memory_buffer_delay_seconds", 20),
-        max_buffer_messages=config.get("memory_max_buffer_messages", 30),
-        max_facts_per_thread=config.get("memory_max_facts_per_thread", 50),
-        recall_limit=config.get("memory_recall_limit", 10),
+        # 记忆链路参数由 memory/config.py 统一管理，不再经 agent_config.json 配置
     )
     agent = await AgentCore.acreate(
         llm_client=llm,
@@ -82,6 +80,7 @@ async def build_agent(provider: str, process_type: str | None = None) -> tuple[A
         agent_prompt_file=agent_prompt_file,
         max_execution_history=config.get("max_execution_history", 100),
         tool_timeout=config.get("tool_timeout", 120),
+        short_term_size=config.get("latest_msg_cnt", 10),
         checkpointer=memory_ctx.checkpointer,
         store=memory_ctx.store,
         extra_middleware=[memory_ctx.read_middleware],

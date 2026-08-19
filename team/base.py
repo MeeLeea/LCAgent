@@ -72,6 +72,8 @@ class TeamAgent:
             temperature: LLM 采样温度,不传则用类属性默认值
             max_tokens: LLM 最大生成 token 数,不传则用类属性默认值
             prompt_file: 角色 AGENT.md 路径,同时提供系统提示词与工作流节点提示词模板
+            注:经 team/factory.py 构建时,采样参数由角色 agent_config.json 解析后传入
+            (未配置则回退 llm/config.py 的 DEFAULTS)
         """
         # 参数优先,否则回退到类属性默认值
         self.temperature = temperature if temperature is not None else self.temperature

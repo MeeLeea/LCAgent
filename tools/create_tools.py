@@ -204,7 +204,7 @@ def create_tool(
 
     Args:
         tool_name: 工具函数名，仅小写字母、下划线，例如 "read_markdown_file"
-        tool_description: 工具文档字符串，说明能力、用途、适用场景
+        tool_description: 工具文档字符串，说明能力、用途、适用场景，清晰列出工具的边界条件
         args_spec: 参数定义说明，每个参数格式：参数名:参数类型=参数说明
                    示例："file_path:str=本地文件路径;encoding:str=utf-8文件编码，可选"
         tool_logic: 工具主体业务逻辑（函数内部实现代码，不要写函数定义、装饰器）

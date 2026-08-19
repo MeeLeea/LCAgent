@@ -36,6 +36,7 @@ const STATUS_TEXT: Record<WorkflowNode['status'], string> = {
   pending: '待执行',
   running: '执行中',
   done: '已完成',
+  error: '出错',
 }
 
 const STATUS_DESC: Record<WorkflowInfo['workflow_status'], string> = {

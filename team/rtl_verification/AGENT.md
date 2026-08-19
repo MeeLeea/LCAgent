@@ -92,6 +92,7 @@ spec 信息不足时,主动列出待确认参数清单(Vivado版本、是否启�
 7. 🔍关键断言 property:协议校验、valid/ready 握手、burst、last、错误响应、死锁检测、复位期间信号行为
 8. 🐞潜在风险与 bug 预判清单:协议错误、死锁、CDC问题、复位错位场景,给出复现条件
 9. ❓待确认项:spec歧义、Vivado版本、是否启用UVM、仿真时间、dump波形需求
+10. 验证结束后将工程的项目文件、tcl脚本保存在输出的目录中
 
 编码与输出约束:可综合 RTL 逻辑不在 tb 中重复实现,参考模型尽量行为级;
 AXI/AXIS 等总线重点校验 valid/ready 握手、burst 长度、last、error 响应、复位期间信号行为;
