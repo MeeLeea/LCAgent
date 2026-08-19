@@ -246,7 +246,19 @@ LangChainAgent/
 │   ├── llm_client.py        # 统一大模型封装（多提供商 + 多模型）
 │   ├── config.py            # 运行时配置加载(agent/agent_config.json)
 │   ├── message_utils.py     # LLM 异常信息提取（中文化错误提示）
-│   └── agent_core.py        # Agent 核心调度：run/chat/cot 三种模式 + HITL + 异步 API
+│   ├── agent_core.py        # Agent 核心调度主类：构造/生命周期/共享工具方法（多继承聚合入口）
+│   ├── session_mgmt.py      # SessionMgmt Mixin：会话/Store/中断状态管理
+│   ├── mcp_tools.py         # McpTools Mixin：MCP 工具加载
+│   ├── graph_builder.py     # GraphBuilder Mixin：executor 构建/重建 + LLM 切换
+│   ├── streaming.py         # Streaming Mixin：事件流引擎（arun/aresume_events）
+│   ├── interrupts.py        # Interrupts Mixin：中断检查/恢复命令/拒绝处理
+│   ├── turn_runners.py      # TurnRunners Mixin：结构化执行入口（arun/achat/aresume_structured）
+│   ├── skill_ops.py         # SkillOps Mixin：技能加载/清理 + 手动压缩
+│   ├── turn_types.py        # AgentTurnResult（结构化执行结果类型）
+│   ├── skill_mw.py          # SkillInjectionMW：技能注入中间件
+│   ├── tool_error_mw.py     # ToolExecutionErrorMW：工具错误反思纠错中间件
+│   ├── workspace_mw.py      # WorkspaceSecurityMW：工作空间安全中间件
+│   └── role_sw.py           # 团队角色切换
 ├── utils/                   # 通用工具（与业务解耦，供 agent/graph/session 等共用）
 │   ├── compaction.py        # LangGraph 上下文压缩中间件（增量摘要 + 工具输出 Prune）
 │   ├── events.py            # 标准化执行事件模型（AgentEvent / EventType，含节点进度事件）
@@ -342,7 +354,7 @@ LangChainAgent/
 | [utils/metrics.py](utils/metrics.py)                     | `MetricsCollector`：线程安全的运行时指标收集（LLM 调用 / 工具执行 / 压缩统计）                                                                                                                                                           |
 | [utils/logging_config.py](utils/logging_config.py)       | 结构化日志：`contextvars` 实现 trace_id / thread_id 异步安全注入                                                                                                                                                                         |
 | [utils/exceptions.py](utils/exceptions.py)               | 统一异常层次：`LCAgentError` 基类及 MCP/超时/压缩/中断/状态等子类                                                                                                                                                                        |
-| [agent/agent_core.py](agent/agent_core.py)               | Agent 核心：`run()` / `chat()` / `cot()` 三种模式 + 全套异步 API + `AgentTurnResult` 结构化暂停/恢复 + 技能注入 + 压缩/裁剪                                                                                                        |
+| [agent/](agent/)                                         | Agent 核心按职责拆分：`agent_core.py`（主类，构造/生命周期/共享工具方法）+ 7 个 Mixin（`session_mgmt`/`mcp_tools`/`graph_builder`/`streaming`/`interrupts`/`turn_runners`/`skill_ops`）+ `turn_types.py`（`AgentTurnResult`）+ 3 个中间件（`skill_mw`/`tool_error_mw`/`workspace_mw`）+ `role_sw`                                                                                          |
 | [session/](session/)                                     | 三层架构 Session 层：`SessionContext`（单会话运行时上下文）/ `SessionStore`（per-session 瞬态状态）/ `SessionRegistry`（生命周期管理）/ `WorkspaceStore`（工作空间映射）/ `SessionManager`（对外门面 & 会话调度）                |
 | [team/](team/)                                           | 多 Agent 团队协作：ManagerAgent（拆解）/ WorkerAgent（执行）/ TerminatorAgent（汇总）+ 工厂函数                                                                                                                                            |
 | [graph/common.py](graph/common.py)                       | 工作流通用能力：`NodeTrackingHandler` 节点级进度回调(含 TOKEN 级流式)、`SkillInjector` 技能注入、`arun_compiled_workflow` 跨轮次记忆压缩 + `workspace_path` 注入 `config.configurable`                                                                        |
@@ -1003,7 +1015,7 @@ session/
 
 CLI 命令 `workspace` / `workspace <路径>` / `workspace:clear` 即对应上述 API；`get_context()` 读取 `SessionContext` 供每次图执行注入。
 
-**工作流（workflow）同样受 workspace 隔离**：`workflow` 命令从会话上下文提取 `workspace_path` → 经运行器（`arun_workflow_by_name` → `arun_compiled_workflow`）注入 `config.configurable` → LangGraph 按节点签名注入 `worker_exec` 节点 → 透传 `Worker.execute_task`，使 Worker 的工具调用经 `WorkspaceSecurityMiddleware` 路径解析与逃逸校验（`team/base.py::_create_tool_agent` 对工具型 Agent 挂载该中间件）。未绑定 workspace 的会话自动降级为不受限（`workspace_path=None`）。
+**工作流（workflow）同样受 workspace 隔离**：`workflow` 命令从会话上下文提取 `workspace_path` → 经运行器（`arun_workflow_by_name` → `arun_compiled_workflow`）注入 `config.configurable` → LangGraph 按节点签名注入 `worker_exec` 节点 → 透传 `Worker.execute_task`，使 Worker 的工具调用经 `WorkspaceSecurityMW` 路径解析与逃逸校验（`team/base.py::_create_tool_agent` 对工具型 Agent 挂载该中间件）。未绑定 workspace 的会话自动降级为不受限（`workspace_path=None`）。
 
 HTTP API（[api/server.py](api/server.py)）同样暴露三个 RESTful 端点，供 Web 前端调用：
 
@@ -1352,9 +1364,9 @@ LLM 决定是否调用工具
 
 工具内部抛异常时（MCP 崩溃、路径解析 bug、权限错误等），分两层处理：
 
-**Layer 4：`ToolExecutionErrorMiddleware`（工具执行层，LLM 反思纠错）**
+**Layer 4：`ToolExecutionErrorMW`（工具执行层，LLM 反思纠错）**
 
-基于 langchain 内置 `ToolErrorMiddleware`，挂载在 `create_agent` 中间件链最外层（`agent/tool_error_middleware.py`）。在 `wrap_tool_call`/`awrap_tool_call` 拦截层捕获工具执行异常，转换为 `ToolMessage(status="error")` **进入图状态**——这是 LLM 下一轮 ReAct 循环真正读到的内容：
+基于 langchain 内置 `ToolErrorMiddleware`，挂载在 `create_agent` 中间件链最外层（`agent/tool_error_mw.py`）。在 `wrap_tool_call`/`awrap_tool_call` 拦截层捕获工具执行异常，转换为 `ToolMessage(status="error")` **进入图状态**——这是 LLM 下一轮 ReAct 循环真正读到的内容：
 
 - **所有工具异常统一转换**：任意异常类型（`FileNotFoundError` / `OSError` / `PermissionError` / MCP 错误等）都不再逃逸终止流，而是成为错误 `ToolMessage`，图继续执行，LLM 有机会反思后重试
 - **点名异常类型**：按 langchain 官方建议，错误内容包含异常类型名 + 安全消息（而非裸异常细节），避免泄露内部信息
