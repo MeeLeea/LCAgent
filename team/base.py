@@ -3,7 +3,9 @@ TeamAgent 轻量基类 - 为多 Agent 工作流设计的轻量角色
 
 与 AgentCore 的区别:
 - 单轮任务执行(无会话记忆/checkpoint)
-- 可选工具注入(不默认加载全部工具/MCP/技能)
+- 可选工具注入(不默认加载全部工具/MCP);工具模式挂载工具错误纠错与
+  workspace 安全中间件,并做超时保护
+- 内建技能注入(build_skill_block / inject_into_prompt,满足 PromptInjector 协议)
 - 更快的构建速度,适合团队协作场景
 """
 import logging
@@ -15,6 +17,7 @@ from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool
 
 from llm.llm_client import LLMClient
+from tools.skills import SkillManager, default_skills_dir
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +58,10 @@ class TeamAgent:
         config_file: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        tool_timeout: float | None = None,
         prompt_file: str | None = None,
+        skills_dir: str | None = None,
+        auto_match_skills: bool = True,
     ):
         """
         初始化团队 Agent
@@ -71,13 +77,24 @@ class TeamAgent:
             config_file: LLM 配置文件路径(默认 config/llm_config.json)
             temperature: LLM 采样温度,不传则用类属性默认值
             max_tokens: LLM 最大生成 token 数,不传则用类属性默认值
+            tool_timeout: 工具执行超时秒数(0 或 None 时使用 tools.tool_wrapper 的
+                默认超时策略:全局 60 秒 + 工具级覆盖如 ask_human 600 秒)
             prompt_file: 角色 AGENT.md 路径,同时提供系统提示词与工作流节点提示词模板
+            skills_dir: 技能目录路径(默认 <项目根>/.agents/skills)
+            auto_match_skills: 是否开启技能自动匹配(经 build_skill_block/inject_into_prompt)
             注:经 team/factory.py 构建时,采样参数由角色 agent_config.json 解析后传入
             (未配置则回退 llm/config.py 的 DEFAULTS)
         """
         # 参数优先,否则回退到类属性默认值
         self.temperature = temperature if temperature is not None else self.temperature
         self.max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+        # 工具超时:0 或 None 视为未配置,由 wrap_tools_with_timeout 落默认策略
+        self.tool_timeout = (
+            tool_timeout if tool_timeout is not None and tool_timeout > 0 else None
+        )
+        # 技能管理器(本地 .agents/skills 读取 + 任务自动匹配)
+        self.skill_manager = SkillManager(skills_dir or default_skills_dir())
+        self.auto_match_skills = auto_match_skills
         
         self.llm = LLMClient(
             provider=provider,
@@ -204,23 +221,73 @@ class TeamAgent:
             )
         return self._workflow_templates.get(name, self.default_templates.get(name, ""))
     
+    def build_skill_block(self, task: str) -> str:
+        """根据任务匹配技能并渲染指引块(内建技能注入能力)。
+
+        复用 tools.skills.SkillManager 的确定性打分匹配 + 指引块渲染,
+        与 graph.common.SkillInjector 行为一致,使 TeamAgent 不再依赖外部
+        注入器:角色节点可直接调用本方法,或把 self 作为 PromptInjector 传入。
+
+        Args:
+            task: 用户任务描述(用于技能匹配)
+
+        Returns:
+            技能指引块文本;未命中任何技能或未开启自动匹配时返回空串
+        """
+        if not self.auto_match_skills or not task:
+            return ""
+        names = self.skill_manager.match_skills(task)
+        if not names:
+            return ""
+        return self.skill_manager.render_block(sorted(names))
+    
+    def inject_into_prompt(self, prompt: str, task: str) -> str:
+        """将技能指引块追加到 prompt 末尾(已含 skill 块时跳过)。
+
+        实现 PromptInjector 协议,工作流节点可直接把 TeamAgent 实例当注入器
+        传给节点函数(如 worker_exec),无需 graph 层额外创建 SkillInjector。
+
+        Args:
+            prompt: 渲染后的节点提示词
+            task: 用户任务描述
+
+        Returns:
+            注入技能指引块后的提示词
+        """
+        skill_block = self.build_skill_block(task)
+        if not skill_block:
+            return prompt
+        if "【已加载的技能指引" in prompt:
+            return prompt
+        return f"{prompt}\n\n{skill_block}"
+    
     def _create_tool_agent(self) -> None:
         """创建轻量工具 agent(仅当有 tools 时调用)"""
         from langchain.agents import create_agent
 
         # 延迟导入避免循环依赖(agent.workspace_mw 顶层仅依赖 langchain,
         # 且 agent_core 早已在顶层导入该模块,此处只是保险)
+        from agent.tool_error_mw import ToolExecutionErrorMW
         from agent.workspace_mw import WorkspaceSecurityMW
+        from tools.tool_wrapper import wrap_tools_with_timeout
 
         chat_model = self.llm.get_chat_model()
-        
-        # 不带 checkpointer,单轮执行无需持久化;挂工作空间安全中间件,
-        # 使工作流内工具调用同样受 workspace 隔离约束(路径解析 + 逃逸校验)
+
+        # 工具超时保护(防卡死):超时/异常由包装器转 JSON 错误字符串,
+        # LLM 下一轮 ReAct 循环可读到并调整参数重试
+        # getattr 兼容测试中 object.__new__ 创建的实例(无 tool_timeout 属性)
+        wrapped_tools = wrap_tools_with_timeout(
+            self.tools, getattr(self, "tool_timeout", None)
+        )
+
+        # 中间件链:工具错误纠错(异常 → ToolMessage(status="error") + 反思指令)
+        # + 工作空间安全(路径解析 + 逃逸校验),使工作流内工具调用同样受
+        # workspace 隔离约束
         self.agent_executor = create_agent(
             model=chat_model,
-            tools=self.tools,
+            tools=wrapped_tools,
             system_prompt=self.system_prompt,
-            middleware=[WorkspaceSecurityMW()],
+            middleware=[ToolExecutionErrorMW(), WorkspaceSecurityMW()],
         )
     
     async def ainvoke(self, task: str, config: dict | None = None) -> str:
