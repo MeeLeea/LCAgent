@@ -333,7 +333,7 @@ async def arun_compiled_workflow(
 
     workspace 隔离：
         workspace_path 注入 config.configurable，节点经 config 透传给
-        Worker 角色，其工具调用由 WorkspaceSecurityMiddleware 约束在
+        Worker 角色，其工具调用由 WorkspaceSecurityMW 约束在
         workspace 内（路径解析 + 逃逸校验）。
 
     Args:

@@ -13,7 +13,7 @@
 workspace 隔离说明：
     worker_exec 节点接收 LangGraph 注入的 config（含 configurable.workspace_path），
     透传给 Worker.execute_task → self.invoke，使 Worker 工具调用受
-    WorkspaceSecurityMiddleware 约束（见 graph/common.arun_compiled_workflow）。
+    WorkspaceSecurityMW 约束（见 graph/common.arun_compiled_workflow）。
 
 会话化说明：
     WorkflowState 含 ``messages``（add_messages reducer）与 ``summary`` 字段，

@@ -631,7 +631,7 @@ def confirm(prompt: str) -> bool:
 def check_workspace_escape(path: str, workspace: str) -> tuple[str, str]:
     """校验路径是否落在 workspace 内，返回解析后的绝对路径 + 校验结果。
 
-    供 WorkspaceSecurityMiddleware 调用，统一复用 safety.py 的路径规范化能力
+    供 WorkspaceSecurityMW 调用，统一复用 safety.py 的路径规范化能力
     （_normalize_path：absolute + realpath + normcase），保证与安全护栏的路径
     处理逻辑一致。
 

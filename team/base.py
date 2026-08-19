@@ -208,9 +208,9 @@ class TeamAgent:
         """创建轻量工具 agent(仅当有 tools 时调用)"""
         from langchain.agents import create_agent
 
-        # 延迟导入避免循环依赖(agent.workspace_middleware 顶层仅依赖 langchain,
+        # 延迟导入避免循环依赖(agent.workspace_mw 顶层仅依赖 langchain,
         # 且 agent_core 早已在顶层导入该模块,此处只是保险)
-        from agent.workspace_middleware import WorkspaceSecurityMiddleware
+        from agent.workspace_mw import WorkspaceSecurityMW
 
         chat_model = self.llm.get_chat_model()
         
@@ -220,7 +220,7 @@ class TeamAgent:
             model=chat_model,
             tools=self.tools,
             system_prompt=self.system_prompt,
-            middleware=[WorkspaceSecurityMiddleware()],
+            middleware=[WorkspaceSecurityMW()],
         )
     
     async def ainvoke(self, task: str, config: dict | None = None) -> str:

@@ -4,7 +4,7 @@
 - worker_exec 节点把 LangGraph 注入的 config 透传给 Worker.execute_task
 - arun_compiled_workflow 把 workspace_path 注入 config.configurable
 - TeamAgent 工具模式构造最小 config(仅 workspace_path,不转发 callbacks)
-- TeamAgent._create_tool_agent 挂载 WorkspaceSecurityMiddleware
+- TeamAgent._create_tool_agent 挂载 WorkspaceSecurityMW
 - cli run_workflow 经 workflow_sm 执行(workspace 注入由 WorkflowAdapter 承载)
 
 运行：
@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Any
 from unittest.mock import MagicMock
 
-from agent.workspace_middleware import WorkspaceSecurityMiddleware
+from agent.workspace_mw import WorkspaceSecurityMW
 from graph.simple import arun_compiled_workflow, worker_exec_node
 from team.base import TeamAgent
 
@@ -137,7 +137,7 @@ def test_arun_compiled_workflow_no_workspace_by_default():
 # TeamAgent 级:工具模式中间件挂载
 # --------------------------------------------------------------------------- #
 def test_create_tool_agent_mounts_workspace_middleware(monkeypatch):
-    """工具模式的 create_agent 挂载 WorkspaceSecurityMiddleware。"""
+    """工具模式的 create_agent 挂载 WorkspaceSecurityMW。"""
     captured: dict[str, list[Any]] = {}
 
     def fake_create_agent(*args: Any, **kwargs: Any) -> MagicMock:
@@ -155,8 +155,8 @@ def test_create_tool_agent_mounts_workspace_middleware(monkeypatch):
     agent._create_tool_agent()
 
     assert any(
-        isinstance(m, WorkspaceSecurityMiddleware) for m in captured["middleware"]
-    ), "工具 agent 必须挂载 WorkspaceSecurityMiddleware"
+        isinstance(m, WorkspaceSecurityMW) for m in captured["middleware"]
+    ), "工具 agent 必须挂载 WorkspaceSecurityMW"
 
 
 # --------------------------------------------------------------------------- #
