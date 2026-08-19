@@ -22,7 +22,7 @@ from tools.skills import SkillManager
 logger = logging.getLogger(__name__)
 
 
-class SkillInjectionMiddleware(AgentMiddleware):
+class SkillInjectionMW(AgentMiddleware):
     """从 state 读取活跃技能并注入 system prompt 的中间件。
 
     在 ``awrap_model_call`` 中：
@@ -91,4 +91,4 @@ class SkillInjectionMiddleware(AgentMiddleware):
         return request.override(system_message=new_sys_msg)
 
 
-__all__ = ["SkillInjectionMiddleware"]
+__all__ = ["SkillInjectionMW"]

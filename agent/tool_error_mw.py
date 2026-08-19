@@ -1,9 +1,9 @@
 """工具执行错误纠错中间件 - 将工具异常转换为 LLM 可读的反思提示。
 
-四层架构的 layer 4（安全隔离层）补充：与 ``WorkspaceSecurityMiddleware`` 同层，
+四层架构的 layer 4（安全隔离层）补充：与 ``WorkspaceSecurityMW`` 同层，
 职责互补：
 
-- ``WorkspaceSecurityMiddleware``：拦截文件/执行类工具，解析路径 + 逃逸校验
+- ``WorkspaceSecurityMW``：拦截文件/执行类工具，解析路径 + 逃逸校验
 - ``ToolErrorMiddleware``：捕获工具执行抛出的异常，转换为 ``ToolMessage(status="error")``
   进入图状态，使 LLM 在下一轮 ReAct 循环中读到错误并反思修正
 
@@ -18,7 +18,7 @@ LLM 没有机会在同一轮 ReAct 循环中根据报错调整参数。本中间
 - 从 ``request.runtime.config`` 动态读取 workspace 根目录并附加到提示中（非硬编码路径）
 - 附加反思指令，引导 LLM 分析失败原因后重试（ReAct 反思）
 - 不捕获 ``GraphBubbleUp`` 控制流信号（中断/父命令必须继续传播）
-- 与 ``WorkspaceSecurityMiddleware`` 组合：外层工具错误 → 内层路径逃逸拦截（返回
+- 与 ``WorkspaceSecurityMW`` 组合：外层工具错误 → 内层路径逃逸拦截（返回
   ToolMessage 而非抛异常，不受本中间件影响）
 """
 from __future__ import annotations
@@ -82,7 +82,7 @@ def _format_error_message(
     return "。".join(parts)
 
 
-class ToolExecutionErrorMiddleware(ToolErrorMiddleware):
+class ToolExecutionErrorMW(ToolErrorMiddleware):
     """将工具执行异常转换为带反思指令的 ToolMessage。
 
     继承 langchain 内置 ``ToolErrorMiddleware``，注入自定义错误格式化逻辑。
@@ -111,4 +111,4 @@ class ToolExecutionErrorMiddleware(ToolErrorMiddleware):
         return _format_error_message(exc, request)
 
 
-__all__ = ["ToolExecutionErrorMiddleware"]
+__all__ = ["ToolExecutionErrorMW"]
