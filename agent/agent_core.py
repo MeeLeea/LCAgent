@@ -29,9 +29,11 @@ from langchain_core.tools import BaseTool
 
 from llm.llm_client import LLMClient
 from session import SessionStore
+from skmng.manager import SkillManager, default_skills_dir
+from skmng.middleware import SkillInjectionMW
+from skmng.ops import SkillOps
 from tools.mcp_loader import DEFAULT_CONFIG_FILE
 from tools.mcp_pool import MCPPool
-from tools.skills import SkillManager, default_skills_dir
 from utils.compaction import CompactionConfig
 from utils.exceptions import AgentStateError
 from utils.metrics import MetricsCollector
@@ -40,8 +42,6 @@ from .graph_builder import GraphBuilder
 from .interrupts import Interrupts
 from .mcp_tools import McpTools
 from .session_mgmt import SessionMgmt
-from .skill_ops import SkillOps
-from .skill_mw import SkillInjectionMW
 from .streaming import Streaming
 from .tool_error_mw import ToolExecutionErrorMW
 from .turn_runners import TurnRunners
