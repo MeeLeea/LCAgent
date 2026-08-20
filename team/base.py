@@ -12,7 +12,7 @@ TeamAgent 轻量基类 - 为多 Agent 工作流设计的轻量角色
 """
 import logging
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import ClassVar
 
 from langchain_core.messages import HumanMessage
@@ -227,16 +227,21 @@ class TeamAgent:
             )
         return self._workflow_templates.get(name, self.default_templates.get(name, ""))
     
-    def build_skill_block(self, task: str) -> str:
+    def build_skill_block(
+        self,
+        task: str,
+        active_names: Sequence[str] = (),
+    ) -> str:
         """根据任务匹配技能并渲染指引块(内建技能注入能力)
 
         转发 skmng.core.build_skill_block 实现三来源合并:
         - fixed_skills(self 类属性,角色级固定依赖)
-        - active_names(当前阶段不透传,Commit 4 由节点函数从 state 取值传入)
+        - active_names(由节点函数从 state["active_skills"] 取值传入)
         - match_skills(auto_match_skills 开启时按任务文本自动匹配)
 
         Args:
             task: 用户任务描述(用于技能匹配)
+            active_names: 手动加载的技能名(由节点函数从 state 取值传入)
 
         Returns:
             技能指引块文本;未命中任何技能或未开启自动匹配时返回空串
@@ -244,12 +249,17 @@ class TeamAgent:
         return _build_skill_block(
             self.skill_manager,
             task,
-            active_names=(),
+            active_names=tuple(active_names),
             fixed_skills=tuple(self.fixed_skills),
             auto_match=self.auto_match_skills,
         )
 
-    def inject_into_prompt(self, prompt: str, task: str) -> str:
+    def inject_into_prompt(
+        self,
+        prompt: str,
+        task: str,
+        active_names: Sequence[str] = (),
+    ) -> str:
         """将技能指引块追加到 prompt 末尾(已含 skill 块时跳过)
 
         实现 PromptInjector 协议,工作流节点可直接把 TeamAgent 实例当注入器
@@ -258,11 +268,12 @@ class TeamAgent:
         Args:
             prompt: 渲染后的节点提示词
             task: 用户任务描述
+            active_names: 手动加载的技能名(由节点函数从 state 取值传入)
 
         Returns:
             注入技能指引块后的提示词
         """
-        block = self.build_skill_block(task)
+        block = self.build_skill_block(task, active_names)
         return _inject_into_prompt(prompt, block)
     
     @property
