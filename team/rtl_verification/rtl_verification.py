@@ -1,6 +1,7 @@
 """
 Verification Agent - 数字芯片 RTL 验证工程师,负责验证需求梳理、验证计划、Testbench/UVM 开发与 Vivado Xsim 仿真
 """
+from collections.abc import Sequence
 from typing import ClassVar
 
 from graph.registry import register_agent
@@ -62,24 +63,26 @@ class VerificationAgent(TeamAgent):
         task: str,
         injector: PromptInjector | None,
         config: dict | None = None,
+        active_names: Sequence[str] = (),
     ) -> str:
         """RTL 验证工作流方法异步通用执行体:模板渲染/技能注入同步,LLM 调用异步流式
 
         vivado-2025.2 技能指引经 self.fixed_skills 类属性由 build_skill_block
         统一合并注入(注入器走 self.inject_into_prompt 时合并;即使外部 injector
         传入,self.fixed_skills 在 self.build_skill_block 内仍生效)。
+        active_names 由节点函数从 state["active_skills"] 取值传入。
         """
         template = self.get_template(template_name)
         prompt = self.render_template(template, task=task)
         if injector is not None:
-            prompt = injector.inject_into_prompt(prompt, task)
+            prompt = injector.inject_into_prompt(prompt, task, active_names)
         return await self.ainvoke(prompt, config)
 
-    async def aspec_design_task(self, task: str, injector: PromptInjector | None = None, config: dict | None = None) -> str:
+    async def aspec_design_task(self, task: str, injector: PromptInjector | None = None, config: dict | None = None, active_names: Sequence[str] = ()) -> str:
         """异步版 spec_design_task(供 spec_design 节点调用)"""
-        return await self._arun_rtl_design_task_async("spec_design", task, injector, config)
+        return await self._arun_rtl_design_task_async("spec_design", task, injector, config, active_names)
 
-    async def averilog_design_task(self, task: str, injector: PromptInjector | None = None, config: dict | None = None) -> str:
+    async def averilog_design_task(self, task: str, injector: PromptInjector | None = None, config: dict | None = None, active_names: Sequence[str] = ()) -> str:
         """异步版 verilog_design_task(供 verilog_design 节点调用)"""
-        return await self._arun_rtl_design_task_async("verilog_design", task, injector, config)
+        return await self._arun_rtl_design_task_async("verilog_design", task, injector, config, active_names)
 
