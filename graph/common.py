@@ -1,12 +1,13 @@
 """
-工作流共享组件 - 节点进度跟踪、异步执行、技能注入、跨轮次记忆压缩与会话化
+工作流共享组件 - 节点进度跟踪、异步执行、跨轮次记忆压缩与会话化
 
 从 graph/simple.py 提取的公共逻辑，供所有工作流复用：
 - NodeCallback 类型别名
 - NodeTrackingHandler 节点级进度回调(TOKEN 级流式)
-- SkillInjector 节点 prompt 层技能注入（复用 tools.skills.SkillManager）
 - arun_compiled_workflow 通用异步工作流运行器（含跨轮次记忆压缩）
 - compaction 基础设施：节点级压缩 wrapper（消息通道超阈值时增量摘要）
+
+注：SkillInjector 已迁往 skmng/injector.py（Commit 2a），此处不再提供。
 
 异步化说明：
     运行器使用 ``await graph.ainvoke(...)`` 而非同步 ``graph.invoke()``，
@@ -25,6 +26,7 @@ from typing import Any
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage
 
+from skmng.injector import SkillInjector  # noqa: F401 - re-export 兼容窗口,Commit 5 删除
 from utils.compaction import CompactionConfig, LCAgentCompactionMiddleware
 from utils.events import AgentEvent
 from utils.logging_config import TraceContext
@@ -139,67 +141,6 @@ class NodeTrackingHandler(BaseCallbackHandler):
         content = getattr(response, "content", None)
         if isinstance(content, str) and content:
             self.on_token(AgentEvent.token(text=content))
-
-
-class SkillInjector:
-    """工作流技能注入器 - 在节点 prompt 层注入技能指引块。
-
-    不走 AgentMiddleware（那是 create_agent 内部机制），而是复用
-    tools.skills.SkillManager 的确定性打分匹配 + 指引块渲染：
-
-    1. match_skills(task): 按任务文本与技能 name/description 的关键词重叠打分
-    2. render_block(names): 把命中技能正文渲染为可注入 system prompt 的指引块
-
-    工作流节点渲染 prompt 后，将 ``build_skill_block(task)`` 的结果追加到
-    prompt 末尾（或作为 ``{skills}`` 占位符替换），实现技能注入。
-
-    Args:
-        skills_dir: 技能目录路径；为 None 时使用默认目录（<项目根>/.agents/skills）
-        auto_match: 是否开启自动匹配（False 时始终返回空块，需手动指定技能名）
-    """
-
-    def __init__(
-        self,
-        skills_dir: str | None = None,
-        auto_match: bool = True,
-    ) -> None:
-        from tools.skills import SkillManager, default_skills_dir
-
-        self.skill_manager = SkillManager(skills_dir or default_skills_dir())
-        self.auto_match = auto_match
-
-    def build_skill_block(self, task: str) -> str:
-        """根据任务匹配技能并渲染指引块。
-
-        Args:
-            task: 用户任务描述（用于技能匹配）
-
-        Returns:
-            技能指引块文本；未命中任何技能或未开启自动匹配时返回空串
-        """
-        if not self.auto_match or not task:
-            return ""
-        names = self.skill_manager.match_skills(task)
-        if not names:
-            return ""
-        return self.skill_manager.render_block(sorted(names))
-
-    def inject_into_prompt(self, prompt: str, task: str) -> str:
-        """将技能指引块追加到 prompt 末尾（已含 skill 块时跳过）。
-
-        Args:
-            prompt: 渲染后的节点提示词
-            task: 用户任务描述
-
-        Returns:
-            注入技能指引块后的提示词
-        """
-        skill_block = self.build_skill_block(task)
-        if not skill_block:
-            return prompt
-        if "【已加载的技能指引" in prompt:
-            return prompt
-        return f"{prompt}\n\n{skill_block}"
 
 
 def _build_compaction_middleware(

@@ -33,12 +33,12 @@ from langgraph.graph.message import add_messages
 
 from graph.common import (
     NodeCallback,
-    SkillInjector,
     _build_compaction_middleware,
     arun_compiled_workflow,
     wrap_node_with_compaction,
 )
 from graph.registry import register_workflow
+from skmng.injector import SkillInjector
 from utils.compaction import CompactionConfig
 
 

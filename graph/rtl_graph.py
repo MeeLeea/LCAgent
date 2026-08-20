@@ -39,12 +39,12 @@ import team.rtl_designer.rtl_designer
 import team.rtl_verification.rtl_verification  # noqa: F401
 from graph.common import (
     NodeCallback,
-    SkillInjector,
     _build_compaction_middleware,
     arun_compiled_workflow,
     wrap_node_with_compaction,
 )
 from graph.registry import register_workflow
+from skmng.injector import SkillInjector
 from team.base import TeamAgent
 from utils.compaction import CompactionConfig
 
