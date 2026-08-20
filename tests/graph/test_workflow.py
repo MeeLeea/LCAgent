@@ -64,21 +64,21 @@ class FakeAgent:
         """占位符替换"""
         return TeamAgent.render_template(template, **kwargs)
 
-    async def aplan_task(self, task: str, context_summary: str = "", injector=None, config=None, active_names=()) -> str:
+    async def aplan_task(self, task: str, context_summary: str = "", injector=None, config=None) -> str:
         """异步版 plan_task:记录调用并返回模拟结果(与同步版同前缀,兼容既有断言)"""
         prompt = self.render_template(
             self.get_template("manager_plan"), task=task, context_summary=context_summary
         )
         if injector is not None:
-            prompt = injector.inject_into_prompt(prompt, task, active_names)
+            prompt = injector.inject_into_prompt(prompt, task)
         self.calls.append(("invoke", prompt))
         return self.response
 
-    async def aexecute_task(self, plan: str, injector=None, config=None, active_names=()) -> str:
+    async def aexecute_task(self, plan: str, injector=None, config=None) -> str:
         """异步版 execute_task:记录调用并返回模拟结果(与同步版同前缀)"""
         prompt = self.render_template(self.get_template("worker_exec"), plan=plan)
         if injector is not None:
-            prompt = injector.inject_into_prompt(prompt, plan, active_names)
+            prompt = injector.inject_into_prompt(prompt, plan)
         self.calls.append(("invoke", prompt))
         return self.response
 
@@ -90,7 +90,6 @@ class FakeAgent:
         context_summary: str = "",
         injector=None,
         config=None,
-        active_names=(),
     ) -> str:
         """异步版 finalize:记录调用并返回模拟结果(与同步版同前缀)"""
         prompt = self.render_template(
@@ -101,7 +100,7 @@ class FakeAgent:
             context_summary=context_summary,
         )
         if injector is not None:
-            prompt = injector.inject_into_prompt(prompt, task, active_names)
+            prompt = injector.inject_into_prompt(prompt, task)
         self.calls.append(("invoke", prompt))
         return self.response
 
@@ -1197,101 +1196,3 @@ def test_node_end_output_not_dict_is_empty():
     handler.on_chain_start({}, {}, run_id="r1", metadata={"langgraph_node": "node_a"})
     handler.on_chain_end(None, run_id="r1")
     assert events[0].content == ""
-
-
-# ==================== 测试 active_skills 透传 ====================
-
-def test_manager_plan_node_passes_active_skills_to_injector(tmp_path):
-    """manager_plan_node 从 state["active_skills"] 取值透传给 injector
-
-    验证行为不一致修复:原节点函数不传 active_names,injector 读不到手动加载的技能;
-    现节点函数从 state 取值传入,injector 可合并 active_names 注入。
-    """
-    from skmng.injector import SkillInjector
-
-    skill_dir = tmp_path / "skills"
-    skill_md = skill_dir / "git" / "SKILL.md"
-    skill_md.parent.mkdir(parents=True)
-    skill_md.write_text(
-        "---\nname: git-helper\ndescription: commit git\n---\n# git 指引\n提交前先 status",
-        encoding="utf-8",
-    )
-    injector = SkillInjector(skills_dir=str(skill_dir), auto_match=True)
-
-    manager = FakeAgent(response="plan")
-    # state 含 active_skills,任务不含 git 关键词(纯 auto_match 不会命中)
-    state = {"task": "算 1+1", "context_summary": "", "active_skills": ["git-helper"]}
-    asyncio.run(manager_plan_node(state, manager, injector))
-
-    # 最后一次调用应含 git-helper 技能指引(证明 active_names 透传生效)
-    last_call = manager.calls[-1]
-    assert last_call[0] == "invoke"
-    assert "git-helper" in last_call[1]
-
-
-def test_worker_exec_node_passes_active_skills_to_injector(tmp_path):
-    """worker_exec_node 从 state["active_skills"] 取值透传给 injector"""
-    from skmng.injector import SkillInjector
-
-    skill_dir = tmp_path / "skills"
-    skill_md = skill_dir / "git" / "SKILL.md"
-    skill_md.parent.mkdir(parents=True)
-    skill_md.write_text(
-        "---\nname: git-helper\ndescription: commit git\n---\n# git 指引\n提交前先 status",
-        encoding="utf-8",
-    )
-    injector = SkillInjector(skills_dir=str(skill_dir), auto_match=True)
-
-    worker = FakeAgent(response="done")
-    # plan 不含 git 关键词,但 active_skills 含 git-helper
-    state = {"plan": "执行计划", "active_skills": ["git-helper"]}
-    asyncio.run(worker_exec_node(state, worker, injector))
-
-    last_call = worker.calls[-1]
-    assert last_call[0] == "invoke"
-    assert "git-helper" in last_call[1]
-
-
-def test_terminator_final_node_passes_active_skills_to_injector(tmp_path):
-    """terminator_final_node 从 state["active_skills"] 取值透传给 injector"""
-    from skmng.injector import SkillInjector
-
-    skill_dir = tmp_path / "skills"
-    skill_md = skill_dir / "git" / "SKILL.md"
-    skill_md.parent.mkdir(parents=True)
-    skill_md.write_text(
-        "---\nname: git-helper\ndescription: commit git\n---\n# git 指引\n提交前先 status",
-        encoding="utf-8",
-    )
-    injector = SkillInjector(skills_dir=str(skill_dir), auto_match=True)
-
-    terminator = FakeAgent(response="final")
-    state = {
-        "task": "算 1+1",
-        "plan": "计划",
-        "worker_result": "结果",
-        "context_summary": "",
-        "active_skills": ["git-helper"],
-    }
-    asyncio.run(terminator_final_node(state, terminator, injector))
-
-    last_call = terminator.calls[-1]
-    assert last_call[0] == "invoke"
-    assert "git-helper" in last_call[1]
-
-
-def test_node_no_active_skills_in_state_uses_empty_default(tmp_path):
-    """state 无 active_skills 字段时,节点函数降级为空元组(不报错)"""
-    from skmng.injector import SkillInjector
-
-    injector = SkillInjector(
-        skills_dir=str(tmp_path / "nonexistent"), auto_match=True
-    )
-    manager = FakeAgent(response="plan")
-    # state 不含 active_skills 键
-    state = {"task": "算 1+1", "context_summary": ""}
-    asyncio.run(manager_plan_node(state, manager, injector))
-
-    # 不注入任何技能(任务不匹配 + 无 active_skills)
-    last_call = manager.calls[-1]
-    assert "【已加载的技能指引" not in last_call[1]

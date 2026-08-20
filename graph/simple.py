@@ -83,15 +83,10 @@ async def manager_plan_node(
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 见 worker_exec_node 注释
 ) -> WorkflowState:
-    """Manager 拆解任务,生成执行计划(结合记忆上下文摘要)
-
-    从 state["active_skills"] 取手动加载的技能名,透传给 injector 使其
-    在 graph 节点生效(修复原 SkillInjector 读不到 state 的行为不一致)。
-    """
+    """Manager 拆解任务,生成执行计划(结合记忆上下文摘要)"""
     task = state["task"]
     summary = state.get("context_summary", "")
-    active_names = state.get("active_skills") or ()
-    result = await manager.aplan_task(task, summary, injector, config, active_names)
+    result = await manager.aplan_task(task, summary, injector, config)
     return {"plan": result, "messages": [AIMessage(content=result)]}
 
 
@@ -107,16 +102,13 @@ async def worker_exec_node(
     透传给 Worker.aexecute_task 使工具调用受 workspace 隔离约束、LLM token 增量
     经 callbacks 流出到外层事件流。
 
-    从 state["active_skills"] 取手动加载的技能名透传给 injector。
-
     注:必须用 Optional[RunnableConfig] 而非 RunnableConfig | None——模块启用
     ``from __future__ import annotations`` 后注解为字符串,仅
     'Optional[RunnableConfig]'/'RunnableConfig' 在 LangGraph 判定中被接受,
     'RunnableConfig | None' 字符串不匹配会导致 config 静默不注入。
     """
     plan = state["plan"]
-    active_names = state.get("active_skills") or ()
-    result = await worker.aexecute_task(plan, injector, config, active_names)
+    result = await worker.aexecute_task(plan, injector, config)
     return {"worker_result": result, "messages": [AIMessage(content=result)]}
 
 
@@ -126,16 +118,12 @@ async def terminator_final_node(
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 见 worker_exec_node 注释
 ) -> WorkflowState:
-    """Terminator 汇总结果并返回最终答案(结合记忆上下文摘要)
-
-    从 state["active_skills"] 取手动加载的技能名透传给 injector。
-    """
+    """Terminator 汇总结果并返回最终答案(结合记忆上下文摘要)"""
     task = state["task"]
     plan = state["plan"]
     worker_result = state["worker_result"]
     summary = state.get("context_summary", "")
-    active_names = state.get("active_skills") or ()
-    result = await terminator.afinalize(task, plan, worker_result, summary, injector, config, active_names)
+    result = await terminator.afinalize(task, plan, worker_result, summary, injector, config)
     return {"final_answer": result, "messages": [AIMessage(content=result)]}
 
 
