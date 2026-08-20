@@ -3,6 +3,7 @@ LangChainAgent Tools Package
 """
 
 from cli.human_input import ask_human
+from skmng.tool import read_skill
 
 from .calculator import calculate
 from .create_tools import create_tool
@@ -16,7 +17,6 @@ from .scheduler_tool import (
     schedule_task,
 )
 from .search import search
-from .skill_tool import read_skill
 from .terminal_tools import run_cmd, run_python, run_shell
 
 # 导出所有本地工具供Agent使用

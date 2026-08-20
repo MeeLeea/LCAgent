@@ -7,8 +7,6 @@
 - arun_compiled_workflow 通用异步工作流运行器（含跨轮次记忆压缩）
 - compaction 基础设施：节点级压缩 wrapper（消息通道超阈值时增量摘要）
 
-注：SkillInjector 已迁往 skmng/injector.py（Commit 2a），此处不再提供。
-
 异步化说明：
     运行器使用 ``await graph.ainvoke(...)`` 而非同步 ``graph.invoke()``，
     避免在 asyncio 事件循环中阻塞。NodeTrackingHandler 设置 ``run_inline=True``，
@@ -26,7 +24,6 @@ from typing import Any
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage
 
-from skmng.injector import SkillInjector  # noqa: F401 - re-export 兼容窗口,Commit 5 删除
 from utils.compaction import CompactionConfig, LCAgentCompactionMiddleware
 from utils.events import AgentEvent
 from utils.logging_config import TraceContext
