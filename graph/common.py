@@ -18,11 +18,13 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage
+from langgraph.graph import StateGraph
 
 from agent.compaction import CompactionConfig, LCAgentCompactionMiddleware
 from utils.events import AgentEvent
@@ -189,6 +191,48 @@ def wrap_node_with_compaction(node_fn: Callable, mw: LCAgentCompactionMiddleware
     if mw is None:
         return node_fn
     return partial(_compaction_wrapper, node_fn, mw)
+
+
+@dataclass
+class NodeSpec:
+    """声明式节点规格:把「节点名 + 节点函数 + 绑定哪个角色」声明成数据。
+
+    所有节点函数第二参数已统一为 ``agent: TeamAgent``,partial 绑定固定为
+    ``agent=agents[role]``,无需再额外指定绑定名,role 只作 agents 字典索引键。
+
+    Attributes:
+        name: 节点名(LangGraph builder.add_node 的第一参数)
+        fn: 节点函数(未绑定,统一签名 ``async def fn(state, agent, injector=None, config=None)``)
+        role: agents 字典中该角色实例的键名(如 "manager"/"architect"/"rtl_designer")
+    """
+
+    name: str
+    fn: Callable
+    role: str
+
+
+def register_nodes(
+    builder: StateGraph,
+    agents: dict[str, Any],
+    injector: Any,
+    mw: LCAgentCompactionMiddleware | None,
+    specs: list[NodeSpec],
+) -> None:
+    """批量注册带 compaction 包装的节点。
+
+    将「partial 绑定 agent/injector → wrap_node_with_compaction → add_node」
+    三步合一,避免每个节点重复写一长串模板代码。调用方只需提供声明式 NodeSpec 表。
+
+    Args:
+        builder: 待注册节点的 LangGraph StateGraph 构造器
+        agents: 角色实例字典,``agents[spec.role]`` 取出该节点绑定的 TeamAgent
+        injector: 技能注入器(SkillInjector),绑定到节点函数的 injector= 参数
+        mw: compaction 中间件;None 时 wrap_node_with_compaction 原样返回节点
+        specs: 节点规格列表,顺序即注册顺序(与边添加顺序无关)
+    """
+    for spec in specs:
+        bound = partial(spec.fn, agent=agents[spec.role], injector=injector)
+        builder.add_node(spec.name, wrap_node_with_compaction(bound, mw))
 
 
 async def _compaction_wrapper(

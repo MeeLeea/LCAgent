@@ -23,7 +23,6 @@ workspace 隔离说明：
 """
 from __future__ import annotations
 
-from functools import partial
 from typing import Annotated, Optional, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage
@@ -34,9 +33,10 @@ from langgraph.graph.message import add_messages
 from agent.compaction import CompactionConfig
 from graph.common import (
     NodeCallback,
+    NodeSpec,
     _build_compaction_middleware,
     arun_compiled_workflow,
-    wrap_node_with_compaction,
+    register_nodes,
 )
 from graph.registry import register_workflow
 from skmng.injector import SkillInjector
@@ -153,8 +153,6 @@ def build_simple_workflow(
         编译好的 LangGraph StateGraph
     """
     manager = agents["manager"]
-    worker = agents["worker"]
-    terminator = agents["terminator"]
 
     # 技能注入器:节点渲染 prompt 时追加匹配的技能指引块
     injector = SkillInjector(
@@ -167,14 +165,22 @@ def build_simple_workflow(
 
     builder = StateGraph(WorkflowState)
 
-    # 添加节点(使用 partial 绑定 agent 实例;提示词模板由节点内懒加载)
-    # 注意:必须用 functools.partial 而非 lambda —— partial 保留 async 函数
-    # 的 coroutine 特征(LangGraph 据此判定节点为异步并 await),lambda 会返回
-    # 未 await 的 coroutine 导致 InvalidUpdateError
-    builder.add_node("summarize", wrap_node_with_compaction(partial(summarize_context, agent=manager, injector=injector), compaction_mw))
-    builder.add_node("manager_plan", wrap_node_with_compaction(partial(manager_plan_node, agent=manager, injector=injector), compaction_mw))
-    builder.add_node("worker_exec", wrap_node_with_compaction(partial(worker_exec_node, agent=worker, injector=injector), compaction_mw))
-    builder.add_node("terminator_final", wrap_node_with_compaction(partial(terminator_final_node, agent=terminator, injector=injector), compaction_mw))
+    # 添加节点(声明式 NodeSpec 表:partial 绑定 + compaction 包装 + add_node 三步合一)
+    # 注意:register_nodes 内部用 functools.partial 绑定 agent 实例;提示词模板由节点内懒加载
+    # partial 保留 async 函数的 coroutine 特征(LangGraph 据此判定节点为异步并 await),
+    # lambda 会返回未 await 的 coroutine 导致 InvalidUpdateError
+    register_nodes(
+        builder,
+        agents,
+        injector,
+        compaction_mw,
+        [
+            NodeSpec("summarize", summarize_context, role="manager"),
+            NodeSpec("manager_plan", manager_plan_node, role="manager"),
+            NodeSpec("worker_exec", worker_exec_node, role="worker"),
+            NodeSpec("terminator_final", terminator_final_node, role="terminator"),
+        ],
+    )
 
     # 添加边: START → summarize → manager_plan → worker_exec → terminator_final → END
     builder.add_edge(START, "summarize")

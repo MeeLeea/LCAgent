@@ -26,7 +26,6 @@ RTL 芯片设计流水线工作流 - Manager 提炼 → Architect 架构 → Des
 """
 from __future__ import annotations
 
-from functools import partial
 from typing import Annotated, Optional, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage
@@ -40,9 +39,10 @@ import team.rtl_verification.rtl_verification  # noqa: F401
 from agent.compaction import CompactionConfig
 from graph.common import (
     NodeCallback,
+    NodeSpec,
     _build_compaction_middleware,
     arun_compiled_workflow,
-    wrap_node_with_compaction,
+    register_nodes,
 )
 from graph.registry import register_workflow
 from skmng.injector import SkillInjector
@@ -342,9 +342,6 @@ def build_rtl_graph_workflow(
         编译好的 LangGraph StateGraph
     """
     manager = agents["manager"]
-    architect = agents["architect"]
-    designer = agents["rtl_designer"]
-    verifier = agents["rtl_verification"]
 
     # 技能注入器:节点渲染 prompt 时追加匹配的技能指引块
     injector = SkillInjector(
@@ -357,21 +354,29 @@ def build_rtl_graph_workflow(
 
     builder = StateGraph(RTLGraphState)
 
-    # 添加节点(使用 partial 绑定 agent 实例;提示词模板由节点内懒加载)
-    # 注意:必须用 functools.partial 而非 lambda —— partial 保留 async 函数
-    # 的 coroutine 特征(LangGraph 据此判定节点为异步并 await),lambda 会返回
-    # 未 await 的 coroutine 导致 InvalidUpdateError
-    builder.add_node("summarize", wrap_node_with_compaction(partial(summarize_context, agent=manager, injector=injector), compaction_mw))
-    builder.add_node("architect_plan", wrap_node_with_compaction(partial(architect_plan_node, agent=architect, injector=injector), compaction_mw))
-    builder.add_node("architect_design", wrap_node_with_compaction(partial(architect_design_node, agent=architect, injector=injector), compaction_mw))
-    builder.add_node("architect_analyze", wrap_node_with_compaction(partial(architect_analyze_node, agent=architect, injector=injector), compaction_mw))
-    builder.add_node("architect_review", wrap_node_with_compaction(partial(architect_review_node, agent=architect, injector=injector), compaction_mw))
-    builder.add_node("architect_spec", wrap_node_with_compaction(partial(architect_spec_node, agent=architect, injector=injector), compaction_mw))
-    builder.add_node("designer_spec", wrap_node_with_compaction(partial(designer_spec_node, agent=designer, injector=injector), compaction_mw))
-    builder.add_node("verification_plan", wrap_node_with_compaction(partial(verification_plan_node, agent=verifier, injector=injector), compaction_mw))
-    builder.add_node("designer_verilog", wrap_node_with_compaction(partial(designer_verilog_node, agent=designer, injector=injector), compaction_mw))
-    builder.add_node("verification_check", wrap_node_with_compaction(partial(verification_check_node, agent=verifier, injector=injector), compaction_mw))
-    builder.add_node("designer_output", wrap_node_with_compaction(partial(designer_output_node, agent=designer, injector=injector), compaction_mw))
+    # 添加节点(声明式 NodeSpec 表:partial 绑定 + compaction 包装 + add_node 三步合一)
+    # 注意:register_nodes 内部用 functools.partial 绑定 agent 实例;提示词模板由节点内懒加载
+    # partial 保留 async 函数的 coroutine 特征(LangGraph 据此判定节点为异步并 await),
+    # lambda 会返回未 await 的 coroutine 导致 InvalidUpdateError
+    register_nodes(
+        builder,
+        agents,
+        injector,
+        compaction_mw,
+        [
+            NodeSpec("summarize", summarize_context, role="manager"),
+            NodeSpec("architect_plan", architect_plan_node, role="architect"),
+            NodeSpec("architect_design", architect_design_node, role="architect"),
+            NodeSpec("architect_analyze", architect_analyze_node, role="architect"),
+            NodeSpec("architect_review", architect_review_node, role="architect"),
+            NodeSpec("architect_spec", architect_spec_node, role="architect"),
+            NodeSpec("designer_spec", designer_spec_node, role="rtl_designer"),
+            NodeSpec("verification_plan", verification_plan_node, role="rtl_verification"),
+            NodeSpec("designer_verilog", designer_verilog_node, role="rtl_designer"),
+            NodeSpec("verification_check", verification_check_node, role="rtl_verification"),
+            NodeSpec("designer_output", designer_output_node, role="rtl_designer"),
+        ],
+    )
 
     # 添加边: START → summarize → architect 五阶段 → designer_spec → verification_plan
     #        → designer_verilog → verification_check →(条件) designer_output → END
