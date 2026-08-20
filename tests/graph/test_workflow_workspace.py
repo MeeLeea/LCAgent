@@ -32,7 +32,7 @@ class CapturingWorker:
     response: str = "done"
     received_config: dict[str, Any] | None = None
 
-    async def aexecute_task(self, plan: str, injector=None, config: dict[str, Any] | None = None) -> str:
+    async def aexecute_task(self, plan: str, injector=None, config: dict[str, Any] | None = None, active_names=()) -> str:
         """异步版 execute_task(节点现直接 await 调用)"""
         self.received_config = config
         return self.response

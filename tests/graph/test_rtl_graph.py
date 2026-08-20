@@ -58,25 +58,25 @@ class FakeRTLAgent:
     async def asummarize_context(self, memory_text: str, config=None) -> str:
         return self._record("summarize_context", memory_text)
 
-    async def aplan_task(self, task: str, context_summary: str = "", injector=None, config=None) -> str:
+    async def aplan_task(self, task: str, context_summary: str = "", injector=None, config=None, active_names=()) -> str:
         return self._record("plan_task", task)
 
-    async def adesign_task(self, task: str, context_summary: str = "", injector=None, config=None) -> str:
+    async def adesign_task(self, task: str, context_summary: str = "", injector=None, config=None, active_names=()) -> str:
         return self._record("design_task", task)
 
-    async def aanalyze_task(self, task: str, context_summary: str = "", injector=None, config=None) -> str:
+    async def aanalyze_task(self, task: str, context_summary: str = "", injector=None, config=None, active_names=()) -> str:
         return self._record("analyze_task", task)
 
-    async def areview_task(self, task: str, context_summary: str = "", injector=None, config=None) -> str:
+    async def areview_task(self, task: str, context_summary: str = "", injector=None, config=None, active_names=()) -> str:
         return self._record("review_task", task)
 
-    async def aspec_task(self, task: str, context_summary: str = "", injector=None, config=None) -> str:
+    async def aspec_task(self, task: str, context_summary: str = "", injector=None, config=None, active_names=()) -> str:
         return self._record("spec_task", task)
 
-    async def aspec_design_task(self, task: str, injector=None, config=None) -> str:
+    async def aspec_design_task(self, task: str, injector=None, config=None, active_names=()) -> str:
         return self._record("spec_design_task", task)
 
-    async def averilog_design_task(self, task: str, injector=None, config=None) -> str:
+    async def averilog_design_task(self, task: str, injector=None, config=None, active_names=()) -> str:
         return self._record("verilog_design_task", task)
 
 

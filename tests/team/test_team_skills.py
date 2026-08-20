@@ -103,3 +103,22 @@ def test_team_agent_satisfies_prompt_injector_protocol(monkeypatch, tmp_path):
     injector: PromptInjector = agent  # 类型层面即满足协议
     prompt = injector.inject_into_prompt("执行:{plan}", "提交代码")
     assert "【已加载的技能指引" in prompt
+
+
+def test_inject_into_prompt_with_active_names(monkeypatch, tmp_path):
+    """active_names 透传后,手动加载的技能在 TeamAgent 注入器中生效
+
+    验证行为不一致修复:原 TeamAgent.build_skill_block 仅走 auto_match 单通道,
+    读不到运行时 active_names;现经 skmng.core 三来源合并,active_names 注入生效。
+    """
+    _monkeypatch_llm(monkeypatch)
+    skills_dir = _make_skill_dir(tmp_path)
+    agent = TeamAgent(name="test", skills_dir=str(skills_dir))
+
+    # 任务不含 git 关键词,auto_match 不会命中;但 active_names 传入 git-helper 应注入
+    prompt = agent.inject_into_prompt("执行计划", "算一下 1+1", active_names=("git-helper",))
+    assert "git-helper" in prompt
+    assert "【已加载的技能指引" in prompt
+
+    # active_names 为空时,不相关任务不注入
+    assert agent.inject_into_prompt("执行计划", "算一下 1+1") == "执行计划"
