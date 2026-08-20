@@ -77,32 +77,32 @@ class RTLGraphState(TypedDict, total=False):
 # 2. 节点函数(提示词模板由各角色 TeamAgent 懒加载,节点需要时调用 get_template)
 async def summarize_context(
     state: RTLGraphState,
-    manager: TeamAgent,
+    agent: TeamAgent,
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
     """Manager 提炼记忆上下文,生成分发给下游节点的上下文摘要"""
     raw = state.get("raw_context", "")
-    result = await manager.asummarize_context(raw, config)
+    result = await agent.asummarize_context(raw, config)
     return {"context_summary": result, "messages": [AIMessage(content=result)]}
 
 
 async def architect_plan_node(
     state: RTLGraphState,
-    architect: TeamAgent,
+    agent: TeamAgent,
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
     """Architect 制定架构执行计划(结合记忆上下文摘要)"""
     task = state["task"]
     summary = state.get("context_summary", "")
-    result = await architect.aplan_task(task, summary, injector, config)
+    result = await agent.aplan_task(task, summary, injector, config)
     return {"arch_plan": result, "messages": [AIMessage(content=result)]}
 
 
 async def architect_design_node(
     state: RTLGraphState,
-    architect: TeamAgent,
+    agent: TeamAgent,
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
@@ -111,13 +111,13 @@ async def architect_design_node(
     plan = state.get("arch_plan", "")
     summary = state.get("context_summary", "")
     prompt_task = f"{task}\n\n【架构执行计划】\n{plan}" if plan else task
-    result = await architect.adesign_task(prompt_task, summary, injector, config)
+    result = await agent.adesign_task(prompt_task, summary, injector, config)
     return {"arch_design": result, "messages": [AIMessage(content=result)]}
 
 
 async def architect_analyze_node(
     state: RTLGraphState,
-    architect: TeamAgent,
+    agent: TeamAgent,
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
@@ -126,13 +126,13 @@ async def architect_analyze_node(
     design = state.get("arch_design", "")
     summary = state.get("context_summary", "")
     prompt_task = f"{task}\n\n【架构方案设计】\n{design}" if design else task
-    result = await architect.aanalyze_task(prompt_task, summary, injector, config)
+    result = await agent.aanalyze_task(prompt_task, summary, injector, config)
     return {"arch_analysis": result, "messages": [AIMessage(content=result)]}
 
 
 async def architect_review_node(
     state: RTLGraphState,
-    architect: TeamAgent,
+    agent: TeamAgent,
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
@@ -147,13 +147,13 @@ async def architect_review_node(
     if analysis:
         parts.append(f"【权衡分析】\n{analysis}")
     prompt_task = "\n\n".join(parts)
-    result = await architect.areview_task(prompt_task, summary, injector, config)
+    result = await agent.areview_task(prompt_task, summary, injector, config)
     return {"arch_review": result, "messages": [AIMessage(content=result)]}
 
 
 async def architect_spec_node(
     state: RTLGraphState,
-    architect: TeamAgent,
+    agent: TeamAgent,
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
@@ -168,13 +168,13 @@ async def architect_spec_node(
     if review:
         parts.append(f"【评审意见】\n{review}")
     prompt_task = "\n\n".join(parts)
-    result = await architect.aspec_task(prompt_task, summary, injector, config)
+    result = await agent.aspec_task(prompt_task, summary, injector, config)
     return {"arch_spec": result, "messages": [AIMessage(content=result)]}
 
 
 async def designer_spec_node(
     state: RTLGraphState,
-    designer: TeamAgent,
+    agent: TeamAgent,
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
@@ -182,13 +182,13 @@ async def designer_spec_node(
     task = state["task"]
     arch_spec = state.get("arch_spec", "")
     prompt_task = f"{task}\n\n【架构规格文档】\n{arch_spec}" if arch_spec else task
-    result = await designer.aspec_design_task(prompt_task, injector, config)
+    result = await agent.aspec_design_task(prompt_task, injector, config)
     return {"design_spec": result, "messages": [AIMessage(content=result)]}
 
 
 async def verification_plan_node(
     state: RTLGraphState,
-    verifier: TeamAgent,
+    agent: TeamAgent,
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
@@ -202,13 +202,13 @@ async def verification_plan_node(
     if design_spec:
         parts.append(f"【设计规格与Filelist】\n{design_spec}")
     prompt_task = "\n\n".join(parts)
-    result = await verifier.aspec_design_task(prompt_task, injector, config)
+    result = await agent.aspec_design_task(prompt_task, injector, config)
     return {"verification_plan": result, "messages": [AIMessage(content=result)]}
 
 
 async def designer_verilog_node(
     state: RTLGraphState,
-    designer: TeamAgent,
+    agent: TeamAgent,
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 simple.py 一致:LangGraph 注解判定要求该字符串形态
 ) -> RTLGraphState:
@@ -230,13 +230,13 @@ async def designer_verilog_node(
     if round_n > 0 and report:
         parts.append(f"【第 {round_n} 轮验证报告反馈(请据此修正 RTL)】\n{report}")
     prompt_task = "\n\n".join(parts)
-    result = await designer.averilog_design_task(prompt_task, injector, config)
+    result = await agent.averilog_design_task(prompt_task, injector, config)
     return {"rtl_code": result, "round": round_n + 1, "messages": [AIMessage(content=result)]}
 
 
 async def verification_check_node(
     state: RTLGraphState,
-    verifier: TeamAgent,
+    agent: TeamAgent,
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
@@ -261,13 +261,13 @@ async def verification_check_node(
         "或 验证结论: FAIL(表示需修改,并在报告中给出具体修改建议)。"
     )
     prompt_task = "\n\n".join(parts)
-    result = await verifier.averilog_design_task(prompt_task, injector, config)
+    result = await agent.averilog_design_task(prompt_task, injector, config)
     return {"verification_report": result, "messages": [AIMessage(content=result)]}
 
 
 async def designer_output_node(
     state: RTLGraphState,
-    designer: TeamAgent,
+    agent: TeamAgent,
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
@@ -285,7 +285,7 @@ async def designer_output_node(
         parts.append(f"【验证报告】\n{report}")
     parts.append("请整理以上内容,输出最终交付文件清单与完整 RTL 源码(作为最终交付物)。")
     prompt_task = "\n\n".join(parts)
-    result = await designer.averilog_design_task(prompt_task, injector, config)
+    result = await agent.averilog_design_task(prompt_task, injector, config)
     return {"final_answer": result, "messages": [AIMessage(content=result)]}
 
 
@@ -361,17 +361,17 @@ def build_rtl_graph_workflow(
     # 注意:必须用 functools.partial 而非 lambda —— partial 保留 async 函数
     # 的 coroutine 特征(LangGraph 据此判定节点为异步并 await),lambda 会返回
     # 未 await 的 coroutine 导致 InvalidUpdateError
-    builder.add_node("summarize", wrap_node_with_compaction(partial(summarize_context, manager=manager, injector=injector), compaction_mw))
-    builder.add_node("architect_plan", wrap_node_with_compaction(partial(architect_plan_node, architect=architect, injector=injector), compaction_mw))
-    builder.add_node("architect_design", wrap_node_with_compaction(partial(architect_design_node, architect=architect, injector=injector), compaction_mw))
-    builder.add_node("architect_analyze", wrap_node_with_compaction(partial(architect_analyze_node, architect=architect, injector=injector), compaction_mw))
-    builder.add_node("architect_review", wrap_node_with_compaction(partial(architect_review_node, architect=architect, injector=injector), compaction_mw))
-    builder.add_node("architect_spec", wrap_node_with_compaction(partial(architect_spec_node, architect=architect, injector=injector), compaction_mw))
-    builder.add_node("designer_spec", wrap_node_with_compaction(partial(designer_spec_node, designer=designer, injector=injector), compaction_mw))
-    builder.add_node("verification_plan", wrap_node_with_compaction(partial(verification_plan_node, verifier=verifier, injector=injector), compaction_mw))
-    builder.add_node("designer_verilog", wrap_node_with_compaction(partial(designer_verilog_node, designer=designer, injector=injector), compaction_mw))
-    builder.add_node("verification_check", wrap_node_with_compaction(partial(verification_check_node, verifier=verifier, injector=injector), compaction_mw))
-    builder.add_node("designer_output", wrap_node_with_compaction(partial(designer_output_node, designer=designer, injector=injector), compaction_mw))
+    builder.add_node("summarize", wrap_node_with_compaction(partial(summarize_context, agent=manager, injector=injector), compaction_mw))
+    builder.add_node("architect_plan", wrap_node_with_compaction(partial(architect_plan_node, agent=architect, injector=injector), compaction_mw))
+    builder.add_node("architect_design", wrap_node_with_compaction(partial(architect_design_node, agent=architect, injector=injector), compaction_mw))
+    builder.add_node("architect_analyze", wrap_node_with_compaction(partial(architect_analyze_node, agent=architect, injector=injector), compaction_mw))
+    builder.add_node("architect_review", wrap_node_with_compaction(partial(architect_review_node, agent=architect, injector=injector), compaction_mw))
+    builder.add_node("architect_spec", wrap_node_with_compaction(partial(architect_spec_node, agent=architect, injector=injector), compaction_mw))
+    builder.add_node("designer_spec", wrap_node_with_compaction(partial(designer_spec_node, agent=designer, injector=injector), compaction_mw))
+    builder.add_node("verification_plan", wrap_node_with_compaction(partial(verification_plan_node, agent=verifier, injector=injector), compaction_mw))
+    builder.add_node("designer_verilog", wrap_node_with_compaction(partial(designer_verilog_node, agent=designer, injector=injector), compaction_mw))
+    builder.add_node("verification_check", wrap_node_with_compaction(partial(verification_check_node, agent=verifier, injector=injector), compaction_mw))
+    builder.add_node("designer_output", wrap_node_with_compaction(partial(designer_output_node, agent=designer, injector=injector), compaction_mw))
 
     # 添加边: START → summarize → architect 五阶段 → designer_spec → verification_plan
     #        → designer_verilog → verification_check →(条件) designer_output → END
