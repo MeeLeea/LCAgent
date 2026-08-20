@@ -253,12 +253,19 @@ LangChainAgent/
 │   ├── streaming.py         # Streaming Mixin：事件流引擎（arun/aresume_events）
 │   ├── interrupts.py        # Interrupts Mixin：中断检查/恢复命令/拒绝处理
 │   ├── turn_runners.py      # TurnRunners Mixin：结构化执行入口（arun/achat/aresume_structured）
-│   ├── skill_ops.py         # SkillOps Mixin：技能加载/清理 + 手动压缩
 │   ├── turn_types.py        # AgentTurnResult（结构化执行结果类型）
-│   ├── skill_mw.py          # SkillInjectionMW：技能注入中间件
 │   ├── tool_error_mw.py     # ToolExecutionErrorMW：工具错误反思纠错中间件
 │   ├── workspace_mw.py      # WorkspaceSecurityMW：工作空间安全中间件
 │   └── role_sw.py           # 团队角色切换（唯一实现/入口）
+├── skmng/                    # 技能管理统一包（收敛原 tools/skills+skill_tool+graph/common:SkillInjector+agent/skill_mw+skill_ops+team/base:PromptInjector）
+│   ├── __init__.py          # 聚合导出 SkillManager/SkillInjector/SkillInjectionMW/SkillOps/read_skill/PromptInjector/build_skill_block/inject_into_prompt
+│   ├── manager.py           # SkillManager：扫描/匹配/渲染本地技能（原 tools/skills.py）
+│   ├── tool.py              # read_skill 工具：LLM 自助读取技能指引（原 tools/skill_tool.py）
+│   ├── core.py              # 统一注入核心：build_skill_block 三来源合并（fixed_skills+active_names+auto_match）+ inject_into_prompt 防重复
+│   ├── protocols.py         # PromptInjector 协议（独立放置，防 team→graph 循环依赖）
+│   ├── injector.py          # SkillInjector：工作流节点 prompt 层注入器（改调 core 三来源合并）
+│   ├── middleware.py        # SkillInjectionMW：agent 层 model 调用前注入中间件（改调 core）
+│   └── ops.py               # SkillOps Mixin：技能加载/清理 + 手动压缩（原 agent/skill_ops.py，供 AgentCore 多继承）
 ├── utils/                   # 通用工具（与业务解耦，供 agent/graph/session 等共用）
 │   ├── compaction.py        # LangGraph 上下文压缩中间件（增量摘要 + 工具输出 Prune）
 │   ├── events.py            # 标准化执行事件模型（AgentEvent / EventType，含节点进度事件）
@@ -288,7 +295,7 @@ LangChainAgent/
 │       ├── agent_config.json
 │       └── AGENT.md
 ├── graph/                   # LangGraph 工作流编排
-│   ├── common.py            # 工作流通用能力：异步执行辅助 + 技能注入 + 跨轮次记忆压缩 + workspace 透传
+│   ├── common.py            # 工作流通用能力：异步执行辅助 + 跨轮次记忆压缩 + workspace 透传
 │   ├── simple.py            # 监督者模式工作流（Manager→Worker→Terminator，异步节点，worker_exec 接收 config 注入 workspace）
 │   ├── pipline.py           # 流水线模式工作流（异步节点，与 simple 同构，worker_exec 接收 config 注入 workspace）
 │   ├── rtl_graph.py         # RTL 芯片设计流水线（Manager 提炼→Architect 架构→Designer 设计↔Verification 多轮验证→Designer 交付）
@@ -301,8 +308,8 @@ LangChainAgent/
 │   ├── terminal_tools.py    # 终端命令工具（shell/python/bat/ps1,含安全护栏）
 │   ├── get_local_time.py    # 获取本地时间工具
 │   ├── open_file.py         # 文件打开工具（系统默认程序/DB Browser）
-│   ├── skills.py            # SkillManager（扫描/匹配/渲染技能）
-│   ├── skill_tool.py        # read_skill 工具（LLM 自助读取技能指引）
+│   ├── skills.py            # re-export skmng.manager（向后兼容，待删）
+│   ├── skill_tool.py        # re-export skmng.tool（向后兼容，待删）
 │   ├── create_tools.py      # 动态生成工具代码，保存为 .py 并自动注册到 __init__.py
 │   ├── safety.py            # 安全护栏(黑名单/白名单/交互确认/路径保护)
 │   ├── mcp_loader.py        # MCP 配置管理与工具加载器
@@ -355,16 +362,17 @@ LangChainAgent/
 | [utils/metrics.py](utils/metrics.py)                     | `MetricsCollector`：线程安全的运行时指标收集（LLM 调用 / 工具执行 / 压缩统计）                                                                                                                                                           |
 | [utils/logging_config.py](utils/logging_config.py)       | 结构化日志：`contextvars` 实现 trace_id / thread_id 异步安全注入                                                                                                                                                                         |
 | [utils/exceptions.py](utils/exceptions.py)               | 统一异常层次：`LCAgentError` 基类及 MCP/超时/压缩/中断/状态等子类                                                                                                                                                                        |
-| [agent/](agent/)                                         | Agent 核心按职责拆分：`agent_core.py`（主类，构造/生命周期/共享工具方法）+ 7 个 Mixin（`session_mgmt`/`mcp_tools`/`graph_builder`/`streaming`/`interrupts`/`turn_runners`/`skill_ops`）+ `turn_types.py`（`AgentTurnResult`）+ 3 个中间件（`skill_mw`/`tool_error_mw`/`workspace_mw`）+ `role_sw.py`（团队角色切换唯一实现） |
+| [agent/](agent/)                                         | Agent 核心按职责拆分：`agent_core.py`（主类，构造/生命周期/共享工具方法）+ 6 个 Mixin（`session_mgmt`/`mcp_tools`/`graph_builder`/`streaming`/`interrupts`/`turn_runners`）+ `turn_types.py`（`AgentTurnResult`）+ 2 个中间件（`tool_error_mw`/`workspace_mw`）+ `role_sw.py`（团队角色切换唯一实现）；技能相关 Mixin/中间件已迁入 `skmng/` 包 |
 | [session/](session/)                                     | 三层架构 Session 层：`SessionContext`（单会话运行时上下文）/ `SessionStore`（per-session 瞬态状态）/ `SessionRegistry`（生命周期管理）/ `WorkspaceStore`（工作空间映射）/ `SessionManager`（对外门面 & 会话调度）                |
 | [team/](team/)                                           | 多 Agent 团队协作：ManagerAgent（拆解）/ WorkerAgent（执行）/ TerminatorAgent（汇总）+ 工厂函数                                                                                                                                            |
-| [graph/common.py](graph/common.py)                       | 工作流通用能力：`NodeTrackingHandler` 节点级进度回调(含 TOKEN 级流式)、`SkillInjector` 技能注入、`arun_compiled_workflow` 跨轮次记忆压缩 + `workspace_path` 注入 `config.configurable`                                                                        |
+| [skmng/](skmng/)                                         | 技能管理统一包：`SkillManager`（扫描/匹配/渲染）+ `SkillInjector`（工作流节点注入器）+ `SkillInjectionMW`（agent 层中间件）+ `SkillOps`（Mixin）+ `core.py`（三来源合并核心）+ `protocols.py`（PromptInjector 协议）+ `read_skill` 工具 |
+| [graph/common.py](graph/common.py)                       | 工作流通用能力：`NodeTrackingHandler` 节点级进度回调(含 TOKEN 级流式)、`arun_compiled_workflow` 跨轮次记忆压缩 + `workspace_path` 注入 `config.configurable`（SkillInjector 已迁往 `skmng/injector.py`）                                                                        |
 | [graph/simple.py](graph/simple.py)                       | LangGraph 监督者模式工作流编排（Manager→Worker→Terminator，异步节点）；`worker_exec` 节点接收 LangGraph 注入的 config（含 `workspace_path`）透传 Worker                                                                                     |
 | [graph/pipline.py](graph/pipline.py)                     | LangGraph 流水线模式工作流编排（异步节点，与 simple 同构）；`worker_exec` 节点同样透传 workspace config                                                                                                                                    |
 | [graph/rtl_graph.py](graph/rtl_graph.py)                 | RTL 芯片设计流水线：Manager 提炼上下文→Architect 计划/设计/分析/评审/规格→Designer 规格+编码↔Verification 验证多轮交互（条件路由 + max_rounds 限轮）→Designer 交付                                                                       |
 | [graph/registry.py](graph/registry.py)                   | 工作流/Agent 注册表：`register_workflow` / `register_agent` / `build_workflow`；runner 统一支持 `workspace_path` 透传                                                                                                                   |
-| [tools/skills.py](tools/skills.py)                       | `SkillManager`：扫描/匹配/渲染本地技能                                                                                                                                                                                                   |
-| [tools/skill_tool.py](tools/skill_tool.py)               | `read_skill` 工具：LLM 在任务中自助读取技能指引                                                                                                                                                                                          |
+| [tools/skills.py](tools/skills.py)                       | re-export `skmng.manager.SkillManager`（向后兼容，待删）                                                                                                                                                                                   |
+| [tools/skill_tool.py](tools/skill_tool.py)               | re-export `skmng.tool.read_skill`（向后兼容，待删）                                                                                                                                                                                       |
 | [tools/mcp_pool.py](tools/mcp_pool.py)                   | `MCPPool`：per-server 连接管理 + 健康探测 + 自动重连，替代全量重载                                                                                                                                                                       |
 | [tools/tool_wrapper.py](tools/tool_wrapper.py)           | 工具超时包装：统一超时保护，超时返回 JSON 错误而非抛异常                                                                                                                                                                                   |
 | [tools/](tools/)                                         | 本地工具 + MCP 工具加载 + 技能管理                                                                                                                                                                                                         |
@@ -1094,7 +1102,7 @@ Agent 的工具分为两类：
 | `get_local_time` | [tools/get_local_time.py](tools/get_local_time.py) | 获取本地时间                                                                                                                                                                                                                                                                                                                                             | 无                                                                                           |
 | `open_file`      | [tools/open_file.py](tools/open_file.py)           | 用系统默认/指定程序打开文件或文件夹                                                                                                                                                                                                                                                                                                                      | `file_path`, `app_path`                                                                  |
 | `open_sqlite`    | [tools/open_file.py](tools/open_file.py)           | 用 DB Browser for SQLite 打开 .sqlite/.db                                                                                                                                                                                                                                                                                                                | `file_path`                                                                                |
-| `read_skill`     | [tools/skill_tool.py](tools/skill_tool.py)         | 读取本地技能(SKILL.md)的指引正文                                                                                                                                                                                                                                                                                                                         | `skill_name`(可空)                                                                         |
+| `read_skill`     | [skmng/tool.py](skmng/tool.py)                     | 读取本地技能(SKILL.md)的指引正文                                                                                                                                                                                                                                                                                                                         | `skill_name`(可空)                                                                         |
 | `create_tool`    | [tools/create_tools.py](tools/create_tools.py)     | 动态生成工具代码并保存为 .py 文件（默认保存到 tools/ 目录并自动注册到 tools/__init__.py；tool_logic 支持含 f-string/多行字符串的代码，内容行不会被误缩进）。安全边界：工具名须为合法 Python 标识符、路径限制在 tools/ 目录内禁止逃逸、默认禁止覆盖已有文件（`force=True` 可覆盖）、生成源码经 AST 校验禁止导入 os/subprocess/socket 等高风险模块 | `tool_name`, `tool_description`, `args_spec`, `tool_logic`, `tool_path`, `force` |
 | `ask_human`      | [cli/human_input.py](cli/human_input.py)           | 暂停 LangGraph 图并请求人工结构化选择                                                                                                                                                                                                                                                                                                                    | `prompt`, `choices`                                                                      |
 
@@ -1159,7 +1167,7 @@ Agent 可以在任务中**阅读并使用这些技能指引**，支持三种方�
 
 #### 已注册的技能（本地）
 
-由 [tools/skills.py](tools/skills.py) 的 `SkillManager` 扫描 `.agents/skills/` 自动发现：
+由 [skmng/manager.py](skmng/manager.py) 的 `SkillManager` 扫描 `.agents/skills/` 自动发现：
 
 | 技能            | 说明                                   |
 | --------------- | -------------------------------------- |
@@ -2098,7 +2106,7 @@ Designer (输出最终交付文件)
 
 > **RTL 团队角色模型配置**：`manager`/`architect`/`rtl_designer`/`rtl_verification` 均配置为云雾提供商 `qwen3.7-max`、`max_tokens=4096`。原因：云雾网关对 `max_completion_tokens` 参数的处理存在缺陷——思考型模型（`glm-5.2`/`qwen3.7-max`）的 reasoning token 会计入该预算，复杂设计任务（RTL 编码/验证方案）思考消耗远超 `max_tokens`，触发 `finish=length` 且 `content` 为空，导致工作流节点输出空字符串。`llm/llm_client.py` 中 `CloudmistChatOpenAI` 子类将 `max_completion_tokens` 还原为 `max_tokens` 规避该缺陷（仅 `provider="yunwu"` 生效），详见该文件类文档。
 
-> **固定技能注入**：`VerificationAgent` 每次节点调用都会强制注入 `.agents/skills/vivado-2025.2` 技能指引（验证环境固定使用 Vivado Xsim，不依赖任务关键词自动匹配），见 `team/rtl_verification/rtl_verification.py::_inject_vivado_skill`。
+> **固定技能注入**：`VerificationAgent` 经 `fixed_skills: ClassVar[list[str]] = ["vivado-2025.2"]` 类属性始终注入 Vivado 技能指引（验证环境固定使用 Vivado Xsim，不依赖任务关键词自动匹配），由 `skmng.core.build_skill_block` 统一合并注入，见 `team/rtl_verification/rtl_verification.py`。
 
 **轻量设计**：团队 Agent 继承 `TeamAgent` 轻量基类,不继承 `AgentCore`。相比完整智能体:
 
@@ -2106,7 +2114,7 @@ Designer (输出最终交付文件)
 - **按需工具注入**:Manager/Terminator 纯 LLM 推理,Worker 注入工具列表后用 `create_agent` 构建轻量 ReAct 循环
 - **工具超时 + 错误纠错**:工具经 `tools.tool_wrapper.wrap_tools_with_timeout` 包裹超时保护(防卡死,默认 60 秒+工具级覆盖如 `ask_human` 600 秒);executor 挂载 `ToolExecutionErrorMW`(工具异常转 `ToolMessage(status="error")` + 反思指令,LLM 可读到报错修正重试)与 `WorkspaceSecurityMW`(workspace 路径解析 + 逃逸校验),与主 Agent 的工具执行质量对齐
 - **快速构建**:不加载 MCP Server、不创建 SQLite checkpointer
-- **内建技能注入**:持有 `SkillManager`(`skills_dir` 参数指定目录,默认 `.agents/skills`),提供 `build_skill_block`/`inject_into_prompt` 方法(满足 `PromptInjector` 协议),工作流节点可直接以角色实例为注入器,无需外部构造
+- **内建技能注入**:持有 `SkillManager`(`skills_dir` 参数指定目录,默认 `.agents/skills`),`build_skill_block`/`inject_into_prompt` 转发 `skmng.core`(满足 `PromptInjector` 协议),三来源合并(角色级 `fixed_skills` 类属性 + 运行时 `active_names` + 自动匹配);工作流节点可直接以角色实例为注入器,无需外部构造
 - **类型化执行结果**:`arun_structured` 返回 `AgentTurnResult`(completed / cancelled,复用 `agent/turn_types.py`),调用方可区分"正常完成"与"LLM 失败",工作流节点可据此重试/降级;`ainvoke`/`astream` 保持返回字符串契约不变
 - **运行时指标**:`metrics` 惰性收集器(与 `AgentCore.metrics` 同构)——LLM 调用 token 用量(流式事件与纯文本通道自动提取)、工具执行计数/失败/超时、turn 计数,经 `get_summary()` 汇总
 - **能力边界清晰**:规划/汇总角色不暴露危险工具(如 `run_shell`),Worker 才拥有工具执行能力
@@ -2118,7 +2126,7 @@ Designer (输出最终交付文件)
 工作流节点已全面异步化,`TeamAgent` 提供 `ainvoke`/`astream` 异步能力,节点直接 `await` 角色类 async 业务方法并透传 LangGraph `config`(callbacks 通道)实现 TOKEN 级流式;同时具备技能注入与跨轮次记忆压缩能力:
 
 - **异步节点执行 + TOKEN 流式**:`simple.py` / `rtl_graph.py` 的业务节点(`summarize`/`manager_plan`/`worker_exec`/`terminator_final` 及 RTL 各节点)全部为 `async`,直接 `await` 角色类 async 业务方法(`asummarize_context`/`aplan_task`/`aexecute_task`/`afinalize` 等)并透传 LangGraph 注入的 `config: Optional[RunnableConfig]`。`TeamAgent`(`team/base.py`)提供 `ainvoke`(`astream` 聚合)/`astream` 异步能力:`_astream_with_tools` 经 `agent_executor.astream_events(version="v2")` 过滤 `on_chat_model_stream`;`_astream_pure_text` 经 chat model `astream`。因同事件循环执行,callbacks 自然透传——`NodeTrackingHandler.on_chat_model_stream` 捕获 LLM token 增量转发为 `AgentEvent.token`,`WorkflowAdapter._on_token` 闭包补 `thread_id`/`role="assistant"`/`trace_id` 后注入事件流,实现节点执行期间的 TOKEN 级流式(空块自动过滤)。同步业务方法与 `ainvoke_team_agent()` 兼容辅助已移除,统一走 async 链路。
-- **技能注入(SkillInjector)**:`build_simple_workflow` 接受 `skills_dir` / `auto_match_skills` 参数,构建时创建 `SkillInjector`(复用 `tools.skills.SkillManager` 的确定性打分匹配 + 指引块渲染)。节点渲染 prompt 后调用 `inject_into_prompt()` 把命中技能(`match_skills(task)`)的指引块追加到 prompt 末尾,已含技能块时跳过(防重复)。`TeamAgent` 亦内建同等能力(`build_skill_block` / `inject_into_prompt`,满足 `PromptInjector` 协议)——节点可直接以角色实例为注入器,无需外部构造;`team/factory.py` 会把角色 `agent_config.json` 的 `skills_dir` / `auto_match_skills` / `tool_timeout` 透传给 TeamAgent。
+- **技能注入(SkillInjector)**:`build_simple_workflow` 接受 `skills_dir` / `auto_match_skills` 参数,构建时创建 `skmng.injector.SkillInjector`(改调 `skmng.core.build_skill_block` 三来源合并:角色级 `fixed_skills` + 运行时 `active_names` + 自动匹配)。节点渲染 prompt 后调用 `inject_into_prompt()` 把命中技能(`match_skills(task)`)的指引块追加到 prompt 末尾,已含技能块时跳过(防重复)。`TeamAgent` 亦内建同等能力(`build_skill_block` / `inject_into_prompt` 转发 `skmng.core`,满足 `PromptInjector` 协议)——节点可直接以角色实例为注入器,无需外部构造;`team/factory.py` 会把角色 `agent_config.json` 的 `skills_dir` / `auto_match_skills` / `tool_timeout` 透传给 TeamAgent。
 - **消息通道压缩(compaction)**:`simple.py` / `rtl_graph.py` / `pipline.py` 的 `WorkflowState` / `RTLGraphState` 新增 `messages`(LangGraph `add_messages` 通道)与 `summary` 字段,每个业务节点产出追加一条 `AIMessage`。`build_*_workflow` 接受 `compaction_config` 参数,经 `graph/common.py` 的 `_build_compaction_middleware` + `wrap_node_with_compaction` 包装节点:消息累计超过阈值(默认 50)时调用 `arun_compaction(force=True)` 把历史消息压缩为增量摘要并入 `summary`,防止长会话撑爆上下文。`compaction_config=None` 且 agent 无 LLM 时静默禁用。
 - **跨轮次上下文延续**:统一入口(CLI/API)经 `WorkflowAdapter`(`session/workflow_adapter.py`)执行——运行前从 workflow 专属会话的 checkpoint `messages` 通道读取历史节点产出(预览最多 5 条、每条截断 200 字符,拼为 `【历史执行记录】` 块),叠加 `MemoryManager.recall_text` 的长期记忆,合并注入 `raw_context`,实现多轮运行间的上下文延续。直接调用 `arun_simple_workflow` + `thread_id` 时,旧的 `_aget_previous_workflow_summary()`(checkpoint 摘要)仍可用(已标记 deprecated,待消息通道完全接管后移除)。
 
@@ -2852,7 +2860,8 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 | `tests/config/test_config.py`          | 运行时配置：默认值合并、路径解析                                                        |
 | `tests/config/test_config_templates.py` | 配置模板验证：.example 文件完整性检查                                                    |
 | `tests/tools/test_safety.py`           | 安全护栏：黑名单拒绝、白名单放行、危险命令确认、路径保护                                |
-| `tests/tools/test_skills.py`           | `SkillManager`：列出/读取/匹配(中→英别名)/渲染技能                                    |
+| `tests/tools/test_skills.py`           | `SkillManager`：列出/读取/匹配(中→英别名)/渲染技能（经 `tools/skills.py` re-export 测旧路径）                                    |
+| `tests/skmng/test_core.py`             | `skmng.core`：build_skill_block 三来源合并去重、inject_into_prompt 防重复、auto_match=False 行为、fixed_skills 独立注入                                    |
 | `tests/tools/test_search.py`           | `search` 工具：无 Key 降级、Tavily 返回结构(mock)                                      |
 | `tests/cli/test_cli_commands.py`       | CLI 命令分发：路由优先级、状态变更和各领域处理器                                        |
 | `tests/agent/test_human_input.py`      | LangGraph HITL：interrupt、恢复、并行选择和线程隔离                                     |
@@ -2873,7 +2882,7 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 | `tests/graph/test_workflow.py`         | 监督者模式工作流编排：Manager→Worker→Terminator 模板                                  |
 | `tests/team/test_sampling_config.py`   | 团队 Agent 采样参数：角色级/全局优先级与显式参数覆盖                                   |
 | `tests/team/test_team_tools.py`        | TeamAgent 工具模式：超时参数归一、中间件链挂载(ToolExecutionErrorMW + WorkspaceSecurityMW) |
-| `tests/team/test_team_skills.py`       | TeamAgent 技能内建：build_skill_block/inject_into_prompt、PromptInjector 协议兼容       |
+| `tests/team/test_team_skills.py`       | TeamAgent 技能内建：build_skill_block/inject_into_prompt 转发 skmng.core、PromptInjector 协议兼容、active_names 透传       |
 | `tests/team/test_team_metrics.py`      | TeamAgent 指标与类型化结果：LLM/tool/turn 指标收集、arun_structured 状态映射           |
 | `tests/utils/test_metrics.py`          | `MetricsCollector`：LLM/工具/压缩指标记录、token 提取与汇总                           |
 | `tests/tools/test_tool_wrapper.py`     | 工具超时包装：超时返回 JSON、按工具名覆盖、无限等待排除                                 |
