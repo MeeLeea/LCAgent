@@ -5,20 +5,25 @@ TeamAgent 轻量基类 - 为多 Agent 工作流设计的轻量角色
 - 单轮任务执行(无会话记忆/checkpoint)
 - 可选工具注入(不默认加载全部工具/MCP);工具模式挂载工具错误纠错与
   workspace 安全中间件,并做超时保护
-- 内建技能注入(build_skill_block / inject_into_prompt,满足 PromptInjector 协议)
+- 内建技能注入(build_skill_block / inject_into_prompt,满足 PromptInjector 协议):
+  三来源合并(角色级 fixed_skills 类属性 + 运行时 active_names + 自动匹配),
+  统一转发 skmng.core 实现,使 TeamAgent 不再依赖外部注入器
 - 更快的构建速度,适合团队协作场景
 """
 import logging
 import os
 from collections.abc import AsyncIterator
-from typing import ClassVar, Protocol
+from typing import ClassVar
 
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool
 
 from agent.turn_types import AgentTurnResult
 from llm.llm_client import LLMClient
-from tools.skills import SkillManager, default_skills_dir
+from skmng.core import build_skill_block as _build_skill_block
+from skmng.core import inject_into_prompt as _inject_into_prompt
+from skmng.manager import SkillManager, default_skills_dir
+from skmng.protocols import PromptInjector
 from utils.metrics import MetricsCollector
 
 logger = logging.getLogger(__name__)
@@ -29,27 +34,23 @@ WORKFLOW_SECTION_PREFIX = "## workflow:"
 # 任务执行失败时 astream 产出的错误文本前缀(arun_structured 据此判定 cancelled)
 TASK_ERROR_PREFIX = "任务执行失败"
 
-
-class PromptInjector(Protocol):
-    """提示词注入器协议(鸭子类型,兼容 graph.common.SkillInjector)
-
-    仅声明工作流节点需要的注入接口,避免 TeamAgent 及其子类对 graph 层的
-    强依赖(循环导入防护):任何提供 inject_into_prompt 的对象皆可注入。
-    """
-
-    def inject_into_prompt(self, prompt: str, task: str) -> str:
-        """把技能指引块追加到 prompt 末尾,返回注入后的提示词"""
+__all__ = ["PromptInjector", "TeamAgent"]
 
 
 class TeamAgent:
     """轻量团队 Agent 基类,适用于单轮角色化任务执行"""
-    
+
     # LLM 采样参数默认值(子类可通过类属性或 __init__ 参数覆盖)
     temperature: float = 0.7
     max_tokens: int = 2048
-    
+
     # 工作流节点提示词的默认模板(子类覆盖;仅 AGENT.md 缺失或未定义小节时兜底)
     default_templates: ClassVar[dict[str, str]] = {}
+
+    # 角色级固定技能依赖(子类覆盖;由 build_skill_block 统一合并注入,
+    # 不走配置穿透、不走 state;aclear_skills 只清 state 不影响此处)。
+    # 例: rtl_verification 设 ["vivado-2025.2"] 始终注入 Vivado Xsim 指引
+    fixed_skills: ClassVar[list[str]] = []
     
     def __init__(
         self,
@@ -227,11 +228,12 @@ class TeamAgent:
         return self._workflow_templates.get(name, self.default_templates.get(name, ""))
     
     def build_skill_block(self, task: str) -> str:
-        """根据任务匹配技能并渲染指引块(内建技能注入能力)。
+        """根据任务匹配技能并渲染指引块(内建技能注入能力)
 
-        复用 tools.skills.SkillManager 的确定性打分匹配 + 指引块渲染,
-        与 graph.common.SkillInjector 行为一致,使 TeamAgent 不再依赖外部
-        注入器:角色节点可直接调用本方法,或把 self 作为 PromptInjector 传入。
+        转发 skmng.core.build_skill_block 实现三来源合并:
+        - fixed_skills(self 类属性,角色级固定依赖)
+        - active_names(当前阶段不透传,Commit 4 由节点函数从 state 取值传入)
+        - match_skills(auto_match_skills 开启时按任务文本自动匹配)
 
         Args:
             task: 用户任务描述(用于技能匹配)
@@ -239,15 +241,16 @@ class TeamAgent:
         Returns:
             技能指引块文本;未命中任何技能或未开启自动匹配时返回空串
         """
-        if not self.auto_match_skills or not task:
-            return ""
-        names = self.skill_manager.match_skills(task)
-        if not names:
-            return ""
-        return self.skill_manager.render_block(sorted(names))
-    
+        return _build_skill_block(
+            self.skill_manager,
+            task,
+            active_names=(),
+            fixed_skills=tuple(self.fixed_skills),
+            auto_match=self.auto_match_skills,
+        )
+
     def inject_into_prompt(self, prompt: str, task: str) -> str:
-        """将技能指引块追加到 prompt 末尾(已含 skill 块时跳过)。
+        """将技能指引块追加到 prompt 末尾(已含 skill 块时跳过)
 
         实现 PromptInjector 协议,工作流节点可直接把 TeamAgent 实例当注入器
         传给节点函数(如 worker_exec),无需 graph 层额外创建 SkillInjector。
@@ -259,12 +262,8 @@ class TeamAgent:
         Returns:
             注入技能指引块后的提示词
         """
-        skill_block = self.build_skill_block(task)
-        if not skill_block:
-            return prompt
-        if "【已加载的技能指引" in prompt:
-            return prompt
-        return f"{prompt}\n\n{skill_block}"
+        block = self.build_skill_block(task)
+        return _inject_into_prompt(prompt, block)
     
     @property
     def metrics(self) -> MetricsCollector:
