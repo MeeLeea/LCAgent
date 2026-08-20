@@ -256,6 +256,7 @@ LangChainAgent/
 │   ├── turn_types.py        # AgentTurnResult（结构化执行结果类型）
 │   ├── tool_error_mw.py     # ToolExecutionErrorMW：工具错误反思纠错中间件
 │   ├── workspace_mw.py      # WorkspaceSecurityMW：工作空间安全中间件
+│   ├── compaction.py        # LangGraph 上下文压缩中间件（增量摘要 + 工具输出 Prune + 保留近期消息）
 │   └── role_sw.py           # 团队角色切换（唯一实现/入口）
 ├── skmng/                    # 技能管理统一包（收敛原 tools/skills+skill_tool+graph/common:SkillInjector+agent/skill_mw+skill_ops+team/base:PromptInjector）
 │   ├── __init__.py          # 聚合导出 SkillManager/SkillInjector/SkillInjectionMW/SkillOps/read_skill/PromptInjector/build_skill_block/inject_into_prompt
@@ -267,7 +268,6 @@ LangChainAgent/
 │   ├── middleware.py        # SkillInjectionMW：agent 层 model 调用前注入中间件（改调 core）
 │   └── ops.py               # SkillOps Mixin：技能加载/清理 + 手动压缩（原 agent/skill_ops.py，供 AgentCore 多继承）
 ├── utils/                   # 通用工具（与业务解耦，供 agent/graph/session 等共用）
-│   ├── compaction.py        # LangGraph 上下文压缩中间件（增量摘要 + 工具输出 Prune）
 │   ├── events.py            # 标准化执行事件模型（AgentEvent / EventType，含节点进度事件）
 │   ├── exceptions.py        # 统一异常层次（LCAgentError 及其子类）
 │   ├── logging_config.py    # 结构化日志（trace_id/thread_id 上下文注入）
@@ -345,7 +345,7 @@ LangChainAgent/
 │   ├── session/             # 会话存储、WorkspaceStore 映射、WorkflowAdapter
 │   ├── team/                # 团队：TeamAgent 基类、角色切换与 LLM 重建
 │   ├── tools/               # 工具：calculator/create_tool/terminal/safety/search/MCP/包装器
-│   └── utils/               # 公共组件：compaction/events/metrics/logging/exceptions
+│   └── utils/               # 公共组件：events/metrics/logging/exceptions
 └── exports/                 # 对话导出目录(运行 export 命令时生成)
 ```
 
@@ -357,7 +357,7 @@ LangChainAgent/
 | [agent/llm_client.py](agent/llm_client.py)               | 从`config/llm_config.json` 读取提供商配置，支持运行时切换提供商/模型                                                                                                                                                                     |
 | [agent/config.py](agent/config.py)                       | 加载`agent/agent_config.json`，统一运行时配置                                                                                                                                                                                            |
 | [memory/](memory/)                                       | 三层架构 Memory 层：`AgentMemory`（checkpointer + Store 基础设施）/ `MemoryContext`（统一工厂，透传 `process_type` / `max_agent_facts`）/ `MemoryManager`（统一门面，含 agent 级召回接口）/ `ThreadMemoryStore`（Store 业务封装，agent 级 + thread 级两级 namespace）/ 读写中间件（防抖 + Fact 抽取 + 两级路由 + prompt 注入）/ per-thread 锁池 |
-| [utils/compaction.py](utils/compaction.py)               | 长上下文压缩中间件：增量摘要 + 工具输出 Prune + 保留近期消息，摘要随 checkpoint 持久化、per-thread 隔离                                                                                                                                    |
+| [agent/compaction.py](agent/compaction.py)               | 长上下文压缩中间件：增量摘要 + 工具输出 Prune + 保留近期消息，摘要随 checkpoint 持久化、per-thread 隔离                                                                                                                                    |
 | [utils/events.py](utils/events.py)                       | 标准化执行事件模型：`AgentEvent`（frozen dataclass）+ `EventType` 枚举（含 TOKEN/TOOL_*/INTERRUPT/ERROR/DONE/NODE_*）+ SSE dict 序列化，三层架构唯一通信载体                                                        |
 | [utils/metrics.py](utils/metrics.py)                     | `MetricsCollector`：线程安全的运行时指标收集（LLM 调用 / 工具执行 / 压缩统计）                                                                                                                                                           |
 | [utils/logging_config.py](utils/logging_config.py)       | 结构化日志：`contextvars` 实现 trace_id / thread_id 异步安全注入                                                                                                                                                                         |
@@ -497,7 +497,7 @@ Agent 有三种执行模式，对应三种不同的交互入口：
 | `models.py`                   | [memory/models.py](memory/models.py)             | `MemoryCategory` / `ThreadFactItem`（含 `scope` 字段：`thread` / `agent`）/ `MemoryInputEvent` / `judge_long_term_memory` 分类判定 |
 | `config.py`                   | [memory/config.py](memory/config.py)             | 运行时参数默认值（buffer 延迟 / 上限 / thread 级 fact 上限 / agent 级 fact 上限 / 召回条数） |
 
-> 除此之外还有一层 **Compaction 压缩中间件**（[utils/compaction.py](utils/compaction.py)）负责控制**单会话内的上下文长度**：当 checkpoint 恢复的消息数超过阈值时，`before_model` 自动把旧消息增量摘要成 `state.summary`（随 checkpoint 持久化、per-thread 隔离），并 Prune 过长的历史工具输出，无需新开 thread。注意这与记忆系统的 `compress` 命令是两回事（前者压缩会话上下文，后者压缩长期记忆 facts）。详见[可观测性与可靠性 → 长上下文压缩中间件](#长上下文压缩中间件compaction)。
+> 除此之外还有一层 **Compaction 压缩中间件**（[agent/compaction.py](agent/compaction.py)）负责控制**单会话内的上下文长度**：当 checkpoint 恢复的消息数超过阈值时，`before_model` 自动把旧消息增量摘要成 `state.summary`（随 checkpoint 持久化、per-thread 隔离），并 Prune 过长的历史工具输出，无需新开 thread。注意这与记忆系统的 `compress` 命令是两回事（前者压缩会话上下文，后者压缩长期记忆 facts）。详见[可观测性与可靠性 → 长上下文压缩中间件](#长上下文压缩中间件compaction)。
 
 ### 两级作用域（agent 级 / thread 级）
 
@@ -1567,7 +1567,7 @@ create_tool(
 
 ### 长上下文压缩中间件（Compaction）
 
-[`utils/compaction.py`](utils/compaction.py) 实现了 `LCAgentCompactionMiddleware`，采用**三层压缩策略**，在会话过长时无损释放大量 token：
+[`agent/compaction.py`](agent/compaction.py) 实现了 `LCAgentCompactionMiddleware`，采用**三层压缩策略**，在会话过长时无损释放大量 token：
 
 1. **增量摘要**：已有 `state.summary` + 旧消息 → 更新后的 summary（避免每次全量重做摘要）
 2. **工具输出 Prune**：把保留区中过长的历史工具输出替换为占位符（`[工具输出已裁剪 N→M 字符] ...`），工具输出常占 70%+ token
@@ -1586,7 +1586,7 @@ create_tool(
 | 自动     | `before_model` / `abefore_model` 中间件         | 消息数 >`max_messages`（默认 50）时触发             |
 | 手动     | `AgentCore.manually_compact()` / `compact` 命令 | `force=True` 跳过阈值，仍需消息数 > `keep_recent` |
 
-`CompactionConfig` 关键参数（`utils/compaction.py`）：
+`CompactionConfig` 关键参数（`agent/compaction.py`）：
 
 | 参数                      | 默认 | 说明                           |
 | ------------------------- | ---- | ------------------------------ |
@@ -2874,7 +2874,7 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 | `tests/llm/test_message_utils.py`      | LLM 异常信息提取：429/5xx/鉴权/未知错误的中文提示                                       |
 | `tests/llm/test_llm_client.py`         | 瞬时错误自动重试：should_retry 判定与重试行为                                           |
 | `tests/llm/test_llm_client_config.py`  | LLMClient 采样参数默认值来源：显式参数 > 全局配置 > DEFAULTS 兜底                      |
-| `tests/utils/test_compaction.py`       | 长上下文压缩中间件：增量摘要、工具输出 Prune、安全切割                                  |
+| `tests/agent/test_compaction.py`       | 长上下文压缩中间件：增量摘要、工具输出 Prune、安全切割                                  |
 | `tests/tools/test_create_tool.py`      | `create_tool` 动态生成工具代码并自动注册到 `tools/__init__.py`                       |
 | `tests/agent/test_graph_rebuild.py`    | Graph 重建：MCP 工具变化触发重建、技能变化不重建                                        |
 | `tests/tools/test_mcp_pool.py`         | `MCPPool` 连接池：连接管理、健康探测、重连（mock 注入）                                |

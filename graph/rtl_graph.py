@@ -37,6 +37,7 @@ from langgraph.graph.message import add_messages
 # 显式导入 RTL 角色模块,触发 @register_agent 装饰器注册(team/__init__.py 未导入)
 import team.rtl_designer.rtl_designer
 import team.rtl_verification.rtl_verification  # noqa: F401
+from agent.compaction import CompactionConfig
 from graph.common import (
     NodeCallback,
     _build_compaction_middleware,
@@ -46,7 +47,6 @@ from graph.common import (
 from graph.registry import register_workflow
 from skmng.injector import SkillInjector
 from team.base import TeamAgent
-from utils.compaction import CompactionConfig
 
 
 # 1. 定义工作流状态

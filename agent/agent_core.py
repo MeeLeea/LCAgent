@@ -34,10 +34,10 @@ from skmng.middleware import SkillInjectionMW
 from skmng.ops import SkillOps
 from tools.mcp_loader import DEFAULT_CONFIG_FILE
 from tools.mcp_pool import MCPPool
-from utils.compaction import CompactionConfig
 from utils.exceptions import AgentStateError
 from utils.metrics import MetricsCollector
 
+from .compaction import CompactionConfig
 from .graph_builder import GraphBuilder
 from .interrupts import Interrupts
 from .mcp_tools import McpTools

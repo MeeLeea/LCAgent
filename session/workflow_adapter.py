@@ -30,10 +30,10 @@ from typing import Any
 
 from langchain_core.messages import AIMessage
 
+from agent.compaction import CompactionConfig
 from graph.common import NodeTrackingHandler, _build_compaction_middleware
 from memory.manager import MemoryManager
 from session.registry import SessionRegistry
-from utils.compaction import CompactionConfig
 from utils.events import AgentEvent
 from utils.logging_config import TraceContext, generate_trace_id
 

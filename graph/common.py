@@ -24,7 +24,7 @@ from typing import Any
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage
 
-from utils.compaction import CompactionConfig, LCAgentCompactionMiddleware
+from agent.compaction import CompactionConfig, LCAgentCompactionMiddleware
 from utils.events import AgentEvent
 from utils.logging_config import TraceContext
 
@@ -399,7 +399,7 @@ async def _arun_with_trace(
 async def _aget_previous_workflow_summary(
     graph,
     config: dict[str, Any],
-    max_chars: int = 6000,
+    max_chars: int = 10000,
 ) -> str:
     """读取指定 thread 上一轮工作流状态并压缩为摘要。
 
