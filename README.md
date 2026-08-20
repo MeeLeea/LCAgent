@@ -2127,7 +2127,7 @@ Designer (输出最终交付文件)
 
 - **异步节点执行 + TOKEN 流式**:`simple.py` / `rtl_graph.py` 的业务节点(`summarize`/`manager_plan`/`worker_exec`/`terminator_final` 及 RTL 各节点)全部为 `async`,直接 `await` 角色类 async 业务方法(`asummarize_context`/`aplan_task`/`aexecute_task`/`afinalize` 等)并透传 LangGraph 注入的 `config: Optional[RunnableConfig]`。`TeamAgent`(`team/base.py`)提供 `ainvoke`(`astream` 聚合)/`astream` 异步能力:`_astream_with_tools` 经 `agent_executor.astream_events(version="v2")` 过滤 `on_chat_model_stream`;`_astream_pure_text` 经 chat model `astream`。因同事件循环执行,callbacks 自然透传——`NodeTrackingHandler.on_chat_model_stream` 捕获 LLM token 增量转发为 `AgentEvent.token`,`WorkflowAdapter._on_token` 闭包补 `thread_id`/`role="assistant"`/`trace_id` 后注入事件流,实现节点执行期间的 TOKEN 级流式(空块自动过滤)。同步业务方法与 `ainvoke_team_agent()` 兼容辅助已移除,统一走 async 链路。
 - **技能注入(SkillInjector)**:`build_simple_workflow` 接受 `skills_dir` / `auto_match_skills` 参数,构建时创建 `skmng.injector.SkillInjector`(改调 `skmng.core.build_skill_block` 三来源合并:角色级 `fixed_skills` + 运行时 `active_names` + 自动匹配)。节点渲染 prompt 后调用 `inject_into_prompt()` 把命中技能(`match_skills(task)`)的指引块追加到 prompt 末尾,已含技能块时跳过(防重复)。`TeamAgent` 亦内建同等能力(`build_skill_block` / `inject_into_prompt` 转发 `skmng.core`,满足 `PromptInjector` 协议)——节点可直接以角色实例为注入器,无需外部构造;`team/factory.py` 会把角色 `agent_config.json` 的 `skills_dir` / `auto_match_skills` / `tool_timeout` 透传给 TeamAgent。
-- **消息通道压缩(compaction)**:`simple.py` / `rtl_graph.py` / `pipline.py` 的 `WorkflowState` / `RTLGraphState` 新增 `messages`(LangGraph `add_messages` 通道)与 `summary` 字段,每个业务节点产出追加一条 `AIMessage`。`build_*_workflow` 接受 `compaction_config` 参数,经 `graph/common.py` 的 `_build_compaction_middleware` + `wrap_node_with_compaction` 包装节点:消息累计超过阈值(默认 50)时调用 `arun_compaction(force=True)` 把历史消息压缩为增量摘要并入 `summary`,防止长会话撑爆上下文。`compaction_config=None` 且 agent 无 LLM 时静默禁用。
+- **消息通道压缩(compaction)**:`simple.py` / `rtl_graph.py` / `pipline.py` 的 `WorkflowState` / `RTLGraphState` 新增 `messages`(LangGraph `add_messages` 通道)与 `summary` 字段,每个业务节点产出追加一条 `AIMessage`。`build_*_workflow` 接受 `compaction_config` 参数,经 `graph/common.py` 的 `_build_compaction_middleware` 构造中间件,再由 `register_nodes` 工厂统一包装节点(`wrap_node_with_compaction`):消息累计超过阈值(默认 50)时调用 `arun_compaction(force=True)` 把历史消息压缩为增量摘要并入 `summary`,防止长会话撑爆上下文。`compaction_config=None` 且 agent 无 LLM 时静默禁用。
 - **跨轮次上下文延续**:统一入口(CLI/API)经 `WorkflowAdapter`(`session/workflow_adapter.py`)执行——运行前从 workflow 专属会话的 checkpoint `messages` 通道读取历史节点产出(预览最多 5 条、每条截断 200 字符,拼为 `【历史执行记录】` 块),叠加 `MemoryManager.recall_text` 的长期记忆,合并注入 `raw_context`,实现多轮运行间的上下文延续。直接调用 `arun_simple_workflow` + `thread_id` 时,旧的 `_aget_previous_workflow_summary()`(checkpoint 摘要)仍可用(已标记 deprecated,待消息通道完全接管后移除)。
 
 ### 状态隔离机制
@@ -2295,12 +2295,20 @@ class MyAgent(TeamAgent):
 
 ```python
 # graph/my_workflow.py
+from graph.common import NodeSpec, register_nodes, _build_compaction_middleware
 from graph.registry import register_workflow
 
 def build_my_workflow(agents: dict) -> StateGraph:
     my_agent = agents["my_agent"]
+    injector = SkillInjector(...)  # 可选:技能注入
+    compaction_mw = _build_compaction_middleware(my_agent)  # None 时禁用压缩
     builder = StateGraph(MyWorkflowState)
-    builder.add_node("step1", lambda state: step1_node(state, my_agent))
+    # 声明式注册:NodeSpec(name, fn, role) 三步合一
+    # 节点函数第二参数统一为 agent: TeamAgent(register_nodes 内部 partial 绑定)
+    register_nodes(
+        builder, agents, injector, compaction_mw,
+        [NodeSpec("step1", step1_node, role="my_agent")],
+    )
     builder.add_edge(START, "step1")
     builder.add_edge("step1", END)
     return builder.compile()
@@ -2314,6 +2322,8 @@ register_workflow(
     description="我的自定义工作流",  # 可选,CLI 列表展示用
 )
 ```
+
+> ⚠️ **必须用 `register_nodes`/`functools.partial` 而非 `lambda` 绑定 agent 实例**:`partial` 保留 async 函数的 coroutine 特征(LangGraph 据此判定节点为异步并 `await`),`lambda` 会返回未 await 的 coroutine 导致 `InvalidUpdateError`。
 
 `graph/registry.py` 底部 `_load_builtin_workflows()` 在 registry 首次 import 时加载 `graph.simple` / `graph.pipline`,触发其自注册;新增内置工作流时在该函数中补充 import 即可。
 
