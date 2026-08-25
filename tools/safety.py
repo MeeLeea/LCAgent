@@ -56,7 +56,8 @@ BUILTIN_CONFIRM = [
     r"\bmv\b", r"\bkill\b", r"\btaskkill\b", r"\bschtasks\b",
     # 解释器可隐藏任意副作用，脚本、内联代码和命令包装器统一要求人工确认
     # ["']? 容忍带引号的完整路径（如 "C:\...\python.exe" -c "..."）
-    r'\b(?:python(?:3)?|py)(?:\.exe)?\b["\']?\s+(?:-[cmo]\b|[^\s;&|]+\.py\b)',
+    # (?<![\w.]) 替代 \b：防止 config.py 末尾的 py 被误匹配为 py 命令
+    r'(?<![\w.])(?:python(?:3)?|py)(?:\.exe)?\b["\']?\s+(?:-[cmo]\b|[^\s;&|]+\.py\b)',
     r'\b(?:powershell|pwsh)(?:\.exe)?\b["\']?[^\r\n]*\s-(?:command|file)\b',
     r'\bcmd(?:\.exe)?\b["\']?\s+/(?:c|k)\b',
     r'\b(?:bash|sh)\b["\']?\s+-c\b',
@@ -630,7 +631,7 @@ def confirm(prompt: str) -> bool:
 def check_workspace_escape(path: str, workspace: str) -> tuple[str, str]:
     """校验路径是否落在 workspace 内，返回解析后的绝对路径 + 校验结果。
 
-    供 WorkspaceSecurityMiddleware 调用，统一复用 safety.py 的路径规范化能力
+    供 WorkspaceSecurityMW 调用，统一复用 safety.py 的路径规范化能力
     （_normalize_path：absolute + realpath + normcase），保证与安全护栏的路径
     处理逻辑一致。
 

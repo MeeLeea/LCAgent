@@ -17,6 +17,8 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
+from utils.events import AgentEvent
+
 logger = logging.getLogger(__name__)
 
 AgentFactory = Callable[[], Any]  # 返回具备 .run(task_text) -> str 接口的对象
@@ -83,11 +85,11 @@ async def _arun_workflow_task(task_id: Any, task_text: str) -> tuple[bool, str]:
         return False, f"未知工作流: {workflow_name}。可用: {', '.join(available)}"
 
     # 节点进度打印（供调度器日志查看执行过程）
-    def _on_node_start(node: str) -> None:
-        logger.info("  ▸ 节点开始: %s", node)
+    def _on_node_start(event: AgentEvent) -> None:
+        logger.info("  ▸ 节点开始: %s", event.node)
 
-    def _on_node_end(node: str) -> None:
-        logger.info("  ✓ 节点完成: %s", node)
+    def _on_node_end(event: AgentEvent) -> None:
+        logger.info("  ✓ 节点完成: %s", event.node)
 
     try:
         result = await arun_workflow_by_name(

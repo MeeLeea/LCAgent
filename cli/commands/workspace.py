@@ -1,7 +1,7 @@
 """工作空间(workspace)管理命令 - 绑定/查看/清除当前会话的工作目录。
 
 绑定后，文件类与执行类工具的路径将被限制在 workspace 内，
-防止 Agent 越权访问其他目录（由 WorkspaceSecurityMiddleware 拦截）。
+防止 Agent 越权访问其他目录（由 WorkspaceSecurityMW 拦截）。
 
 子命令:
     workspace            查看当前会话绑定的 workspace

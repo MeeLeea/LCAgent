@@ -7,7 +7,7 @@ import os
 
 from langchain_core.tools import BaseTool
 
-from agent.config import load_agent_config, resolve_path
+from llm.config import load_agent_config, resolve_path
 from team.base import TeamAgent
 
 
@@ -37,23 +37,32 @@ def build_team_agent(
     # 应用覆盖参数
     config.update(overrides)
     
-    # 解析角色 AGENT.md 绝对路径,供工作流节点提示词模板加载
-    prompt_file = resolve_path(config.get("agent_prompt_file", "agent/AGENT.md"), base_dir)
-
-    content = TeamAgent._read_prompt_file(prompt_file) or ""
-    # 剥离 AGENT.md 中的 ## workflow:* 小节,避免模板混入系统提示词
-    system_prompt, _ = TeamAgent.parse_prompt_sections(content)
+    # 采样参数来源：角色级 agent_config.json（load_agent_config 已合并 DEFAULTS，
+    # 未显式配置时自动落到 DEFAULTS 默认值），overrides 经 config.update 已优先覆盖
+    temperature = config.get("temperature")
+    max_tokens = config.get("max_tokens")
     
-    # 构建轻量 TeamAgent
+    # 解析角色 AGENT.md 绝对路径(system_prompt 与工作流模板均由 TeamAgent 自动解析)
+    prompt_file = resolve_path(config.get("agent_prompt_file", "agent/AGENT.md"), base_dir)
+    # 技能目录(绝对路径):默认 <项目根>/.agents/skills
+    skills_dir = (
+        resolve_path(config["skills_dir"], base_dir) if config.get("skills_dir") else None
+    )
+    
+    # 构建轻量 TeamAgent(system_prompt 由 __init__ 从 prompt_file 自动解析)
     agent = agent_class(
         name=config["name"],
-        system_prompt=system_prompt,
         tools=tools,
         max_iterations=config["max_iterations"],
         verbose=config.get("verbose", False),
         provider=config.get("provider", "zhipu"),
         model=config.get("model"),
         prompt_file=prompt_file,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        tool_timeout=config.get("tool_timeout"),
+        skills_dir=skills_dir,
+        auto_match_skills=config.get("auto_match_skills", True),
     )
     
     return agent

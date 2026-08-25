@@ -41,7 +41,7 @@ class LCAgentState(AgentState):
 
     - ``summary``: 当前 thread 的历史对话摘要，由 CompactionMiddleware 增量更新。
     - ``active_skills``: 当前 thread 手动加载的技能名列表，由
-      ``SkillInjectionMiddleware`` 在 model 调用时读取并注入提示词。
+      ``SkillInjectionMW`` 在 model 调用时读取并注入提示词。
       使用 ``OmitFromInput`` 防止用户输入覆盖此字段。
 
     每个 thread 拥有独立的 state，天然隔离。

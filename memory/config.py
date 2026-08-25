@@ -7,17 +7,20 @@
 from __future__ import annotations
 
 # ── 防抖缓冲 ──
-MEMORY_BUFFER_DELAY_SECONDS = 20
+MEMORY_BUFFER_DELAY_SECONDS = 30
 """防抖缓冲窗口（秒）：同一 thread 的新事件重置计时"""
 
-MEMORY_MAX_BUFFER_MESSAGES = 30
+MEMORY_MAX_BUFFER_MESSAGES = 40
 """单 thread 缓冲区上限（防溢出）"""
 
 # ── 存储容量 ──
-MEMORY_MAX_FACTS_PER_THREAD = 50
+MEMORY_MAX_FACTS_PER_THREAD = 60
 """单 thread 最大 fact 条数（超出 LRU 淘汰）"""
 
-MEMORY_RECALL_LIMIT = 10
+MEMORY_MAX_AGENT_FACTS = 200
+"""agent 级长期记忆最大 fact 条数（超出 LRU 淘汰）"""
+
+MEMORY_RECALL_LIMIT = 20
 """召回长期记忆时的默认条数上限"""
 
 # ── Session 层开关 ──
@@ -29,6 +32,7 @@ CONFIG_KEYS = [
     "memory_buffer_delay_seconds",
     "memory_max_buffer_messages",
     "memory_max_facts_per_thread",
+    "memory_max_agent_facts",
     "memory_recall_limit",
     "session_enable_memory",
 ]
@@ -38,6 +42,7 @@ DEFAULTS = {
     "memory_buffer_delay_seconds": MEMORY_BUFFER_DELAY_SECONDS,
     "memory_max_buffer_messages": MEMORY_MAX_BUFFER_MESSAGES,
     "memory_max_facts_per_thread": MEMORY_MAX_FACTS_PER_THREAD,
+    "memory_max_agent_facts": MEMORY_MAX_AGENT_FACTS,
     "memory_recall_limit": MEMORY_RECALL_LIMIT,
     "session_enable_memory": SESSION_ENABLE_MEMORY,
 }

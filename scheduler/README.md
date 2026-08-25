@@ -390,7 +390,7 @@ schedule_task(
 
 ```python
 from scheduler import TaskStore, SchedulerEngine
-from agent.llm_client import LLMClient
+from llm.llm_client import LLMClient
 from agent import AgentCore
 
 # 1. 准备 agent_factory

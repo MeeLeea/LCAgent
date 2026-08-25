@@ -18,7 +18,7 @@
     └── store.py           # ThreadMemoryStore（Store 业务封装）
 
 依赖关系：
-    memory → agent.events  （消费 AgentEvent 事件流）
+    memory → utils.events  （消费 AgentEvent 事件流）
     memory ← session       （SessionManager 调用 MemoryManager）
     memory ← 入口程序      （main.py / api / scheduler 通过 MemoryContext 创建）
 """

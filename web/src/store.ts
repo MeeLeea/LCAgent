@@ -40,6 +40,20 @@ export function isWorkflowThread(t: { thread_id: string; type?: 'chat' | 'workfl
   return t.type === 'workflow' || t.thread_id.includes('workflow')
 }
 
+/** 从 thread_id 中反解工作流名称（与后端 registry.workflow_name_of 逻辑一致） */
+export function workflowNameOf(threadId: string): string | null {
+  let body: string
+  if (threadId.startsWith('workflow-')) {
+    body = threadId.slice('workflow-'.length)
+  } else if (threadId.includes('-workflow-')) {
+    body = threadId.split('-workflow-', 2)[1]
+  } else {
+    return null
+  }
+  const idx = body.lastIndexOf('-thread-')
+  return idx >= 0 ? body.slice(0, idx) : body
+}
+
 /**
  * 剥离后端写回记忆的 "workflow:" 命令前缀（仅显示层使用，不动原始消息数据，
  * 以保证重新生成/编辑重发时仍携带完整命令）。
@@ -224,6 +238,26 @@ function markStreaming(get: StoreGet, set: StoreSet, threadId: string, streaming
   })
 }
 
+/**
+ * 流结束时补齐未匹配到结果的工具调用：若后端 tool_result 事件的 id 缺失/不匹配
+ * （tool_call 与 tool_result 无法关联），为剩余 toolCall 添加占位 result，
+ * 避免 ToolCallCard 永久停留在"执行中"。
+ */
+function fillMissingToolResults(msg: ChatMessage): ChatMessage {
+  if (!msg.toolCalls || msg.toolCalls.length === 0) return msg
+  const results = msg.toolResults ?? []
+  const have = new Set(results.map((r) => r.id))
+  const missing = msg.toolCalls.filter((c) => c.id && !have.has(c.id))
+  if (missing.length === 0) return msg
+  return {
+    ...msg,
+    toolResults: [
+      ...results,
+      ...missing.map((c) => ({ id: c.id, name: c.name, content: '' })),
+    ],
+  }
+}
+
 /** 构造某线程流的终止处理器（幂等：只执行一次） */
 function makeFinish(get: StoreGet, set: StoreSet, threadId: string) {
   return () => {
@@ -291,10 +325,32 @@ function handleStreamEvent(
   ev: StreamEvent,
   ctx: { finish: () => void },
 ): string {
-  if (terminatedThreads.has(threadId)) return threadId
+  // terminatedThreads 仅阻止终止事件重复处理（done/error/cancelled/interrupt），
+  // 不阻止 tool_result 等迟到事件——代理缓冲可能导致 done 先于 tool_result 到达。
+  const isTerminalEv = ev.type === 'done' || ev.type === 'error' || ev.type === 'cancelled' || ev.type === 'interrupt'
+  if (isTerminalEv && terminatedThreads.has(threadId)) return threadId
   const arr = [...(get().messagesByThread[threadId] ?? [])]
   const lastIndex = arr.length - 1
   const last = arr[lastIndex]
+  // 流式操作目标：最后一条 streaming 的 assistant 消息。
+  // 流已结束（done 已处理）时回退到最后一条带 toolCalls 的 assistant 消息，
+  // 使迟到的 tool_result 仍能配对到正确的回合。
+  let streamIdx = lastIndex
+  for (let i = lastIndex; i >= 0; i--) {
+    if (arr[i].role === 'assistant' && arr[i].streaming) {
+      streamIdx = i
+      break
+    }
+  }
+  if (!arr[streamIdx]?.streaming) {
+    for (let i = lastIndex; i >= 0; i--) {
+      if (arr[i].role === 'assistant' && (arr[i].toolCalls?.length || arr[i].content)) {
+        streamIdx = i
+        break
+      }
+    }
+  }
+  const streamLast = arr[streamIdx]
 
   switch (ev.type) {
     case 'thread_created':
@@ -302,36 +358,53 @@ function handleStreamEvent(
       get().fetchThreads()
       return ev.thread_id
     case 'token':
-      if (!last || last.role !== 'assistant') return threadId
-      arr[lastIndex] = { ...last, content: last.content + ev.content }
+      if (!streamLast || streamLast.role !== 'assistant') return threadId
+      arr[streamIdx] = { ...streamLast, content: streamLast.content + ev.content }
       commitThreadMessages(get, set, threadId, arr)
       break
     case 'tool_call':
-      if (!last || last.role !== 'assistant') return threadId
+      if (!streamLast || streamLast.role !== 'assistant') return threadId
       // ask_human 的 UI 由 INTERRUPT 事件渲染，不添加到 toolCalls 避免重复显示
       if (ev.name === 'ask_human') return threadId
-      arr[lastIndex] = {
-        ...last,
-        toolCalls: [...(last.toolCalls ?? []), { id: ev.id, name: ev.name, args: ev.args }],
+      arr[streamIdx] = {
+        ...streamLast,
+        toolCalls: [...(streamLast.toolCalls ?? []), { id: ev.id, name: ev.name, args: ev.args }],
       }
       commitThreadMessages(get, set, threadId, arr)
       break
     case 'tool_result':
-      if (!last || last.role !== 'assistant') return threadId
+      if (!streamLast || streamLast.role !== 'assistant') return threadId
       // ask_human 的结果不渲染为 ToolCallCard（避免孤儿 toolResult）
       if (ev.name === 'ask_human') return threadId
-      arr[lastIndex] = {
-        ...last,
-        toolResults: [
-          ...(last.toolResults ?? []),
-          { id: ev.id, name: ev.name, content: ev.content },
-        ],
+      {
+        // ID 桥接兜底：后端 tool_result.id 可能因 LangChain 事件
+        // 不含 tool_call_id 而回退为工具名，导致与 tool_call.id 不匹配。
+        // 按 ID 精确匹配 → 按 name+顺序兜底，确保结果能配对到正确的工具卡片。
+        const calls = streamLast.toolCalls ?? []
+        const results = streamLast.toolResults ?? []
+        const hasResult = (cid: string) => results.some((r) => r.id === cid)
+        let matchId = ev.id
+        if (!calls.some((c) => c.id === ev.id)) {
+          const fallback = calls.find(
+            (c) => c.name === ev.name && !hasResult(c.id),
+          )
+          if (fallback) matchId = fallback.id
+        }
+        // 已存在同 ID 结果则替换（迟到的正确结果覆盖空占位）
+        const filtered = results.filter((r) => r.id !== matchId)
+        arr[streamIdx] = {
+          ...streamLast,
+          toolResults: [
+            ...filtered,
+            { id: matchId, name: ev.name, content: ev.content },
+          ],
+        }
       }
       commitThreadMessages(get, set, threadId, arr)
       break
     case 'interrupt': {
-      if (!last || last.role !== 'assistant') return threadId
-      arr[lastIndex] = { ...last, streaming: false, interrupted: true }
+      if (!streamLast || streamLast.role !== 'assistant') return threadId
+      arr[streamIdx] = { ...streamLast, streaming: false, interrupted: true }
       const info: InterruptInfo = { prompt: ev.prompt, choices: ev.choices }
       set((s) => {
         const pendingInterrupts = { ...s.pendingInterrupts, [threadId]: info }
@@ -344,25 +417,25 @@ function handleStreamEvent(
       break
     }
     case 'cancelled':
-      if (!last || last.role !== 'assistant') return threadId
-      arr[lastIndex] = {
-        ...last,
+      if (!streamLast || streamLast.role !== 'assistant') return threadId
+      arr[streamIdx] = {
+        ...fillMissingToolResults(streamLast),
         streaming: false,
-        content: last.content + (last.content ? '\n\n' : '') + `> ⚠️ ${ev.content}`,
+        content: streamLast.content + (streamLast.content ? '\n\n' : '') + `> ⚠️ ${ev.content}`,
       }
       commitThreadMessages(get, set, threadId, arr)
       ctx.finish()
       get().fetchThreads()
       break
     case 'error':
-      if (!last || last.role !== 'assistant') return threadId
+      if (!streamLast || streamLast.role !== 'assistant') return threadId
       // 避免重复追加多条错误
-      if (!last.error) {
-        arr[lastIndex] = {
-          ...last,
+      if (!streamLast.error) {
+        arr[streamIdx] = {
+          ...fillMissingToolResults(streamLast),
           streaming: false,
           error: true,
-          content: last.content + (last.content ? '\n\n' : '') + `> ❌ ${ev.content}`,
+          content: streamLast.content + (streamLast.content ? '\n\n' : '') + `> ❌ ${ev.content}`,
         }
         commitThreadMessages(get, set, threadId, arr)
       }
@@ -378,6 +451,19 @@ function handleStreamEvent(
           },
         })
       }
+      // 节点正常结束且携带产出：在消息区追加节点结果块（与 token 实时流并存）
+      if (ev.status === 'done' && ev.content) {
+        const nodeMsg: ChatMessage = {
+          id: nextId(),
+          role: 'assistant',
+          content: ev.content,
+          nodeName: ev.node,
+          toolCalls: [],
+          toolResults: [],
+          timestamp: Date.now(),
+        }
+        commitThreadMessages(get, set, threadId, [...arr, nodeMsg])
+      }
       break
     }
     case 'workflow_status': {
@@ -386,8 +472,8 @@ function handleStreamEvent(
       break
     }
     case 'done': {
-      if (!last || last.role !== 'assistant') return threadId
-      arr[lastIndex] = { ...last, streaming: false }
+      if (!streamLast || streamLast.role !== 'assistant') return threadId
+      arr[streamIdx] = { ...fillMissingToolResults(streamLast), streaming: false }
       commitThreadMessages(get, set, threadId, arr)
       set((s) => {
         const pendingInterrupts = { ...s.pendingInterrupts }
@@ -582,6 +668,9 @@ export const useStore = create<AppState>((set, get) => ({
       currentThreadId: id,
       pendingInterrupt: s.pendingInterrupts[id] ?? null,
     }))
+    // 同步工作流显示：从 thread_id 反解工作流名称并加载对应图结构
+    const wfName = workflowNameOf(id)
+    if (wfName) void get().fetchWorkflow(wfName, true)
     // 加载该会话绑定的工作空间（输入栏左下角展示）
     void get().fetchWorkspace(id)
     const cached = get().messagesByThread[id]
@@ -696,6 +785,10 @@ export const useStore = create<AppState>((set, get) => ({
     commitThreadMessages(get, set, key, arr)
     markStreaming(get, set, key, true)
 
+    // 清除上一轮的终止标记：finish() 会将 key 加入 terminatedThreads 且永不删除，
+    // 若不清理，后续 handleStreamEvent 的 early return 会丢弃所有事件（需刷新才恢复）
+    terminatedThreads.delete(key)
+
     // 可变线程 key：thread_created 事件后由 handleStreamEvent 返回新值，
     // 确保后续事件（token/done 等）写入正确的线程缓冲。
     // 修复：此前 key 为闭包常量，rebindThread 迁移状态后旧 key 的缓冲被删除，
@@ -790,6 +883,9 @@ export const useStore = create<AppState>((set, get) => ({
     commitThreadMessages(get, set, threadId, arr)
     markStreaming(get, set, threadId, true)
 
+    // 清除上一轮的终止标记，确保恢复流的事件不被阻塞
+    terminatedThreads.delete(threadId)
+
     const finish = makeFinish(get, set, threadId)
     const watchdogHandler = makeWatchdogHandler(get, set, threadId, finish)
     armWatchdog(threadId, watchdogHandler)
@@ -802,6 +898,10 @@ export const useStore = create<AppState>((set, get) => ({
 
   stopStreaming: () => {
     const key = normKey(get().currentThreadId)
+    // 先向后端发送显式停止信号：即使 abort 连接后后端仍在 LLM 阻塞调用
+    // （含 SDK 内部重试）期间，也能立即感知取消并中断生成。
+    const threadId = get().currentThreadId
+    if (threadId) void api.stop(threadId).catch(() => {})
     clearWatchdog(key)
     if (abortFns[key]) abortFns[key]!()
     delete abortFns[key]

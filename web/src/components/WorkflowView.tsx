@@ -36,6 +36,7 @@ const STATUS_TEXT: Record<WorkflowNode['status'], string> = {
   pending: '待执行',
   running: '执行中',
   done: '已完成',
+  error: '出错',
 }
 
 const STATUS_DESC: Record<WorkflowInfo['workflow_status'], string> = {
@@ -125,7 +126,12 @@ export function WorkflowView() {
           <select
             className="workflow-select"
             value={selectValue}
-            onChange={(e) => fetchWorkflow(e.target.value, true)}
+            disabled={isStreaming}
+            onChange={(e) => {
+              const name = e.target.value
+              fetchWorkflow(name, true)
+              newWorkflowThread(name)
+            }}
             title="切换工作流"
           >
             {workflows.map((w) => (

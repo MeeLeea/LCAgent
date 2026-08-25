@@ -17,11 +17,14 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Callable
 from typing import TypeVar
 
 from langchain_core.tools import BaseTool
+
+logger = logging.getLogger(__name__)
 
 # 项目根目录(基于本文件位置计算)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -162,6 +165,7 @@ def build_workflow(name: str, checkpointer=None) -> tuple[object, dict[str, obje
     """
     if name not in WORKFLOWS:
         available = ", ".join(WORKFLOWS.keys())
+        logger.warning("未知工作流: %s（可用: %s）", name, available)
         raise KeyError(f"未知工作流: {name}。可用工作流: {available}")
 
     spec = _get_workflow_spec(name)
@@ -172,6 +176,7 @@ def build_workflow(name: str, checkpointer=None) -> tuple[object, dict[str, obje
     def _build(role: str) -> object:
         if role not in AGENT_REGISTRY:
             available = ", ".join(AGENT_REGISTRY.keys()) or "(空)"
+            logger.warning("未注册的角色: %s（已注册: %s）", role, available)
             raise KeyError(f"未注册的角色: {role}。已注册角色: {available}")
         role_spec = AGENT_REGISTRY[role]
         return build_team_agent(
@@ -188,6 +193,7 @@ def build_workflow(name: str, checkpointer=None) -> tuple[object, dict[str, obje
         missing = [r for r in required_roles if r not in AGENT_REGISTRY]
         if missing:
             available = ", ".join(AGENT_REGISTRY.keys()) or "(空)"
+            logger.warning("工作流 '%s' 缺少角色: %s（已注册: %s）", name, missing, available)
             raise KeyError(f"工作流 '{name}' 缺少角色: {missing}。已注册角色: {available}")
     else:
         roles_to_build = list(AGENT_REGISTRY.keys())
@@ -197,6 +203,7 @@ def build_workflow(name: str, checkpointer=None) -> tuple[object, dict[str, obje
     # 调用工作流构建器(统一接收 agents 字典 + checkpointer)
     graph = spec["builder"](agents, checkpointer=checkpointer)
 
+    logger.info("工作流构建成功: %s（角色: %s）", name, ", ".join(sorted(roles_to_build)))
     return graph, agents
 
 
@@ -240,8 +247,12 @@ async def arun_workflow_by_name(
     task: str,
     checkpointer=None,
     thread_id: str | None = None,
+    workspace_path: str | None = None,
     on_node_start: Callable | None = None,
     on_node_end: Callable | None = None,
+    memory=None,
+    memory_thread_id: str | None = None,
+    is_run_mode: bool = False,
 ) -> dict:
     """
     按名称构建并异步运行工作流(不依赖 CLI 上下文)
@@ -256,8 +267,13 @@ async def arun_workflow_by_name(
             为 None 时无持久化（scheduler 场景默认无持久化）。
         thread_id: 会话线程 ID。为 None 时自动生成；传入显式值时配合
             checkpointer 可实现状态持久化。
+        workspace_path: 会话绑定的工作空间绝对路径。为 None 时工作流内
+            Worker 工具调用不做 workspace 隔离（scheduler 场景默认无绑定）。
         on_node_start: 节点开始回调(可选,接收节点名)
         on_node_end: 节点结束回调(可选,接收节点名)
+        memory: MemoryManager 实例（长期记忆召回与结果沉淀）；None 禁用
+        memory_thread_id: 长期记忆使用的会话线程 ID
+        is_run_mode: 是否运行模式（决定 DONE 事件是否标记为重要记忆）
 
     Returns:
         工作流结果字典(含 "final_answer" 键)
@@ -278,6 +294,10 @@ async def arun_workflow_by_name(
         task,
         raw_context="",  # scheduler 场景无会话记忆
         thread_id=thread_id,
+        workspace_path=workspace_path,
         on_node_start=on_node_start,
         on_node_end=on_node_end,
+        memory=memory,
+        memory_thread_id=memory_thread_id,
+        is_run_mode=is_run_mode,
     )

@@ -27,8 +27,8 @@ import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
-from agent.events import AgentEvent
 from memory.manager import MemoryManager
+from utils.events import AgentEvent
 
 from .registry import SessionRegistry
 
@@ -327,12 +327,17 @@ class SessionManager:
         session_info = await self.session.asummarize()
         cp_info = self._agent.checkpoint_info
         long_term_count = await self._memory.count_facts(sid) if self._memory else 0
+        # agent 级（跨会话共享）长期记忆条数：与 thread 级计数并列展示
+        agent_fact_count = (
+            await self._memory.count_agent_facts() if self._memory else 0
+        )
         return {
             "thread_id": sid,
             "checkpoint_messages": session_info["checkpoint_messages"],
             "checkpoint_backend": cp_info["checkpoint_backend"],
             "checkpoint_file": cp_info["checkpoint_file"],
             "long_term_count": long_term_count,
+            "agent_fact_count": agent_fact_count,
             "total_threads": session_info["total_sessions"],
         }
 
@@ -388,4 +393,35 @@ class SessionManager:
         await self._agent.aclose()
 
 
-__all__ = ["SessionManager"]
+def create_workflow_session_manager(
+    registry: SessionRegistry,
+    memory: MemoryManager | None = None,
+    checkpointer: Any = None,
+) -> SessionManager:
+    """创建 workflow 链路的统一 SessionManager 门面（绑定 WorkflowAdapter）。
+
+    workflow(graph/team 链路)与 AgentCore 会话链路共享同一 SessionRegistry /
+    MemoryManager / checkpointer，使上层（CLI/API）以同一门面无差别调度两类执行体。
+
+    Args:
+        registry: SessionRegistry 实例（与 AgentCore 共享）
+        memory: MemoryManager 实例（与 chat 门面共享同一实例）
+        checkpointer: LangGraph checkpointer；为 None 时 WorkflowAdapter
+                     复用 registry 的 checkpointer
+
+    Returns:
+        绑定 WorkflowAdapter 的 SessionManager（提供 arun_stream / achat_stream /
+        锁 / 记忆提交与沉淀 / 手动压缩等统一能力）
+    """
+    # 延迟导入避免启动期依赖（WorkflowAdapter 依赖 graph 模块）
+    from .workflow_adapter import WorkflowAdapter
+
+    adapter = WorkflowAdapter(
+        registry=registry,
+        memory=memory,
+        checkpointer=checkpointer,
+    )
+    return SessionManager(adapter, memory=memory)
+
+
+__all__ = ["SessionManager", "create_workflow_session_manager"]

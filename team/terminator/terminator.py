@@ -1,10 +1,11 @@
 """
 Terminator Agent - 负责汇总 Worker 执行结果并返回最终答案
 """
+from collections.abc import Sequence
 from typing import ClassVar
 
 from graph.registry import register_agent
-from team.base import TeamAgent
+from team.base import PromptInjector, TeamAgent
 
 
 @register_agent("terminator", "team/terminator/agent_config.json", tools=None)
@@ -26,3 +27,34 @@ class TerminatorAgent(TeamAgent):
             "请汇总以上信息,为用户提供清晰的最终答案。"
         ),
     }
+
+    async def afinalize(
+        self,
+        task: str,
+        plan: str,
+        worker_result: str,
+        context_summary: str = "",
+        injector: PromptInjector | None = None,
+        config: dict | None = None,
+        active_names: Sequence[str] = (),
+    ) -> str:
+        """
+        异步版 finalize(供 terminator_final 节点直接 await 调用)
+
+        模板渲染/技能注入保持同步(纯 CPU),仅 LLM 调用走异步流式
+        (``await self.ainvoke``),token 增量可透传到外层事件流。
+
+        active_names 由节点函数从 state["active_skills"] 取值传入,
+        使手动加载的技能在 graph 节点生效。
+        """
+        template = self.get_template("terminator_final")
+        prompt = self.render_template(
+            template,
+            task=task,
+            plan=plan,
+            worker_result=worker_result,
+            context_summary=context_summary,
+        )
+        if injector is not None:
+            prompt = injector.inject_into_prompt(prompt, task, active_names)
+        return await self.ainvoke(prompt, config)

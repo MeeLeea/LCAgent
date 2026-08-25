@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from agent.logging_config import LOG_LEVELS, get_log_level_name, set_log_level
+from utils.logging_config import LOG_LEVELS, get_log_level_name, set_log_level
 
 from .types import HANDLED, CommandContext, CommandOutcome
 

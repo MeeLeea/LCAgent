@@ -13,15 +13,15 @@ except ImportError:
     pass
 
 from agent import AgentCore
-from agent.config import load_agent_config, resolve_path
-from agent.logging_config import setup_logging
 from cli.cli_menu import select_menu
 from cli.commands import CommandContext, dispatch_command
 from cli.commands.core import show_ready
 from cli.commands.provider import create_llm, select_provider
 from cli.human_input import chat_until_completion, run_structured_until_completion
+from llm.config import load_agent_config, resolve_path
 from memory import MemoryContext
 from tools import safety as safety_module
+from utils.logging_config import setup_logging
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LLM_FILE = os.path.join(BASE_DIR, "config", "llm_config.json")
@@ -44,9 +44,10 @@ async def build_agent(provider: str, process_type: str | None = None) -> tuple[A
         process_type: 进程类型标识(feishu/None)，用于多进程隔离。
                       CLI 模式传 None(单进程不需要隔离)
     """
-    from agent.llm_client import load_providers as list_providers
+    from llm.llm_client import load_providers as list_providers
     
     print(f"\n初始化 {list_providers(LLM_FILE)[provider]['name']} 客户端...")
+    # 采样参数由 LLMClient 内部从全局 agent_config.json 读取，无需外部传参
     llm = create_llm(provider, LLM_FILE)
     print("加载运行时配置...")
     config = load_agent_config(AGENT_CONFIG_FILE)
@@ -58,14 +59,11 @@ async def build_agent(provider: str, process_type: str | None = None) -> tuple[A
     # 三层架构：先创建 MemoryContext（记忆基础设施），再创建 AgentCore（纯执行内核）
     memory_ctx = await MemoryContext.acreate(
         checkpoint_file=CHECKPOINT_FILE,
-        short_term_size=config["memory_size"],
+        short_term_size=config["latest_msg_cnt"],
         use_sqlite=True,
         process_type=process_type,
         llm_getter=lambda: llm,
-        buffer_delay_seconds=config.get("memory_buffer_delay_seconds", 20),
-        max_buffer_messages=config.get("memory_max_buffer_messages", 30),
-        max_facts_per_thread=config.get("memory_max_facts_per_thread", 50),
-        recall_limit=config.get("memory_recall_limit", 10),
+        # 记忆链路参数由 memory/config.py 统一管理，不再经 agent_config.json 配置
     )
     agent = await AgentCore.acreate(
         llm_client=llm,
@@ -82,6 +80,7 @@ async def build_agent(provider: str, process_type: str | None = None) -> tuple[A
         agent_prompt_file=agent_prompt_file,
         max_execution_history=config.get("max_execution_history", 100),
         tool_timeout=config.get("tool_timeout", 120),
+        short_term_size=config.get("latest_msg_cnt", 10),
         checkpointer=memory_ctx.checkpointer,
         store=memory_ctx.store,
         extra_middleware=[memory_ctx.read_middleware],
@@ -98,8 +97,14 @@ async def build_agent(provider: str, process_type: str | None = None) -> tuple[A
 
 def make_context(agent: AgentCore) -> CommandContext:
     """组装命令分发器所需的运行时依赖。"""
-    from agent.llm_client import load_providers as list_providers
-    
+    from llm.llm_client import load_providers as list_providers
+    from session.manager import create_workflow_session_manager
+
+    # workflow 链路统一门面：与 chat 门面共享 SessionRegistry / MemoryManager，
+    # 使 workflow 命令经同一套锁/记忆/事件流设施执行。
+    mm = getattr(agent.session_manager, "memory", None)
+    workflow_sm = create_workflow_session_manager(agent.session, memory=mm)
+
     # 命令模块只依赖该上下文，便于在测试中替换输入、菜单、LLM 和安全后端。
     return CommandContext(
         agent=agent,
@@ -114,6 +119,7 @@ def make_context(agent: AgentCore) -> CommandContext:
         run_structured_until_completion=run_structured_until_completion,
         chat_until_completion=chat_until_completion,
         safety_backend=safety_module,
+        workflow_sm=workflow_sm,
     )
 
 
