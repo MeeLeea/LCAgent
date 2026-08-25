@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from langchain_core.messages import AIMessage, SystemMessage
 
 from agent.agent_core import AgentCore
-from utils.compaction import CompactionConfig, LCAgentCompactionMiddleware
+from agent.compaction import CompactionConfig, LCAgentCompactionMiddleware
 
 # ============ 辅助：创建最小化 AgentCore 测试实例 ============
 

@@ -23,7 +23,6 @@ workspace 隔离说明：
 """
 from __future__ import annotations
 
-from functools import partial
 from typing import Annotated, Optional, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage
@@ -31,15 +30,17 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
+from agent.compaction import CompactionConfig
 from graph.common import (
     NodeCallback,
-    SkillInjector,
+    NodeSpec,
     _build_compaction_middleware,
     arun_compiled_workflow,
-    wrap_node_with_compaction,
+    register_nodes,
 )
 from graph.registry import register_workflow
-from utils.compaction import CompactionConfig
+from skmng.injector import SkillInjector
+from team.base import TeamAgent
 
 
 # 1. 定义工作流状态
@@ -61,7 +62,7 @@ class WorkflowState(TypedDict, total=False):
 # 2. 节点函数(提示词模板由各角色 TeamAgent 懒加载,节点需要时调用 get_template)
 async def summarize_context(
     state: WorkflowState,
-    manager,
+    agent: TeamAgent,
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 见 worker_exec_node 注释
 ) -> WorkflowState:
@@ -73,26 +74,26 @@ async def summarize_context(
     config 透传(含 callbacks):使 summarize 的 LLM token 增量可流出到外层事件流。
     """
     raw = state.get("raw_context", "")
-    result = await manager.asummarize_context(raw, config)
+    result = await agent.asummarize_context(raw, config)
     return {"context_summary": result, "messages": [AIMessage(content=result)]}
 
 
 async def manager_plan_node(
     state: WorkflowState,
-    manager,
+    agent: TeamAgent,
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 见 worker_exec_node 注释
 ) -> WorkflowState:
     """Manager 拆解任务,生成执行计划(结合记忆上下文摘要)"""
     task = state["task"]
     summary = state.get("context_summary", "")
-    result = await manager.aplan_task(task, summary, injector, config)
+    result = await agent.aplan_task(task, summary, injector, config)
     return {"plan": result, "messages": [AIMessage(content=result)]}
 
 
 async def worker_exec_node(
     state: WorkflowState,
-    worker,
+    agent: TeamAgent,
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 见下文:须用 Optional 写法,LangGraph 注解判定仅接受该字符串形态
 ) -> WorkflowState:
@@ -108,13 +109,13 @@ async def worker_exec_node(
     'RunnableConfig | None' 字符串不匹配会导致 config 静默不注入。
     """
     plan = state["plan"]
-    result = await worker.aexecute_task(plan, injector, config)
+    result = await agent.aexecute_task(plan, injector, config)
     return {"worker_result": result, "messages": [AIMessage(content=result)]}
 
 
 async def terminator_final_node(
     state: WorkflowState,
-    terminator,
+    agent: TeamAgent,
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 见 worker_exec_node 注释
 ) -> WorkflowState:
@@ -123,7 +124,7 @@ async def terminator_final_node(
     plan = state["plan"]
     worker_result = state["worker_result"]
     summary = state.get("context_summary", "")
-    result = await terminator.afinalize(task, plan, worker_result, summary, injector, config)
+    result = await agent.afinalize(task, plan, worker_result, summary, injector, config)
     return {"final_answer": result, "messages": [AIMessage(content=result)]}
 
 
@@ -152,8 +153,6 @@ def build_simple_workflow(
         编译好的 LangGraph StateGraph
     """
     manager = agents["manager"]
-    worker = agents["worker"]
-    terminator = agents["terminator"]
 
     # 技能注入器:节点渲染 prompt 时追加匹配的技能指引块
     injector = SkillInjector(
@@ -166,14 +165,22 @@ def build_simple_workflow(
 
     builder = StateGraph(WorkflowState)
 
-    # 添加节点(使用 partial 绑定 agent 实例;提示词模板由节点内懒加载)
-    # 注意:必须用 functools.partial 而非 lambda —— partial 保留 async 函数
-    # 的 coroutine 特征(LangGraph 据此判定节点为异步并 await),lambda 会返回
-    # 未 await 的 coroutine 导致 InvalidUpdateError
-    builder.add_node("summarize", wrap_node_with_compaction(partial(summarize_context, manager=manager, injector=injector), compaction_mw))
-    builder.add_node("manager_plan", wrap_node_with_compaction(partial(manager_plan_node, manager=manager, injector=injector), compaction_mw))
-    builder.add_node("worker_exec", wrap_node_with_compaction(partial(worker_exec_node, worker=worker, injector=injector), compaction_mw))
-    builder.add_node("terminator_final", wrap_node_with_compaction(partial(terminator_final_node, terminator=terminator, injector=injector), compaction_mw))
+    # 添加节点(声明式 NodeSpec 表:partial 绑定 + compaction 包装 + add_node 三步合一)
+    # 注意:register_nodes 内部用 functools.partial 绑定 agent 实例;提示词模板由节点内懒加载
+    # partial 保留 async 函数的 coroutine 特征(LangGraph 据此判定节点为异步并 await),
+    # lambda 会返回未 await 的 coroutine 导致 InvalidUpdateError
+    register_nodes(
+        builder,
+        agents,
+        injector,
+        compaction_mw,
+        [
+            NodeSpec("summarize", summarize_context, role="manager"),
+            NodeSpec("manager_plan", manager_plan_node, role="manager"),
+            NodeSpec("worker_exec", worker_exec_node, role="worker"),
+            NodeSpec("terminator_final", terminator_final_node, role="terminator"),
+        ],
+    )
 
     # 添加边: START → summarize → manager_plan → worker_exec → terminator_final → END
     builder.add_edge(START, "summarize")

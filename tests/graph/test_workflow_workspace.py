@@ -80,7 +80,7 @@ def test_real_langgraph_injects_config_into_worker_exec_node():
     worker = CapturingWorker()
     graph = StateGraph(WfState)
     graph.add_node(
-        "worker_exec", partial(worker_exec_node, worker=worker, injector=None)
+        "worker_exec", partial(worker_exec_node, agent=worker, injector=None)
     )
     graph.add_edge(START, "worker_exec")
     graph.add_edge("worker_exec", END)

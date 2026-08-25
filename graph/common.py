@@ -1,10 +1,9 @@
 """
-工作流共享组件 - 节点进度跟踪、异步执行、技能注入、跨轮次记忆压缩与会话化
+工作流共享组件 - 节点进度跟踪、异步执行、跨轮次记忆压缩与会话化
 
 从 graph/simple.py 提取的公共逻辑，供所有工作流复用：
 - NodeCallback 类型别名
 - NodeTrackingHandler 节点级进度回调(TOKEN 级流式)
-- SkillInjector 节点 prompt 层技能注入（复用 tools.skills.SkillManager）
 - arun_compiled_workflow 通用异步工作流运行器（含跨轮次记忆压缩）
 - compaction 基础设施：节点级压缩 wrapper（消息通道超阈值时增量摘要）
 
@@ -19,13 +18,15 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage
+from langgraph.graph import StateGraph
 
-from utils.compaction import CompactionConfig, LCAgentCompactionMiddleware
+from agent.compaction import CompactionConfig, LCAgentCompactionMiddleware
 from utils.events import AgentEvent
 from utils.logging_config import TraceContext
 
@@ -141,67 +142,6 @@ class NodeTrackingHandler(BaseCallbackHandler):
             self.on_token(AgentEvent.token(text=content))
 
 
-class SkillInjector:
-    """工作流技能注入器 - 在节点 prompt 层注入技能指引块。
-
-    不走 AgentMiddleware（那是 create_agent 内部机制），而是复用
-    tools.skills.SkillManager 的确定性打分匹配 + 指引块渲染：
-
-    1. match_skills(task): 按任务文本与技能 name/description 的关键词重叠打分
-    2. render_block(names): 把命中技能正文渲染为可注入 system prompt 的指引块
-
-    工作流节点渲染 prompt 后，将 ``build_skill_block(task)`` 的结果追加到
-    prompt 末尾（或作为 ``{skills}`` 占位符替换），实现技能注入。
-
-    Args:
-        skills_dir: 技能目录路径；为 None 时使用默认目录（<项目根>/.agents/skills）
-        auto_match: 是否开启自动匹配（False 时始终返回空块，需手动指定技能名）
-    """
-
-    def __init__(
-        self,
-        skills_dir: str | None = None,
-        auto_match: bool = True,
-    ) -> None:
-        from tools.skills import SkillManager, default_skills_dir
-
-        self.skill_manager = SkillManager(skills_dir or default_skills_dir())
-        self.auto_match = auto_match
-
-    def build_skill_block(self, task: str) -> str:
-        """根据任务匹配技能并渲染指引块。
-
-        Args:
-            task: 用户任务描述（用于技能匹配）
-
-        Returns:
-            技能指引块文本；未命中任何技能或未开启自动匹配时返回空串
-        """
-        if not self.auto_match or not task:
-            return ""
-        names = self.skill_manager.match_skills(task)
-        if not names:
-            return ""
-        return self.skill_manager.render_block(sorted(names))
-
-    def inject_into_prompt(self, prompt: str, task: str) -> str:
-        """将技能指引块追加到 prompt 末尾（已含 skill 块时跳过）。
-
-        Args:
-            prompt: 渲染后的节点提示词
-            task: 用户任务描述
-
-        Returns:
-            注入技能指引块后的提示词
-        """
-        skill_block = self.build_skill_block(task)
-        if not skill_block:
-            return prompt
-        if "【已加载的技能指引" in prompt:
-            return prompt
-        return f"{prompt}\n\n{skill_block}"
-
-
 def _build_compaction_middleware(
     agent: Any,
     config: CompactionConfig | None = None,
@@ -251,6 +191,48 @@ def wrap_node_with_compaction(node_fn: Callable, mw: LCAgentCompactionMiddleware
     if mw is None:
         return node_fn
     return partial(_compaction_wrapper, node_fn, mw)
+
+
+@dataclass
+class NodeSpec:
+    """声明式节点规格:把「节点名 + 节点函数 + 绑定哪个角色」声明成数据。
+
+    所有节点函数第二参数已统一为 ``agent: TeamAgent``,partial 绑定固定为
+    ``agent=agents[role]``,无需再额外指定绑定名,role 只作 agents 字典索引键。
+
+    Attributes:
+        name: 节点名(LangGraph builder.add_node 的第一参数)
+        fn: 节点函数(未绑定,统一签名 ``async def fn(state, agent, injector=None, config=None)``)
+        role: agents 字典中该角色实例的键名(如 "manager"/"architect"/"rtl_designer")
+    """
+
+    name: str
+    fn: Callable
+    role: str
+
+
+def register_nodes(
+    builder: StateGraph,
+    agents: dict[str, Any],
+    injector: Any,
+    mw: LCAgentCompactionMiddleware | None,
+    specs: list[NodeSpec],
+) -> None:
+    """批量注册带 compaction 包装的节点。
+
+    将「partial 绑定 agent/injector → wrap_node_with_compaction → add_node」
+    三步合一,避免每个节点重复写一长串模板代码。调用方只需提供声明式 NodeSpec 表。
+
+    Args:
+        builder: 待注册节点的 LangGraph StateGraph 构造器
+        agents: 角色实例字典,``agents[spec.role]`` 取出该节点绑定的 TeamAgent
+        injector: 技能注入器(SkillInjector),绑定到节点函数的 injector= 参数
+        mw: compaction 中间件;None 时 wrap_node_with_compaction 原样返回节点
+        specs: 节点规格列表,顺序即注册顺序(与边添加顺序无关)
+    """
+    for spec in specs:
+        bound = partial(spec.fn, agent=agents[spec.role], injector=injector)
+        builder.add_node(spec.name, wrap_node_with_compaction(bound, mw))
 
 
 async def _compaction_wrapper(
@@ -461,7 +443,7 @@ async def _arun_with_trace(
 async def _aget_previous_workflow_summary(
     graph,
     config: dict[str, Any],
-    max_chars: int = 6000,
+    max_chars: int = 10000,
 ) -> str:
     """读取指定 thread 上一轮工作流状态并压缩为摘要。
 

@@ -13,7 +13,7 @@ def test_compaction_retains_recent_messages_in_new_thread_state():
     # Given: the current thread has more messages than the compaction threshold.
     # Updated: tests manually_compact (replaces old _acompact_if_needed)
     from agent.agent_core import AgentCore
-    from utils.compaction import CompactionConfig, LCAgentCompactionMiddleware
+    from agent.compaction import CompactionConfig, LCAgentCompactionMiddleware
 
     messages = [HumanMessage(content=f"message-{idx}") for idx in range(8)]
     state_updates = []
@@ -85,7 +85,7 @@ def test_compaction_does_not_change_thread_when_summary_fails():
     # Given: compaction is needed but summarization returns no summary.
     # Updated: tests manually_compact with LLM failure
     from agent.agent_core import AgentCore
-    from utils.compaction import CompactionConfig, LCAgentCompactionMiddleware
+    from agent.compaction import CompactionConfig, LCAgentCompactionMiddleware
 
     messages = [HumanMessage(content=f"message-{idx}") for idx in range(8)]
 

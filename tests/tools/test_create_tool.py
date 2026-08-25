@@ -13,7 +13,7 @@ VALID_ARGS = {
     "tool_logic": "with open(file_path, 'r', encoding=encoding) as f:\n    result = f.read()",
 }
 
-INIT_STUB = """from .skill_tool import read_skill
+INIT_STUB = """from skmng.tool import read_skill
 from .scheduler_tool import schedule_task
 
 all_tools = [

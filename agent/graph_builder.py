@@ -16,10 +16,10 @@ import logging
 from langchain.agents import create_agent
 
 from llm.llm_client import LLMClient
+from skmng.middleware import SkillInjectionMW
 from tools.tool_wrapper import wrap_tools_with_timeout
-from utils.compaction import LCAgentCompactionMiddleware, LCAgentState
 
-from .skill_mw import SkillInjectionMW
+from .compaction import LCAgentCompactionMiddleware, LCAgentState
 from .tool_error_mw import ToolExecutionErrorMW
 from .workspace_mw import WorkspaceSecurityMW
 

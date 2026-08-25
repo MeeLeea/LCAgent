@@ -1,6 +1,7 @@
 """
 Manager Agent - 负责拆解任务并生成执行计划
 """
+from collections.abc import Sequence
 from typing import ClassVar
 
 from graph.registry import register_agent
@@ -60,15 +61,19 @@ class ManagerAgent(TeamAgent):
         context_summary: str = "",
         injector: PromptInjector | None = None,
         config: dict | None = None,
+        active_names: Sequence[str] = (),
     ) -> str:
         """
         异步版 plan_task(供 manager_plan 节点直接 await 调用)
 
         模板渲染/技能注入保持同步(纯 CPU),仅 LLM 调用走异步流式
         (``await self.ainvoke``),token 增量可透传到外层事件流。
+
+        active_names 由节点函数从 state["active_skills"] 取值传入,
+        使手动加载的技能在 graph 节点生效。
         """
         template = self.get_template("manager_plan")
         prompt = self.render_template(template, task=task, context_summary=context_summary)
         if injector is not None:
-            prompt = injector.inject_into_prompt(prompt, task)
+            prompt = injector.inject_into_prompt(prompt, task, active_names)
         return await self.ainvoke(prompt, config)

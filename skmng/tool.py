@@ -1,13 +1,13 @@
 """
 技能阅读工具 - 让 Agent 在任务中自行读取本地技能(SKILL.md)的指引
 
-依赖 tools/skills.py 的 SkillManager。
+依赖 skmng.manager 的 SkillManager。
 """
 from typing import Any
 
 from langchain_core.tools import tool
 
-from .skills import SkillManager, default_skills_dir
+from skmng.manager import SkillManager, default_skills_dir
 
 
 @tool

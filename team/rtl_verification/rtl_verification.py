@@ -1,6 +1,7 @@
 """
 Verification Agent - 数字芯片 RTL 验证工程师,负责验证需求梳理、验证计划、Testbench/UVM 开发与 Vivado Xsim 仿真
 """
+from collections.abc import Sequence
 from typing import ClassVar
 
 from graph.registry import register_agent
@@ -13,14 +14,16 @@ class VerificationAgent(TeamAgent):
     验证师 Agent,负责 RTL 验证、测试用例设计、覆盖率分析与 bug 定位
 
     继承 TeamAgent 轻量基类,纯文本推理模式(不使用工具);各工作流方法
-    渲染对应 `## workflow:*` 小节 → 可选技能注入 → 强制注入 vivado-2025.2
-    技能指引 → 异步 LLM 调用(TOKEN 级流式)。
+    渲染对应 `## workflow:*` 小节 → 可选技能注入(fixed_skills 始终合并
+    vivado-2025.2) → 异步 LLM 调用(TOKEN 级流式)。
     """
 
     # 验证环境固定依赖 Vivado Xsim(AGENT.md 环境约束:当前仿真环境优先使用
     # Vivado Xsim),始终注入 vivado-2025.2 技能指引,不依赖任务关键词自动匹配,
     # 保证 Vivado 工程创建 / 仿真运行 / dump 波形的 TCL 规范始终可被遵循。
-    _VIVADO_SKILL_NAME: ClassVar[str] = "vivado-2025.2"
+    # 经 TeamAgent.fixed_skills 类属性由 build_skill_block 统一合并注入,
+    # 无需特殊函数、不走配置穿透、aclear_skills 只清 state 不影响此处。
+    fixed_skills: ClassVar[list[str]] = ["vivado-2025.2"]
 
     # 工作流节点提示词的默认模板(仅 AGENT.md 缺失或未定义小节时兜底)
     default_templates: ClassVar[dict[str, str]] = {
@@ -60,49 +63,26 @@ class VerificationAgent(TeamAgent):
         task: str,
         injector: PromptInjector | None,
         config: dict | None = None,
+        active_names: Sequence[str] = (),
     ) -> str:
         """RTL 验证工作流方法异步通用执行体:模板渲染/技能注入同步,LLM 调用异步流式
 
-        与同步版一致,始终强制注入 vivado-2025.2 技能指引(验证环境固定依赖)。
+        vivado-2025.2 技能指引经 self.fixed_skills 类属性由 build_skill_block
+        统一合并注入(注入器走 self.inject_into_prompt 时合并;即使外部 injector
+        传入,self.fixed_skills 在 self.build_skill_block 内仍生效)。
+        active_names 由节点函数从 state["active_skills"] 取值传入。
         """
         template = self.get_template(template_name)
         prompt = self.render_template(template, task=task)
         if injector is not None:
-            prompt = injector.inject_into_prompt(prompt, task)
-        prompt = self._inject_vivado_skill(prompt)
+            prompt = injector.inject_into_prompt(prompt, task, active_names)
         return await self.ainvoke(prompt, config)
 
-    async def aspec_design_task(self, task: str, injector: PromptInjector | None = None, config: dict | None = None) -> str:
+    async def aspec_design_task(self, task: str, injector: PromptInjector | None = None, config: dict | None = None, active_names: Sequence[str] = ()) -> str:
         """异步版 spec_design_task(供 spec_design 节点调用)"""
-        return await self._arun_rtl_design_task_async("spec_design", task, injector, config)
+        return await self._arun_rtl_design_task_async("spec_design", task, injector, config, active_names)
 
-    async def averilog_design_task(self, task: str, injector: PromptInjector | None = None, config: dict | None = None) -> str:
+    async def averilog_design_task(self, task: str, injector: PromptInjector | None = None, config: dict | None = None, active_names: Sequence[str] = ()) -> str:
         """异步版 verilog_design_task(供 verilog_design 节点调用)"""
-        return await self._arun_rtl_design_task_async("verilog_design", task, injector, config)
-
-    def _inject_vivado_skill(self, prompt: str, skills_dir: str | None = None) -> str:
-        """
-        强制注入 vivado-2025.2 技能指引块,已含时跳过(防重复)
-
-        vivado-2025.2 是验证环境的固定技能依赖(AGENT.md 环境约束:当前仿真环境
-        优先使用 Vivado Xsim),不以任务关键词自动匹配结果为准,始终注入其指引,
-        保证 Vivado 工程创建 / 仿真运行 / dump 波形的 TCL 规范始终可被遵循。
-
-        Args:
-            prompt: 渲染后的节点提示词
-            skills_dir: 技能目录路径;为 None 时使用默认目录(<项目根>/.agents/skills)
-
-        Returns:
-            注入 vivado-2025.2 技能指引块后的提示词;技能缺失时原样返回
-        """
-        if f"### 技能: {self._VIVADO_SKILL_NAME}" in prompt:
-            return prompt
-        from tools.skills import SkillManager, default_skills_dir
-
-        block = SkillManager(skills_dir or default_skills_dir()).render_block(
-            [self._VIVADO_SKILL_NAME]
-        )
-        if not block:
-            return prompt
-        return f"{prompt}\n\n{block}"
+        return await self._arun_rtl_design_task_async("verilog_design", task, injector, config, active_names)
 
