@@ -161,7 +161,7 @@ def test_resume_structured_invokes_command_resume_with_same_thread_config():
     assert config == {"configurable": {"thread_id": "thread-123"}, "recursion_limit": 25}
 
 
-def test_abuild_resume_command_maps_to_first_interrupt_id_when_multiple_pending():
+def test_abuild_resume_command_maps_bare_payload_to_all_pending_interrupt_ids():
     # Given: 图上同时挂起两个并行 interrupt（LangGraph 要求恢复时按 id 映射）。
     from agent.agent_core import AgentCore
 
@@ -190,9 +190,12 @@ def test_abuild_resume_command_maps_to_first_interrupt_id_when_multiple_pending(
         )
     )
 
-    # Then: 恢复值按第一个 pending interrupt 的 id 映射，避免 LangGraph 报错。
+    # Then: 同一答案批量应用到所有 pending interrupt，实现并行中断一次恢复。
     assert isinstance(command, Command)
-    assert command.resume == {"interrupt-a": {"choice_id": "approve"}}
+    assert command.resume == {
+        "interrupt-a": {"choice_id": "approve"},
+        "interrupt-b": {"choice_id": "approve"},
+    }
 
 
 def test_abuild_resume_command_keeps_raw_payload_for_single_interrupt():
@@ -299,12 +302,15 @@ def test_aresume_structured_resumes_with_interrupt_id_mapping():
     # When: 裸值 payload 恢复多中断会话。
     turn = asyncio.run(core.aresume_structured({"choice_id": "approve"}))
 
-    # Then: resume 按第一个 interrupt id 映射，图正常恢复执行。
+    # Then: resume 按所有 pending interrupt id 映射，图正常恢复执行。
     assert turn.status == "completed"
     assert turn.output == "resumed"
     command, _config = calls[0]
     assert isinstance(command, Command)
-    assert command.resume == {"interrupt-a": {"choice_id": "approve"}}
+    assert command.resume == {
+        "interrupt-a": {"choice_id": "approve"},
+        "interrupt-b": {"choice_id": "approve"},
+    }
 
 
 def test_cli_helper_renders_and_resumes_until_completion():

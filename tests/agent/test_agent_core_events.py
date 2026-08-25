@@ -11,7 +11,7 @@
 - 直接调 _arun_graph_events 收集 AgentEvent 列表
 
 注意：工具错误的 LLM 反思纠错（转 ToolMessage(status="error")）由
-ToolExecutionErrorMiddleware 负责（见 test_tool_error_middleware.py），
+ToolExecutionErrorMW 负责（见 test_tool_error_mw.py），
 本文件只覆盖事件流映射。
 """
 from __future__ import annotations

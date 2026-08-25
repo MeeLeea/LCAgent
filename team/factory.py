@@ -44,6 +44,10 @@ def build_team_agent(
     
     # 解析角色 AGENT.md 绝对路径(system_prompt 与工作流模板均由 TeamAgent 自动解析)
     prompt_file = resolve_path(config.get("agent_prompt_file", "agent/AGENT.md"), base_dir)
+    # 技能目录(绝对路径):默认 <项目根>/.agents/skills
+    skills_dir = (
+        resolve_path(config["skills_dir"], base_dir) if config.get("skills_dir") else None
+    )
     
     # 构建轻量 TeamAgent(system_prompt 由 __init__ 从 prompt_file 自动解析)
     agent = agent_class(
@@ -56,6 +60,9 @@ def build_team_agent(
         prompt_file=prompt_file,
         temperature=temperature,
         max_tokens=max_tokens,
+        tool_timeout=config.get("tool_timeout"),
+        skills_dir=skills_dir,
+        auto_match_skills=config.get("auto_match_skills", True),
     )
     
     return agent

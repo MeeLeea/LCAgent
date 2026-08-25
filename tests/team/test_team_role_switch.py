@@ -1,11 +1,11 @@
-"""测试团队角色切换：rebuild_agent_from_team_dir 单一入口。
+"""测试团队角色切换：role_sw.arebuild_agent_from_team_dir 单一入口。
 
 覆盖三件事：
 1. _locate_team_agent_dir 扫描 team/ 精确定位角色目录，未命中抛 KeyError。
-2. arebuild_from_team_dir 在仅提示词变化与 provider/model 变化两种场景下，
+2. arebuild_agent_from_team_dir 在仅提示词变化与 provider/model 变化两种场景下，
    都调用 _arebuild_agent_executor 重建 executor（system_prompt 已改为静态字符串，
    旧的仅更新提示词路径已移除，两条路径统一走 _arebuild_agent_executor）。
-3. arebuild_from_team_dir 在 provider/model 变化时重建 LLMClient + executor。
+3. arebuild_agent_from_team_dir 在 provider/model 变化时重建 LLMClient + executor。
 
 断言约定：LLM 相关的预期值从 team/<角色>/agent_config.json 动态读取，
 不硬编码具体 provider/model 名——验证的是"切换后 LLM 与角色配置一致"
@@ -117,7 +117,7 @@ def test_rebuild_calls_agent_executor_for_prompt_only_and_llm_change(monkeypatch
     core._arebuild_agent_executor = counting_rebuild_prompt_only
 
     # When: 切换到 manager 角色（provider/model 与当前一致 → 仅重建 executor）
-    asyncio.run(core.arebuild_from_team_dir("manager"))
+    asyncio.run(role_sw.arebuild_agent_from_team_dir(core, "manager"))
 
     # Then: 仅提示词变化也重建了 executor
     assert rebuild_calls_prompt_only == 1
@@ -145,7 +145,7 @@ def test_rebuild_calls_agent_executor_for_prompt_only_and_llm_change(monkeypatch
     monkeypatch.setattr(role_sw, "LLMClient", fake_llm_ctor_change)
 
     # When: 切换到 manager（provider 与当前不同 → 触发 LLM 重建）
-    asyncio.run(core2.arebuild_from_team_dir("manager"))
+    asyncio.run(role_sw.arebuild_agent_from_team_dir(core2, "manager"))
 
     # Then: LLM 变化也重建了 executor，且 LLMClient 被按角色配置重建
     assert rebuild_calls_llm_change == 1
@@ -179,7 +179,7 @@ def test_rebuild_switches_llm_when_provider_changes(monkeypatch):
     monkeypatch.setattr(role_sw, "LLMClient", fake_llm_ctor)
 
     # When: 切换到 manager（provider 与当前不同 → 触发 LLM 重建）
-    asyncio.run(core.arebuild_from_team_dir("manager"))
+    asyncio.run(role_sw.arebuild_agent_from_team_dir(core, "manager"))
 
     # Then: 重建了 executor，LLMClient 按角色配置重建（不绑定具体 provider 名）
     assert rebuild_calls == 1
@@ -211,7 +211,7 @@ def test_rebuild_applies_role_sampling_params(monkeypatch):
     monkeypatch.setattr(role_sw, "LLMClient", fake_llm_ctor)
 
     # When: 切换到 worker 角色
-    asyncio.run(core.arebuild_from_team_dir("worker"))
+    asyncio.run(role_sw.arebuild_agent_from_team_dir(core, "worker"))
 
     # Then: 重建的 LLMClient 携带角色级采样参数
     assert constructed["provider"] == worker_llm["provider"]

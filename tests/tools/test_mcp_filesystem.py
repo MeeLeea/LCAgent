@@ -1,6 +1,6 @@
 """MCP-Filesystem 工作空间隔离集成测试。
 
-验证 MCP-Filesystem server 加载的文件工具经 WorkspaceSecurityMiddleware
+验证 MCP-Filesystem server 加载的文件工具经 WorkspaceSecurityMW
 拦截后，实现 per-session workspace 隔离：
 - 两会话绑定不同 workspace，文件操作互不可见
 - 路径逃逸被中间件拦截
@@ -140,9 +140,9 @@ class TestMCPFilesystemWorkspaceIsolation:
         self, mcp_pool, workspace_a
     ):
         """中间件把相对路径解析为 workspace 内绝对路径后传给 MCP 工具。"""
-        from agent.workspace_middleware import WorkspaceSecurityMiddleware
+        from agent.workspace_mw import WorkspaceSecurityMW
 
-        mw = WorkspaceSecurityMiddleware()
+        mw = WorkspaceSecurityMW()
         read_file_tool = next(
             t for t in mcp_pool.get_all_tools() if t.name == "read_file"
         )
@@ -172,9 +172,9 @@ class TestMCPFilesystemWorkspaceIsolation:
         self, mcp_pool, workspace_a, workspace_b
     ):
         """两会话绑定不同 workspace，A 无法读 B 的文件。"""
-        from agent.workspace_middleware import WorkspaceSecurityMiddleware
+        from agent.workspace_mw import WorkspaceSecurityMW
 
-        mw = WorkspaceSecurityMiddleware()
+        mw = WorkspaceSecurityMW()
         read_file_tool = next(
             t for t in mcp_pool.get_all_tools() if t.name == "read_file"
         )

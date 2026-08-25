@@ -106,7 +106,7 @@ def _validate_exec_path(path: str, workspace: str) -> str:
     return _resolve_in_workspace(path, workspace)
 
 
-class WorkspaceSecurityMiddleware(AgentMiddleware):
+class WorkspaceSecurityMW(AgentMiddleware):
     """工作空间安全隔离中间件。
 
     拦截文件类和执行类工具调用，从 config 读取 workspace_path，
@@ -365,4 +365,4 @@ class WorkspaceSecurityMiddleware(AgentMiddleware):
         )
 
 
-__all__ = ["WorkspaceSecurityMiddleware"]
+__all__ = ["WorkspaceSecurityMW"]

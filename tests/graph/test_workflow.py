@@ -964,7 +964,7 @@ def test_team_agent_astream_error_yields_error_message():
 
 def test_skill_injector_no_skills_dir(tmp_path):
     """技能目录不存在时注入器正常降级(不抛异常)"""
-    from graph.common import SkillInjector
+    from skmng.injector import SkillInjector
 
     injector = SkillInjector(skills_dir=str(tmp_path / "nonexistent"), auto_match=True)
     block = injector.build_skill_block("随便什么任务")
@@ -976,7 +976,7 @@ def test_skill_injector_no_skills_dir(tmp_path):
 
 def test_skill_injector_injects_matched_skill(tmp_path):
     """任务匹配到技能时注入技能指引块"""
-    from graph.common import SkillInjector
+    from skmng.injector import SkillInjector
 
     skill_dir = tmp_path / "skills"
     skill_md = skill_dir / "git" / "SKILL.md"
@@ -998,7 +998,7 @@ def test_skill_injector_injects_matched_skill(tmp_path):
 
 def test_skill_injector_auto_match_disabled(tmp_path):
     """auto_match=False 时不自动注入技能块"""
-    from graph.common import SkillInjector
+    from skmng.injector import SkillInjector
 
     skill_dir = tmp_path / "skills"
     skill_md = skill_dir / "git" / "SKILL.md"
@@ -1018,7 +1018,7 @@ def test_skill_injector_auto_match_disabled(tmp_path):
 
 def test_skill_injector_skip_when_already_injected(tmp_path):
     """已注入过技能块时不重复注入"""
-    from graph.common import SkillInjector
+    from skmng.injector import SkillInjector
 
     skill_dir = tmp_path / "skills"
     skill_md = skill_dir / "git" / "SKILL.md"

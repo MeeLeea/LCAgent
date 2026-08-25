@@ -6,7 +6,7 @@
 
 注意：
 - ``active_skills`` 不在此处，而是放入 ``LCAgentState``（随 checkpoint per-thread
-  持久化），由 ``SkillInjectionMiddleware`` 在 model 调用时从 state 直接读取。
+  持久化），由 ``SkillInjectionMW`` 在 model 调用时从 state 直接读取。
 - Store 实例本身不持有任何会话级可变状态，可安全在多会话间共享。
 - 使用异步 API（aput/aget/adelete）保持与持久化 backend（如 PostgresStore）兼容；
   InMemoryStore 的异步方法内部即内存操作，不阻塞事件循环。

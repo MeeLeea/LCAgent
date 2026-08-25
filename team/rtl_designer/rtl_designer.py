@@ -1,6 +1,7 @@
 """
 Designer Agent - 数字芯片 RTL 设计工程师,负责规格梳理、模块拆分、Filelist 生成与可综合 RTL 编码
 """
+from collections.abc import Sequence
 from typing import ClassVar
 
 from graph.registry import register_agent
@@ -53,19 +54,23 @@ class DesignerAgent(TeamAgent):
         task: str,
         injector: PromptInjector | None,
         config: dict | None = None,
+        active_names: Sequence[str] = (),
     ) -> str:
-        """RTL 设计工作流方法异步通用执行体:模板渲染/技能注入同步,LLM 调用异步流式"""
+        """RTL 设计工作流方法异步通用执行体:模板渲染/技能注入同步,LLM 调用异步流式
+
+        active_names 由节点函数从 state["active_skills"] 取值传入。
+        """
         template = self.get_template(template_name)
         prompt = self.render_template(template, task=task)
         if injector is not None:
-            prompt = injector.inject_into_prompt(prompt, task)
+            prompt = injector.inject_into_prompt(prompt, task, active_names)
         return await self.ainvoke(prompt, config)
 
-    async def aspec_design_task(self, task: str, injector: PromptInjector | None = None, config: dict | None = None) -> str:
+    async def aspec_design_task(self, task: str, injector: PromptInjector | None = None, config: dict | None = None, active_names: Sequence[str] = ()) -> str:
         """异步版 spec_design_task(供 spec_design 节点调用)"""
-        return await self._arun_rtl_design_task_async("spec_design", task, injector, config)
+        return await self._arun_rtl_design_task_async("spec_design", task, injector, config, active_names)
 
-    async def averilog_design_task(self, task: str, injector: PromptInjector | None = None, config: dict | None = None) -> str:
+    async def averilog_design_task(self, task: str, injector: PromptInjector | None = None, config: dict | None = None, active_names: Sequence[str] = ()) -> str:
         """异步版 verilog_design_task(供 verilog_design 节点调用)"""
-        return await self._arun_rtl_design_task_async("verilog_design", task, injector, config)
+        return await self._arun_rtl_design_task_async("verilog_design", task, injector, config, active_names)
 

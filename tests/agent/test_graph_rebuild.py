@@ -1,7 +1,7 @@
 """测试 Graph 重建消除：技能变化不触发 Graph 重建，工具变化才重建。
 
 核心机制：AgentCore 无状态化——system_prompt 为静态字符串，
-技能注入由 SkillInjectionMiddleware 在 model 调用时从 LCAgentState.active_skills
+技能注入由 SkillInjectionMW 在 model 调用时从 LCAgentState.active_skills
 读取（随 checkpoint per-thread 隔离）。技能变化只写入 state，不重建 Graph；
 仅工具列表/LLM 变化时才调用 _arebuild_agent_executor 重新编译 LangGraph。
 """
@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from langchain_core.messages import AIMessage, SystemMessage
 
 from agent.agent_core import AgentCore
-from utils.compaction import CompactionConfig, LCAgentCompactionMiddleware
+from agent.compaction import CompactionConfig, LCAgentCompactionMiddleware
 
 # ============ 辅助：创建最小化 AgentCore 测试实例 ============
 
@@ -137,7 +137,7 @@ def test_arun_structured_uses_update_not_rebuild():
 
     core._arebuild_agent_executor = counting_rebuild
 
-    # When: 执行任务（技能注入由 SkillInjectionMiddleware 自动完成，无需重建 Graph）
+    # When: 执行任务（技能注入由 SkillInjectionMW 自动完成，无需重建 Graph）
     asyncio.run(core.arun_structured("git commit my code"))
 
     # Then: Graph 没有被重建，但 executor 被调用了一次
@@ -216,7 +216,7 @@ def test_achat_structured_updates_prompt_without_rebuild():
 
     core._arebuild_agent_executor = counting_rebuild
 
-    # When: 对话（技能注入由 SkillInjectionMiddleware 自动完成，无需重建 Graph）
+    # When: 对话（技能注入由 SkillInjectionMW 自动完成，无需重建 Graph）
     asyncio.run(core.achat_structured("review my code"))
 
     # Then: Graph 没有被重建，但 executor 被调用了一次

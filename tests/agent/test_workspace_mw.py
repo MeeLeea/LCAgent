@@ -1,4 +1,4 @@
-"""WorkspaceSecurityMiddleware 测试 - 验证文件/执行类工具的 workspace 隔离。
+"""WorkspaceSecurityMW 测试 - 验证文件/执行类工具的 workspace 隔离。
 
 覆盖：
 - 文件工具相对路径解析为 workspace 内绝对路径
@@ -9,7 +9,7 @@
 - 非文件/执行类工具直接放行
 
 运行：
-  pytest tests/agent/test_workspace_middleware.py -v
+  pytest tests/agent/test_workspace_mw.py -v
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Any
 from unittest.mock import MagicMock
 
-from agent.workspace_middleware import WorkspaceSecurityMiddleware
+from agent.workspace_mw import WorkspaceSecurityMW
 
 
 @dataclass
@@ -76,7 +76,7 @@ class TestFilesystemToolResolution:
         ws.mkdir()
         (ws / "test.txt").write_text("hello", encoding="utf-8")
 
-        mw = WorkspaceSecurityMiddleware()
+        mw = WorkspaceSecurityMW()
         handler = MagicMock(return_value="ok")
         request = _make_request("read_file", {"path": "test.txt"}, _make_config(str(ws)))
 
@@ -91,7 +91,7 @@ class TestFilesystemToolResolution:
         ws = tmp_path / "workspace"
         ws.mkdir()
 
-        mw = WorkspaceSecurityMiddleware()
+        mw = WorkspaceSecurityMW()
         handler = MagicMock(return_value="ok")
         request = _make_request(
             "write_file", {"path": "out.txt", "content": "data"},
@@ -107,7 +107,7 @@ class TestFilesystemToolResolution:
         ws = tmp_path / "workspace"
         ws.mkdir()
 
-        mw = WorkspaceSecurityMiddleware()
+        mw = WorkspaceSecurityMW()
         handler = MagicMock(return_value="ok")
         request = _make_request(
             "list_directory", {"path": "."}, _make_config(str(ws)),
@@ -122,7 +122,7 @@ class TestFilesystemToolResolution:
         ws = tmp_path / "workspace"
         ws.mkdir()
 
-        mw = WorkspaceSecurityMiddleware()
+        mw = WorkspaceSecurityMW()
         handler = MagicMock(return_value="ok")
         request = _make_request(
             "move_file",
@@ -147,7 +147,7 @@ class TestFilesystemToolEscapeBlocked:
         ws = tmp_path / "workspace"
         ws.mkdir()
 
-        mw = WorkspaceSecurityMiddleware()
+        mw = WorkspaceSecurityMW()
         handler = MagicMock(return_value="ok")
         request = _make_request(
             "read_file", {"path": "../../etc/passwd"}, _make_config(str(ws)),
@@ -166,7 +166,7 @@ class TestFilesystemToolEscapeBlocked:
         outside = tmp_path / "secret.txt"
         outside.write_text("secret", encoding="utf-8")
 
-        mw = WorkspaceSecurityMiddleware()
+        mw = WorkspaceSecurityMW()
         handler = MagicMock(return_value="ok")
         request = _make_request(
             "read_file", {"path": str(outside)}, _make_config(str(ws)),
@@ -181,7 +181,7 @@ class TestFilesystemToolEscapeBlocked:
         ws = tmp_path / "workspace"
         ws.mkdir()
 
-        mw = WorkspaceSecurityMiddleware()
+        mw = WorkspaceSecurityMW()
         handler = MagicMock(return_value="ok")
         request = _make_request(
             "move_file",
@@ -205,7 +205,7 @@ class TestExecToolCwdAlignment:
         ws = tmp_path / "workspace"
         ws.mkdir()
 
-        mw = WorkspaceSecurityMiddleware()
+        mw = WorkspaceSecurityMW()
         handler = MagicMock(return_value="ok")
         request = _make_request(
             "run_shell",
@@ -223,7 +223,7 @@ class TestExecToolCwdAlignment:
         ws = tmp_path / "workspace"
         ws.mkdir()
 
-        mw = WorkspaceSecurityMiddleware()
+        mw = WorkspaceSecurityMW()
         handler = MagicMock(return_value="ok")
         request = _make_request(
             "run_shell", {"command": "ls"}, _make_config(str(ws)),
@@ -238,7 +238,7 @@ class TestExecToolCwdAlignment:
         ws = tmp_path / "workspace"
         ws.mkdir()
 
-        mw = WorkspaceSecurityMiddleware()
+        mw = WorkspaceSecurityMW()
         handler = MagicMock(return_value="ok")
         request = _make_request(
             "run_python",
@@ -256,7 +256,7 @@ class TestExecToolCwdAlignment:
         ws.mkdir()
         (ws / "script.py").write_text("print(1)", encoding="utf-8")
 
-        mw = WorkspaceSecurityMiddleware()
+        mw = WorkspaceSecurityMW()
         handler = MagicMock(return_value="ok")
         request = _make_request(
             "run_python",
@@ -278,7 +278,7 @@ class TestPassthroughCases:
     """无 workspace 绑定或非目标工具时直接放行。"""
 
     def test_no_workspace_passes_through(self, tmp_path):
-        mw = WorkspaceSecurityMiddleware()
+        mw = WorkspaceSecurityMW()
         handler = MagicMock(return_value="ok")
         request = _make_request(
             "read_file", {"path": "test.txt"}, _make_config(None),
@@ -294,7 +294,7 @@ class TestPassthroughCases:
         ws = tmp_path / "workspace"
         ws.mkdir()
 
-        mw = WorkspaceSecurityMiddleware()
+        mw = WorkspaceSecurityMW()
         handler = MagicMock(return_value="ok")
         request = _make_request(
             "calculate", {"expression": "1+1"}, _make_config(str(ws)),
@@ -322,7 +322,7 @@ class TestListAllowedDirectoriesInterception:
         ws = tmp_path / "workspace"
         ws.mkdir()
 
-        mw = WorkspaceSecurityMiddleware()
+        mw = WorkspaceSecurityMW()
         handler = MagicMock(return_value="should_not_be_called")
         request = _make_request(
             "list_allowed_directories", {}, _make_config(str(ws)),
@@ -343,7 +343,7 @@ class TestListAllowedDirectoriesInterception:
         ws = tmp_path / "workspace"
         ws.mkdir()
 
-        mw = WorkspaceSecurityMiddleware()
+        mw = WorkspaceSecurityMW()
         handler = MagicMock(return_value="should_not_be_called")
         request = _make_request(
             "list_allowed_directories", {}, _make_config(str(ws)),
@@ -362,7 +362,7 @@ class TestListAllowedDirectoriesInterception:
 
     def test_no_workspace_passes_through_to_mcp(self, tmp_path):
         """无 workspace 绑定时，list_allowed_directories 直接放行给 MCP。"""
-        mw = WorkspaceSecurityMiddleware()
+        mw = WorkspaceSecurityMW()
         handler = MagicMock(return_value="mcp_result")
         request = _make_request(
             "list_allowed_directories", {}, _make_config(None),
@@ -379,7 +379,7 @@ class TestListAllowedDirectoriesInterception:
         ws = tmp_path / "deepseek-harness"
         ws.mkdir()
 
-        mw = WorkspaceSecurityMiddleware()
+        mw = WorkspaceSecurityMW()
         handler = MagicMock(return_value="should_not_be_called")
         request = _make_request(
             "list_allowed_directories", {}, _make_config(str(ws)),
