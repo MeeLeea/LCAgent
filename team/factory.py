@@ -4,6 +4,7 @@ Team Agent 工厂函数 - 统一构建团队 Agent
 from __future__ import annotations
 
 import os
+from typing import Any
 
 from langchain_core.tools import BaseTool
 
@@ -16,18 +17,21 @@ def build_team_agent(
     config_file: str,
     base_dir: str,
     tools: list[BaseTool] | None = None,
-    **overrides
+    checkpointer: Any | None = None,
+    **overrides,
 ) -> TeamAgent:
     """
     构建团队 Agent(Manager/Worker/Terminator)
-    
+
     Args:
         agent_class: Agent 类(ManagerAgent/WorkerAgent/TerminatorAgent)
         config_file: agent_config.json 路径(相对项目根)
         base_dir: 项目根目录
         tools: 可选工具列表(Worker 需要,Manager/Terminator 不需要)
+        checkpointer: LangGraph checkpointer 实例。传入时由 TeamAgent 持有，
+            供需要持久化的子图使用；为 None 时无持久化
         **overrides: 覆盖配置中的参数
-        
+
     Returns:
         初始化好的 Agent 实例
     """
@@ -63,6 +67,7 @@ def build_team_agent(
         tool_timeout=config.get("tool_timeout"),
         skills_dir=skills_dir,
         auto_match_skills=config.get("auto_match_skills", True),
+        checkpointer=checkpointer,
     )
     
     return agent

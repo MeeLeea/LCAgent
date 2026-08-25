@@ -184,6 +184,7 @@ def build_workflow(name: str, checkpointer=None) -> tuple[object, dict[str, obje
             role_spec["config_file"],
             BASE_DIR,
             tools=role_spec["tools"],
+            checkpointer=checkpointer,
         )
 
     # 按工作流声明的 roles 构建;未声明则构建全部已注册角色
