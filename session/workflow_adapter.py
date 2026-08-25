@@ -4,14 +4,16 @@
 （统一会话/记忆/锁/SSE），上层（CLI/API）可无差别调度两类执行体。
 
 实现 SessionAgent 协议（SessionManager 对 agent 依赖的 11 个接口）：
-    arun_events / aresume_events(不支持) / session / _current_sid /
+    arun_events / aresume_events / session / _current_sid /
     set_current_session / checkpoint_info / aget_execution_history /
     aclear_history / manually_compact / aclose
 
 能力边界（OMO 式渐进）：
-- 事件为节点级：NODE_START / NODE_END / NODE_ERROR → DONE（无 TOKEN 流，
-  内层 team agent 的同步 invoke 不可见）
-- aresume_events 不支持（workflow 无 HITL 中断语义）
+- 事件为节点级：NODE_START / NODE_END / NODE_ERROR → INTERRUPT / DONE
+  （内层 team agent 的 token 增量经 NodeTrackingHandler.on_token 转发
+  例外：节点内 TeamAgent.astream 透传 callbacks 后 LLM token 增量可见）
+- arun_events 与 aresume_events 同构：均基于 _arun_input_events 处理
+  graph.ainvoke 的事件队列 + 终止事件
 - 跨轮次上下文由 checkpoint messages 通道 + 长期记忆(recall_text)承载
 
 执行流程（arun_events）：
@@ -19,19 +21,34 @@
 2. build_workflow 构建图（checkpointer + compaction 默认启用）
 3. 执行前：checkpoint 历史消息 + 长期记忆拼 raw_context 注入
 4. graph.ainvoke 边执行边经 NodeTrackingHandler 队列吐出节点事件
-5. 结束后 yield DONE(final_answer)；记忆沉淀由 SessionManager 消费事件完成
+5. 结束后：__interrupt__ → INTERRUPT；否则 DONE(final_answer)；
+   记忆沉淀由 SessionManager 消费事件完成
+
+恢复流程（aresume_events）：
+1. 复用 _awarm_and_build_workflow 重建 graph + config（与 arun_events 一致）
+2. 用 Command(resume=payload) 调 graph.ainvoke 恢复外层 graph
+3. 复用 _arun_input_events 吐出节点事件 + INTERRUPT/DONE
+
+allow: SIZE_OK — 文件 ~290 pure LOC 超 250 上限；arun_events/aresume_events
+共享 _WorkflowRuntime + _awarm_and_build_workflow + _arun_input_events 三件套
+是单文件内的内聚拆分，进一步拆到 session/workflow_runtime.py 会违反
+"唯一改动文件" 任务约束。manually_compact/_build_raw_context 是 SessionAgent
+协议的一部分，无法外移。
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Any
 
 from langchain_core.messages import AIMessage
+from langgraph.types import Command
 
 from agent.compaction import CompactionConfig
 from graph.common import NodeTrackingHandler, _build_compaction_middleware
+from llm.message_utils import build_interrupt_event
 from memory.manager import MemoryManager
 from session.registry import SessionRegistry
 from utils.events import AgentEvent
@@ -115,7 +132,7 @@ class WorkflowAdapter:
     ) -> AsyncIterator[AgentEvent]:
         """纯执行接口：运行 workflow 图，yield 节点级 AgentEvent 流。
 
-        事件顺序：NODE_START/NODE_END/NODE_ERROR* → DONE(final_answer)
+        事件顺序：NODE_START/NODE_END/NODE_ERROR* → INTERRUPT 或 DONE(final_answer)
         或 ERROR。SessionManager 负责锁/记忆提交/SSE 转发。
 
         Args:
@@ -129,7 +146,15 @@ class WorkflowAdapter:
 
         with TraceContext(trace_id=trace_id, thread_id=tid):
             logger.info("workflow arun_events [%s]: %s", tid, message[:100])
-            async for ev in self._arun_graph_events(message, tid, trace_id, is_run_mode):
+            runtime = await self._awarm_and_build_workflow(tid, trace_id)
+            # 执行前上下文：checkpoint 历史消息 + 长期记忆
+            raw_context = await self._build_raw_context(tid)
+            initial_state: dict[str, str] = {
+                "task": message,
+                "raw_context": raw_context,
+                "context_summary": "",
+            }
+            async for ev in self._arun_input_events(runtime, initial_state, is_run_mode):
                 yield ev
 
     async def aresume_events(
@@ -138,8 +163,31 @@ class WorkflowAdapter:
         *,
         thread_id: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
-        """恢复中断会话 — workflow 无 HITL 中断语义，不支持。"""
-        raise NotImplementedError("WorkflowAdapter 不支持 aresume_events（无 HITL 中断）")
+        """恢复中断会话 — 用 Command(resume=payload) 恢复外层 graph。
+
+        与 arun_events 同构：复用 _awarm_and_build_workflow + _arun_input_events，
+        仅 graph.ainvoke 的输入不同（initial_state vs resume_command）。
+
+        外层 graph 从被 interrupt 的节点恢复，节点内
+        run_team_turn_with_interrupt 的 interrupt() 返回 resume_value，
+        调 aresume_structured 恢复内层 TeamAgent。
+
+        Args:
+            payload: 恢复数据（多 interrupt 时可为 {interrupt_id: value} 映射）
+            thread_id: 目标 workflow 会话 ID（为 None 时用当前会话）
+        """
+        self._ensure_not_closed()
+        tid = self._current_sid(thread_id)
+        trace_id = generate_trace_id()
+
+        with TraceContext(trace_id=trace_id, thread_id=tid):
+            logger.info("workflow aresume_events [%s]", tid)
+            runtime = await self._awarm_and_build_workflow(tid, trace_id)
+            resume_command = Command(resume=payload)
+            async for ev in self._arun_input_events(
+                runtime, resume_command, is_run_mode=False
+            ):
+                yield ev
 
     # ============ SessionAgent 协议：历史 ============
 
@@ -237,44 +285,65 @@ class WorkflowAdapter:
 
     # ============ 内部：workflow 执行 ============
 
-    async def _arun_graph_events(
+    @dataclass(slots=True)
+    class _WorkflowRuntime:
+        """graph.ainvoke 执行所需的运行时上下文。
+
+        - graph: build_workflow 构建的编译图
+        - config: 含 thread_id / workspace_path / callbacks 的 LangGraph 配置
+        - node_queue: NodeTrackingHandler 回调实时入队的节点事件队列
+        - tid: 会话线程 ID（已写入 config.configurable.thread_id，此处冗余存储
+          便于 _arun_input_events 直接消费）
+        - trace_id: 当前 turn 的追踪 ID（构造 NodeTrackingHandler 用）
+        """
+
+        graph: Any
+        config: dict[str, Any]
+        node_queue: asyncio.Queue[AgentEvent]
+        tid: str
+        trace_id: str
+
+    async def _awarm_and_build_workflow(
         self,
-        task: str,
         tid: str,
         trace_id: str,
-        is_run_mode: bool,
-    ) -> AsyncIterator[AgentEvent]:
-        """执行 workflow 图并产出节点级事件流。"""
-        # 1. warm workspace 缓存（断点续跑后缓存可能为空）
+    ) -> _WorkflowRuntime:
+        """warm workspace 缓存 + 构建 graph + 构造 config + callbacks。
+
+        arun_events 与 aresume_events 的共享前置步骤：
+        1. awarm_workspace（断点续跑后缓存可能为空）
+        2. 反解 workflow_name，构建 graph（checkpointer + compaction 默认启用）
+        3. 构造 config（thread_id + workspace_path）
+        4. 构造 node_queue + NodeTrackingHandler（节点事件 + LLM token 增量入队）
+
+        不含 raw_context 注入（仅 arun_events 需要）和 graph.ainvoke 调用。
+        """
+        # 1. warm workspace 缓存
         await self._registry.awarm_workspace(tid)
 
-        # 2. 从会话 ID 反解 workflow 名称
+        # 2. 反解 workflow 名称 + 构建图
         workflow_name = self._registry.workflow_name_of(tid)
         if not workflow_name:
             raise ValueError(f"会话 {tid} 不是 workflow 会话,无法执行工作流")
 
-        # 3. 构建图（checkpointer 持久化 + compaction 默认启用）
         from graph.registry import build_workflow
 
         graph, _agents = build_workflow(workflow_name, checkpointer=self._checkpointer)
 
-        # 4. 执行前上下文：checkpoint 历史消息 + 长期记忆
-        raw_context = await self._build_raw_context(tid)
-
+        # 3. 构造 config（thread_id + workspace_path）
         configurable: dict[str, Any] = {"thread_id": tid}
         workspace_path = getattr(self._registry.get_context(tid), "workspace_path", None)
         if workspace_path:
             configurable["workspace_path"] = workspace_path
-        config: dict[str, Any] = {"configurable": configurable}
-
-        # 5. 节点事件队列 + NodeTrackingHandler（run_inline 回调直接 put_nowait）
         node_queue: asyncio.Queue[AgentEvent] = asyncio.Queue()
+
+        # 4. NodeTrackingHandler：节点事件 + LLM token 增量入队
         known_nodes = {
             n.id for n in graph.get_graph().nodes.values() if not n.id.startswith("__")
         }
 
         def _on_token(ev: AgentEvent) -> None:
-            """LLM token 增量 → TOKEN 事件入队(补充会话元数据)"""
+            """LLM token 增量 → TOKEN 事件入队（补充会话元数据）。"""
             node_queue.put_nowait(
                 AgentEvent.token(
                     text=ev.content,
@@ -284,32 +353,51 @@ class WorkflowAdapter:
                 )
             )
 
-        config["callbacks"] = [
-            NodeTrackingHandler(
-                known_nodes,
-                on_node_start=node_queue.put_nowait,
-                on_node_end=node_queue.put_nowait,
-                on_node_error=node_queue.put_nowait,
-                on_token=_on_token,
-            )
-        ]
-
-        initial_state: dict[str, str] = {
-            "task": task,
-            "raw_context": raw_context,
-            "context_summary": "",
+        config: dict[str, Any] = {
+            "configurable": configurable,
+            "callbacks": [
+                NodeTrackingHandler(
+                    known_nodes,
+                    on_node_start=node_queue.put_nowait,
+                    on_node_end=node_queue.put_nowait,
+                    on_node_error=node_queue.put_nowait,
+                    on_token=_on_token,
+                )
+            ],
         }
 
-        async def _run() -> dict[str, Any]:
-            return await graph.ainvoke(initial_state, config=config)
+        return self._WorkflowRuntime(
+            graph=graph,
+            config=config,
+            node_queue=node_queue,
+            tid=tid,
+            trace_id=trace_id,
+        )
+
+    async def _arun_input_events(
+        self,
+        runtime: _WorkflowRuntime,
+        graph_input: Any,
+        is_run_mode: bool,
+    ) -> AsyncIterator[AgentEvent]:
+        """执行 graph.ainvoke 并吐出节点事件 + 终止事件。
+
+        arun_events 传 initial_state；aresume_events 传 Command(resume=...)。
+        终止事件逻辑：
+        - final 为异常 → ERROR
+        - final 含 __interrupt__ → INTERRUPT（对照 interrupts.py:166-196）
+        - 否则 → DONE(final_answer)
+        """
+        async def _run() -> Any:
+            return await runtime.graph.ainvoke(graph_input, config=runtime.config)
 
         run_task = asyncio.create_task(_run())
 
-        # 6. 边执行边吐出节点事件（NodeTrackingHandler 回调实时入队）
+        # 边执行边吐出节点事件（NodeTrackingHandler 回调实时入队）
         final: Any = None
         while True:
             try:
-                ev = node_queue.get_nowait()
+                ev = runtime.node_queue.get_nowait()
             except asyncio.QueueEmpty:
                 if run_task.done():
                     final = run_task.result()
@@ -318,7 +406,9 @@ class WorkflowAdapter:
                 continue
             yield ev
 
-        # 7. 终止事件：ERROR 或 DONE(final_answer)
+        # 终止事件：ERROR / INTERRUPT / DONE
+        tid = runtime.tid
+        trace_id = runtime.trace_id
         if isinstance(final, BaseException):
             logger.error("工作流执行异常 [%s]: %s", tid, final)
             yield AgentEvent.error(
@@ -327,6 +417,27 @@ class WorkflowAdapter:
                 trace_id=trace_id,
             )
             return
+
+        # Todo 3.1：检测 __interrupt__，yield INTERRUPT（对照 interrupts.py:166-196
+        # + streaming.py:323-326）。interrupt 时 final_answer 为空。
+        if isinstance(final, dict) and "__interrupt__" in final:
+            interrupts = final["__interrupt__"] or []
+            if interrupts:
+                ev_dicts = [
+                    build_interrupt_event(getattr(intr, "value", None))
+                    for intr in interrupts
+                ]
+                # 多 interrupt 合并 prompt（同 interrupts.py:179-189 的批量语义）
+                prompt = "\n\n".join(d.get("prompt", "") for d in ev_dicts)
+                choices = ev_dicts[0].get("choices") if ev_dicts else None
+                logger.info("工作流执行被中断 [%s] interrupts=%d", tid, len(interrupts))
+                yield AgentEvent.interrupt(
+                    prompt=prompt,
+                    choices=choices,
+                    thread_id=tid,
+                    trace_id=trace_id,
+                )
+                return
 
         final_answer = (
             final.get("final_answer", "") if isinstance(final, dict) else ""

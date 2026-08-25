@@ -8,10 +8,58 @@ Workflow 命令处理 - 多 Agent 工作流执行
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from .types import HANDLED, CommandContext, CommandOutcome
 
 logger = logging.getLogger(__name__)
+
+
+def _render_interrupt_choices(ev: dict[str, Any], context: CommandContext) -> None:
+    """渲染 interrupt 事件的 prompt + choices（参考 human_input.render_human_interrupt）。"""
+    prompt = str(ev.get("prompt") or "需要人工输入")
+    context.print()
+    for line in prompt.split("\n"):
+        context.print(line.strip())
+    choices = ev.get("choices") or []
+    for choice in choices:
+        if isinstance(choice, dict):
+            cid = str(choice.get("id", ""))
+            label = str(choice.get("label", cid))
+            context.print(f"  [{cid}] {label}")
+
+
+def _collect_interrupt_choice(
+    ev: dict[str, Any],
+    context: CommandContext,
+) -> dict[str, Any]:
+    """收集用户对 interrupt 的选择，返回 resume payload。
+
+    约定（对照 tools/safety.py:606-609 与 cli/human_input.py:82-98）：
+      {"choice_id": "<id>"}  -> 选择某个 choice
+      {"cancelled": True}    -> 用户取消（Esc/空输入）
+    """
+    _render_interrupt_choices(ev, context)
+    choices = ev.get("choices") or []
+    if not choices:
+        # 非结构化中断回退到自由文本
+        text = context.input("请输入: ").strip()
+        return {"text": text} if text else {"cancelled": True}
+
+    options = []
+    for choice in choices:
+        if isinstance(choice, dict):
+            label = str(choice.get("label") or choice.get("id", ""))
+            options.append((label, str(choice.get("id", ""))))
+        else:
+            options.append((str(choice), str(choice)))
+
+    selected = context.select_menu(
+        str(ev.get("prompt") or "请选择"), options
+    )
+    if selected is None:
+        return {"cancelled": True}
+    return {"choice_id": selected}
 
 
 async def run_workflow(context: CommandContext, name: str, task: str) -> dict:
@@ -55,23 +103,53 @@ async def run_workflow(context: CommandContext, name: str, task: str) -> dict:
     _emit({"type": "workflow_status", "status": "running"})
     final_answer = ""
     try:
-        async for ev_dict in sm.arun_stream(task, thread_id=workflow_thread_id):
-            ev_type = ev_dict.get("type")
-            if ev_type == "workflow_node":
-                node = ev_dict.get("node", "")
-                status = ev_dict.get("status", "")
-                if status == "running":
-                    context.print(f"▸ 节点开始: {node}")
-                elif status == "done":
-                    context.print(f"✓ 节点完成: {node}")
-                elif status == "error":
-                    context.print(f"✗ 节点失败: {node}")
-                _emit(ev_dict)
-            elif ev_type == "done":
-                final_answer = ev_dict.get("content", "")
-            elif ev_type == "error":
-                context.print(f"\n工作流执行错误: {ev_dict.get('content', '')}")
-                _emit(ev_dict)
+        # 多轮 HITL：首次用 arun_stream，遇到 interrupt 收集用户答案后
+        # 切到 aresume_stream 恢复；resume 可能再次中断，循环直至 done/error。
+        resume_payload: dict[str, Any] | None = None
+        while True:
+            if resume_payload is None:
+                stream = sm.arun_stream(task, thread_id=workflow_thread_id)
+            else:
+                stream = sm.aresume_stream(
+                    resume_payload, thread_id=workflow_thread_id
+                )
+                resume_payload = None
+
+            got_done = False
+            async for ev_dict in stream:
+                ev_type = ev_dict.get("type")
+                if ev_type == "workflow_node":
+                    node = ev_dict.get("node", "")
+                    status = ev_dict.get("status", "")
+                    if status == "running":
+                        context.print(f"▸ 节点开始: {node}")
+                    elif status == "done":
+                        context.print(f"✓ 节点完成: {node}")
+                    elif status == "error":
+                        context.print(f"✗ 节点失败: {node}")
+                    _emit(ev_dict)
+                elif ev_type == "done":
+                    final_answer = ev_dict.get("content", "")
+                    got_done = True
+                elif ev_type == "error":
+                    context.print(
+                        f"\n工作流执行错误: {ev_dict.get('content', '')}"
+                    )
+                    _emit(ev_dict)
+                    got_done = True
+                elif ev_type == "interrupt":
+                    # 展示 prompt + choices 并收集用户答案（参考
+                    # cli/human_input.py 的 render_human_interrupt +
+                    # read_human_resume 模式；resume 负载约定
+                    # {"choice_id": "<id>"} / {"cancelled": True}，
+                    # 对照 tools/safety.py:606-609）
+                    resume_payload = _collect_interrupt_choice(ev_dict, context)
+                    _emit(ev_dict)
+                    # 跳出内层 for，由外层 while 调 aresume_stream 续跑
+                    break
+
+            if resume_payload is None or got_done:
+                break
     finally:
         # 无论成功失败都复位整体状态,避免前端 UI 停留在"运行中"
         _emit({"type": "workflow_status", "status": "done"})

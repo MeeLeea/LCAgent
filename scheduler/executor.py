@@ -98,6 +98,11 @@ async def _arun_workflow_task(task_id: Any, task_text: str) -> tuple[bool, str]:
             on_node_start=_on_node_start,
             on_node_end=_on_node_end,
         )
+        # 检测 interrupt：graph.ainvoke 在 interrupt 时返回含 "__interrupt__" 键的 dict
+        # scheduler 无人在场，不接入 HITL，直接返回需人工介入提示
+        if isinstance(result, dict) and "__interrupt__" in result:
+            logger.info("  工作流 %s 被中断（需人工介入）", workflow_name)
+            return False, "工作流被中断（需人工介入），请通过 CLI/API 恢复"
         final_answer = result.get("final_answer", "")
         if not final_answer:
             return False, "工作流执行完成但未返回结果"
