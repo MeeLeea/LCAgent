@@ -13,10 +13,11 @@ TeamAgent 轻量基类 - 为多 Agent 工作流设计的轻量角色
 import logging
 import os
 from collections.abc import AsyncIterator, Sequence
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool
+from langgraph.types import Command, Interrupt
 
 from agent.turn_types import AgentTurnResult
 from llm.llm_client import LLMClient
@@ -24,6 +25,7 @@ from skmng.core import build_skill_block as _build_skill_block
 from skmng.core import inject_into_prompt as _inject_into_prompt
 from skmng.manager import SkillManager, default_skills_dir
 from skmng.protocols import PromptInjector
+from tools.terminal_tools import UserRejectedCommandError
 from utils.metrics import MetricsCollector
 
 logger = logging.getLogger(__name__)
@@ -68,6 +70,7 @@ class TeamAgent:
         prompt_file: str | None = None,
         skills_dir: str | None = None,
         auto_match_skills: bool = True,
+        checkpointer: Any | None = None,
     ):
         """
         初始化团队 Agent
@@ -88,6 +91,9 @@ class TeamAgent:
             prompt_file: 角色 AGENT.md 路径,同时提供系统提示词与工作流节点提示词模板
             skills_dir: 技能目录路径(默认 <项目根>/.agents/skills)
             auto_match_skills: 是否开启技能自动匹配(经 build_skill_block/inject_into_prompt)
+            checkpointer: LangGraph checkpointer 实例(如 MemorySaver),用于工具模式
+                agent_executor 的 interrupt/resume 支持;None 时 agent_executor 不带
+                checkpointer,interrupt 不可用(纯文本模式始终不受影响)
             注:经 team/factory.py 构建时,采样参数由角色 agent_config.json 解析后传入
             (未配置则回退 llm/config.py 的 DEFAULTS)
         """
@@ -114,6 +120,11 @@ class TeamAgent:
         self.tools = list(tools) if tools else []
         self.max_iterations = max_iterations
         self.verbose = verbose
+        # checkpointer: 工具模式 agent_executor 编译时注入,支持 interrupt/resume
+        # (纯文本模式无 agent_executor,checkpointer 不参与执行)。None 时
+        # agent_executor 不带 checkpointer,interrupt 检测会因 aget_state 缺失而
+        # 安全跳过(见 _aget_pending_interrupts 的 except 守卫)
+        self._checkpointer = checkpointer
         
         # 工作流模板缓存(None 表示尚未解析;解析过一次后不再重复读文件)
         self._workflow_templates: dict[str, str] | None = None
@@ -317,6 +328,7 @@ class TeamAgent:
             tools=wrapped_tools,
             system_prompt=self.system_prompt,
             middleware=[ToolExecutionErrorMW(), WorkspaceSecurityMW()],
+            checkpointer=getattr(self, "_checkpointer", None),
         )
     
     async def ainvoke(self, task: str, config: dict | None = None) -> str:
@@ -326,17 +338,28 @@ class TeamAgent:
         经 ``config["callbacks"]``(异步同一事件循环,透传安全)流出到外层
         NodeTrackingHandler,实现 workflow 节点执行期间的前端 TOKEN 流式。
 
+        工具模式下若用户拒绝危险命令(工具 raise UserRejectedCommandError),
+        ``astream`` 会 re-raise 该异常;此方法将其转为错误文本返回(契约:
+        返回 str,不抛异常),与通用 Exception 路径产出同一前缀,使工作流
+        节点(worker_exec 等)能消费错误文本而非被异常打断。
+
         Args:
             task: 任务描述
             config: 外层运行配置(RunnableConfig)。透传 configurable.workspace_path
                 使工具调用受 workspace 隔离约束;透传 callbacks 使 token 事件可达外层。
 
         Returns:
-            执行结果字符串
+            执行结果字符串;用户拒绝危险命令或 LLM 异常时返回错误文本
+            (以 ``TASK_ERROR_PREFIX`` 开头)
         """
         chunks: list[str] = []
-        async for chunk in self.astream(task, config):
-            chunks.append(chunk)
+        try:
+            async for chunk in self.astream(task, config):
+                chunks.append(chunk)
+        except UserRejectedCommandError:
+            # 用户拒绝危险命令:转错误文本返回(ainvoke 契约不抛异常)
+            # arun_structured 走自己的 cancelled 分支,不依赖此路径
+            return f"{TASK_ERROR_PREFIX}: 用户拒绝执行危险命令"
         return "".join(chunks)
     
     async def astream(self, task: str, config: dict | None = None) -> AsyncIterator[str]:
@@ -362,29 +385,222 @@ class TeamAgent:
     async def arun_structured(self, task: str, config: dict | None = None) -> AgentTurnResult:
         """异步执行单轮任务并返回类型化结果(对齐 agent.TurnRunners.arun_structured)
 
-        与 ainvoke 的区别:返回 ``AgentTurnResult``(completed / cancelled),
-        调用方可区分"正常完成"与"LLM 调用失败/执行异常",工作流节点可据此
-        走重试或降级路径,而非把错误文本当正常结果消费。
+        与 ainvoke 的区别:返回 ``AgentTurnResult``(completed / interrupted /
+        cancelled),调用方可区分"正常完成"/"工具内 interrupt()"/"LLM 调用
+        失败/执行异常/用户拒绝危险命令",工作流节点可据此走 resume / 重试 /
+        降级路径,而非把错误文本当正常结果消费。
+
+        执行路径:
+        - **工具模式**(agent_executor is not None):走 ``astream_events``
+          聚合 token(保留流式,经 callbacks 流出到外层 NodeTrackingHandler),
+          流后调 ``aget_state`` 检查 pending interrupts(对照
+          agent/streaming.py:322-326)。有 interrupt → interrupted;否则
+          completed。``UserRejectedCommandError`` → cancelled。
+        - **纯文本模式**(agent_executor is None):走 ``astream`` 聚合,
+          返回 completed,**不检查 interrupt**(纯文本通道不进 ReAct 循环,
+          不会触发工具内 interrupt())。
+
+        异常处理对齐 agent/turn_runners.py 的模式(行 50-53):
+        - ``UserRejectedCommandError``(工具内用户拒绝危险命令)→ cancelled,
+          output 为"用户拒绝"语义,不混入通用"任务执行失败"前缀。
+          TeamAgent 无 SessionStore,故不调用 ``_arepair_rejected_tool_calls``
+          / ``_aclear_pending_interrupt`` 这两个 checkpoint 副作用(AgentCore 专属)。
+        - 其他 ``Exception`` → cancelled,output 以
+          ``TASK_ERROR_PREFIX`` 开头(兼容 ainvoke 路径产出同一前缀)。
+        - ``astream`` 内部已把 LLM 异常 ``yield`` 成错误文本,此处的
+          ``except Exception`` 兜底捕获 ``astream`` 调用本身抛出的异常
+          (如 LangGraph ``astream_events`` 接口异常)。
 
         Args:
             task: 任务描述
-            config: 外层运行配置(RunnableConfig),透传 workspace_path 与 callbacks
+            config: 外层运行配置(RunnableConfig),透传 workspace_path 与 callbacks;
+                启用 checkpointer 时还透传 configurable.thread_id(经
+                ``_build_run_config`` 改写为内层隔离 thread_id)
 
         Returns:
             AgentTurnResult:
                 - completed: 正常完成,output 为生成文本
-                - cancelled: LLM 调用失败/执行异常,output 为错误信息
+                - interrupted: 工具内 interrupt() 触发,interrupts 为 pending
+                  interrupts 列表(仅工具模式 + checkpointer 时可能)
+                - cancelled: LLM 调用失败/执行异常/用户拒绝危险命令,
+                  output 为错误信息(用户拒绝时含"用户拒绝"语义)
         """
         try:
-            chunks: list[str] = []
-            async for chunk in self.astream(task, config):
+            # 每次 arun_structured 视为一个 turn(对齐 AgentCore turn_runners.py:58)。
+            # arun_structured 直接调 _astream_with_tools / _astream_pure_text,
+            # 绕过了 astream 的 increment_turn,需在此显式计数。
+            self.metrics.increment_turn()
+            if self.agent_executor is not None:
+                # 工具模式:走 astream_events 聚合 token(保留流式),流后调
+                # aget_state 检查 pending interrupts(对照 streaming.py:322-326)
+                run_config = self._build_run_config(config)
+                chunks: list[str] = []
+                async for chunk in self._astream_with_tools(task, config):
+                    chunks.append(chunk)
+                output = "".join(chunks)
+                if output.startswith(TASK_ERROR_PREFIX):
+                    return AgentTurnResult.cancelled(output)
+                interrupts = await self._aget_pending_interrupts(run_config)
+                if interrupts:
+                    return AgentTurnResult.interrupted(interrupts)
+                return AgentTurnResult.completed(output)
+            # 纯文本模式:astream 聚合,不检查 interrupt(纯文本不进 ReAct 循环)
+            chunks = []
+            async for chunk in self._astream_pure_text(task, config):
                 chunks.append(chunk)
             output = "".join(chunks)
             if output.startswith(TASK_ERROR_PREFIX):
                 return AgentTurnResult.cancelled(output)
             return AgentTurnResult.completed(output)
+        except UserRejectedCommandError:
+            # 用户拒绝危险命令:单独识别为 cancelled,语义不混入通用错误
+            # (对齐 agent/turn_runners.py:52-53,但不做 checkpoint 修复)
+            return AgentTurnResult.cancelled(
+                "用户已拒绝执行危险命令,当前任务已取消。"
+            )
         except Exception as e:
             return AgentTurnResult.cancelled(f"{TASK_ERROR_PREFIX}: {e!s}")
+
+    async def aresume_structured(
+        self,
+        payload: dict,
+        config: dict | None = None,
+    ) -> AgentTurnResult:
+        """异步恢复中断会话(对齐 agent.TurnRunners.aresume_structured)
+
+        用 ``Command(resume=...)`` 恢复内层 agent_executor 的 pending
+        interrupts(对照 turn_runners.py:93-125)。仅工具模式 + checkpointer
+        时有意义;纯文本模式无 agent_executor,直接返回 cancelled。
+
+        流程:
+        1. ``_abuild_resume_command`` 构造 Command(多 pending interrupts
+           时批量恢复,对照 interrupts.py:201-239)
+        2. ``agent_executor.ainvoke(resume_command, config=...)`` 恢复
+        3. ``_parse_turn_result`` 检查结果(对照 turn_runners.py:207-217)
+        4. 若 completed,再次调 ``_aget_pending_interrupts`` 检查是否
+           恢复后又被中断(如多个 dangerous_command 串行确认)
+
+        异常处理:
+        - ``UserRejectedCommandError`` → cancelled(同 arun_structured)
+        - 其他 ``Exception`` → cancelled(output 以 TASK_ERROR_PREFIX 开头)
+
+        Args:
+            payload: 恢复数据(单 interrupt 时为裸值;多 interrupt 时可为
+                ``{interrupt_id: value}`` 映射,由 _abuild_resume_command 处理)
+            config: 外层运行配置(RunnableConfig),透传 thread_id / callbacks
+
+        Returns:
+            AgentTurnResult:
+                - completed: 恢复后正常完成
+                - interrupted: 恢复后再次被中断(多 interrupt 串行场景)
+                - cancelled: 纯文本模式 / 用户拒绝 / 执行异常
+        """
+        if self.agent_executor is None:
+            return AgentTurnResult.cancelled(
+                f"{TASK_ERROR_PREFIX}: 纯文本模式不支持 resume"
+            )
+        try:
+            run_config = self._build_run_config(config)
+            resume_command = await self._abuild_resume_command(run_config, payload)
+            result = await self.agent_executor.ainvoke(resume_command, config=run_config)
+        except UserRejectedCommandError:
+            return AgentTurnResult.cancelled(
+                "用户已拒绝执行危险命令,当前任务已取消。"
+            )
+        except Exception as e:
+            return AgentTurnResult.cancelled(f"{TASK_ERROR_PREFIX}: {e!s}")
+        turn = self._parse_turn_result(result)
+        # 恢复后再次检查 interrupt(多 interrupt 串行确认场景)
+        if turn.is_completed:
+            interrupts = await self._aget_pending_interrupts(run_config)
+            if interrupts:
+                return AgentTurnResult.interrupted(interrupts)
+        return turn
+
+    async def _aget_pending_interrupts(self, config: dict) -> list[Interrupt]:
+        """流后读取 checkpoint 的 pending interrupts(对照 streaming.py:322-326)
+
+        未启用 checkpointer 时返回空列表(agent_executor 无 aget_state 或
+        aget_state 返回 None)。读取失败时记录警告并返回空列表,不抛异常
+        (arun_structured 的调用方不应因状态查询失败而把 turn 当 cancelled)。
+
+        Args:
+            config: 内层 run_config(含 thread_id,由 _build_run_config 构造)
+
+        Returns:
+            pending interrupts 列表;无或读取失败时为空
+        """
+        if self._checkpointer is None:
+            return []
+        try:
+            state = await self.agent_executor.aget_state(config)
+        except (AttributeError, RuntimeError, TypeError, ValueError) as e:
+            if self.verbose:
+                logger.warning("[%s] 读取 pending interrupts 失败: %s", self.name, e)
+            return []
+        if state is None:
+            return []
+        return [
+            intr
+            for task in getattr(state, "tasks", []) or []
+            for intr in getattr(task, "interrupts", []) or []
+        ]
+
+    def _parse_turn_result(self, result: dict) -> AgentTurnResult:
+        """解析 ainvoke 返回的 dict,检查 __interrupt__(对照 turn_runners.py:207-217)
+
+        Args:
+            result: agent_executor.ainvoke 的返回 dict
+
+        Returns:
+            - interrupted: result["__interrupt__"] 非空时,interrupts 为该列表
+            - completed: 否则取最后一条有 content 的 AIMessage 的 content;
+              无则空串 completed
+        """
+        interrupts = result.get("__interrupt__")
+        if interrupts:
+            return AgentTurnResult.interrupted(list(interrupts))
+        messages = result.get("messages", [])
+        for msg in reversed(messages):
+            content = getattr(msg, "content", None)
+            if content:
+                return AgentTurnResult.completed(str(content))
+        return AgentTurnResult.completed("")
+
+    async def _abuild_resume_command(self, config: dict, payload: dict) -> Command:
+        """构造恢复命令:多 pending interrupts 时批量恢复(对照 interrupts.py:201-239)
+
+        并行工具调用可能产生多个 pending interrupts(如多个危险命令确认)。
+        将同一答案应用到所有 pending interrupts,避免用户逐个确认。
+
+        Args:
+            config: 内层 run_config(含 thread_id,用于 aget_state)
+            payload: 调用方传入的恢复数据
+
+        Returns:
+            可直接传给 agent_executor.ainvoke 的 ``Command(resume=...)``
+        """
+        try:
+            state = await self.agent_executor.aget_state(config)
+        except (AttributeError, RuntimeError, TypeError, ValueError) as e:
+            if self.verbose:
+                logger.warning("[%s] 读取 pending interrupts 失败: %s", self.name, e)
+            return Command(resume=payload)
+        if state is None:
+            return Command(resume=payload)
+        interrupts = [
+            intr
+            for task in getattr(state, "tasks", []) or []
+            for intr in getattr(task, "interrupts", []) or []
+        ]
+        if len(interrupts) <= 1:
+            return Command(resume=payload)
+        # payload 已是 {interrupt_id: value} 映射
+        pending_ids = {intr.id for intr in interrupts}
+        if isinstance(payload, dict) and payload and pending_ids.issuperset(payload.keys()):
+            return Command(resume=payload)
+        # 多中断 + 裸值:将同一答案应用到所有 pending interrupts
+        return Command(resume={intr.id: payload for intr in interrupts})
     
     async def _astream_with_tools(self, task: str, config: dict | None = None) -> AsyncIterator[str]:
         """工具模式异步流式执行(经 agent_executor.astream_events)
@@ -397,18 +613,8 @@ class TeamAgent:
             logger.info("[%s] 执行任务(工具模式·异步): %s", self.name, task[:100])
         
         recorded_msg_ids: set[str] = set()
+        run_config = self._build_run_config(config)
         try:
-            run_config: dict = {"recursion_limit": self.max_iterations}
-            # 仅提取 workspace_path 构造最小 config,严禁转发外层 config 的
-            # thread_id 等运行时字段——checkpointer 由外层 workflow 图统一管理。
-            # callbacks 可安全透传:异步执行与 LangGraph 主循环同一事件循环,
-            # 不再有同步 invoke + to_thread 的跨线程回调风险。
-            configurable = config.get("configurable") if config else None
-            if isinstance(configurable, dict) and configurable.get("workspace_path"):
-                run_config["configurable"] = {"workspace_path": configurable["workspace_path"]}
-            if config and config.get("callbacks"):
-                run_config["callbacks"] = config["callbacks"]
-            
             async for ev in self.agent_executor.astream_events(
                 {"messages": [HumanMessage(content=task)]},
                 config=run_config,
@@ -451,11 +657,73 @@ class TeamAgent:
                         name=ev.get("name") or "",
                         success=False,
                     )
+        except UserRejectedCommandError:
+            # 用户拒绝危险命令:不混入通用"任务执行失败"语义,
+            # re-raise 给上层(arun_structured)单独识别为 cancelled,
+            # 与 agent/turn_runners.py 的 _ahandle_rejected_command 同构
+            # (TeamAgent 无 SessionStore/checkpoint,故不修复 checkpoint 状态)
+            raise
         except Exception as e:
             error_msg = f"{TASK_ERROR_PREFIX}: {e!s}"
             if self.verbose:
                 logger.error("[%s] %s", self.name, error_msg)
             yield error_msg
+
+    def _build_run_config(self, config: dict | None) -> dict:
+        """构造 agent_executor 用的内层 run config
+
+        与 _astream_with_tools 旧逻辑的区别:启用 checkpointer 时,从外层
+        config 的 configurable.thread_id 解析出内层隔离 thread_id
+        ``f"team:{self.name}:{tid}"``,写入 run_config["configurable"]["thread_id"]。
+        这样:
+        - 不同外层会话的 TeamAgent turn 落到不同的内层 checkpoint 线程,
+          避免 interrupt 状态串台
+        - 不转发外层的其他 configurable 字段(如 workspace_path 显式取值另放,
+          其余字段如 trace_id 不透传,保持内层 config 最小化)
+
+        未启用 checkpointer 时,不写 thread_id 字段,行为与旧版一致
+        (agent_executor 无 checkpointer,configurable 字段被忽略)。
+
+        Args:
+            config: 外层 RunnableConfig(可 None)
+
+        Returns:
+            内层 run_config 字典
+        """
+        run_config: dict = {"recursion_limit": self.max_iterations}
+        # 内层 thread_id 隔离:启用 checkpointer 时从外层解析 tid 并改写
+        # (未启用 checkpointer 时不写,agent_executor 无 checkpointer → 字段被忽略)
+        # getattr 兼容测试中 object.__new__(TeamAgent) 创建的实例(无 _checkpointer 属性)
+        if getattr(self, "_checkpointer", None) is not None:
+            outer_tid = self._extract_outer_thread_id(config)
+            if outer_tid:
+                run_config["configurable"] = {"thread_id": f"team:{self.name}:{outer_tid}"}
+        # workspace_path 隔离:工具调用受 workspace 约束(独立于 thread_id)
+        configurable = config.get("configurable") if config else None
+        if isinstance(configurable, dict) and configurable.get("workspace_path"):
+            run_config.setdefault("configurable", {})["workspace_path"] = configurable["workspace_path"]
+        # callbacks 透传:异步同事件循环,无跨线程风险
+        if config and config.get("callbacks"):
+            run_config["callbacks"] = config["callbacks"]
+        return run_config
+
+    @staticmethod
+    def _extract_outer_thread_id(config: dict | None) -> str | None:
+        """从外层 RunnableConfig 的 configurable.thread_id 提取 tid
+
+        Args:
+            config: 外层 RunnableConfig(可 None)
+
+        Returns:
+            外层 thread_id 字符串;无则 None
+        """
+        if not config:
+            return None
+        configurable = config.get("configurable")
+        if not isinstance(configurable, dict):
+            return None
+        tid = configurable.get("thread_id")
+        return tid if isinstance(tid, str) and tid else None
     
     async def _astream_pure_text(self, task: str, config: dict | None = None) -> AsyncIterator[str]:
         """纯文本模式异步流式执行(经 chat model.astream)"""
