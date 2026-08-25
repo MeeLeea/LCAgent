@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
+from agent.turn_types import AgentTurnResult
 from cli.commands.workflow import workflow_command
 from graph.simple import (
     arun_simple_workflow,
@@ -33,7 +34,18 @@ DEFAULT_TEMPLATES: dict[str, str] = {
 
 @dataclass
 class FakeAgent:
-    """模拟 TeamAgent,不联网"""
+    """模拟 TeamAgent,不联网;节点改调 run_team_turn_with_interrupt 后,
+    统一经 ``arun_structured`` 入口记录调用并返回 ``AgentTurnResult.completed``。
+
+    summarize 节点(summarize_context 节点)的 prompt 含 ``summarize_context``
+    模板前缀(节点把模板拼到 raw 前部),据此识别后返回 ``summary_response``,
+    与原 ``asummarize_context`` 返回 summary_response 的语义对齐;其余节点
+    回退 ``response``。
+    """
+
+    # summarize_context 节点 prompt 的特征字符串(节点模板固定,稳定可识别)
+    _SUMMARIZE_MARKER: str = "你是一个工作流上下文提炼助手"
+
     name: str = "test-agent"
     response: str = "fake response"
     summary_response: str = "记忆摘要: 用户偏好中文"
@@ -42,14 +54,19 @@ class FakeAgent:
     calls: list[tuple[str, str]] = field(default_factory=list)
 
     async def ainvoke(self, task: str, config=None) -> str:
-        """异步版 invoke:记录调用并返回模拟结果(与同步版同前缀,兼容既有断言)"""
+        """异步版 invoke:记录调用并返回模拟结果(兼容 TeamAgent.ainvoke 既有调用方)"""
         self.calls.append(("invoke", task))
         return self.response
 
-    async def asummarize_context(self, memory_text: str, config=None) -> str:
-        """异步版 summarize_context:记录调用并返回模拟摘要"""
-        self.calls.append(("summarize", memory_text))
-        return self.summary_response
+    def _is_summarize_node(self, prompt: str) -> bool:
+        """识别是否为 summarize_context 节点的 prompt(含模板特征)"""
+        return self._SUMMARIZE_MARKER in prompt
+
+    def _next(self, prompt: str) -> str:
+        """按节点类型返回模拟响应:summarize 节点返回 summary_response,其余返回 response"""
+        if self._is_summarize_node(prompt):
+            return self.summary_response
+        return self.response
 
     def get_template(self, name: str) -> str:
         """懒加载模板:优先读 AGENT.md 小节,缺失回退默认模板"""
@@ -64,45 +81,16 @@ class FakeAgent:
         """占位符替换"""
         return TeamAgent.render_template(template, **kwargs)
 
-    async def aplan_task(self, task: str, context_summary: str = "", injector=None, config=None) -> str:
-        """异步版 plan_task:记录调用并返回模拟结果(与同步版同前缀,兼容既有断言)"""
-        prompt = self.render_template(
-            self.get_template("manager_plan"), task=task, context_summary=context_summary
-        )
-        if injector is not None:
-            prompt = injector.inject_into_prompt(prompt, task)
-        self.calls.append(("invoke", prompt))
-        return self.response
+    def inject_into_prompt(self, prompt: str, task: str, active_names=()) -> str:
+        """技能注入占位:测试不验证技能块,原样返回 prompt(已含渲染内容)"""
+        return prompt
 
-    async def aexecute_task(self, plan: str, injector=None, config=None) -> str:
-        """异步版 execute_task:记录调用并返回模拟结果(与同步版同前缀)"""
-        prompt = self.render_template(self.get_template("worker_exec"), plan=plan)
-        if injector is not None:
-            prompt = injector.inject_into_prompt(prompt, plan)
-        self.calls.append(("invoke", prompt))
-        return self.response
-
-    async def afinalize(
-        self,
-        task: str,
-        plan: str,
-        worker_result: str,
-        context_summary: str = "",
-        injector=None,
-        config=None,
-    ) -> str:
-        """异步版 finalize:记录调用并返回模拟结果(与同步版同前缀)"""
-        prompt = self.render_template(
-            self.get_template("terminator_final"),
-            task=task,
-            plan=plan,
-            worker_result=worker_result,
-            context_summary=context_summary,
-        )
-        if injector is not None:
-            prompt = injector.inject_into_prompt(prompt, task)
-        self.calls.append(("invoke", prompt))
-        return self.response
+    async def arun_structured(self, prompt: str, config=None) -> AgentTurnResult:
+        """节点经 run_team_turn_with_interrupt 调用的唯一入口;
+        记录 (arun_structured, prompt) 并返回 completed(self._next(prompt))
+        """
+        self.calls.append(("arun_structured", prompt))
+        return AgentTurnResult.completed(self._next(prompt))
 
 
 # ==================== 测试工作流节点 ====================
@@ -116,8 +104,10 @@ def test_summarize_context_node():
 
     assert result["context_summary"] == "记忆摘要: 项目背景A"
     assert len(manager.calls) == 1
-    assert manager.calls[0][0] == "summarize"
-    assert manager.calls[0][1] == "用户: 之前聊过项目A"
+    # 节点改调 run_team_turn_with_interrupt → arun_structured
+    assert manager.calls[0][0] == "arun_structured"
+    # prompt 含 summarize_context 模板前缀 + raw_context
+    assert "用户: 之前聊过项目A" in manager.calls[0][1]
 
 
 def test_manager_plan_node():
@@ -129,7 +119,7 @@ def test_manager_plan_node():
     
     assert result["plan"] == "计划: 步骤1、步骤2"
     assert len(manager.calls) == 1
-    assert manager.calls[0][0] == "invoke"
+    assert manager.calls[0][0] == "arun_structured"
     assert "请为以下任务制定详细的执行计划" in manager.calls[0][1]
 
 
@@ -142,7 +132,7 @@ def test_worker_exec_node():
     
     assert result["worker_result"] == "已完成步骤1和步骤2"
     assert len(worker.calls) == 1
-    assert worker.calls[0][0] == "invoke"
+    assert worker.calls[0][0] == "arun_structured"
     assert "请执行以下计划" in worker.calls[0][1]
 
 
@@ -159,7 +149,7 @@ def test_terminator_final_node():
     
     assert result["final_answer"] == "最终答案: 项目包含3个模块"
     assert len(terminator.calls) == 1
-    assert terminator.calls[0][0] == "invoke"
+    assert terminator.calls[0][0] == "arun_structured"
     prompt = terminator.calls[0][1]
     assert "原始任务" in prompt
     assert "执行计划" in prompt
@@ -323,13 +313,15 @@ def test_build_simple_workflow_with_prompt_file(tmp_path):
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
     asyncio.run(graph.ainvoke({
         "task": "任务T",
-        "raw_context": "",
+        "raw_context": "原始上下文",  # 非空 → summarize 调 helper 返回 summary_response
         "context_summary": "摘要S",
         "plan": "",
         "worker_result": "",
         "final_answer": "",
     }))
 
+    # summarize 节点(raw 非空)调 arun_structured 返回 summary_response="摘要S";
+    # manager_plan 节点经 arun_structured 注入 context_summary="摘要S"
     assert "按文件计划: 任务T" in manager.calls[1][1]
     assert "记忆块: 摘要S" in manager.calls[1][1]
     assert "按文件执行: 计划X" in worker.calls[0][1]
@@ -352,8 +344,9 @@ def test_run_simple_workflow():
     assert result["worker_result"] == "执行结果: 完成A、B、C"
     assert result["final_answer"] == "最终答案: 全部完成"
     
-    # 验证三个 Agent 都被调用(manager 承担 summarize + plan 两次调用)
-    assert len(manager.calls) == 2
+    # raw_context 默认空串 → summarize 节点短路不调 helper;
+    # manager 只剩 manager_plan 一次调用(经 arun_structured)
+    assert len(manager.calls) == 1
     assert len(worker.calls) == 1
     assert len(terminator.calls) == 1
 
@@ -550,8 +543,9 @@ def test_workflow_thread_isolation():
     assert result2["task"] == "任务2"
     assert result2["final_answer"] == "答案2"
     
-    # 验证两次都调用了 agent(manager 为 summarize + plan 两次调用)
-    assert len(manager.calls) == 2
+    # 验证两次都调用了 agent(raw_context 默认空 → summarize 短路,
+    # manager 只剩 manager_plan 一次调用)
+    assert len(manager.calls) == 1
     assert len(worker.calls) == 1
     assert len(terminator.calls) == 1
 
@@ -567,12 +561,13 @@ def test_run_simple_workflow_with_memory():
 
     result = asyncio.run(arun_simple_workflow(graph, "测试任务", raw_context="用户: 之前聊过偏好中文"))
 
-    # manager 两次调用:summarize + plan
-    assert manager.calls[0] == ("summarize", "用户: 之前聊过偏好中文")
-    assert manager.calls[1][0] == "invoke"
+    # manager 两次调用:summarize + plan(均经 arun_structured)
+    assert manager.calls[0][0] == "arun_structured"
+    assert "用户: 之前聊过偏好中文" in manager.calls[0][1]
+    assert manager.calls[1][0] == "arun_structured"
     assert "记忆摘要: 用户偏好中文" in manager.calls[1][1]
     # worker 只拿 plan,不注入摘要
-    assert worker.calls[0][0] == "invoke"
+    assert worker.calls[0][0] == "arun_structured"
     assert "请执行以下计划" in worker.calls[0][1]
     assert "记忆摘要" not in worker.calls[0][1]
     # terminator 注入摘要
@@ -1053,9 +1048,10 @@ def test_workflow_cross_round_compression():
     # 第一轮:无历史,不注入
     result1 = asyncio.run(arun_simple_workflow(graph, "第一轮任务", thread_id="wf-t1"))
     assert result1["final_answer"] == "最终答案: 全部完成"
-    # summarize 节点第一轮 raw_context 为空
-    assert manager.calls[0][0] == "summarize"
-    assert manager.calls[0][1] == ""
+    # summarize 节点第一轮 raw_context 为空 → 短路不调 helper;
+    # manager 只剩 manager_plan 一次调用(经 arun_structured)
+    assert len(manager.calls) == 1
+    assert manager.calls[0][0] == "arun_structured"
 
     # 第二轮:同一 thread_id,上一轮状态应注入 raw_context
     manager.calls.clear()
@@ -1068,8 +1064,8 @@ def test_workflow_cross_round_compression():
     result2 = asyncio.run(arun_simple_workflow(graph, "第二轮任务", thread_id="wf-t1"))
     assert result2["final_answer"] == "答案2"
 
-    # summarize 节点收到上一轮工作流记录
-    assert manager.calls[0][0] == "summarize"
+    # summarize 节点收到上一轮工作流记录(经 arun_structured)
+    assert manager.calls[0][0] == "arun_structured"
     assert "【上一轮工作流记录】" in manager.calls[0][1]
     assert "第一轮任务" in manager.calls[0][1]
     assert "最终答案: 全部完成" in manager.calls[0][1]
@@ -1111,7 +1107,10 @@ def test_workflow_cross_round_no_checkpointer():
 
     result = asyncio.run(arun_simple_workflow(graph, "任务", thread_id="wf-t3"))
     assert result["final_answer"] == "答案"
-    assert manager.calls[0][1] == ""  # 无历史,summarize 收到空 raw_context
+    # 无 checkpointer → 无历史,summarize 节点 raw 为空 → 短路不调 helper;
+    # manager.calls[0] 是 manager_plan 节点调用,prompt 含 manager_plan 模板内容
+    assert manager.calls[0][0] == "arun_structured"
+    assert "请为以下任务制定详细的执行计划" in manager.calls[0][1]
 
 
 # ==================== 节点产出提取（NODE_END content） ====================

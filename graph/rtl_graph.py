@@ -14,10 +14,12 @@ RTL 芯片设计流水线工作流 - Manager 提炼 → Architect 架构 → Des
     验证未通过且轮次未达 max_rounds → 携带上轮验证报告反馈回到 designer_verilog 重新设计;
     轮次达 max_rounds 上限 → 强制进入 designer_output 交付(防止死循环)。
 
-异步化说明：
-    节点函数全部为 async,通过 asyncio.to_thread 执行团队 Agent 的同步方法
-    (不阻塞事件循环);技能注入通过 SkillInjector 在节点渲染 prompt 时
-    追加技能指引块(TeamAgent 零改动)。
+节点执行链路说明：
+    节点函数在自身渲染 prompt(get_template + render_template + 技能注入)后,
+    调 ``run_team_turn_with_interrupt(agent, prompt, config)``(见 graph/common.py)。
+    helper 内部经 ``TeamAgent.arun_structured`` 流式执行 LLM(token 增量经
+    config["callbacks"] 流出到外层事件流);工具内 ``interrupt()`` 时透传给
+    外层 graph 的 checkpointer,由外层 resume 恢复(对照 plan team-checkpointer-interrupt)。
 
 注册说明：
     team/__init__.py 未导入 rtl_designer / rtl_verification 模块,本模块顶部
@@ -43,6 +45,7 @@ from graph.common import (
     _build_compaction_middleware,
     arun_compiled_workflow,
     register_nodes,
+    run_team_turn_with_interrupt,
 )
 from graph.registry import register_workflow
 from skmng.injector import SkillInjector
@@ -81,9 +84,23 @@ async def summarize_context(
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
-    """Manager 提炼记忆上下文,生成分发给下游节点的上下文摘要"""
+    """Manager 提炼记忆上下文,生成分发给下游节点的上下文摘要
+
+    raw_context 为空时短路返回空串,跳过 LLM 调用(对照原
+    ManagerAgent.asummarize_context 的短路语义)。非空时把
+    ``summarize_context`` 模板内容拼到 prompt 前部作为指令(原实现经
+    _astream_messages 的 system 消息语义,helper 单 prompt 通道下合并为用户消息),
+    调 ``run_team_turn_with_interrupt`` 流式执行。
+
+    config 透传(含 callbacks):使 summarize 的 LLM token 增量可流出到外层事件流。
+    """
     raw = state.get("raw_context", "")
-    result = await agent.asummarize_context(raw, config)
+    # 与原 asummarize_context 一致:raw 为空时短路返回空串(不调 helper)
+    if not raw:
+        return {"context_summary": "", "messages": [AIMessage(content="")]}
+    # summarize 节点不注入技能块(原 asummarize_context 也不调 injector)
+    prompt = f"{agent.get_template('summarize_context')}\n\n{raw}"
+    result = await run_team_turn_with_interrupt(agent, prompt, config)
     return {"context_summary": result, "messages": [AIMessage(content=result)]}
 
 
@@ -93,10 +110,20 @@ async def architect_plan_node(
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
-    """Architect 制定架构执行计划(结合记忆上下文摘要)"""
+    """Architect 制定架构执行计划(结合记忆上下文摘要)
+
+    节点内渲染 ``architect_plan`` 模板 + 注入技能块,然后调
+    ``run_team_turn_with_interrupt`` 流式执行;技能注入 match 文本为
+    ``task``(对照原 ArchiAgent.aplan_task)。
+    """
     task = state["task"]
     summary = state.get("context_summary", "")
-    result = await agent.aplan_task(task, summary, injector, config)
+    prompt = agent.render_template(
+        agent.get_template("architect_plan"), task=task, context_summary=summary
+    )
+    if injector is not None:
+        prompt = injector.inject_into_prompt(prompt, task)
+    result = await run_team_turn_with_interrupt(agent, prompt, config)
     return {"arch_plan": result, "messages": [AIMessage(content=result)]}
 
 
@@ -106,12 +133,25 @@ async def architect_design_node(
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
-    """Architect 输出架构方案设计(结合执行计划)"""
+    """Architect 输出架构方案设计(结合执行计划)
+
+    节点内拼装 task + 架构执行计划为 ``prompt_task``,渲染
+    ``architect_design`` 模板 + 注入技能块,然后调
+    ``run_team_turn_with_interrupt`` 流式执行;技能注入 match 文本为
+    ``prompt_task``(对照原 ArchiAgent.adesign_task,任务文本含上游计划)。
+    """
     task = state["task"]
     plan = state.get("arch_plan", "")
     summary = state.get("context_summary", "")
     prompt_task = f"{task}\n\n【架构执行计划】\n{plan}" if plan else task
-    result = await agent.adesign_task(prompt_task, summary, injector, config)
+    prompt = agent.render_template(
+        agent.get_template("architect_design"),
+        task=prompt_task,
+        context_summary=summary,
+    )
+    if injector is not None:
+        prompt = injector.inject_into_prompt(prompt, prompt_task)
+    result = await run_team_turn_with_interrupt(agent, prompt, config)
     return {"arch_design": result, "messages": [AIMessage(content=result)]}
 
 
@@ -121,12 +161,25 @@ async def architect_analyze_node(
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
-    """Architect 进行 PPA 权衡分析与瓶颈风险识别"""
+    """Architect 进行 PPA 权衡分析与瓶颈风险识别
+
+    节点内拼装 task + 架构方案设计为 ``prompt_task``,渲染
+    ``architect_analyze`` 模板 + 注入技能块,然后调
+    ``run_team_turn_with_interrupt`` 流式执行;技能注入 match 文本为
+    ``prompt_task``(对照原 ArchiAgent.aanalyze_task)。
+    """
     task = state["task"]
     design = state.get("arch_design", "")
     summary = state.get("context_summary", "")
     prompt_task = f"{task}\n\n【架构方案设计】\n{design}" if design else task
-    result = await agent.aanalyze_task(prompt_task, summary, injector, config)
+    prompt = agent.render_template(
+        agent.get_template("architect_analyze"),
+        task=prompt_task,
+        context_summary=summary,
+    )
+    if injector is not None:
+        prompt = injector.inject_into_prompt(prompt, prompt_task)
+    result = await run_team_turn_with_interrupt(agent, prompt, config)
     return {"arch_analysis": result, "messages": [AIMessage(content=result)]}
 
 
@@ -136,7 +189,13 @@ async def architect_review_node(
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
-    """Architect 从架构/RTL/后端/软件/验证多维度评审方案"""
+    """Architect 从架构/RTL/后端/软件/验证多维度评审方案
+
+    节点内拼装 task + 架构方案设计 + 权衡分析为 ``prompt_task``,渲染
+    ``architect_review`` 模板 + 注入技能块,然后调
+    ``run_team_turn_with_interrupt`` 流式执行;技能注入 match 文本为
+    ``prompt_task``(对照原 ArchiAgent.areview_task)。
+    """
     task = state["task"]
     design = state.get("arch_design", "")
     analysis = state.get("arch_analysis", "")
@@ -147,7 +206,14 @@ async def architect_review_node(
     if analysis:
         parts.append(f"【权衡分析】\n{analysis}")
     prompt_task = "\n\n".join(parts)
-    result = await agent.areview_task(prompt_task, summary, injector, config)
+    prompt = agent.render_template(
+        agent.get_template("architect_review"),
+        task=prompt_task,
+        context_summary=summary,
+    )
+    if injector is not None:
+        prompt = injector.inject_into_prompt(prompt, prompt_task)
+    result = await run_team_turn_with_interrupt(agent, prompt, config)
     return {"arch_review": result, "messages": [AIMessage(content=result)]}
 
 
@@ -157,7 +223,13 @@ async def architect_spec_node(
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
-    """Architect 整理可交付 RTL 开发的规格文档"""
+    """Architect 整理可交付 RTL 开发的规格文档
+
+    节点内拼装 task + 架构方案设计 + 评审意见为 ``prompt_task``,渲染
+    ``architect_spec`` 模板 + 注入技能块,然后调
+    ``run_team_turn_with_interrupt`` 流式执行;技能注入 match 文本为
+    ``prompt_task``(对照原 ArchiAgent.aspec_task)。
+    """
     task = state["task"]
     design = state.get("arch_design", "")
     review = state.get("arch_review", "")
@@ -168,7 +240,14 @@ async def architect_spec_node(
     if review:
         parts.append(f"【评审意见】\n{review}")
     prompt_task = "\n\n".join(parts)
-    result = await agent.aspec_task(prompt_task, summary, injector, config)
+    prompt = agent.render_template(
+        agent.get_template("architect_spec"),
+        task=prompt_task,
+        context_summary=summary,
+    )
+    if injector is not None:
+        prompt = injector.inject_into_prompt(prompt, prompt_task)
+    result = await run_team_turn_with_interrupt(agent, prompt, config)
     return {"arch_spec": result, "messages": [AIMessage(content=result)]}
 
 
@@ -178,11 +257,20 @@ async def designer_spec_node(
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
-    """Designer 基于架构规格完成 RTL 设计前的规格梳理与 Filelist 规划"""
+    """Designer 基于架构规格完成 RTL 设计前的规格梳理与 Filelist 规划
+
+    节点内拼装 task + 架构规格文档为 ``prompt_task``,渲染
+    ``spec_design`` 模板 + 注入技能块,然后调
+    ``run_team_turn_with_interrupt`` 流式执行;技能注入 match 文本为
+    ``prompt_task``(对照原 DesignerAgent.aspec_design_task)。
+    """
     task = state["task"]
     arch_spec = state.get("arch_spec", "")
     prompt_task = f"{task}\n\n【架构规格文档】\n{arch_spec}" if arch_spec else task
-    result = await agent.aspec_design_task(prompt_task, injector, config)
+    prompt = agent.render_template(agent.get_template("spec_design"), task=prompt_task)
+    if injector is not None:
+        prompt = injector.inject_into_prompt(prompt, prompt_task)
+    result = await run_team_turn_with_interrupt(agent, prompt, config)
     return {"design_spec": result, "messages": [AIMessage(content=result)]}
 
 
@@ -192,7 +280,13 @@ async def verification_plan_node(
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
-    """Verification 基于架构规格与设计规格制定验证计划"""
+    """Verification 基于架构规格与设计规格制定验证计划
+
+    节点内拼装 task + 架构规格 + 设计规格为 ``prompt_task``,渲染
+    ``spec_design`` 模板 + 注入技能块,然后调
+    ``run_team_turn_with_interrupt`` 流式执行;技能注入 match 文本为
+    ``prompt_task``(对照原 VerificationAgent.aspec_design_task)。
+    """
     task = state["task"]
     arch_spec = state.get("arch_spec", "")
     design_spec = state.get("design_spec", "")
@@ -202,7 +296,10 @@ async def verification_plan_node(
     if design_spec:
         parts.append(f"【设计规格与Filelist】\n{design_spec}")
     prompt_task = "\n\n".join(parts)
-    result = await agent.aspec_design_task(prompt_task, injector, config)
+    prompt = agent.render_template(agent.get_template("spec_design"), task=prompt_task)
+    if injector is not None:
+        prompt = injector.inject_into_prompt(prompt, prompt_task)
+    result = await run_team_turn_with_interrupt(agent, prompt, config)
     return {"verification_plan": result, "messages": [AIMessage(content=result)]}
 
 
@@ -213,6 +310,11 @@ async def designer_verilog_node(
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 simple.py 一致:LangGraph 注解判定要求该字符串形态
 ) -> RTLGraphState:
     """Designer 输出可综合 RTL 源码(多轮迭代时携带上轮验证反馈)。
+
+    节点内拼装 task + 设计规格 + 验证计划 + 上轮反馈为 ``prompt_task``,
+    渲染 ``verilog_design`` 模板 + 注入技能块,然后调
+    ``run_team_turn_with_interrupt`` 流式执行;技能注入 match 文本为
+    ``prompt_task``(对照原 DesignerAgent.averilog_design_task)。
 
     round 计数:每次进入本节点轮次 +1,供条件路由判断是否达 max_rounds 上限。
     config 透传(含 callbacks):使 Designer LLM token 增量可流出到外层事件流。
@@ -230,7 +332,10 @@ async def designer_verilog_node(
     if round_n > 0 and report:
         parts.append(f"【第 {round_n} 轮验证报告反馈(请据此修正 RTL)】\n{report}")
     prompt_task = "\n\n".join(parts)
-    result = await agent.averilog_design_task(prompt_task, injector, config)
+    prompt = agent.render_template(agent.get_template("verilog_design"), task=prompt_task)
+    if injector is not None:
+        prompt = injector.inject_into_prompt(prompt, prompt_task)
+    result = await run_team_turn_with_interrupt(agent, prompt, config)
     return {"rtl_code": result, "round": round_n + 1, "messages": [AIMessage(content=result)]}
 
 
@@ -241,6 +346,11 @@ async def verification_check_node(
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
     """Verification 对 RTL 输出 Testbench/验证报告,并强制输出验证结论标记。
+
+    节点内拼装 task + 设计规格 + 验证计划 + 待验证 RTL 为 ``prompt_task``,
+    渲染 ``verilog_design`` 模板 + 注入技能块,然后调
+    ``run_team_turn_with_interrupt`` 流式执行;技能注入 match 文本为
+    ``prompt_task``(对照原 VerificationAgent.averilog_design_task)。
 
     提示词末尾要求输出"验证结论: PASS / FAIL"行,供 route_after_verification
     解析判定是否进入下一轮迭代。
@@ -261,7 +371,10 @@ async def verification_check_node(
         "或 验证结论: FAIL(表示需修改,并在报告中给出具体修改建议)。"
     )
     prompt_task = "\n\n".join(parts)
-    result = await agent.averilog_design_task(prompt_task, injector, config)
+    prompt = agent.render_template(agent.get_template("verilog_design"), task=prompt_task)
+    if injector is not None:
+        prompt = injector.inject_into_prompt(prompt, prompt_task)
+    result = await run_team_turn_with_interrupt(agent, prompt, config)
     return {"verification_report": result, "messages": [AIMessage(content=result)]}
 
 
@@ -271,7 +384,13 @@ async def designer_output_node(
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
 ) -> RTLGraphState:
-    """Designer 基于最终 RTL 与验证报告整理交付文件,输出最终答案。"""
+    """Designer 基于最终 RTL 与验证报告整理交付文件,输出最终答案。
+
+    节点内拼装 task + 设计规格 + 最终 RTL + 验证报告为 ``prompt_task``,
+    渲染 ``verilog_design`` 模板 + 注入技能块,然后调
+    ``run_team_turn_with_interrupt`` 流式执行;技能注入 match 文本为
+    ``prompt_task``(对照原 DesignerAgent.averilog_design_task)。
+    """
     task = state["task"]
     rtl = state.get("rtl_code", "")
     report = state.get("verification_report", "")
@@ -285,7 +404,10 @@ async def designer_output_node(
         parts.append(f"【验证报告】\n{report}")
     parts.append("请整理以上内容,输出最终交付文件清单与完整 RTL 源码(作为最终交付物)。")
     prompt_task = "\n\n".join(parts)
-    result = await agent.averilog_design_task(prompt_task, injector, config)
+    prompt = agent.render_template(agent.get_template("verilog_design"), task=prompt_task)
+    if injector is not None:
+        prompt = injector.inject_into_prompt(prompt, prompt_task)
+    result = await run_team_turn_with_interrupt(agent, prompt, config)
     return {"final_answer": result, "messages": [AIMessage(content=result)]}
 
 

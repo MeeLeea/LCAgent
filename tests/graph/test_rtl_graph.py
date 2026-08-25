@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 
+from agent.turn_types import AgentTurnResult
 from graph.rtl_graph import (
     RTLGraphState,
     architect_analyze_node,
@@ -31,53 +32,66 @@ from graph.rtl_graph import (
     verification_passed,
     verification_plan_node,
 )
+from team.base import TeamAgent
+
+# 默认模板(与各角色类的 default_templates 一致,供 FakeRTLAgent.get_template 兜底)
+DEFAULT_TEMPLATES: dict[str, str] = {
+    "summarize_context": "你是一个工作流上下文提炼助手。",
+    "architect_plan": "请为以下芯片架构设计任务制定详细的执行计划:\n\n{task}\n\n",
+    "architect_design": "请为以下任务完成芯片架构方案设计:\n\n{task}\n\n",
+    "architect_analyze": "请对以下架构方案进行权衡分析(性能-面积-功耗PPA、风险与瓶颈):\n\n{task}\n\n",
+    "architect_review": "请从架构、RTL实现、后端物理、软件驱动、验证多维度评审以下方案:\n\n{task}\n\n",
+    "architect_spec": "请将以下架构方案整理为可直接交付RTL开发的规格文档:\n\n{task}\n\n",
+    "spec_design": "请根据以下任务完成 RTL 设计前的规格梳理与工程规划:\n\n{task}\n\n",
+    "verilog_design": "请根据以下任务与上下文输出可综合的 SystemVerilog RTL 源码:\n\n{task}\n\n",
+}
 
 
 @dataclass
 class FakeRTLAgent:
-    """模拟 TeamAgent,不联网;按方法名记录调用,支持顺序返回序列"""
+    """模拟 TeamAgent,不联网;节点改调 run_team_turn_with_interrupt 后,
+    统一经 ``arun_structured`` 入口记录调用并返回 ``AgentTurnResult.completed``。
+
+    sequence 为 verification_check 节点的按序响应(耗尽后回退 response),
+    供多轮迭代测试设置不同轮次的返回值(如 verifier 的 FAIL→PASS 序列);
+    通过 prompt 含"待验证 RTL 源码"特征识别 verification_check 节点
+    (其他节点回退 response,与原 verilog_sequence 语义一致)。
+    """
+
+    # verification_check 节点 prompt 的特征字符串(节点模板固定,稳定可识别)
+    _CHECK_PROMPT_MARKER: str = "待验证 RTL 源码"
 
     name: str = "test-agent"
     response: str = "fake response"
-    sequence: list[str] = field(default_factory=list)  # 按序弹出,耗尽后回退 response
-    verilog_sequence: list[str] = field(default_factory=list)  # verilog_design_task 专用序列
+    sequence: list[str] = field(default_factory=list)  # verification_check 专用序列
     calls: list[tuple[str, str]] = field(default_factory=list)
 
-    def _next(self, method: str) -> str:
-        seq = self.verilog_sequence if method == "verilog_design_task" else self.sequence
-        if seq:
-            return seq.pop(0)
+    def _is_check_node(self, prompt: str) -> bool:
+        """识别是否为 verification_check 节点的 prompt(含"待验证 RTL 源码"特征)"""
+        return self._CHECK_PROMPT_MARKER in prompt
+
+    def _next(self, prompt: str) -> str:
+        if self._is_check_node(prompt) and self.sequence:
+            return self.sequence.pop(0)
         return self.response
 
-    def _record(self, method: str, prompt: str) -> str:
-        self.calls.append((method, prompt))
-        return self._next(method)
+    def get_template(self, name: str) -> str:
+        """懒加载模板:复用 TeamAgent 静态解析(无 prompt_file 时回退默认模板)"""
+        return DEFAULT_TEMPLATES.get(name, "")
 
-    # ---- async 业务方法(节点改调 await agent.a*_task 后的唯一入口) ----
-    # calls 记录基础名(不带 a 前缀),保持既有断言兼容
-    async def asummarize_context(self, memory_text: str, config=None) -> str:
-        return self._record("summarize_context", memory_text)
+    def render_template(self, template: str, **kwargs) -> str:
+        """占位符替换(复用 TeamAgent 静态方法,与生产路径一致)"""
+        return TeamAgent.render_template(template, **kwargs)
 
-    async def aplan_task(self, task: str, context_summary: str = "", injector=None, config=None) -> str:
-        return self._record("plan_task", task)
+    def inject_into_prompt(self, prompt: str, task: str, active_names=()) -> str:
+        """技能注入占位:测试不验证技能块,原样返回(prompt 已含渲染内容)"""
+        return prompt
 
-    async def adesign_task(self, task: str, context_summary: str = "", injector=None, config=None) -> str:
-        return self._record("design_task", task)
-
-    async def aanalyze_task(self, task: str, context_summary: str = "", injector=None, config=None) -> str:
-        return self._record("analyze_task", task)
-
-    async def areview_task(self, task: str, context_summary: str = "", injector=None, config=None) -> str:
-        return self._record("review_task", task)
-
-    async def aspec_task(self, task: str, context_summary: str = "", injector=None, config=None) -> str:
-        return self._record("spec_task", task)
-
-    async def aspec_design_task(self, task: str, injector=None, config=None) -> str:
-        return self._record("spec_design_task", task)
-
-    async def averilog_design_task(self, task: str, injector=None, config=None) -> str:
-        return self._record("verilog_design_task", task)
+    async def arun_structured(self, task: str, config=None) -> AgentTurnResult:
+        """节点经 run_team_turn_with_interrupt 调用的唯一入口;
+        记录 (arun_structured, task) 并返回 completed(self._next(task))"""
+        self.calls.append(("arun_structured", task))
+        return AgentTurnResult.completed(self._next(task))
 
 
 def build_fake_agents(
@@ -94,7 +108,7 @@ def build_fake_agents(
         "rtl_verification": FakeRTLAgent(
             name="rtl_verification",
             response=verifier_sequence[-1] if verifier_sequence else "验证结论: PASS",
-            verilog_sequence=list(verifier_sequence or []),
+            sequence=list(verifier_sequence or []),
         ),
     }
 
@@ -129,7 +143,9 @@ def test_summarize_context_node():
     manager = FakeRTLAgent(name="manager", response="摘要: 用户偏好中文")
     result = asyncio.run(summarize_context(initial_state(raw_context="历史对话"), manager))
     assert result["context_summary"] == "摘要: 用户偏好中文"
-    assert manager.calls == [("summarize_context", "历史对话")]
+    # 节点改调 run_team_turn_with_interrupt → arun_structured,prompt 含模板+raw
+    assert manager.calls[0][0] == "arun_structured"
+    assert "历史对话" in manager.calls[0][1]
 
 
 def test_architect_plan_node():
@@ -138,7 +154,7 @@ def test_architect_plan_node():
     state = initial_state(context_summary="摘要S")
     result = asyncio.run(architect_plan_node(state, architect))
     assert result["arch_plan"] == "计划"
-    assert architect.calls[0][0] == "plan_task"
+    assert architect.calls[0][0] == "arun_structured"
     assert "设计一个 UART 模块" in architect.calls[0][1]
 
 
@@ -379,11 +395,12 @@ def test_run_rtl_graph_pass_once():
     assert result["verification_report"] == "验证结论: PASS\nRTL 无问题"
 
     # designer 调用:spec_design + verilog_design(编码) + verilog_design(交付)
+    # 节点改调 run_team_turn_with_interrupt 后,统一经 arun_structured 入口
     designer_calls = [c[0] for c in designer.calls]
-    assert designer_calls == ["spec_design_task", "verilog_design_task", "verilog_design_task"]
+    assert designer_calls == ["arun_structured", "arun_structured", "arun_structured"]
     # verifier 调用:spec_design(计划) + verilog_design(检查)
     verifier_calls = [c[0] for c in verifier.calls]
-    assert verifier_calls == ["spec_design_task", "verilog_design_task"]
+    assert verifier_calls == ["arun_structured", "arun_structured"]
 
 
 def test_run_rtl_graph_multi_round_iteration():
@@ -393,7 +410,7 @@ def test_run_rtl_graph_multi_round_iteration():
     designer = FakeRTLAgent(name="rtl_designer", response="module uart;")
     verifier = FakeRTLAgent(
         name="rtl_verification",
-        verilog_sequence=[
+        sequence=[
             "验证结论: FAIL\n波特率配置错误",
             "验证结论: PASS\n修改后正确",
         ],
@@ -410,8 +427,12 @@ def test_run_rtl_graph_multi_round_iteration():
 
     assert result["round"] == 2
     assert result["final_answer"] == "module uart;"
-    # designer 的 verilog_design_task 被调用 3 次:两轮迭代设计 + 最终交付
-    designer_prompts = [c[1] for c in designer.calls if c[0] == "verilog_design_task"]
+    # designer 的 verilog 类节点(designer_verilog + designer_output)被调 3 次:
+    # 2 轮迭代设计 + 1 次交付;用 verilog_design 模板特征过滤(含"可综合...RTL 源码")
+    designer_prompts = [
+        c[1] for c in designer.calls
+        if c[0] == "arun_structured" and "可综合" in c[1]
+    ]
     assert len(designer_prompts) == 3
     # 首轮设计无反馈,第二轮设计携带 FAIL 反馈,交付轮拼入最终 RTL 与验证报告
     assert "验证结论: FAIL" not in designer_prompts[0]
@@ -441,9 +462,13 @@ def test_run_rtl_graph_forced_output_at_max_rounds():
 
     # 3 次迭代后强制交付,round 达上限
     assert result["round"] == 3
-    assert result["final_answer"] == "module uart;"
-    verifier_design_calls = [c for c in verifier.calls if c[0] == "verilog_design_task"]
-    assert len(verifier_design_calls) == 3
+    # verifier 调用:1 次 verification_plan + 3 次 verification_check(共 4 次 arun_structured)
+    # verification_check 的 prompt 含"待验证 RTL 源码",据此过滤 3 次
+    verifier_check_calls = [
+        c for c in verifier.calls
+        if c[0] == "arun_structured" and "待验证 RTL 源码" in c[1]
+    ]
+    assert len(verifier_check_calls) == 3
 
 
 def test_run_rtl_graph_with_context_memory():
@@ -465,10 +490,11 @@ def test_run_rtl_graph_with_context_memory():
     )
 
     assert result["context_summary"] == "摘要: 用户偏好 SystemVerilog"
-    # manager 调用:summarize + (无 plan_task,architect 承担计划)
-    assert manager.calls == [("summarize_context", "之前聊过偏好 SystemVerilog")]
-    # architect_plan 收到上下文摘要
-    assert architect.calls[0][0] == "plan_task"
+    # manager 调用:summarize 节点改调 arun_structured,prompt 含模板+raw
+    assert manager.calls[0][0] == "arun_structured"
+    assert "之前聊过偏好 SystemVerilog" in manager.calls[0][1]
+    # architect_plan 收到上下文摘要(经 arun_structured)
+    assert architect.calls[0][0] == "arun_structured"
 
 
 # ==================== 注册测试 ====================

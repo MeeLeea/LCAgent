@@ -57,7 +57,7 @@ def test_recall_injected_into_raw_context():
     )
 
     assert memory.recall_calls == ["wf-mem-1"]
-    assert manager.calls[0][0] == "summarize"
+    assert manager.calls[0][0] == "arun_structured"
     assert "【长期记忆】" in manager.calls[0][1]
     assert "用户偏好中文" in manager.calls[0][1]
 
@@ -102,7 +102,7 @@ def test_memory_none_skips_all():
 
     asyncio.run(arun_simple_workflow(graph, "测试任务"))
 
-    assert manager.calls[0][0] == "summarize"
+    assert manager.calls[0][0] == "arun_structured"
     assert "【长期记忆】" not in manager.calls[0][1]
 
 
