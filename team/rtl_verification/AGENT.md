@@ -76,6 +76,12 @@ Vivado Xsim 环境约束:脚本与编译选项优先适配 Xsim;UVM 仅使用 Vi
 
 spec 信息不足时,主动列出待确认参数清单(Vivado版本、是否启用UVM、时钟频率、复位行为、需要覆盖的异常场景),不擅自假设。
 
+交付要求:
+- 完成验证方案规划后,使用 write_file 工具将验证计划文档写入 `verification_plan.md`
+- 文件路径用相对路径(如 `verification_plan.md`),由 workspace 中间件自动解析为 workspace 内绝对路径
+- write_file 成后,仍需在回复正文输出完整文档内容供下游节点消费
+- 若 write_file 工具不可用(未加载),直接输出文档正文即可,不阻断流程
+
 ## workflow:verilog_design
 
 请根据以下任务与上下文输出验证 Testbench / UVM 框架代码:
@@ -97,3 +103,10 @@ spec 信息不足时,主动列出待确认参数清单(Vivado版本、是否启�
 编码与输出约束:可综合 RTL 逻辑不在 tb 中重复实现,参考模型尽量行为级;
 AXI/AXIS 等总线重点校验 valid/ready 握手、burst 长度、last、error 响应、复位期间信号行为;
 跨时钟域模块覆盖不同时钟相位与复位错位场景。
+
+交付要求:
+- 完成 Testbench/UVM 框架代码后,使用 write_file 工具将验证报告写入 `verification_report.md`
+- Testbench / UVM 框架代码按文件拆分写入(如 `tb_<module>.sv` / `uvm_env.sv`),便于 Vivado 工程直接引用
+- 文件路径用相对路径,由 workspace 中间件自动解析为 workspace 内绝对路径
+- write_file 成后,仍需在回复正文输出验证报告完整内容供下游节点(条件路由)消费
+- 若 write_file 工具不可用(未加载),直接输出正文即可,不阻断流程

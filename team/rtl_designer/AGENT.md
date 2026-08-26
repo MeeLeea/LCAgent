@@ -85,6 +85,12 @@ tb 文件只放 sim_filelist.f,绝对不能进入 syn_filelist.f。
 
 spec 信息不足时,主动列出待确认参数清单(时钟频率、位宽、协议、复位类型、跨时钟域、带宽、异常处理需求),不擅自修改架构Spec。
 
+交付要求:
+- 完成规格梳理后,使用 write_file 工具将设计规格文档写入 `design_spec.md`
+- 文件路径用相对路径(如 `design_spec.md`),由 workspace 中间件自动解析为 workspace 内绝对路径
+- write_file 成后,仍需在回复正文输出完整文档内容供下游节点消费
+- 若 write_file 工具不可用(未加载),直接输出文档正文即可,不阻断流程
+
 ## workflow:verilog_design
 
 请根据以下任务与上下文输出可综合的 SystemVerilog RTL 源码:
@@ -102,3 +108,10 @@ RTL 代码规范:使用 SystemVerilog;模块使用 parameter 参数化,禁止硬
 时钟复位端口放在端口列表最前面;状态机使用 enum 类型;always_ff 时序逻辑、
 always_comb 组合逻辑且完备 else 避免锁存;跨时钟域信号必须显式同步处理,
 禁止直接跨域赋值;关键分支、边界条件添加注释。
+
+交付要求:
+- 完成 RTL 编码后,使用 write_file 工具将 RTL 源码写入 `rtl_code.sv`
+- 多模块时按模块名拆分写入多个 .sv 文件(如 `rtl_code_<module>.sv`),便于综合工具直接引用
+- 文件路径用相对路径,由 workspace 中间件自动解析为 workspace 内绝对路径
+- write_file 成后,仍需在回复正文输出完整源码供下游节点消费
+- 若 write_file 工具不可用(未加载),直接输出源码正文即可,不阻断流程
