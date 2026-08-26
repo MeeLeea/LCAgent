@@ -470,17 +470,26 @@ def test_builtin_agents_registered():
     assert AGENT_REGISTRY["manager"]["tools"] is None
     assert AGENT_REGISTRY["terminator"]["tools"] is None
 
-    # Architect 声明 mcp_tools=["write_file"],本地 tools 为 None
+    # Architect 声明文件系统类 MCP 工具(读写/编辑/列表/删除文件与目录),
+    # 本地 tools 含 request_user_confirmation(架构评审的待确认输入清单升级为
+    # LangGraph interrupt/resume 语义,见 tools/human_confirmation.py)
     # (MCP 工具由 build_workflow 装配期同步拉取,见 test_build_workflow_mcp_tools_injection)
-    assert AGENT_REGISTRY["architect"]["tools"] is None
-    assert AGENT_REGISTRY["architect"]["mcp_tools"] == ["write_file"]
+    _fs_mcp_tools = [
+        "write_file", "edit_file", "list_directory", "read_file",
+        "delete_file", "create_directory", "delete_directory",
+    ]
+    _arch_tool_names = [t.name for t in (AGENT_REGISTRY["architect"]["tools"] or [])]
+    assert _arch_tool_names == ["request_user_confirmation"]
+    assert AGENT_REGISTRY["architect"]["mcp_tools"] == _fs_mcp_tools
 
-    # RTL Designer / Verification 同样声明 mcp_tools=["write_file"],
-    # 让规格文档/RTL 源码/验证报告/验证计划可写入 workspace
-    assert AGENT_REGISTRY["rtl_designer"]["tools"] is None
-    assert AGENT_REGISTRY["rtl_designer"]["mcp_tools"] == ["write_file"]
-    assert AGENT_REGISTRY["rtl_verification"]["tools"] is None
-    assert AGENT_REGISTRY["rtl_verification"]["mcp_tools"] == ["write_file"]
+    # RTL Designer / Verification 同样声明上述文件系统类 MCP 工具 + request_user_confirmation,
+    # 让规格文档/RTL 源码/验证报告/验证计划可写入 workspace, 且待确认项可走 interrupt/resume
+    _designer_tool_names = [t.name for t in (AGENT_REGISTRY["rtl_designer"]["tools"] or [])]
+    assert _designer_tool_names == ["request_user_confirmation"]
+    assert AGENT_REGISTRY["rtl_designer"]["mcp_tools"] == _fs_mcp_tools
+    _verif_tool_names = [t.name for t in (AGENT_REGISTRY["rtl_verification"]["tools"] or [])]
+    assert _verif_tool_names == ["request_user_confirmation"]
+    assert AGENT_REGISTRY["rtl_verification"]["mcp_tools"] == _fs_mcp_tools
 
 
 def test_build_workflow_mcp_tools_injection():
