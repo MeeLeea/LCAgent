@@ -20,10 +20,12 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Any
+from inspect import signature
+from typing import TYPE_CHECKING, Any, Optional
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph
 from langgraph.types import interrupt
 
@@ -243,6 +245,7 @@ async def _compaction_wrapper(
     node_fn: Callable,
     mw: LCAgentCompactionMiddleware,
     state: dict[str, Any],
+    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 须用 Optional 写法,LangGraph 注解判定仅接受该字符串形态（与 simple.py/rtl_graph.py 节点签名一致）
     *args: Any,
     **kwargs: Any,
 ) -> dict[str, Any]:
@@ -257,12 +260,20 @@ async def _compaction_wrapper(
         node_fn: 被包装的原始节点函数
         mw: compaction 中间件（含阈值与摘要 LLM）
         state: 节点输入状态
-        *args/**kwargs: 透传给节点函数的额外参数（agent/injector/config 等）
+        config: LangGraph 运行时配置（含 configurable.thread_id /
+            workspace_path 等），由框架按节点签名注入。显式声明此参数
+            使 LangGraph 能识别并注入（*args/**kwargs 形态下框架
+            无法检测到 config 参数，会跳过注入导致下游节点收到 None）
+        *args/**kwargs: 透传给节点函数的其他参数（agent/injector 等）
 
     Returns:
         节点返回 dict；若触发压缩则含更新后的 messages/summary
     """
-    result = await node_fn(state, *args, **kwargs)
+    # 检查被包装的节点函数是否接受 config 参数,有则透传,无则不传
+    # (测试用的简易节点可能无 config 参数,避免 TypeError)
+    _accepts_config = "config" in signature(node_fn).parameters
+    call_kwargs = {**kwargs, "config": config} if _accepts_config else kwargs
+    result = await node_fn(state, *args, **call_kwargs)
     new_messages = result.get("messages")
     if not new_messages:
         return result
