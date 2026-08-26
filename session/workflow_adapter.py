@@ -398,17 +398,29 @@ class WorkflowAdapter:
         run_task = asyncio.create_task(_run())
 
         # 边执行边吐出节点事件（NodeTrackingHandler 回调实时入队）
+        # finally 兜底：外层被取消（dispatch_task.cancel / 客户端断开）时，
+        # 同步取消 run_task，避免 graph.ainvoke 继续执行后续节点。
         final: Any = None
-        while True:
-            try:
-                ev = runtime.node_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                if run_task.done():
-                    final = run_task.result()
-                    break
-                await asyncio.sleep(0.005)
-                continue
-            yield ev
+        try:
+            while True:
+                try:
+                    ev = runtime.node_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    if run_task.done():
+                        final = run_task.result()
+                        break
+                    await asyncio.sleep(0.005)
+                    continue
+                yield ev
+        finally:
+            if not run_task.done():
+                run_task.cancel()
+                try:
+                    await run_task
+                except (asyncio.CancelledError, Exception):  # noqa: S110 - 主动取消 run_task
+                    # 仅吞 run_task 自身的取消/执行异常；
+                    # 外层 CancelledError 不在此处被吞，会在 finally 完成后继续向上传播
+                    pass
 
         # 终止事件：ERROR / INTERRUPT / DONE
         tid = runtime.tid

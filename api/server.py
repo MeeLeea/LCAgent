@@ -919,41 +919,58 @@ async def chat(req: ChatRequest, request: Request):
                             dispatch_task = asyncio.create_task(_run_dispatch())
 
                             # 实时消费队列：print → token 事件；workflow 事件 → 结构化 SSE 事件
+                            # cancel_event 竞速任务一次性创建，与队列 get 一同竞速，使前端停止信号
+                            # （POST /api/stop 置位 cancel_event）立即可见，消除 wait_for 的 ~2s 延迟
+                            # （对照 _forward_stream_with_cancel:673-681）
                             outcome = None
-                            while True:
-                                # 停止信号：前端 POST /api/stop 置位后及时中止命令执行
-                                if cancel_event.is_set():
-                                    logger.info("客户端停止 [%s]，中止命令输出", tid)
-                                    dispatch_task.cancel()
-                                    try:
-                                        await dispatch_task
-                                    except asyncio.CancelledError:
-                                        pass
-                                    yield _sse({"type": "cancelled", "content": "用户已停止生成。"})
-                                    return
-                                # 客户端断开检测：前端 abort 后及时释放锁，避免新请求被阻塞
-                                if await request.is_disconnected():
-                                    logger.info("客户端断开 [%s]，中止命令输出", tid)
-                                    dispatch_task.cancel()
-                                    try:
-                                        await dispatch_task
-                                    except asyncio.CancelledError:
-                                        pass
-                                    return
-                                try:
-                                    kind, payload = await asyncio.wait_for(output_queue.get(), timeout=2.0)
-                                except TimeoutError:
-                                    continue
-                                if kind == "print":
-                                    yield _sse({"type": "token", "content": payload})
-                                elif kind == "event":
-                                    yield _sse(payload)
-                                elif kind == "outcome":
-                                    outcome = payload
-                                    break
-                                else:  # error
-                                    yield _sse({"type": "error", "content": f"命令执行失败: {payload}"})
-                                    return
+                            cancel_waiter = asyncio.create_task(cancel_event.wait())
+                            try:
+                                while True:
+                                    # 停止信号：前端 POST /api/stop 置位后及时中止命令执行
+                                    if cancel_event.is_set():
+                                        logger.info("客户端停止 [%s]，中止命令输出", tid)
+                                        dispatch_task.cancel()
+                                        try:
+                                            await dispatch_task
+                                        except asyncio.CancelledError:
+                                            pass
+                                        yield _sse({"type": "cancelled", "content": "用户已停止生成。"})
+                                        return
+                                    # 客户端断开检测：前端 abort 后及时释放锁，避免新请求被阻塞
+                                    if await request.is_disconnected():
+                                        logger.info("客户端断开 [%s]，中止命令输出", tid)
+                                        dispatch_task.cancel()
+                                        try:
+                                            await dispatch_task
+                                        except asyncio.CancelledError:
+                                            pass
+                                        return
+                                    # 竞速：队列有项 或 cancel_event 置位，先到先得（FIRST_COMPLETED）
+                                    getter = asyncio.create_task(output_queue.get())
+                                    done, _ = await asyncio.wait(
+                                        {getter, cancel_waiter},
+                                        return_when=asyncio.FIRST_COMPLETED,
+                                    )
+                                    # 停止信号胜出 → 取消 getter，下一轮顶部 cancel 分支统一处理
+                                    if cancel_waiter in done and cancel_event.is_set():
+                                        if not getter.done():
+                                            getter.cancel()
+                                        continue
+                                    # 队列项就绪
+                                    kind, payload = getter.result()
+                                    if kind == "print":
+                                        yield _sse({"type": "token", "content": payload})
+                                    elif kind == "event":
+                                        yield _sse(payload)
+                                    elif kind == "outcome":
+                                        outcome = payload
+                                        break
+                                    else:  # error
+                                        yield _sse({"type": "error", "content": f"命令执行失败: {payload}"})
+                                        return
+                            finally:
+                                if not cancel_waiter.done():
+                                    cancel_waiter.cancel()
 
                             await dispatch_task  # 确保命令任务完全退出
 
