@@ -475,6 +475,13 @@ def test_builtin_agents_registered():
     assert AGENT_REGISTRY["architect"]["tools"] is None
     assert AGENT_REGISTRY["architect"]["mcp_tools"] == ["write_file"]
 
+    # RTL Designer / Verification 同样声明 mcp_tools=["write_file"],
+    # 让规格文档/RTL 源码/验证报告/验证计划可写入 workspace
+    assert AGENT_REGISTRY["rtl_designer"]["tools"] is None
+    assert AGENT_REGISTRY["rtl_designer"]["mcp_tools"] == ["write_file"]
+    assert AGENT_REGISTRY["rtl_verification"]["tools"] is None
+    assert AGENT_REGISTRY["rtl_verification"]["mcp_tools"] == ["write_file"]
+
 
 def test_build_workflow_mcp_tools_injection():
     """测试 build_workflow 装配期同步拉取声明的 MCP 工具并合并到 tools
