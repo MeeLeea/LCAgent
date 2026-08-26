@@ -8,12 +8,18 @@ from graph.registry import register_agent
 from team.base import PromptInjector, TeamAgent
 
 
-@register_agent("architect", "team/architect/agent_config.json", tools=None)
+@register_agent(
+    "architect",
+    "team/architect/agent_config.json",
+    tools=None,
+    mcp_tools=["write_file"],
+)
 class ArchiAgent(TeamAgent):
     """
     架构师 Agent,负责芯片架构方案设计、PPA 权衡分析、多维度评审与规格文档输出
 
-    继承 TeamAgent 轻量基类,纯文本推理模式(不使用工具);各工作流方法
+    继承 TeamAgent 轻量基类,可选工具调用能力(声明 mcp_tools=["write_file"],
+    由 build_workflow 装配期同步拉取;加载失败时降级为纯文本模式);各工作流方法
     渲染对应 `## workflow:*` 小节 → 可选技能注入 → 异步 LLM 调用(TOKEN 级流式)。
     """
 
