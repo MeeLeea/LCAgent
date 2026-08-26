@@ -50,6 +50,7 @@ def register_agent(
     name: str,
     config_file: str,
     tools: list[BaseTool] | None = None,
+    mcp_tools: list[str] | None = None,
 ) -> Callable[[type[T]], type[T]]:
     """
     将 Agent 类注册到全局 AGENT_REGISTRY,供 build_workflow 统一构建
@@ -57,7 +58,12 @@ def register_agent(
     Args:
         name: 角色名(如 "manager"/"spec_analyst")
         config_file: agent_config.json 路径(相对项目根)
-        tools: 该角色的工具列表(纯文本角色传 None)
+        tools: 该角色的本地工具列表(纯文本角色传 None)。这些工具在装饰器
+            执行时即确定(模块加载期),与 mcp_tools 互补
+        mcp_tools: 该角色依赖的 MCP 工具名列表(如 ["write_file"])。这些工具
+            在 build_workflow 装配期由 mcp_loader.load_mcp_tools_by_name_sync
+            同步拉取(遍历已启用 MCP server 按名筛选),失败时静默降级为空列表
+            (角色退化为纯文本模式)。声明工具名而非 server 名,解耦 server 配置
 
     Returns:
         装饰器函数,原样返回被装饰的类
@@ -68,6 +74,7 @@ def register_agent(
             "agent_class": cls,
             "config_file": config_file,
             "tools": tools,
+            "mcp_tools": mcp_tools,
         }
         return cls
 
@@ -179,11 +186,30 @@ def build_workflow(name: str, checkpointer=None) -> tuple[object, dict[str, obje
             logger.warning("未注册的角色: %s（已注册: %s）", role, available)
             raise KeyError(f"未注册的角色: {role}。已注册角色: {available}")
         role_spec = AGENT_REGISTRY[role]
+        # 同步拉取声明的 MCP 工具并合并到本地 tools
+        # 失败时 mcp_loader 静默返回空列表,角色降级为纯文本模式(若本地 tools 也为空)
+        tools = list(role_spec["tools"]) if role_spec["tools"] else []
+        mcp_names = role_spec.get("mcp_tools")
+        if mcp_names:
+            from tools.mcp_loader import load_mcp_tools_by_name_sync
+
+            mcp_loaded = load_mcp_tools_by_name_sync(mcp_names)
+            if mcp_loaded:
+                tools.extend(mcp_loaded)
+                logger.info(
+                    "角色 %s: 加载 %d 个 MCP 工具: %s",
+                    role, len(mcp_loaded), [t.name for t in mcp_loaded],
+                )
+            else:
+                logger.warning(
+                    "角色 %s: 声明的 MCP 工具 %s 加载失败或未配置,降级为纯文本模式",
+                    role, mcp_names,
+                )
         return build_team_agent(
             role_spec["agent_class"],
             role_spec["config_file"],
             BASE_DIR,
-            tools=role_spec["tools"],
+            tools=tools or None,
             checkpointer=checkpointer,
         )
 

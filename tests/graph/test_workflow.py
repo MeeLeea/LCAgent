@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from unittest.mock import patch
 
 import pytest
 
@@ -418,6 +419,39 @@ def test_register_agent_tools_passthrough():
         AGENT_REGISTRY.pop("fake_worker", None)
 
 
+def test_register_agent_mcp_tools_passthrough():
+    """测试装饰器的 mcp_tools 参数原样透传到注册表(默认 None,显式声明时存列表)"""
+    from graph.registry import AGENT_REGISTRY, register_agent
+    from team.base import TeamAgent
+
+    # 显式声明 mcp_tools
+    @register_agent(
+        "fake_mcp_role",
+        "team/fake_mcp/agent_config.json",
+        tools=None,
+        mcp_tools=["write_file"],
+    )
+    class FakeMcpAgent(TeamAgent):
+        pass
+
+    try:
+        spec = AGENT_REGISTRY["fake_mcp_role"]
+        assert spec["mcp_tools"] == ["write_file"]
+        # 未声明 mcp_tools 时默认 None(向后兼容)
+    finally:
+        AGENT_REGISTRY.pop("fake_mcp_role", None)
+
+    # 不传 mcp_tools 时默认 None
+    @register_agent("fake_no_mcp", "team/fake_no_mcp/agent_config.json")
+    class FakeNoMcpAgent(TeamAgent):
+        pass
+
+    try:
+        assert AGENT_REGISTRY["fake_no_mcp"]["mcp_tools"] is None
+    finally:
+        AGENT_REGISTRY.pop("fake_no_mcp", None)
+
+
 def test_builtin_agents_registered():
     """测试内置角色(manager/worker/terminator/architect)已通过装饰器注册"""
     import team  # noqa: F401 - 触发各 agent 模块加载,完成注册
@@ -435,6 +469,129 @@ def test_builtin_agents_registered():
     assert len(AGENT_REGISTRY["worker"]["tools"]) > 0
     assert AGENT_REGISTRY["manager"]["tools"] is None
     assert AGENT_REGISTRY["terminator"]["tools"] is None
+
+    # Architect 声明 mcp_tools=["write_file"],本地 tools 为 None
+    # (MCP 工具由 build_workflow 装配期同步拉取,见 test_build_workflow_mcp_tools_injection)
+    assert AGENT_REGISTRY["architect"]["tools"] is None
+    assert AGENT_REGISTRY["architect"]["mcp_tools"] == ["write_file"]
+
+
+def test_build_workflow_mcp_tools_injection():
+    """测试 build_workflow 装配期同步拉取声明的 MCP 工具并合并到 tools
+
+    通过 patch load_mcp_tools_by_name_sync 返回伪造工具,验证:
+    - 声明 mcp_tools 的角色,工具被合并进 build_team_agent 的 tools 参数
+    - 未声明 mcp_tools 的角色,tools 保持原样(本地 tools 或 None)
+    - MCP 加载失败(返回空)时,角色降级为纯文本模式(tools=None)
+    """
+    from graph.registry import AGENT_REGISTRY, register_agent, build_workflow
+    from team.base import TeamAgent
+    from dataclasses import dataclass
+
+    @dataclass
+    class FakeTool:
+        """最小工具桩:只携带 name,供按名筛选测试。"""
+        name: str
+
+    fake_write_file = FakeTool(name="write_file")
+
+    captured: dict = {}
+
+    # 用 fake role 测试,避免污染真实 architect 注册项
+    @register_agent(
+        "fake_mcp_inject_role",
+        "team/architect/agent_config.json",  # 复用 architect 配置避免新建文件
+        tools=None,
+        mcp_tools=["write_file"],
+    )
+    class FakeMcpInjectAgent(TeamAgent):
+        pass
+
+    # 另注册一个无 mcp_tools 的角色作对照
+    @register_agent(
+        "fake_no_mcp_inject_role",
+        "team/manager/agent_config.json",
+        tools=None,
+    )
+    class FakeNoMcpInjectAgent(TeamAgent):
+        pass
+
+    original_build = None
+    try:
+        # registry._build 内部用 `from team import build_team_agent` 取符号,
+        # 每次调用都重新从 team 包命名空间解析,因此 patch team.build_team_agent 即可拦截
+        import team as team_mod
+
+        original_build = team_mod.build_team_agent
+
+        def _spy_build(agent_class, config_file, base_dir, tools=None, **kwargs):
+            captured[agent_class.__name__] = tools
+            # 返回一个最小实例,避免真实 LLM/MCP 初始化
+            inst = object.__new__(agent_class)
+            inst.tools = tools or []
+            inst.agent_executor = None
+            return inst
+
+        team_mod.build_team_agent = _spy_build
+
+        # 还需 patch 工作流 builder,避免真实图编译
+        from graph import registry as reg_mod
+
+        original_get_spec = reg_mod._get_workflow_spec
+
+        def _fake_get_spec(name):
+            return {
+                "builder": lambda agents, checkpointer=None: type(
+                    "FakeGraph", (), {"get_graph": lambda self: type(
+                        "G", (), {"nodes": []}
+                    )()}
+                )(),
+                "runner": None,
+                "roles": ["fake_mcp_inject_role", "fake_no_mcp_inject_role"],
+                "description": "test",
+            }
+
+        reg_mod._get_workflow_spec = _fake_get_spec
+        reg_mod.WORKFLOWS["__test_mcp_inject__"] = {
+            "builder": _fake_get_spec("__test_mcp_inject__")["builder"],
+            "runner": None,
+            "roles": ["fake_mcp_inject_role", "fake_no_mcp_inject_role"],
+            "description": "test",
+        }
+
+        # Case 1: MCP 工具加载成功
+        with patch(
+            "tools.mcp_loader.load_mcp_tools_by_name_sync",
+            return_value=[fake_write_file],
+        ):
+            build_workflow("__test_mcp_inject__", checkpointer=None)
+
+        # 声明 mcp_tools 的角色: tools 含 write_file
+        assert captured.get("FakeMcpInjectAgent") is not None
+        assert len(captured["FakeMcpInjectAgent"]) == 1
+        assert captured["FakeMcpInjectAgent"][0].name == "write_file"
+        # 未声明 mcp_tools 的角色: tools 为 None(本地 tools 也为 None)
+        assert captured.get("FakeNoMcpInjectAgent") is None
+
+        # Case 2: MCP 加载失败(返回空)→ 降级纯文本模式(tools=None)
+        captured.clear()
+        with patch(
+            "tools.mcp_loader.load_mcp_tools_by_name_sync",
+            return_value=[],
+        ):
+            build_workflow("__test_mcp_inject__", checkpointer=None)
+
+        # 声明 mcp_tools 但加载失败: tools 为 None(本地 tools 也为空 → or None)
+        assert captured.get("FakeMcpInjectAgent") is None
+
+    finally:
+        if original_build is not None:
+            team_mod.build_team_agent = original_build
+        if original_get_spec is not None:
+            reg_mod._get_workflow_spec = original_get_spec
+        AGENT_REGISTRY.pop("fake_mcp_inject_role", None)
+        AGENT_REGISTRY.pop("fake_no_mcp_inject_role", None)
+        reg_mod.WORKFLOWS.pop("__test_mcp_inject__", None)
 
 
 # ==================== 测试 CLI 命令 ====================
