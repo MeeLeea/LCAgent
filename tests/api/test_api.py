@@ -1235,6 +1235,101 @@ def test_chat_stop_mid_stream_cleans_pending_memory(client, mock_agent):
     mock_agent._memory_context = None
 
 
+def test_workflow_management_stop_mid_stream(client, mock_agent):
+    """管理型命令(工作流)执行中收到 /api/stop 应取消 dispatch_task 并回送 cancelled。
+
+    回归：早期实现中 workflow 走管理分支，stop 仅取消外层 dispatch_task，
+    内部 graph.ainvoke 的 run_task 未被取消，导致后续节点继续执行。
+    """
+    import threading
+    import time
+
+    async def hanging_dispatch(context, command):
+        if context.workflow_event_cb:
+            context.workflow_event_cb({"type": "workflow_node", "node": "n1", "status": "running"})
+        # 模拟工作流卡在后续节点（等效 graph.ainvoke 长耗时）
+        await asyncio.sleep(30)
+        if context.workflow_event_cb:
+            context.workflow_event_cb({"type": "workflow_node", "node": "n2", "status": "running"})
+
+    events: list[dict] = []
+    errors: list[Exception] = []
+
+    def consume():
+        try:
+            with client.stream(
+                "POST",
+                "/api/chat",
+                json={"message": "/workflow:simple 你好", "thread_id": "test-thread-123"},
+            ) as resp:
+                for line in resp.iter_lines():
+                    if line.startswith("data: "):
+                        events.append(json.loads(line[6:]))
+        except Exception as e:  # noqa: BLE001 - 仅用于测试断言收集
+            errors.append(e)
+
+    with patch("api.server.dispatch_command", hanging_dispatch):
+        thread = threading.Thread(target=consume)
+        thread.start()
+        time.sleep(0.4)  # 等待首个节点事件产出后触发停止
+        resp = client.post("/api/stop", json={"thread_id": "test-thread-123"})
+        assert resp.status_code == 200
+        assert resp.json()["stopped"] is True
+        thread.join(timeout=10)
+    assert not thread.is_alive(), f"管理分支流未在停止后结束: {errors}"
+    types = [e["type"] for e in events]
+    assert "cancelled" in types, f"未收到 cancelled 事件，实际事件: {types}"
+    # 后续节点不应被产出：工作流应被真正中止
+    assert not any(e.get("node") == "n2" for e in events), f"工作流未被中止，n2 已执行: {events}"
+
+
+def test_workflow_adapter_cancels_run_task():
+    """_arun_input_events 被取消时应连带取消内部 run_task(graph.ainvoke)。"""
+    import asyncio
+    from types import SimpleNamespace
+
+    from session.workflow_adapter import WorkflowAdapter
+
+    async def _run() -> bool:
+        cancelled = {"value": False}
+
+        async def slow_ainvoke(graph_input, config=None):
+            try:
+                await asyncio.sleep(30)
+                return {"final_answer": "done"}
+            except asyncio.CancelledError:
+                cancelled["value"] = True
+                raise
+
+        runtime = SimpleNamespace(
+            graph=SimpleNamespace(ainvoke=slow_ainvoke),
+            config={},
+            node_queue=asyncio.Queue(),
+            tid="wt",
+            trace_id="tr",
+        )
+        adapter = WorkflowAdapter.__new__(WorkflowAdapter)  # 避免触发真实初始化
+
+        async def _drive():
+            async for _ in adapter._arun_input_events(runtime, {}, True):
+                pass
+
+        task = asyncio.create_task(_drive())
+        await asyncio.sleep(0.1)  # 让生成器启动并创建 run_task
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        for _ in range(50):
+            if cancelled["value"]:
+                break
+            await asyncio.sleep(0.02)
+        return cancelled["value"]
+
+    assert asyncio.run(_run()) is True
+
+
 # --------------------------------------------------------------------------- #
 # 命令执行
 # --------------------------------------------------------------------------- #
