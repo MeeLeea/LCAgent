@@ -898,35 +898,45 @@ export const useStore = create<AppState>((set, get) => ({
 
   stopStreaming: () => {
     const key = normKey(get().currentThreadId)
-    // 先向后端发送显式停止信号：即使 abort 连接后后端仍在 LLM 阻塞调用
-    // （含 SDK 内部重试）期间，也能立即感知取消并中断生成。
+    // 向后端发送显式停止信号：后端取消工作流后会回送 `cancelled` SSE 事件，
+    // 由 handleStreamEvent 的 case 'cancelled' 负责最终回退 UI（清 streaming、补提示）。
+    // 此处不再立即 abort 连接或本地改写消息——按钮保持"停止生成"直到后端确认取消，
+    // 以避免"本地显示已中止、后端仍在执行"的假反馈。
     const threadId = get().currentThreadId
     if (threadId) void api.stop(threadId).catch(() => {})
     clearWatchdog(key)
-    if (abortFns[key]) abortFns[key]!()
-    delete abortFns[key]
-    // 阻止迟到事件继续写入
-    terminatedThreads.add(key)
-    set((s) => {
-      const arr = [...(s.messagesByThread[key] ?? s.messages)]
-      const lastIndex = arr.length - 1
-      const last = arr[lastIndex]
-      if (last && last.role === 'assistant' && last.streaming) {
-        arr[lastIndex] = {
-          ...last,
-          streaming: false,
-          content: last.content || '_(已中止)_',
+
+    // 安全兜底：若后端在限时内未回送 cancelled（如断网、后端未实现取消），
+    // 在此执行原始拆卸（abort 连接 + 标记终止 + 本地回写"_(已中止)_"），
+    // 确保按钮不会永久卡在"停止生成"。
+    const FALLBACK_MS = 1500
+    setTimeout(() => {
+      // 已由 cancelled 路径正常回退则无需兜底
+      if (!get().streamingThreads[key]) return
+      abortFns[key]?.()
+      delete abortFns[key]
+      terminatedThreads.add(key)
+      set((s) => {
+        const arr = [...(s.messagesByThread[key] ?? s.messages)]
+        const lastIndex = arr.length - 1
+        const last = arr[lastIndex]
+        if (last && last.role === 'assistant' && last.streaming) {
+          arr[lastIndex] = {
+            ...last,
+            streaming: false,
+            content: last.content || '_(已中止)_',
+          }
         }
-      }
-      const streamingThreads = { ...s.streamingThreads }
-      delete streamingThreads[key]
-      const patch: Partial<AppState> = {
-        streamingThreads,
-        messagesByThread: { ...s.messagesByThread, [key]: arr },
-      }
-      if (normKey(s.currentThreadId) === key) patch.messages = arr
-      return patch
-    })
+        const streamingThreads = { ...s.streamingThreads }
+        delete streamingThreads[key]
+        const patch: Partial<AppState> = {
+          streamingThreads,
+          messagesByThread: { ...s.messagesByThread, [key]: arr },
+        }
+        if (normKey(s.currentThreadId) === key) patch.messages = arr
+        return patch
+      })
+    }, FALLBACK_MS)
   },
 
   clearMessages: () => {
