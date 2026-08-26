@@ -163,6 +163,58 @@ async def load_mcp_tools(config_file: str = DEFAULT_CONFIG_FILE) -> list[BaseToo
     return sync_tools
 
 
+async def aload_mcp_tools_by_name(
+    names: list[str],
+    config_file: str = DEFAULT_CONFIG_FILE,
+) -> list[BaseTool]:
+    """按工具名从已启用的 MCP server 中筛选并加载工具。
+
+    全量加载所有启用 server 的工具后按名字过滤,返回命中工具的列表。
+    命中数为 0 时返回空列表(不抛异常,调用方据此降级为纯文本模式)。
+    单个 server 加载失败由 load_mcp_tools 内部兜底(异常 + 继续),不影响其他 server。
+
+    Args:
+        names: 期望加载的工具名列表(如 ["write_file"])
+        config_file: MCP 配置文件路径
+
+    Returns:
+        命中的 BaseTool 列表;无命中或 MCP 未配置时为空
+    """
+    if not names:
+        return []
+    wanted = set(names)
+    all_tools = await load_mcp_tools(config_file)
+    return [t for t in all_tools if t.name in wanted]
+
+
+def load_mcp_tools_by_name_sync(
+    names: list[str],
+    config_file: str = DEFAULT_CONFIG_FILE,
+) -> list[BaseTool]:
+    """aload_mcp_tools_by_name 的同步包装。
+
+    复用 mcp_loader._run_async 在同步上下文(如 build_workflow 装配期)拉起异步
+    加载;当前线程已在事件循环中时,_run_async 会另起线程执行,避免嵌套循环报错。
+
+    Args:
+        names: 期望加载的工具名列表
+        config_file: MCP 配置文件路径
+
+    Returns:
+        命中的 BaseTool 列表;加载失败或无命中时为空(静默降级,记 WARNING)
+    """
+    if not names:
+        return []
+    try:
+        result = _run_async(aload_mcp_tools_by_name(names, config_file))
+        return list(result) if result else []
+    except Exception as e:
+        logger.warning(
+            "MCP 工具按名同步加载失败(names=%s),将降级为纯文本模式: %s", names, e
+        )
+        return []
+
+
 def list_configured_servers(config_file: str = DEFAULT_CONFIG_FILE) -> list[dict[str, Any]]:
     """
     列出配置文件中所有 MCP 服务器
