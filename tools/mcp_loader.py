@@ -215,6 +215,55 @@ def load_mcp_tools_by_name_sync(
         return []
 
 
+def load_all_mcp_tools_sync(
+    config_file: str = DEFAULT_CONFIG_FILE,
+) -> list[BaseTool]:
+    """同步加载所有已启用 MCP server 的全部工具(不过滤)。
+
+    供 register_agent(mcp_all=True) 在 build_workflow 装配期调用:
+    一次性连接所有 enabled MCP server、拉取全部工具、按名去重后返回。
+
+    失败语义与 load_mcp_tools_by_name_sync 一致(静默降级):
+      - 单个 server 加载失败由 load_mcp_tools 内部兜底(异常 + 继续),
+        不影响其他 server,返回部分成功列表
+      - 所有 server 全部失败或配置缺失时返回空列表
+      - _run_async 自身异常时 WARNING + 返回空列表,不向上抛
+        (调用方 _build 据此降级角色为纯文本模式)
+
+    命名冲突处理:多个 server 提供同名工具时,按 server 遍历顺序
+    (json 配置中的 enabled_servers 字典序)保留先到者,丢弃后到者并记 WARNING。
+    这与 aload_mcp_tools_by_name 的既有行为(直接 extend 不去重)略有差异——
+    全量加载场景冲突面更大,故在此收敛。
+
+    Args:
+        config_file: MCP 配置文件路径
+
+    Returns:
+        去重后的 BaseTool 列表;加载失败或无 enabled server 时为空
+    """
+    try:
+        result = _run_async(load_mcp_tools(config_file))
+        tools = list(result) if result else []
+    except Exception as e:
+        logger.warning(
+            "MCP 全量同步加载失败,将降级为纯文本模式: %s", e
+        )
+        return []
+
+    # 按 tool.name 去重,保留先到者(enabled_servers 字典遍历序可预测)
+    seen: set[str] = set()
+    deduped: list[BaseTool] = []
+    for tool in tools:
+        if tool.name in seen:
+            logger.warning(
+                "MCP 工具名冲突: '%s' 已存在,丢弃后到的同名工具", tool.name
+            )
+            continue
+        seen.add(tool.name)
+        deduped.append(tool)
+    return deduped
+
+
 def list_configured_servers(config_file: str = DEFAULT_CONFIG_FILE) -> list[dict[str, Any]]:
     """
     列出配置文件中所有 MCP 服务器

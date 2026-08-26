@@ -12,7 +12,7 @@ from team.base import PromptInjector, TeamAgent
     "rtl_verification",
     "team/rtl_verification/agent_config.json",
     tools=None,
-    mcp_tools=["write_file"],
+    mcp_tools=["write_file","edit_file","list_directory","read_file","delete_file","create_directory","delete_directory"],
 )
 class VerificationAgent(TeamAgent):
     """

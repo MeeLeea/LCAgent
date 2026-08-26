@@ -51,6 +51,7 @@ def register_agent(
     config_file: str,
     tools: list[BaseTool] | None = None,
     mcp_tools: list[str] | None = None,
+    mcp_all: bool = False,
 ) -> Callable[[type[T]], type[T]]:
     """
     将 Agent 类注册到全局 AGENT_REGISTRY,供 build_workflow 统一构建
@@ -64,6 +65,12 @@ def register_agent(
             在 build_workflow 装配期由 mcp_loader.load_mcp_tools_by_name_sync
             同步拉取(遍历已启用 MCP server 按名筛选),失败时静默降级为空列表
             (角色退化为纯文本模式)。声明工具名而非 server 名,解耦 server 配置
+        mcp_all: 是否加载所有已启用 MCP server 的全部工具。True 时在
+            build_workflow 装配期调用 mcp_loader.load_all_mcp_tools_sync 一次性
+            拉取全部 enabled server 的全部工具(按名去重)。与 mcp_tools 互斥:
+            同时给出时 mcp_all 优先,mcp_tools 被忽略并记 WARNING。
+            注意: 全量挂载会让 ReAct 工具描述段膨胀,稀释 LLM 工具选择质量,
+            建议优先用 mcp_tools 精确声明所需工具,mcp_all 仅在确需全部时使用
 
     Returns:
         装饰器函数,原样返回被装饰的类
@@ -75,6 +82,7 @@ def register_agent(
             "config_file": config_file,
             "tools": tools,
             "mcp_tools": mcp_tools,
+            "mcp_all": mcp_all,
         }
         return cls
 
@@ -190,7 +198,30 @@ def build_workflow(name: str, checkpointer=None) -> tuple[object, dict[str, obje
         # 失败时 mcp_loader 静默返回空列表,角色降级为纯文本模式(若本地 tools 也为空)
         tools = list(role_spec["tools"]) if role_spec["tools"] else []
         mcp_names = role_spec.get("mcp_tools")
-        if mcp_names:
+        mcp_all = role_spec.get("mcp_all", False)
+        # 互斥: mcp_all 优先, mcp_tools 被忽略并 warning
+        if mcp_all and mcp_names:
+            logger.warning(
+                "角色 %s: mcp_all=True 与 mcp_tools=%s 同时声明, "
+                "mcp_all 优先,mcp_tools 被忽略",
+                role, mcp_names,
+            )
+        if mcp_all:
+            from tools.mcp_loader import load_all_mcp_tools_sync
+
+            mcp_loaded = load_all_mcp_tools_sync()
+            if mcp_loaded:
+                tools.extend(mcp_loaded)
+                logger.info(
+                    "角色 %s: 加载 %d 个 MCP 工具(全部): %s",
+                    role, len(mcp_loaded), [t.name for t in mcp_loaded],
+                )
+            else:
+                logger.warning(
+                    "角色 %s: mcp_all 加载失败或无 enabled MCP server,降级为纯文本模式",
+                    role,
+                )
+        elif mcp_names:
             from tools.mcp_loader import load_mcp_tools_by_name_sync
 
             mcp_loaded = load_mcp_tools_by_name_sync(mcp_names)

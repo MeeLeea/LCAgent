@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
 
+from session.context import SessionContext
 from session.workflow_adapter import WorkflowAdapter
 from utils.events import EventType
 
@@ -172,7 +173,14 @@ def _make_registry(workflow_name: str = "simple") -> MagicMock:
     reg.workflow_name_of.return_value = workflow_name
     reg.awarm_workspace = AsyncMock()
     reg.aget_messages = AsyncMock(return_value=[])
-    reg.get_context.return_value = types.SimpleNamespace(workspace_path=None)
+    # 用真实 SessionContext.create 而非 SimpleNamespace(workspace_path=...)，
+    # 避免给 SessionContext 不存在的顶级属性造成 mock 与生产代码结构不一致
+    # （曾导致 workflow_adapter.py 读 getattr(ctx, "workspace_path") 的 bug 被测试掩盖）
+    reg.get_context.return_value = SessionContext.create(
+        session_id="workflow-simple-thread-1",
+        checkpointer=None,
+        workspace_path=None,
+    )
     reg._store = FakeStore()
     return reg
 
@@ -387,7 +395,12 @@ def test_arun_events_injects_workspace_path(monkeypatch):
         lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
     )
     reg = _make_registry()
-    reg.get_context.return_value = types.SimpleNamespace(workspace_path="C:/ws")
+    # 用真实 SessionContext.create 构造带 workspace 的 context，结构对齐生产代码
+    reg.get_context.return_value = SessionContext.create(
+        session_id="workflow-simple-thread-1",
+        checkpointer=None,
+        workspace_path="C:/ws",
+    )
     adapter = _make_adapter(reg)
 
     _collect(adapter, thread_id="workflow-simple-thread-1")

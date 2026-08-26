@@ -9,7 +9,12 @@ from team.base import PromptInjector, TeamAgent
 from tools import all_tools
 
 
-@register_agent("worker", "team/worker/agent_config.json", tools=all_tools)
+@register_agent(
+    "architect",
+    "team/architect/agent_config.json",
+    tools=all_tools,
+    mcp_all= True,
+)
 class WorkerAgent(TeamAgent):
     """
     执行者 Agent,负责执行上级分配的子任务

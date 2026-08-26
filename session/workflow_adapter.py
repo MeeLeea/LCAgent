@@ -331,8 +331,12 @@ class WorkflowAdapter:
         graph, _agents = build_workflow(workflow_name, checkpointer=self._checkpointer)
 
         # 3. 构造 config（thread_id + workspace_path）
+        # 从 SessionContext.config.configurable 读 workspace_path（SessionContext
+        # 无顶级 workspace_path 属性，workspace_path 存于 config.configurable）；
+        # 与 awarm_workspace 的 warm 缓存保持一致读源。
         configurable: dict[str, Any] = {"thread_id": tid}
-        workspace_path = getattr(self._registry.get_context(tid), "workspace_path", None)
+        ctx = self._registry.get_context(tid)
+        workspace_path = ctx.config.get("configurable", {}).get("workspace_path")
         if workspace_path:
             configurable["workspace_path"] = workspace_path
         node_queue: asyncio.Queue[AgentEvent] = asyncio.Queue()

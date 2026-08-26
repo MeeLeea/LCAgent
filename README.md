@@ -1548,6 +1548,31 @@ create_tool(
 - 禁止导入高风险模块：`os`、`subprocess`、`socket`、`sys`、`pathlib`、`shutil`、`ctypes`、`importlib`、`requests`、`urllib`
 - 默认禁止覆盖已有文件（`force=True` 才可覆盖）
 
+#### 角色声明 MCP 工具
+
+工作流角色（`team/*/` 下的 `@register_agent` 装饰器）通过两种方式声明对 MCP 工具的依赖，在 `build_workflow` 装配期由 `tools.mcp_loader` 同步拉取并合并到本地 `tools`，失败时静默降级为纯文本模式（不阻断工作流）：
+
+| 声明方式 | 装饰器参数 | 加载器 | 适用场景 |
+| -------- | ---------- | ------ | -------- |
+| **按名声明** | `mcp_tools=["write_file"]` | `load_mcp_tools_by_name_sync` 遍历已启用 server 按名筛选 | 精确指定所需工具（推荐） |
+| **全量声明** | `mcp_all=True` | `load_all_mcp_tools_sync` 加载全部已启用 server 的全部工具（按名去重） | 确需全部工具，不想逐个列名 |
+
+```python
+# 按名声明（推荐，工具数可控）
+@register_agent("architect", "team/architect/agent_config.json",
+    mcp_tools=["write_file"])
+
+# 全量声明
+@register_agent("architect", "team/architect/agent_config.json",
+    mcp_all=True)
+```
+
+> ⚠️ **工具膨胀警告**：`mcp_all=True` 会挂载全部已启用 server 的全部工具到 ReAct 提示词，工具描述段膨胀会稀释 LLM 工具选择质量（实测 >15 个工具后 selection 准确率明显下降）。**建议优先用 `mcp_tools` 精确声明所需工具，`mcp_all` 仅在确需全部时使用**。
+>
+> **互斥语义**：`mcp_all=True` 与 `mcp_tools=[...]` 同时声明时，`mcp_all` 优先、`mcp_tools` 被忽略，并记 WARNING（合并结果恒等于全部，对用户无意义且可能掩盖配置错误）。
+>
+> **命名冲突**：多个 server 提供同名工具时，`load_all_mcp_tools_sync` 按 server 配置顺序（`config/mcp_servers.json` 中 `enabled_servers` 字典序）保留先到者、丢弃后到者并记 WARNING。按名加载路径（`aload_mcp_tools_by_name`）未做去重，冲突时可能返回多个同名工具——全量加载场景冲突面更大，故在 `load_all_mcp_tools_sync` 收敛。
+
 #### 本地工具 vs MCP 工具对比
 
 | 特性       | 本地工具          | MCP 工具                      |

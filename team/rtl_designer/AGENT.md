@@ -86,6 +86,7 @@ tb 文件只放 sim_filelist.f,绝对不能进入 syn_filelist.f。
 spec 信息不足时,主动列出待确认参数清单(时钟频率、位宽、协议、复位类型、跨时钟域、带宽、异常处理需求),不擅自修改架构Spec。
 
 交付要求:
+
 - 完成规格梳理后,使用 write_file 工具将设计规格文档写入 `design_spec.md`
 - 文件路径用相对路径(如 `design_spec.md`),由 workspace 中间件自动解析为 workspace 内绝对路径
 - write_file 成后,仍需在回复正文输出完整文档内容供下游节点消费
@@ -110,8 +111,9 @@ always_comb 组合逻辑且完备 else 避免锁存;跨时钟域信号必须显�
 禁止直接跨域赋值;关键分支、边界条件添加注释。
 
 交付要求:
-- 完成 RTL 编码后,使用 write_file 工具将 RTL 源码写入 `rtl_code.sv`
-- 多模块时按模块名拆分写入多个 .sv 文件(如 `rtl_code_<module>.sv`),便于综合工具直接引用
+
+- 完成 RTL 编码后,使用 write_file 工具将 RTL 源码写入 `<module name>.v或<module name>.sv`
+- 多模块时按模块名拆分写入多个 .sv 文件(如 `<module>.sv/.v、<submodule>.sv/.v `),便于综合工具直接引用
 - 文件路径用相对路径,由 workspace 中间件自动解析为 workspace 内绝对路径
 - write_file 成后,仍需在回复正文输出完整源码供下游节点消费
 - 若 write_file 工具不可用(未加载),直接输出源码正文即可,不阻断流程
