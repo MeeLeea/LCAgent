@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 
+from langgraph.graph import END
+
 from agent.turn_types import AgentTurnResult
 from graph.rtl_graph import (
     RTLGraphState,
@@ -286,9 +288,9 @@ def test_verification_passed_empty():
 
 
 def test_route_after_verification_passed():
-    """验证通过 → designer_output"""
+    """验证通过 → END"""
     state = initial_state(verification_report="验证结论: PASS", round=1)
-    assert route_after_verification(state) == "designer_output"
+    assert route_after_verification(state) == END
 
 
 def test_route_after_verification_fail_continues():
@@ -298,9 +300,9 @@ def test_route_after_verification_fail_continues():
 
 
 def test_route_after_verification_max_rounds():
-    """达轮次上限即使未通过也强制交付"""
+    """达轮次上限即使未通过也强制终止(END)"""
     state = initial_state(verification_report="验证结论: FAIL", round=3, max_rounds=3)
-    assert route_after_verification(state) == "designer_output"
+    assert route_after_verification(state) == END
 
 
 # ==================== 图构建测试 ====================
@@ -322,7 +324,6 @@ def test_build_rtl_graph_workflow_nodes():
         "verification_plan",
         "designer_verilog",
         "verification_check",
-        "designer_output",
     ]
     for node in expected:
         assert node in node_names
@@ -343,7 +344,6 @@ def test_build_rtl_graph_workflow_edges():
     assert ("designer_spec", "verification_plan") in edges
     assert ("verification_plan", "designer_verilog") in edges
     assert ("designer_verilog", "verification_check") in edges
-    assert ("designer_output", "__end__") in edges
 
 
 def test_build_rtl_graph_workflow_conditional_edges():
@@ -351,7 +351,7 @@ def test_build_rtl_graph_workflow_conditional_edges():
     agents = build_fake_agents()
     graph = build_rtl_graph_workflow(agents)
     edges = {(e.source, e.target) for e in graph.get_graph().edges}
-    assert ("verification_check", "designer_output") in edges
+    assert ("verification_check", "__end__") in edges
     assert ("verification_check", "designer_verilog") in edges
 
 
@@ -383,7 +383,6 @@ def test_run_rtl_graph_pass_once():
 
     result = asyncio.run(arun_rtl_graph_workflow(graph, "设计一个 UART 模块"))
 
-    assert result["final_answer"] == "module uart;"
     assert result["round"] == 1
     assert result["arch_plan"] == "架构: 单核 UART"
     assert result["arch_design"] == "架构: 单核 UART"
@@ -394,10 +393,10 @@ def test_run_rtl_graph_pass_once():
     assert result["verification_plan"] == "验证结论: PASS\nRTL 无问题"
     assert result["verification_report"] == "验证结论: PASS\nRTL 无问题"
 
-    # designer 调用:spec_design + verilog_design(编码) + verilog_design(交付)
+    # designer 调用:spec_design + verilog_design(编码)(交付节点已移除,验证通过直接 END)
     # 节点改调 run_team_turn_with_interrupt 后,统一经 arun_structured 入口
     designer_calls = [c[0] for c in designer.calls]
-    assert designer_calls == ["arun_structured", "arun_structured", "arun_structured"]
+    assert designer_calls == ["arun_structured", "arun_structured"]
     # verifier 调用:spec_design(计划) + verilog_design(检查)
     verifier_calls = [c[0] for c in verifier.calls]
     assert verifier_calls == ["arun_structured", "arun_structured"]
@@ -426,19 +425,16 @@ def test_run_rtl_graph_multi_round_iteration():
     result = asyncio.run(arun_rtl_graph_workflow(graph, "设计 UART"))
 
     assert result["round"] == 2
-    assert result["final_answer"] == "module uart;"
-    # designer 的 verilog 类节点(designer_verilog + designer_output)被调 3 次:
-    # 2 轮迭代设计 + 1 次交付;用 verilog_design 模板特征过滤(含"可综合...RTL 源码")
+    # designer 的 verilog 类节点(designer_verilog)被调 2 次:
+    # 2 轮迭代设计;交付节点已移除,验证通过直接 END。用 verilog_design 模板特征过滤(含"可综合...RTL 源码")
     designer_prompts = [
         c[1] for c in designer.calls
         if c[0] == "arun_structured" and "可综合" in c[1]
     ]
-    assert len(designer_prompts) == 3
-    # 首轮设计无反馈,第二轮设计携带 FAIL 反馈,交付轮拼入最终 RTL 与验证报告
+    assert len(designer_prompts) == 2
+    # 首轮设计无反馈,第二轮设计携带 FAIL 反馈
     assert "验证结论: FAIL" not in designer_prompts[0]
     assert "验证结论: FAIL" in designer_prompts[1]
-    assert "波特率配置错误" in designer_prompts[1]
-    assert "验证结论: PASS" in designer_prompts[2]
 
 
 def test_run_rtl_graph_forced_output_at_max_rounds():

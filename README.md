@@ -298,7 +298,7 @@ LangChainAgent/
 │   ├── common.py            # 工作流通用能力：异步执行辅助 + 跨轮次记忆压缩 + workspace 透传
 │   ├── simple.py            # 监督者模式工作流（Manager→Worker→Terminator，异步节点，worker_exec 接收 config 注入 workspace）
 │   ├── pipline.py           # 流水线模式工作流（异步节点，与 simple 同构，worker_exec 接收 config 注入 workspace）
-│   ├── rtl_graph.py         # RTL 芯片设计流水线（Manager 提炼→Architect 架构→Designer 设计↔Verification 多轮验证→Designer 交付）
+│   ├── rtl_graph.py         # RTL 芯片设计流水线（Manager 提炼→Architect 架构→Designer 设计↔Verification 多轮验证→验证通过/达上限即终止(END)）
 │   └── registry.py          # 工作流/Agent 注册表与构建入口（runner 支持 workspace_path 参数）
 ├── tools/
 │   ├── __init__.py          # 本地工具注册
@@ -369,7 +369,7 @@ LangChainAgent/
 | [graph/common.py](graph/common.py)                       | 工作流通用能力：`NodeTrackingHandler` 节点级进度回调(含 TOKEN 级流式)、`arun_compiled_workflow` 跨轮次记忆压缩 + `workspace_path` 注入 `config.configurable`（SkillInjector 已迁往 `skmng/injector.py`）                                                                        |
 | [graph/simple.py](graph/simple.py)                       | LangGraph 监督者模式工作流编排（Manager→Worker→Terminator，异步节点）；`worker_exec` 节点接收 LangGraph 注入的 config（含 `workspace_path`）透传 Worker                                                                                     |
 | [graph/pipline.py](graph/pipline.py)                     | LangGraph 流水线模式工作流编排（异步节点，与 simple 同构）；`worker_exec` 节点同样透传 workspace config                                                                                                                                    |
-| [graph/rtl_graph.py](graph/rtl_graph.py)                 | RTL 芯片设计流水线：Manager 提炼上下文→Architect 计划/设计/分析/评审/规格→Designer 规格+编码↔Verification 验证多轮交互（条件路由 + max_rounds 限轮）→Designer 交付                                                                       |
+| [graph/rtl_graph.py](graph/rtl_graph.py)                 | RTL 芯片设计流水线：Manager 提炼上下文→Architect 计划/设计/分析/评审/规格→Designer 规格+编码↔Verification 验证多轮交互（条件路由 + max_rounds 限轮）→验证通过/达上限即终止(END)                                                                       |
 | [graph/registry.py](graph/registry.py)                   | 工作流/Agent 注册表：`register_workflow` / `register_agent` / `build_workflow`；runner 统一支持 `workspace_path` 透传                                                                                                                   |
 | [tools/skills.py](tools/skills.py)                       | re-export `skmng.manager.SkillManager`（向后兼容，待删）                                                                                                                                                                                   |
 | [tools/skill_tool.py](tools/skill_tool.py)               | re-export `skmng.tool.read_skill`（向后兼容，待删）                                                                                                                                                                                       |
@@ -2091,7 +2091,7 @@ Terminator (汇总结果,返回最终答案)
 
 ### 架构(rtl_graph)
 
-RTL 芯片设计流水线：`Manager` 提炼上下文 → `Architect` 五阶段架构（计划/设计/分析/评审/规格）→ `Designer` 规格+编码 ↔ `Verification` 多轮验证 → `Designer` 交付：
+RTL 芯片设计流水线：`Manager` 提炼上下文 → `Architect` 五阶段架构（计划/设计/分析/评审/规格）→ `Designer` 规格+编码 ↔ `Verification` 多轮验证 → 验证通过/达上限即终止（END）：
 
 ```
 用户任务
@@ -2110,12 +2110,10 @@ Verification (spec_design_task:验证计划)
 │  Verification (verilog_design_task:验证) │──┘
 └──────────────────────────────────────────┘
     ↓ 验证通过 / 达 max_rounds 上限
-Designer (输出最终交付文件)
-    ↓
-最终答案
+   END（终止,不再经 Designer 交付节点）
 ```
 
-- **多轮交互**：`designer_verilog` → `verification_check` 构成迭代环，由 `route_after_verification` 条件路由判定。验证报告含"验证结论: PASS"标记即交付；未通过且轮次未达 `max_rounds`（默认 3）时携带验证反馈回到 Designer 重新编码；达上限强制交付，防止死循环。
+- **多轮交互**：`designer_verilog` → `verification_check` 构成迭代环，由 `route_after_verification` 条件路由判定。验证报告含"验证结论: PASS"标记即终止（END）；未通过且轮次未达 `max_rounds`（默认 3）时携带验证反馈回到 Designer 重新编码；达上限强制终止（END），防止死循环。
 - **上下文衔接**：Architect 各阶段任务文本逐级拼接上游产物（计划→设计→分析→评审→规格），Designer/Verification 基于架构规格分工，多轮迭代时第二轮起注入上一轮验证报告反馈。
 - **角色注册**：`team/__init__.py` 未导入 `rtl_designer`/`rtl_verification`，由 `rtl_graph.py` 顶部显式导入触发 `@register_agent` 注册，与 `graph.registry` 无循环导入。
 

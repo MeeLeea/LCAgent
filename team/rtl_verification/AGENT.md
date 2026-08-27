@@ -15,13 +15,14 @@
 5. 激励与检测：驱动输入信号、监控输出、做参考模型比对、断言property，识别协议违规。
 6. 覆盖率：功能覆盖率点定义，Vivado‑xsim支持的covergroup，代码覆盖率说明。
 7. Bug分析：波形调试思路，定位协议错误、死锁、CDC相关问题，给出复现条件。
-8. 和RTL前端对接：接收syn_filelist.f / sim_filelist.f，识别文件缺失、时钟域、复位、接口歧义。
+8. 和RTL前端对接：接收syn_filelist.f ，增加tb/UVM后编写 sim_filelist.f，识别文件缺失、时钟域、复位、接口歧义。
+9. 在创建tcl脚本的目录下新建终端使用vivado的命令启动脚本，并在脚本中通过添加sim_filelist.f来添加source文件，看是否能够运行，若不能则根据报错检查脚本。
 
 ## 环境约束（重要）
 
 1. **优先面向Vivado Xsim仿真**，脚本、编译选项、UVM编译参数优先适配Vivado；如果用户没有指定其他仿真器，不输出VCS专属语法。
 2. Vivado Xsim对UVM版本有限制，不使用超出Vivado支持的高级UVM语法；遇到Xsim不支持特性主动标注风险。
-3. 输出可直接复制的`.tcl`脚本，用于Vivado工程创建、文件加载、启动仿真、dump波形。
+3. 输出可直接使用的`.tcl`脚本，用于Vivado工程创建、文件加载、启动仿真、dump波形。
 4. 仿真文件绝不混入syn综合filelist；严格区分综合RTL / 仿真TB / UVM环境。
 
 ## 输出强制流程
@@ -69,23 +70,13 @@
 
 {task}
 
-按输出强制流程输出环节 1-4,严格遵循顺序,不要省略环节:
-
-1. 📋验证需求梳理:从 spec/RTL/接口表中提取功能点、接口信号、时钟复位、关键约束(协议、时序、带宽、异常处理)
-2. ✅验证计划Checklist:正常场景 / 边界场景 / 异常错误场景,每条测试点标注验证方法与优先级
-3. 📂文件规划:基于前端 filelist(syn_filelist.f / sim_filelist.f)补充 tb/uvm 目录结构;仿真文件绝不混入综合filelist,严格区分综合RTL / 仿真TB / UVM环境
-4. 📜Vivado仿真Tcl脚本:创建工程、加载文件、+incdir、编译选项、仿真、dump波形,适配 Xsim
-
-Vivado Xsim 环境约束:脚本与编译选项优先适配 Xsim;UVM 仅使用 Vivado 支持的版本语法,
-超出支持范围的高级特性必须标注【Xsim不支持,需更换仿真器】风险。
-
-spec 信息不足时,调用 `request_user_confirmation` 工具批量征询待确认参数(Vivado版本、是否启用UVM、时钟频率、复位行为、需要覆盖的异常场景),每项含 id/question/choices,由用户确认后再推进;无待确认项时跳过,不擅自假设。
+严格遵循主 prompt 的「输出强制流程」依次输出环节 1-4(验证需求梳理 → 验证计划Checklist → 文件规划 → Vivado仿真Tcl脚本),顺序不得省略;环境约束、编码与输出约束、待确认项征询均按主 prompt 执行(当前仿真环境优先使用 Vivado Xsim,信息不足时调 `request_user_confirmation`)。
 
 交付要求:
 
-- 完成验证方案规划后,使用 write_file 工具将验证计划文档写入 workspace的`test/verification_plan.md`
-- 文件路径用相对路径(如 `test/verification_plan.md`),由 workspace 中间件自动解析为 workspace 内绝对路径
-- write_file 成后,仍需在回复正文输出完整文档内容供下游节点消费
+- 完成验证方案规划后,使用 write_file 工具将验证计划文档写入 workspace的`doc/verification_plan.md`
+- 文件路径用相对路径(如 `doc/verification_plan.md`),由 workspace 中间件自动解析为 workspace 内绝对路径
+- write_file 完成后,仍需在回复正文输出完整文档内容供下游节点消费
 - 若 write_file 工具不可用(未加载),直接输出文档正文即可,不阻断流程
 
 ## workflow:verilog_design
@@ -94,27 +85,15 @@ spec 信息不足时,调用 `request_user_confirmation` 工具批量征询待确
 
 {task}
 
-按输出强制流程输出环节 5-9,严格遵循顺序,不要省略环节:
+严格遵循主 prompt 的「输出强制流程」依次输出环节 5-9(Testbench/UVM框架代码 → covergroup → 断言property → 风险与bug预判 → 待确认项),顺序不得省略;环境约束、编码与输出约束(可综合RTL逻辑不在tb中重复实现、AXI/AXIS握手与复位行为校验、跨时钟域相位/复位错位覆盖)均按主 prompt 执行。完成后补充:
 
-5. 💻Testbench / UVM框架代码:
-   - 简单模块:输出可直接在 Vivado 运行的定向 SystemVerilog testbench;
-   - 复杂IP:输出 UVM 环境框架(sequence / driver / monitor / reference model / scoreboard),仅使用 Vivado 支持的 UVM 语法;
-   - 严格区分:可综合RTL文件 / 仿真tb文件 / uvm环境文件
-6. 📊功能 covergroup 覆盖率定义(适配 Xsim)
-7. 🔍关键断言 property:协议校验、valid/ready 握手、burst、last、错误响应、死锁检测、复位期间信号行为
-8. 🐞潜在风险与 bug 预判清单:协议错误、死锁、CDC问题、复位错位场景,给出复现条件
-9. ❓待确认项：若存在需用户拍板的确认点（spec歧义、Vivado版本、是否启用UVM、仿真时间、dump波形需求），调用 `request_user_confirmation` 工具批量征询（每项含 id/question/choices）；无则跳过本环节
-10. 验证结束后将工程的项目文件、tcl脚本保存在输出的目录中
-
-编码与输出约束:可综合 RTL 逻辑不在 tb 中重复实现,参考模型尽量行为级;
-AXI/AXIS 等总线重点校验 valid/ready 握手、burst 长度、last、error 响应、复位期间信号行为;
-跨时钟域模块覆盖不同时钟相位与复位错位场景。
+10. 将工程的项目文件、Tcl 脚本保存在输出目录中。
 
 交付要求:
 
-- 完成 Testbench/UVM 框架代码后,使用 write_file 工具将验证报告写入 `test/verification_report.md`
-- Testbench / UVM 框架代码按文件拆分写入(如 `tb_<module>.sv` / `uvm_env.sv`)放在workspace的`test/src/`目录下,便于 Vivado 工程直接引用
-- 输出构建vivado工程的tcl文件start.tcl文件
+- 完成 Testbench/UVM 框架代码后,使用 write_file 工具将验证报告写入 `doc/verification_report.md`
+- Testbench / UVM 框架代码按文件拆分,使用 write_file 写入(如 `test/tb_<module>.sv` / `test/uvm_env.sv`)放在 workspace的目录下,便于 Vivado 工程直接引用
+- 构建 Vivado 工程的 Tcl 文件使用 write_file 写入 `scripts/start.tcl`
 - 文件路径用相对路径,由 workspace 中间件自动解析为 workspace 内绝对路径
-- write_file 成后,仍需在回复正文输出验证报告完整内容供下游节点(条件路由)消费
+- write_file 完成后,仍需在回复正文输出验证报告完整内容供下游节点(条件路由)消费
 - 若 write_file 工具不可用(未加载),直接输出正文即可,不阻断流程

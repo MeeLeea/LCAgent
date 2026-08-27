@@ -10,9 +10,9 @@ RTL 芯片设计流水线工作流 - Manager 提炼 → Architect 架构 → Des
 
 多轮交互说明：
     designer_verilog → verification_check 构成迭代环,由条件路由 route_after_verification 判定:
-    验证报告含"验证结论: PASS"标记 → 进入 designer_output 交付;
-    验证未通过且轮次未达 max_rounds → 携带上轮验证报告反馈回到 designer_verilog 重新设计;
-    轮次达 max_rounds 上限 → 强制进入 designer_output 交付(防止死循环)。
+     验证报告含"验证结论: PASS"标记 → 直接终止(END);
+     验证未通过且轮次未达 max_rounds → 携带上轮验证报告反馈回到 designer_verilog 重新设计;
+     轮次达 max_rounds 上限 → 强制终止(END,防止死循环)。
 
 节点执行链路说明：
     节点函数在自身渲染 prompt(get_template + render_template + 技能注入)后,
@@ -429,11 +429,11 @@ def verification_passed(report: str) -> bool:
 
 
 def route_after_verification(state: RTLGraphState) -> str:
-    """verification_check 后的条件路由:通过或达轮次上限 → designer_output;否则回 designer_verilog。"""
+    """verification_check 后的条件路由:通过或达轮次上限 → END;否则回 designer_verilog。"""
     round_n = state.get("round", 0)
     max_rounds = state.get("max_rounds", 3)
     if round_n >= max_rounds or verification_passed(state.get("verification_report", "")):
-        return "designer_output"
+        return END
     return "designer_verilog"
 
 
@@ -496,12 +496,11 @@ def build_rtl_graph_workflow(
             NodeSpec("verification_plan", verification_plan_node, role="rtl_verification"),
             NodeSpec("designer_verilog", designer_verilog_node, role="rtl_designer"),
             NodeSpec("verification_check", verification_check_node, role="rtl_verification"),
-            NodeSpec("designer_output", designer_output_node, role="rtl_designer"),
         ],
     )
 
     # 添加边: START → summarize → architect 五阶段 → designer_spec → verification_plan
-    #        → designer_verilog → verification_check →(条件) designer_output → END
+    #        → designer_verilog → verification_check →(条件) END 或回 designer_verilog
     builder.add_edge(START, "summarize")
     builder.add_edge("summarize", "architect_plan")
     builder.add_edge("architect_plan", "architect_design")
@@ -513,16 +512,15 @@ def build_rtl_graph_workflow(
     builder.add_edge("verification_plan", "designer_verilog")
     builder.add_edge("designer_verilog", "verification_check")
 
-    # 多轮交互条件路由:验证通过或达轮次上限 → designer_output;否则回 designer_verilog
+    # 多轮交互条件路由:验证通过或达轮次上限 → END;否则回 designer_verilog
     builder.add_conditional_edges(
         "verification_check",
         route_after_verification,
         {
-            "designer_output": "designer_output",
+            END: END,
             "designer_verilog": "designer_verilog",
         },
     )
-    builder.add_edge("designer_output", END)
 
     return builder.compile(checkpointer=checkpointer)
 
