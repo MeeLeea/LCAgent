@@ -123,10 +123,22 @@ async def arebuild_agent_from_team_dir(
     role_prompt, _templates = TeamAgent.parse_prompt_sections(content)
 
     # provider/model 经 load_agent_config 的 cfg.update(data) 透传(cfg 不过滤键)，
-    # 直接读取即可；缺省则沿用当前 LLM
+    # 直接读取即可。
     # 3. 判断是否需要切换 LLM(provider/model 变化)
+    #    目标 provider：角色显式配置优先，否则沿用当前 LLM 的 provider。
     target_provider = (config.get("provider") or agent.llm.provider).lower()
-    target_model = config.get("model") or agent.llm.model
+    #    目标 model：角色显式配置优先；未配置时回退到「目标 provider」在
+    #    llm_config.json 中声明的默认 model，而非沿用当前 LLM 的 model。
+    #    否则从 yunwu(qwen3.7-max) 切到 zhipu(model=null) 时，会把旧 provider 的
+    #    model 误带到新 provider，触发网关 400「modelCode：不存在」。
+    configured_model = config.get("model")
+    if configured_model:
+        target_model = configured_model
+    else:
+        from llm.llm_client import load_providers
+
+        _providers = load_providers(agent.llm.config_file)
+        target_model = _providers.get(target_provider, {}).get("model")
     llm_changed = (
         target_provider != agent.llm.provider or target_model != agent.llm.model
     )

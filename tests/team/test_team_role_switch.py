@@ -188,6 +188,48 @@ def test_rebuild_switches_llm_when_provider_changes(monkeypatch):
     assert core.llm.provider == constructed["provider"]
 
 
+def test_rebuild_uses_target_provider_default_model_when_role_model_null(monkeypatch):
+    """角色 model 为 null 且 provider 与当前不同时，回退到目标 provider 的默认 model。
+
+    回归测试：修复前 target_model = config.get("model") or agent.llm.model，
+    会从 yunwu(qwen3.7-max) 切到 zhipu(model=null) 时把旧 provider 的 model 误带过去，
+    触发网关 400「modelCode：不存在」。
+
+    Given: 当前 LLM 为 yunwu / qwen3.7-max，切到 worker(zhipu, model=null)
+    Then: 重建的 LLMClient 的 model 应为 zhipu 在 llm_config.json 的默认模型(glm-4.7-flash)，
+          而非沿用当前的 qwen3.7-max。
+    """
+    from llm.llm_client import load_providers
+
+    # 目标 provider(zhipu) 的默认 model，从真实配置读取，不硬编码
+    zhipu_default = load_providers("config/llm_config.json")["zhipu"]["model"]
+    assert zhipu_default, "llm_config.json 中 zhipu 应声明默认 model"
+
+    # Given: 当前处于 yunwu / qwen3.7-max
+    core = _make_minimal_core(FakeLLM(provider="yunwu", model="qwen3.7-max"))
+    constructed = {}
+
+    async def noop_rebuild(task=""):
+        pass
+
+    def fake_llm_ctor(**kwargs):
+        constructed.update(kwargs)
+        # 复用 FakeLLM，但真实解析 model 以便断言
+        m = FakeLLM(provider=kwargs["provider"], model=kwargs.get("model"))
+        return m
+
+    core._arebuild_agent_executor = noop_rebuild
+    monkeypatch.setattr(role_sw, "LLMClient", fake_llm_ctor)
+
+    # When: 切换到 worker（provider=zhipu, model=null）
+    asyncio.run(role_sw.arebuild_agent_from_team_dir(core, "worker"))
+
+    # Then: model 回退到 zhipu 默认模型，而非误带 yunwu 的 qwen3.7-max
+    assert constructed["model"] == zhipu_default
+    assert constructed["model"] != "qwen3.7-max"
+    assert core.llm.model == zhipu_default
+
+
 def test_rebuild_applies_role_sampling_params(monkeypatch):
     """角色切换重建 LLM 时，应用角色级 agent_config.json 的 temperature/max_tokens
 
