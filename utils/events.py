@@ -70,13 +70,24 @@ def _naive_now_iso() -> str:
     return datetime.now().isoformat()  # noqa: DTZ005
 
 
-def make_interrupt_dict(prompt: str, choices: list[Any]) -> dict[str, Any]:
+def make_interrupt_dict(
+    prompt: str,
+    choices: list[Any],
+    items: list[Any] | None = None,
+) -> dict[str, Any]:
     """构造中断事件的前端 SSE dict（前端协议格式的唯一来源）。
 
     ``AgentEvent.to_sse_dict`` 的 INTERRUPT 分支与 ``message_utils.build_interrupt_event``
     共用此函数，避免同一 {type, prompt, choices} 结构在多处重复书写。
+
+    ``items`` 仅当 ``user_confirmation`` 类中断携带分组待确认项时提供；
+    为 ``None`` 时不输出该键，保持 ``human_choice`` / ``dangerous_command``
+    的向后兼容（前端协议两路并存：扁平 choices 与分组 items）。
     """
-    return {"type": "interrupt", "prompt": prompt, "choices": choices}
+    d: dict[str, Any] = {"type": "interrupt", "prompt": prompt, "choices": choices}
+    if items is not None:
+        d["items"] = items
+    return d
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +107,9 @@ class AgentEvent:
         tool_args: 工具输入参数（TOOL_CALL 事件）
         interrupt_prompt: 中断提示文本（INTERRUPT 事件）
         interrupt_choices: 中断可选项列表（INTERRUPT 事件）
+        interrupt_items: 分组待确认项列表（仅 user_confirmation 类 INTERRUPT 事件）；
+            每项结构为 ``{id, question, choices}``，前端按 item 渲染单选组。
+            ``human_choice`` / ``dangerous_command`` 不携带该字段（保持空列表）。
         timestamp: 事件产生时间（naive ISO 字符串）
         trace_id: 追踪 ID（用于日志关联）
         node: 业务节点名（仅 NODE_START / NODE_END / NODE_ERROR 事件有意义）
@@ -111,6 +125,7 @@ class AgentEvent:
     tool_args: Any = None
     interrupt_prompt: str = ""
     interrupt_choices: list[Any] = field(default_factory=list)
+    interrupt_items: list[Any] = field(default_factory=list)
     timestamp: str = field(default_factory=_naive_now_iso)
     trace_id: str = ""
     node: str = ""
@@ -181,14 +196,27 @@ class AgentEvent:
         *,
         prompt: str,
         choices: list[Any] | None = None,
+        items: list[Any] | None = None,
         thread_id: str = "",
         trace_id: str = "",
     ) -> AgentEvent:
-        """创建中断事件（ask_human / 危险命令确认）。"""
+        """创建中断事件（ask_human / 危险命令确认 / 批量用户确认）。
+
+        Args:
+            prompt: 中断提示文本（多 interrupt 时由调用方拼接好）
+            choices: 中断可选项列表（扁平结构）。``user_confirmation`` 时
+                每项带 ``item_id``，其余 kind 为 ``{id, label}``。
+            items: 分组待确认项列表，仅 ``user_confirmation`` 类中断提供；
+                每项结构为 ``{id, question, choices}``。为 ``None`` 时不
+                携带（保持 ``human_choice`` / ``dangerous_command`` 向后兼容）。
+            thread_id: 会话线程 ID
+            trace_id: 追踪 ID
+        """
         return cls(
             event_type=EventType.INTERRUPT,
             interrupt_prompt=prompt,
             interrupt_choices=choices or [],
+            interrupt_items=items or [],
             thread_id=thread_id,
             trace_id=trace_id,
         )
@@ -335,7 +363,8 @@ class AgentEvent:
         - token: {"type": "token", "content": str}
         - tool_call: {"type": "tool_call", "id", "name", "args"}
         - tool_result: {"type": "tool_result", "id", "name", "content"}
-        - interrupt: {"type": "interrupt", "prompt", "choices"}
+        - interrupt: {"type": "interrupt", "prompt", "choices"}；当携带分组
+          待确认项时附带 "items" 键（仅 user_confirmation 类中断）
         - cancelled: {"type": "cancelled", "content"}
         - error: {"type": "error", "content"}
         - done: {"type": "done", "content": str}
@@ -360,7 +389,11 @@ class AgentEvent:
                 "content": self.content,
             }
         elif self.event_type == EventType.INTERRUPT:
-            return make_interrupt_dict(self.interrupt_prompt, self.interrupt_choices)
+            return make_interrupt_dict(
+                self.interrupt_prompt,
+                self.interrupt_choices,
+                self.interrupt_items or None,
+            )
         elif self.event_type == EventType.CANCELLED:
             return {"type": "cancelled", "content": self.content}
         elif self.event_type == EventType.ERROR:

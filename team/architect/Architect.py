@@ -6,12 +6,13 @@ from typing import ClassVar
 
 from graph.registry import register_agent
 from team.base import PromptInjector, TeamAgent
+from tools.human_confirmation import request_user_confirmation
 
 
 @register_agent(
     "architect",
     "team/architect/agent_config.json",
-    tools=None,
+    tools=[request_user_confirmation],
     mcp_tools=["write_file","edit_file","list_directory","read_file","delete_file","create_directory","delete_directory"],
 )
 class ArchiAgent(TeamAgent):

@@ -472,6 +472,61 @@ def test_arun_events_interrupt_with_no_kind_uses_stringified_value(monkeypatch):
     assert events[-1].interrupt_choices == []
 
 
+def test_arun_events_user_confirmation_populates_interrupt_items(monkeypatch):
+    """user_confirmation interrupt.value 经 _arun_input_events 后 items 透传到 AgentEvent。
+
+    验证新增的 items 通道：build_interrupt_event 给 user_confirmation kind 输出
+    结构化分组列表，_arun_input_events 把它传给 AgentEvent.interrupt_items，
+    to_sse_dict 经 make_interrupt_dict 把 items 写入 SSE dict（与 choices 并存）。
+    """
+    interrupt_value = {
+        "kind": "user_confirmation",
+        "items": [
+            {
+                "id": "fpga_path",
+                "question": "FPGA Booth 降级?",
+                "choices": [
+                    {"id": "dsp_hard", "label": "用 DSP 硬核"},
+                    {"id": "base4_logic", "label": "纯逻辑基4"},
+                ],
+            },
+            {
+                "id": "clk_strategy",
+                "question": "复位策略?",
+                "choices": [{"id": "sync", "label": "同步复位"}],
+            },
+        ],
+    }
+    fake_graph = FakeGraphInterrupt(interrupt_value)
+    monkeypatch.setattr(
+        "graph.registry.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
+    adapter = _make_adapter()
+
+    events = _collect(adapter, thread_id="workflow-simple-thread-1")
+
+    interrupt_ev = events[-1]
+    assert interrupt_ev.event_type == EventType.INTERRUPT
+    # choices 扁平聚合仍保留（向后兼容）
+    assert len(interrupt_ev.interrupt_choices) == 3
+    assert interrupt_ev.interrupt_choices[0]["item_id"] == "fpga_path"
+    # items 分组列表透传到 AgentEvent.interrupt_items
+    assert len(interrupt_ev.interrupt_items) == 2
+    assert interrupt_ev.interrupt_items[0]["id"] == "fpga_path"
+    assert interrupt_ev.interrupt_items[0]["question"] == "FPGA Booth 降级?"
+    assert interrupt_ev.interrupt_items[0]["choices"][0] == {
+        "id": "dsp_hard",
+        "label": "用 DSP 硬核",
+    }
+    # to_sse_dict 经 make_interrupt_dict 同时输出 choices + items
+    sse = interrupt_ev.to_sse_dict()
+    assert sse["type"] == "interrupt"
+    assert len(sse["choices"]) == 3
+    assert len(sse["items"]) == 2
+    assert sse["items"][1]["id"] == "clk_strategy"
+
+
 # ────────────── 不支持能力 / 历史 / 压缩 / 生命周期 ──────────────
 
 

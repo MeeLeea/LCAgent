@@ -154,6 +154,13 @@ def test_build_interrupt_event_user_confirmation_renders_multi_question_prompt()
         "label": "用 DSP 硬核",
     }
     assert event["choices"][2]["item_id"] == "clk_strategy"
+    # items 结构化分组列表: 每项 {id, question, choices: [{id, label}]}
+    assert len(event["items"]) == 2
+    assert event["items"][0]["id"] == "fpga_path"
+    assert event["items"][0]["question"] == "FPGA Booth 降级?"
+    assert event["items"][0]["choices"][0] == {"id": "dsp_hard", "label": "用 DSP 硬核"}
+    assert event["items"][1]["id"] == "clk_strategy"
+    assert event["items"][1]["choices"][0] == {"id": "sync", "label": "同步复位"}
 
 
 def test_build_interrupt_event_user_confirmation_empty_items_falls_back():
@@ -162,6 +169,8 @@ def test_build_interrupt_event_user_confirmation_empty_items_falls_back():
     assert event["type"] == "interrupt"
     assert event["prompt"] == "需要用户确认多个架构决策点"
     assert event["choices"] == []
+    # items 为空时 make_interrupt_dict 仍输出空列表（非 None）
+    assert event.get("items") == []
 
 
 def test_build_interrupt_event_user_confirmation_skips_malformed_items():
@@ -182,6 +191,10 @@ def test_build_interrupt_event_user_confirmation_skips_malformed_items():
     assert "无 id" not in event["prompt"]
     assert len(event["choices"]) == 1
     assert event["choices"][0]["item_id"] == "ok"
+    # items 分组列表同样跳过残缺 item, 只保留完整项
+    assert len(event["items"]) == 1
+    assert event["items"][0]["id"] == "ok"
+    assert event["items"][0]["choices"] == [{"id": "y", "label": "是"}]
 
 
 # ============ 与 ask_human 隔离: kind 不串扰 ============

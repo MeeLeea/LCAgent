@@ -446,10 +446,14 @@ class WorkflowAdapter:
                 # 多 interrupt 合并 prompt（同 interrupts.py:179-189 的批量语义）
                 prompt = "\n\n".join(d.get("prompt", "") for d in ev_dicts)
                 choices = ev_dicts[0].get("choices") if ev_dicts else None
+                # 多 interrupt 时把各分组待确认项拼接成一个列表（user_confirmation
+                # 才有 items；human_choice/dangerous_command 走 d.get("items") or [] 为空）
+                items = [it for d in ev_dicts for it in (d.get("items") or [])]
                 logger.info("工作流执行被中断 [%s] interrupts=%d", tid, len(interrupts))
                 yield AgentEvent.interrupt(
                     prompt=prompt,
                     choices=choices,
+                    items=items,
                     thread_id=tid,
                     trace_id=trace_id,
                 )

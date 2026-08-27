@@ -10,10 +10,10 @@ from tools import all_tools
 
 
 @register_agent(
-    "architect",
-    "team/architect/agent_config.json",
+    "worker",
+    "team/worker/agent_config.json",
     tools=all_tools,
-    mcp_all= True,
+    mcp_all=True,
 )
 class WorkerAgent(TeamAgent):
     """

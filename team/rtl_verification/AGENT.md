@@ -39,12 +39,12 @@
 6. 📊功能covergroup覆盖率定义（适配xsim）
 7. 🔍关键断言property（协议、握手、死锁检测）
 8. 🐞潜在风险与bug预判清单
-9. ❓待确认项：spec歧义、Vivado版本、是否启用UVM、仿真时间、dump波形需求
+9. ❓待确认项：若存在需用户拍板的确认点（spec歧义、Vivado版本、是否启用UVM、仿真时间、dump波形需求），调用 `request_user_confirmation` 工具批量征询（每项含 id/question/choices）；无则跳过本环节
 
 职责分工：
 
 - spec_design 节点：输出环节 1-4（验证需求梳理 → 验证计划Checklist → 文件规划 → Vivado仿真Tcl脚本）
-- verilog_design 节点：输出环节 5-9（Testbench/UVM框架 → covergroup → 断言property → 风险与bug预判 → 待确认项）
+- verilog_design 节点：输出环节 5-9（Testbench/UVM框架 → covergroup → 断言property → 风险与bug预判 → 待确认项：需用户拍板时调 `request_user_confirmation` 工具）
 
 ## 编码与输出约束
 
@@ -53,7 +53,7 @@
 3. 波形dump：输出`xsim‑tcl`波形保存脚本，适配Vivado。
 4. 遇到AXI/AXIS等总线，重点校验：valid/ready握手、burst长度、last、error响应、复位期间信号行为。
 5. 跨时钟域模块，tb要覆盖不同时钟相位、复位错位场景。
-6. 当spec信息不足，主动提问：Vivado版本、是否启用UVM、时钟频率、复位行为、需要覆盖的异常场景。
+6. 当spec信息不足，调用 `request_user_confirmation` 工具批量征询：Vivado版本、是否启用UVM、时钟频率、复位行为、需要覆盖的异常场景；无待确认项时不强行调工具。
 
 ## 禁止行为
 
@@ -79,7 +79,7 @@
 Vivado Xsim 环境约束:脚本与编译选项优先适配 Xsim;UVM 仅使用 Vivado 支持的版本语法,
 超出支持范围的高级特性必须标注【Xsim不支持,需更换仿真器】风险。
 
-spec 信息不足时,主动列出待确认参数清单(Vivado版本、是否启用UVM、时钟频率、复位行为、需要覆盖的异常场景),不擅自假设。
+spec 信息不足时,调用 `request_user_confirmation` 工具批量征询待确认参数(Vivado版本、是否启用UVM、时钟频率、复位行为、需要覆盖的异常场景),每项含 id/question/choices,由用户确认后再推进;无待确认项时跳过,不擅自假设。
 
 交付要求:
 
@@ -103,7 +103,7 @@ spec 信息不足时,主动列出待确认参数清单(Vivado版本、是否启�
 6. 📊功能 covergroup 覆盖率定义(适配 Xsim)
 7. 🔍关键断言 property:协议校验、valid/ready 握手、burst、last、错误响应、死锁检测、复位期间信号行为
 8. 🐞潜在风险与 bug 预判清单:协议错误、死锁、CDC问题、复位错位场景,给出复现条件
-9. ❓待确认项:spec歧义、Vivado版本、是否启用UVM、仿真时间、dump波形需求
+9. ❓待确认项：若存在需用户拍板的确认点（spec歧义、Vivado版本、是否启用UVM、仿真时间、dump波形需求），调用 `request_user_confirmation` 工具批量征询（每项含 id/question/choices）；无则跳过本环节
 10. 验证结束后将工程的项目文件、tcl脚本保存在输出的目录中
 
 编码与输出约束:可综合 RTL 逻辑不在 tb 中重复实现,参考模型尽量行为级;

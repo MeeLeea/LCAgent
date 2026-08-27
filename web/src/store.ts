@@ -405,7 +405,7 @@ function handleStreamEvent(
     case 'interrupt': {
       if (!streamLast || streamLast.role !== 'assistant') return threadId
       arr[streamIdx] = { ...streamLast, streaming: false, interrupted: true }
-      const info: InterruptInfo = { prompt: ev.prompt, choices: ev.choices }
+      const info: InterruptInfo = { prompt: ev.prompt, choices: ev.choices, items: ev.items }
       set((s) => {
         const pendingInterrupts = { ...s.pendingInterrupts, [threadId]: info }
         const patch: Partial<AppState> = { pendingInterrupts }

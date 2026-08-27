@@ -6,12 +6,13 @@ from typing import ClassVar
 
 from graph.registry import register_agent
 from team.base import PromptInjector, TeamAgent
+from tools.human_confirmation import request_user_confirmation
 
 
 @register_agent(
     "rtl_verification",
     "team/rtl_verification/agent_config.json",
-    tools=None,
+    tools=[request_user_confirmation],
     mcp_tools=["write_file","edit_file","list_directory","read_file","delete_file","create_directory","delete_directory"],
 )
 class VerificationAgent(TeamAgent):
@@ -44,7 +45,8 @@ class VerificationAgent(TeamAgent):
             "4. 📜Vivado仿真Tcl脚本:创建工程、加载文件、+incdir、编译选项、仿真、dump波形,适配 Xsim\n\n"
             "Vivado Xsim 环境约束:脚本与编译选项优先适配 Xsim;UVM 仅使用 Vivado 支持的版本语法,"
             "超出支持范围必须标注【Xsim不支持,需更换仿真器】风险。\n"
-            "spec 信息不足时,主动列出待确认参数清单(Vivado版本、是否启用UVM、时钟频率、复位行为、异常场景),不擅自假设。"
+            "spec 信息不足时,调用 request_user_confirmation 工具批量征询待确认参数(Vivado版本、是否启用UVM、时钟频率、复位行为、异常场景),"
+            "每项含 id/question/choices,由用户确认后再推进;无待确认项时跳过,不擅自假设。"
         ),
         "verilog_design": (
             "请根据以下任务与上下文输出验证 Testbench / UVM 框架代码:\n\n"
@@ -56,7 +58,8 @@ class VerificationAgent(TeamAgent):
             "6. 📊功能 covergroup 覆盖率定义(适配 Xsim)\n"
             "7. 🔍关键断言 property:协议、握手、死锁检测\n"
             "8. 🐞潜在风险与 bug 预判清单:协议错误、死锁、CDC问题、复位错位,给出复现条件\n"
-            "9. ❓待确认项:spec歧义、Vivado版本、是否启用UVM、仿真时间、dump波形需求\n\n"
+            "9. ❓待确认项:若存在需用户拍板的确认点(spec歧义、Vivado版本、是否启用UVM、仿真时间、dump波形需求),"
+            "调用 request_user_confirmation 工具批量征询(每项含 id/question/choices);无则跳过本环节\n\n"
             "编码与输出约束:可综合 RTL 逻辑不在 tb 中重复实现,参考模型尽量行为级;"
             "AXI/AXIS 等总线重点校验 valid/ready 握手、burst 长度、last、error 响应、复位期间信号行为;"
             "跨时钟域模块覆盖不同时钟相位与复位错位场景。"
