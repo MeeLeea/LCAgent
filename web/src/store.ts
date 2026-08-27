@@ -424,6 +424,14 @@ function handleStreamEvent(
         content: streamLast.content + (streamLast.content ? '\n\n' : '') + `> ⚠️ ${ev.content}`,
       }
       commitThreadMessages(get, set, threadId, arr)
+      // 流被取消，清除残留的中断卡片
+      set((s) => {
+        const pendingInterrupts = { ...s.pendingInterrupts }
+        delete pendingInterrupts[threadId]
+        const patch: Partial<AppState> = { pendingInterrupts }
+        if (normKey(s.currentThreadId) === threadId) patch.pendingInterrupt = null
+        return patch
+      })
       ctx.finish()
       get().fetchThreads()
       break
@@ -439,6 +447,14 @@ function handleStreamEvent(
         }
         commitThreadMessages(get, set, threadId, arr)
       }
+      // 流以错误结束，清除残留的中断卡片（如 resume 后后端返回 error）
+      set((s) => {
+        const pendingInterrupts = { ...s.pendingInterrupts }
+        delete pendingInterrupts[threadId]
+        const patch: Partial<AppState> = { pendingInterrupts }
+        if (normKey(s.currentThreadId) === threadId) patch.pendingInterrupt = null
+        return patch
+      })
       ctx.finish()
       break
     case 'workflow_node': {
@@ -882,6 +898,16 @@ export const useStore = create<AppState>((set, get) => ({
     const arr = [...get().messages, assistantMsg]
     commitThreadMessages(get, set, threadId, arr)
     markStreaming(get, set, threadId, true)
+
+    // 立即清除 pendingInterrupt，使中断卡片在用户点击恢复时立即隐藏。
+    // 若恢复流后续再次被中断，interrupt 事件会重新设置 pendingInterrupt 并显示新卡片。
+    set((s) => {
+      const pendingInterrupts = { ...s.pendingInterrupts }
+      delete pendingInterrupts[threadId]
+      const patch: Partial<AppState> = { pendingInterrupts }
+      if (normKey(s.currentThreadId) === threadId) patch.pendingInterrupt = null
+      return patch
+    })
 
     // 清除上一轮的终止标记，确保恢复流的事件不被阻塞
     terminatedThreads.delete(threadId)

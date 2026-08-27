@@ -256,6 +256,59 @@ class TestCompressAndClear:
 
         asyncio.run(run())
 
+    def test_clear_does_not_remove_agent_facts(self):
+        """clear 仅清 thread 级记忆，agent 级跨会话共享记忆不受影响。"""
+        async def run():
+            mgr, store = _make_manager()
+            await store.save_fact("t1", ThreadFactItem(content="thread-a"))
+            await store.save_agent_fact(
+                ThreadFactItem(content="global-a", category="user_fact")
+            )
+
+            cleared = await mgr.clear("t1")
+            assert cleared == 1
+            assert await mgr.count_facts("t1") == 0
+            assert await mgr.count_agent_facts() == 1
+
+        asyncio.run(run())
+
+    def test_clear_drops_unflushed_buffer(self):
+        """clear 应丢弃未 flush 的缓冲事件，防止清完被回写“复活”。"""
+        async def run():
+            # 大延迟确保防抖定时器在测试期间不会触发 flush
+            mgr, store = _make_manager(buffer_delay_seconds=1000)
+            await mgr.write_middleware.submit_event("t1", "user", "待沉淀事件", False)
+            assert "t1" in mgr.write_middleware._buffer
+
+            cleared = await mgr.clear("t1")
+            assert cleared == 0  # buffer 被丢弃，未落库
+            assert "t1" not in mgr.write_middleware._buffer
+            assert await mgr.count_facts("t1") == 0
+
+        asyncio.run(run())
+
+    def test_clear_release_lock_frees_pool(self):
+        """release_lock=True 时删除完成后释放锁池缓存。"""
+        async def run():
+            mgr, store = _make_manager()
+            await store.save_fact("t1", ThreadFactItem(content="a"))
+
+            await mgr.clear("t1", release_lock=True)
+            assert mgr._lock_pool._locks.get("t1") is None
+
+        asyncio.run(run())
+
+    def test_clear_keeps_lock_without_release(self):
+        """release_lock 默认 False（显式清记忆命令路径）时保留锁池缓存。"""
+        async def run():
+            mgr, store = _make_manager()
+            await store.save_fact("t1", ThreadFactItem(content="a"))
+
+            await mgr.clear("t1")
+            assert mgr._lock_pool._locks.get("t1") is not None
+
+        asyncio.run(run())
+
     def test_count_facts(self):
         async def run():
             mgr, store = _make_manager()

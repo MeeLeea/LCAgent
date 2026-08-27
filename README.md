@@ -1001,7 +1001,7 @@ session/
 | `new_session(workspace_path=None)`    | 开启新会话（原会话保留在数据库），更新 current_session_id                          |
 | `new_workflow_session(workflow_name)` | 开启专属工作流会话（ID 含`workflow-{名称}`）                                     |
 | `aswitch_session(session_id)`         | 切换到指定会话（恢复历史 + warm workspace 缓存）                                   |
-| `adelete_session(session_id)`         | 删除会话：清 checkpoint + Store + workspace 绑定（删当前会话时自动切换到其他会话） |
+| `adelete_session(session_id)`         | 删除会话：先清该会话 **thread 级长期记忆**（与写流水线串行化，避免被防抖 flush 回写“复活”），再清 checkpoint + Store + workspace 绑定（删当前会话时自动切换到其他会话）；agent 级跨会话共享记忆不受影响 |
 | `alist_sessions(all_types=False)`     | 列出所有可见会话（checkpoint 存量 ∪ 当前会话）                                    |
 | `asummarize(session_id)`              | 返回会话统计（session_id / 消息数 / 总会话数）                                     |
 | `aget_messages(session_id)`           | 从 checkpoint 获取该会话所有消息                                                   |
