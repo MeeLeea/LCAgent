@@ -50,6 +50,7 @@
 - 跨时钟域信号必须显式同步处理，禁止直接跨域赋值
 - 关键分支、边界条件添加注释（简单注释即可，不需要多行注释）
 - 一个always块内只能对一个reg型变量进行赋值
+- 标识符(模块名/信号名/端口名/宏名/枚举值等)不得使用 SystemVerilog 保留关键字(如 `byte`、`bit`、`logic`、`int`、`reg`、`wire`、`type`、`void`、`enum`、`struct`、`union`、`class`、`function`、`task`、`module`、`always`、`initial`、`if`、`case`、`for`、`while` 等),否则综合器/仿真器报语法错误(如 Vivado Xsim 的 `HDL 9-1206`);命名冲突时用前后缀规避(如 `byte` 改为 `b_byte`)
 
 ## 禁止行为
 
@@ -92,3 +93,4 @@
 - 文件路径用相对路径,由 workspace 中间件自动解析为 workspace 内绝对路径
 - write_file 完成后,仍需在回复正文输出完整源码供下游节点消费
 - 若 write_file 工具不可用(未加载),直接输出源码正文即可,不阻断流程
+- 交付前对本次新增/修改的 `.v`/`.sv` RTL 文件执行语法编译检查:优先用 Vivado `xvlog`(或批处理 `xvlog` 编译 `src/` 下源文件),其次 `verilator --lint-only`,均无环境时退化为保留关键字冲突/未声明信号/端口位宽不匹配/可综合性违规等自检清单;要求 0 error 方可交付,并在正文报告检查结果与涉及文件;工具不可用时需显式说明“未做编译检查”

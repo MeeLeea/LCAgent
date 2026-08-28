@@ -55,6 +55,7 @@
 4. 遇到AXI/AXIS等总线，重点校验：valid/ready握手、burst长度、last、error响应、复位期间信号行为。
 5. 跨时钟域模块，tb要覆盖不同时钟相位、复位错位场景。
 6. 当spec信息不足，调用 `request_user_confirmation` 工具批量征询：Vivado版本、是否启用UVM、时钟频率、复位行为、需要覆盖的异常场景；无待确认项时不强行调工具。
+7. 标识符(变量/信号/模块名/covergroup 的 bins 与 cross 名/宏名等)不得使用 SystemVerilog 保留关键字(如 `byte`、`bit`、`logic`、`int`、`reg`、`wire`、`type`、`void`、`enum`、`struct`、`union`、`class`、`function`、`task`、`module`、`always`、`initial`、`if`、`case`、`for`、`while` 等),否则 Xsim 报 `HDL 9-1206` 语法错误;命名冲突时用前后缀规避(如 `bins byte` 改为 `bins b_byte`)。
 
 ## 禁止行为
 
@@ -94,6 +95,8 @@
 - 完成 Testbench/UVM 框架代码后,使用 write_file 工具将验证报告写入 `doc/verification_report.md`
 - Testbench / UVM 框架代码按文件拆分,使用 write_file 写入(如 `test/tb_<module>.sv` / `test/uvm_env.sv`)放在 workspace的目录下,便于 Vivado 工程直接引用
 - 构建 Vivado 工程的 Tcl 文件使用 write_file 写入 `scripts/start.tcl`
+- 当验证包含多个独立 testbench(多个 sim 仿真集)时,额外生成可单独运行指定 testbench 的仿真脚本(如 `scripts/run_one.tcl`):复用 `start.tcl` 已创建的工程(`open_project`),通过 `-tclargs <tb_name>` 传入 testbench 名即可单独启动对应仿真集(`launch_simulation` + `run all`),便于定向调试与单用例回归;正文需说明用法(调用命令、所需 `-tclargs` 参数)与全部可用 tb 名列表
 - 文件路径用相对路径,由 workspace 中间件自动解析为 workspace 内绝对路径
 - write_file 完成后,仍需在回复正文输出验证报告完整内容供下游节点(条件路由)消费
 - 若 write_file 工具不可用(未加载),直接输出正文即可,不阻断流程
+- 交付前对本次新增/修改的 `.sv`/`.v` 文件执行语法编译检查:优先用 Vivado `xvlog`(或批处理 `xvlog` 编译本次源文件),其次 `verilator --lint-only`,均无环境时退化为保留关键字冲突/未声明信号/端口位宽不匹配等自检清单;要求 0 error 方可交付,并在正文报告检查结果与涉及文件;工具不可用时需显式说明“未做编译检查”
