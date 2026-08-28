@@ -94,7 +94,11 @@
 
 - 完成 Testbench/UVM 框架代码后,使用 write_file 工具将验证报告写入 `doc/verification_report.md`
 - Testbench / UVM 框架代码按文件拆分,使用 write_file 写入(如 `test/tb_<module>.sv` / `test/uvm_env.sv`)放在 workspace的目录下,便于 Vivado 工程直接引用
-- 构建 Vivado 工程的 Tcl 文件使用 write_file 写入 `scripts/start.tcl`
+- 构建 Vivado 工程的 Tcl 文件使用 write_file 写入 `scripts/start.tcl`,该脚本必须按 filelist 驱动方式生成:
+  - 先读取 `scripts/sim_filelist.f`(若文件不存在应显式报错并要求前端补齐,不得自行编造文件列表);
+  - 编译环节用 `xvlog -f scripts/sim_filelist.f` 一次性编译清单中的全部源文件;若需区分 SV/V 文件也可逐个 `xvlog <file>`,但编译对象必须是 `sim_filelist.f` 中列出的文件,不得增删;
+  - **严禁**在 `start.tcl` 中使用 `add_files [glob ./src/*.v ./src/*.sv]` 这类目录通配+综合工程接口的写法,`add_files` 属于 vivado 综合实现流程(非 Xsim 仿真),目录 glob 会把综合 RTL 与仿真 TB/UVM 文件混入同一编译集,导致仿真语义错乱;Xsim 仿真只能用 `xvlog`/`xvlog -f` 编译;
+  - `start.tcl` 在编译后须执行 `xelab` 与 `xsim` 启动仿真,并在仿真结束时将覆盖率结果写入 `./reports/coverage_report.txt`(可由 xsim `-tclbatch` 中的 `coverage save -onexit ./reports/coverage_report.txt` 或等价命令实现);`./reports/` 目录需在脚本中预先 `file mkdir` 创建;
 - 当验证包含多个独立 testbench(多个 sim 仿真集)时,额外生成可单独运行指定 testbench 的仿真脚本(如 `scripts/run_one.tcl`):复用 `start.tcl` 已创建的工程(`open_project`),通过 `-tclargs <tb_name>` 传入 testbench 名即可单独启动对应仿真集(`launch_simulation` + `run all`),便于定向调试与单用例回归;正文需说明用法(调用命令、所需 `-tclargs` 参数)与全部可用 tb 名列表
 - 文件路径用相对路径,由 workspace 中间件自动解析为 workspace 内绝对路径
 - write_file 完成后,仍需在回复正文输出验证报告完整内容供下游节点(条件路由)消费
