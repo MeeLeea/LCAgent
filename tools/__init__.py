@@ -8,6 +8,7 @@ from skmng.tool import read_skill
 from .calculator import calculate
 from .create_tools import create_tool
 from .get_local_time import get_local_time
+from .human_confirmation import request_user_confirmation
 from .open_file import open_file, open_sqlite
 from .scheduler_tool import (
     cancel_scheduled_task,
@@ -37,6 +38,7 @@ all_tools = [
     delete_scheduled_task,
     cleanup_finished_tasks,
     ask_human,
+    request_user_confirmation,
 ]
 
 __all__ = [
@@ -52,6 +54,7 @@ __all__ = [
     'open_file',
     'open_sqlite',
     'read_skill',
+    'request_user_confirmation',
     'run_cmd',
     'run_python',
     'run_shell',

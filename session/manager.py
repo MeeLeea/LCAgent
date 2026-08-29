@@ -28,7 +28,6 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from memory.manager import MemoryManager
-from utils.events import AgentEvent
 
 from .registry import SessionRegistry
 
@@ -302,7 +301,16 @@ class SessionManager:
         return await self.session.aswitch_session(session_id)
 
     async def adelete_session(self, session_id: str) -> bool:
-        """删除会话。"""
+        """删除会话。
+
+        删除前先清理该会话的 thread 级长期记忆（与写流水线串行化，避免
+        清完又被防抖 flush 回写“复活”），agent 级跨会话共享记忆不受影响。
+        """
+        if self._memory is not None:
+            try:
+                await self._memory.clear(session_id, release_lock=True)
+            except Exception as error:  # 记忆清理失败不应阻断会话删除
+                logger.warning("清理会话长期记忆失败 [sid=%s]: %s", session_id, error)
         return await self.session.adelete_session(session_id)
 
     async def aget_messages(self, session_id: str | None = None) -> list[Any]:

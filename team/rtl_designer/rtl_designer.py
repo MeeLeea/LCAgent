@@ -6,14 +6,21 @@ from typing import ClassVar
 
 from graph.registry import register_agent
 from team.base import PromptInjector, TeamAgent
+from tools.human_confirmation import request_user_confirmation
 
 
-@register_agent("rtl_designer", "team/rtl_designer/agent_config.json", tools=None)
+@register_agent(
+    "rtl_designer",
+    "team/rtl_designer/agent_config.json",
+    tools=[request_user_confirmation],
+    mcp_tools=["write_file","edit_file","list_directory","read_file","delete_file","create_directory","delete_directory"],
+)
 class DesignerAgent(TeamAgent):
     """
     设计师 Agent,负责 RTL 设计、综合、布局布线等
 
-    继承 TeamAgent 轻量基类,纯文本推理模式(不使用工具);各工作流方法
+    继承 TeamAgent 轻量基类,可选工具调用能力(声明 mcp_tools=["write_file"],
+    由 build_workflow 装配期同步拉取;加载失败时降级为纯文本模式);各工作流方法
     渲染对应 `## workflow:*` 小节 → 可选技能注入 → 异步 LLM 调用(TOKEN 级流式)。
     """
 
@@ -28,7 +35,8 @@ class DesignerAgent(TeamAgent):
             "3. 模块接口定义表:信号名｜方向｜位宽｜时钟域｜描述\n"
             "4. 核心设计思路:数据流、状态机、握手、CDC方案、复位策略\n"
             "5. Filelist:syn_filelist.f(综合用,仅可综合RTL不含tb)与 sim_filelist.f(仿真用,RTL + tb + include)\n\n"
-            "spec 信息不足时,主动列出待确认参数清单,不擅自修改架构Spec。"
+            "spec 信息不足时,调用 request_user_confirmation 工具批量征询关键参数(时钟频率、位宽、协议、复位类型、跨时钟域、带宽、异常处理需求),"
+            "每项含 id/question/choices,由用户确认后再推进;无待确认项时跳过,不擅自修改架构Spec。"
         ),
         "verilog_design": (
             "请根据以下任务与上下文输出可综合的 SystemVerilog RTL 源码:\n\n"
@@ -39,7 +47,7 @@ class DesignerAgent(TeamAgent):
             "7. Mermaid框图/状态机(需要时输出)\n"
             "8. 风险点清单:时序隐患、锁存风险、死锁、边界漏洞\n"
             "9. 验证测试点Checklist\n"
-            "10. 待确认参数清单\n\n"
+            "10. 待确认参数清单:若存在需用户拍板的设计决策点,调用 request_user_confirmation 工具批量征询(每项含 id/question/choices);无则跳过本环节\n\n"
             "RTL 代码规范:使用 SystemVerilog;parameter 参数化禁止硬编码位宽;时钟复位端口放最前;"
             "状态机用 enum;always_ff 时序逻辑 / always_comb 组合逻辑且完备 else 避免锁存;"
             "跨时钟域信号必须显式同步,禁止直接跨域赋值。"

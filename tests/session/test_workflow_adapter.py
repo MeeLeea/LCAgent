@@ -4,9 +4,10 @@
 覆盖：
 - SessionAgent 协议属性：session / checkpoint_info / _current_sid / set_current_session
 - arun_events 节点事件流（NODE_START → NODE_END → DONE）与 thread_id/is_important
+- arun_events __interrupt__ 检测 → INTERRUPT 事件
 - 非 workflow 会话拒绝执行（ValueError）
 - 执行前 raw_context 注入：长期记忆 recall + checkpoint 历史消息
-- aresume_events 不支持（NotImplementedError）
+- aresume_events：用 Command(resume=payload) 恢复 + DONE/INTERRUPT 终止事件
 - aget_execution_history / aclear_history（复用 SessionStore）
 - manually_compact（无消息/非 workflow 会话/正常压缩）
 - aclose 幂等
@@ -18,7 +19,9 @@ import types
 from unittest.mock import AsyncMock, MagicMock
 
 from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.types import Command
 
+from session.context import SessionContext
 from session.workflow_adapter import WorkflowAdapter
 from utils.events import EventType
 
@@ -84,6 +87,58 @@ class FakeGraphToken(FakeGraph):
         return dict(self.result)
 
 
+class _FakeInterrupt:
+    """模拟 langgraph Interrupt 对象（含 .value 属性）。"""
+
+    def __init__(self, value: dict) -> None:
+        self.value = value
+
+
+class FakeGraphInterrupt(FakeGraph):
+    """返回 __interrupt__ 的图（触发 INTERRUPT 事件而非 DONE）。
+
+    模拟节点内 run_team_turn_with_interrupt 调 interrupt() 后,
+    graph.ainvoke 返回 {"__interrupt__": [Interrupt(...)], ...} 的场景。
+    final_answer 为空,interrupt.value 携带 kind/prompt/choices。
+    """
+
+    def __init__(self, interrupt_value: dict) -> None:
+        super().__init__(result={"final_answer": "", "__interrupt__": []})
+        self._interrupt_value = interrupt_value
+
+    async def ainvoke(self, state, config):
+        self.last_state = state
+        self.last_config = config
+        handler = config["callbacks"][0]
+        handler.on_chain_start(
+            {}, {}, run_id="r1", metadata={"langgraph_node": "node_a"}
+        )
+        handler.on_chain_end(
+            {"messages": [AIMessage(content="节点产出文本")]}, run_id="r1"
+        )
+        # 返回 __interrupt__ 列表（对照 langgraph 真实返回形状）
+        return {
+            "final_answer": "",
+            "__interrupt__": [_FakeInterrupt(self._interrupt_value)],
+        }
+
+
+class FakeGraphResume(FakeGraph):
+    """记录 resume_command 入参 + 触发节点事件 + 返回 final_answer。
+
+    供 aresume_events 测试验证 graph.ainvoke 收到的是 Command(resume=...)
+    而非 initial_state 字典。
+    """
+
+    def __init__(self, result: dict | None = None) -> None:
+        super().__init__(result=result or {"final_answer": "恢复后完成"})
+        self.received_input: object | None = None
+
+    async def ainvoke(self, state, config):
+        self.received_input = state  # 应为 Command(resume=...)
+        return await super().ainvoke(state, config)
+
+
 class FakeStore:
     """模拟 SessionStore（执行历史按会话隔离）。"""
 
@@ -118,7 +173,14 @@ def _make_registry(workflow_name: str = "simple") -> MagicMock:
     reg.workflow_name_of.return_value = workflow_name
     reg.awarm_workspace = AsyncMock()
     reg.aget_messages = AsyncMock(return_value=[])
-    reg.get_context.return_value = types.SimpleNamespace(workspace_path=None)
+    # 用真实 SessionContext.create 而非 SimpleNamespace(workspace_path=...)，
+    # 避免给 SessionContext 不存在的顶级属性造成 mock 与生产代码结构不一致
+    # （曾导致 workflow_adapter.py 读 getattr(ctx, "workspace_path") 的 bug 被测试掩盖）
+    reg.get_context.return_value = SessionContext.create(
+        session_id="workflow-simple-thread-1",
+        checkpointer=None,
+        workspace_path=None,
+    )
     reg._store = FakeStore()
     return reg
 
@@ -135,6 +197,18 @@ def _collect(adapter, task="测试任务", thread_id=None, is_run_mode=True) -> 
         async for ev in adapter.arun_events(
             task, thread_id=thread_id, is_run_mode=is_run_mode
         ):
+            events.append(ev)
+
+    asyncio.run(_run())
+    return events
+
+
+def _collect_resume(adapter, payload, thread_id=None) -> list:
+    """收集 aresume_events 事件流。"""
+    events = []
+
+    async def _run():
+        async for ev in adapter.aresume_events(payload, thread_id=thread_id):
             events.append(ev)
 
     asyncio.run(_run())
@@ -321,7 +395,12 @@ def test_arun_events_injects_workspace_path(monkeypatch):
         lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
     )
     reg = _make_registry()
-    reg.get_context.return_value = types.SimpleNamespace(workspace_path="C:/ws")
+    # 用真实 SessionContext.create 构造带 workspace 的 context，结构对齐生产代码
+    reg.get_context.return_value = SessionContext.create(
+        session_id="workflow-simple-thread-1",
+        checkpointer=None,
+        workspace_path="C:/ws",
+    )
     adapter = _make_adapter(reg)
 
     _collect(adapter, thread_id="workflow-simple-thread-1")
@@ -346,18 +425,179 @@ def test_arun_events_no_workspace_path_by_default(monkeypatch):
     assert "workspace_path" not in configurable
 
 
+def test_arun_events_emits_interrupt_event(monkeypatch):
+    """graph.ainvoke 返回 __interrupt__ → yield INTERRUPT（不 yield DONE）。
+
+    对照 agent/interrupts.py:166-196 + agent/streaming.py:323-326。
+    """
+    interrupt_value = {
+        "kind": "dangerous_command",
+        "prompt": "确认执行 rm -rf ?",
+        "choices": [{"label": "允许", "value": True}, {"label": "拒绝", "value": False}],
+    }
+    fake_graph = FakeGraphInterrupt(interrupt_value)
+    monkeypatch.setattr(
+        "graph.registry.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
+    adapter = _make_adapter()
+
+    events = _collect(adapter, thread_id="workflow-simple-thread-1")
+
+    # 事件顺序: NODE_START → NODE_END → INTERRUPT（无 DONE）
+    assert [ev.event_type for ev in events] == [
+        EventType.NODE_START,
+        EventType.NODE_END,
+        EventType.INTERRUPT,
+    ]
+    interrupt_ev = events[-1]
+    assert interrupt_ev.thread_id == "workflow-simple-thread-1"
+    assert "确认执行 rm -rf" in interrupt_ev.interrupt_prompt
+    assert interrupt_ev.interrupt_choices == interrupt_value["choices"]
+
+
+def test_arun_events_interrupt_with_no_kind_uses_stringified_value(monkeypatch):
+    """interrupt.value 不是 dict 时,build_interrupt_event 用 stringify 兜底。"""
+    fake_graph = FakeGraphInterrupt("裸字符串中断值")
+    monkeypatch.setattr(
+        "graph.registry.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
+    adapter = _make_adapter()
+
+    events = _collect(adapter, thread_id="workflow-simple-thread-1")
+
+    assert events[-1].event_type == EventType.INTERRUPT
+    assert "裸字符串中断值" in events[-1].interrupt_prompt
+    assert events[-1].interrupt_choices == []
+
+
+def test_arun_events_user_confirmation_populates_interrupt_items(monkeypatch):
+    """user_confirmation interrupt.value 经 _arun_input_events 后 items 透传到 AgentEvent。
+
+    验证新增的 items 通道：build_interrupt_event 给 user_confirmation kind 输出
+    结构化分组列表，_arun_input_events 把它传给 AgentEvent.interrupt_items，
+    to_sse_dict 经 make_interrupt_dict 把 items 写入 SSE dict（与 choices 并存）。
+    """
+    interrupt_value = {
+        "kind": "user_confirmation",
+        "items": [
+            {
+                "id": "fpga_path",
+                "question": "FPGA Booth 降级?",
+                "choices": [
+                    {"id": "dsp_hard", "label": "用 DSP 硬核"},
+                    {"id": "base4_logic", "label": "纯逻辑基4"},
+                ],
+            },
+            {
+                "id": "clk_strategy",
+                "question": "复位策略?",
+                "choices": [{"id": "sync", "label": "同步复位"}],
+            },
+        ],
+    }
+    fake_graph = FakeGraphInterrupt(interrupt_value)
+    monkeypatch.setattr(
+        "graph.registry.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
+    adapter = _make_adapter()
+
+    events = _collect(adapter, thread_id="workflow-simple-thread-1")
+
+    interrupt_ev = events[-1]
+    assert interrupt_ev.event_type == EventType.INTERRUPT
+    # choices 扁平聚合仍保留（向后兼容）
+    assert len(interrupt_ev.interrupt_choices) == 3
+    assert interrupt_ev.interrupt_choices[0]["item_id"] == "fpga_path"
+    # items 分组列表透传到 AgentEvent.interrupt_items
+    assert len(interrupt_ev.interrupt_items) == 2
+    assert interrupt_ev.interrupt_items[0]["id"] == "fpga_path"
+    assert interrupt_ev.interrupt_items[0]["question"] == "FPGA Booth 降级?"
+    assert interrupt_ev.interrupt_items[0]["choices"][0] == {
+        "id": "dsp_hard",
+        "label": "用 DSP 硬核",
+    }
+    # to_sse_dict 经 make_interrupt_dict 同时输出 choices + items
+    sse = interrupt_ev.to_sse_dict()
+    assert sse["type"] == "interrupt"
+    assert len(sse["choices"]) == 3
+    assert len(sse["items"]) == 2
+    assert sse["items"][1]["id"] == "clk_strategy"
+
+
 # ────────────── 不支持能力 / 历史 / 压缩 / 生命周期 ──────────────
 
 
-def test_aresume_events_not_implemented():
-    """workflow 无 HITL 中断语义，aresume_events 抛 NotImplementedError。"""
+def test_aresume_events_uses_command_resume(monkeypatch):
+    """aresume_events 用 Command(resume=payload) 调 graph.ainvoke 恢复。
+
+    对照 agent/turn_runners.py:113-114。验证:
+    - graph.ainvoke 收到的是 Command(resume=payload),不是 initial_state
+    - 节点事件流正常吐出 (NODE_START → NODE_END)
+    - 终止事件 DONE(final_answer)
+    """
+    fake_graph = FakeGraphResume(result={"final_answer": "恢复后完成"})
+    monkeypatch.setattr(
+        "graph.registry.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
     adapter = _make_adapter()
+
+    payload = {"answer": "yes"}
+    events = _collect_resume(adapter, payload, thread_id="workflow-simple-thread-1")
+
+    # graph.ainvoke 收到 Command(resume=...)
+    assert isinstance(fake_graph.received_input, Command)
+    assert fake_graph.received_input.resume == payload
+    # config 含 thread_id（checkpointer 隔离 interrupt 状态）
+    assert fake_graph.last_config["configurable"]["thread_id"] == "workflow-simple-thread-1"
+    # 事件流: NODE_START → NODE_END → DONE
+    assert [ev.event_type for ev in events] == [
+        EventType.NODE_START,
+        EventType.NODE_END,
+        EventType.DONE,
+    ]
+    done = events[-1]
+    assert done.content == "恢复后完成"
+    assert done.thread_id == "workflow-simple-thread-1"
+    # aresume_events 不标记 is_important（非执行模式）
+    assert done.is_important is False
+
+
+def test_aresume_events_emits_interrupt_event(monkeypatch):
+    """resume 后再次中断 → yield INTERRUPT（支持多轮 HITL）。"""
+    interrupt_value = {
+        "kind": "dangerous_command",
+        "prompt": "再次确认？",
+        "choices": [],
+    }
+    fake_graph = FakeGraphInterrupt(interrupt_value)
+    fake_graph.last_config = None  # 由 ainvoke 填充
+    monkeypatch.setattr(
+        "graph.registry.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
+    adapter = _make_adapter()
+
+    events = _collect_resume(adapter, {"answer": "yes"}, thread_id="workflow-simple-thread-1")
+
+    assert events[-1].event_type == EventType.INTERRUPT
+    assert "再次确认" in events[-1].interrupt_prompt
+
+
+def test_aresume_events_non_workflow_session_raises(monkeypatch):
+    """非 workflow 会话 aresume_events 抛 ValueError（与 arun_events 一致）。"""
+    reg = _make_registry(workflow_name=None)
+    adapter = _make_adapter(reg)
+
     try:
-        asyncio.run(adapter.aresume_events({}))
-    except NotImplementedError:
-        pass
+        _collect_resume(adapter, {})
+    except ValueError as error:
+        assert "不是 workflow 会话" in str(error)
     else:
-        raise AssertionError("应抛出 NotImplementedError")
+        raise AssertionError("应抛出 ValueError")
 
 
 def test_aget_execution_history_reuses_store():

@@ -26,8 +26,61 @@ const SUGGESTIONS = [
 function InterruptCard() {
   const pendingInterrupt = useStore((s) => s.pendingInterrupt)
   const resume = useStore((s) => s.resume)
+  // 分组模式：itemId -> 已选 choiceId；扁平模式不使用此状态
+  const [selected, setSelected] = useState<Record<string, string>>({})
   if (!pendingInterrupt) return null
 
+  // 分组单选模式（user_confirmation）：每个 item 独立单选，提交按钮收集全部答案
+  if (pendingInterrupt.items && pendingInterrupt.items.length > 0) {
+    const items = pendingInterrupt.items
+    const allAnswered = items.every((it) => selected[it.id] !== undefined)
+    const handleSubmit = () => {
+      const answers = Object.fromEntries(
+        items.map((it) => [it.id, { choice_id: selected[it.id] }] as const),
+      )
+      resume({ answers })
+    }
+    return (
+      <div className="msg assistant">
+        <div className="avatar assistant">
+          <Sparkles size={16} />
+        </div>
+        <div className="msg-body">
+          <div className="interrupt-card">
+            <div className="interrupt-prompt">{pendingInterrupt.prompt}</div>
+            {items.map((it) => (
+              <div className="interrupt-item" key={it.id}>
+                <div className="interrupt-question">
+                  [{it.id}] {it.question}
+                </div>
+                <div className="interrupt-choices">
+                  {it.choices.map((c) => {
+                    const isSelected = selected[it.id] === c.id
+                    return (
+                      <button
+                        key={c.id}
+                        className={`choice-btn${isSelected ? ' selected' : ''}`}
+                        onClick={() =>
+                          setSelected((prev) => ({ ...prev, [it.id]: c.id }))
+                        }
+                      >
+                        {c.label}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            ))}
+            <button className="confirm-btn" disabled={!allAnswered} onClick={handleSubmit}>
+              提交
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // 扁平单选模式（human_choice / dangerous_command / 无 items 的中断）
   return (
     <div className="msg assistant">
       <div className="avatar assistant">

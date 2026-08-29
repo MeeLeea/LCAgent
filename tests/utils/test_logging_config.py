@@ -10,8 +10,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import io
 import logging
+from collections.abc import AsyncIterator
 
 import pytest
 
@@ -344,3 +346,56 @@ class TestRuntimeLogLevel:
         assert "CRITICAL" in LOG_LEVELS
         assert LOG_LEVELS["DEBUG"] == logging.DEBUG
         assert LOG_LEVELS["CRITICAL"] == logging.CRITICAL
+
+
+# ════════════════════════════════════════════════════════════════
+#  回归测试：跨 Context 关闭（async generator aclose）
+# ════════════════════════════════════════════════════════════════
+
+
+class TestTraceContextCrossContextClose:
+    """回归测试：TraceContext 跨 Context 关闭时不应抛 ValueError
+
+    复现 workflow_adapter.aresume_events / arun_events 中
+    `with TraceContext(...)` 包裹 `yield` 的 async generator 被提前
+    aclose() 时出现的
+    'Token ... was created in a different Context' 报错。
+    """
+
+    def test_exit_in_different_context_does_not_raise(self):
+        """__enter__ 与 __exit__ 处于不同 ContextVar Context 时不应抛错"""
+        tc = TraceContext(trace_id="x-trace", thread_id="x-thread")
+
+        # 在“当前 context”中执行 set（保存 token）
+        tc.__enter__()
+
+        # 在另一个 context 中执行 __exit__（模拟 async generator 被 aclose）
+        new_ctx: contextvars.Context = contextvars.copy_context()
+
+        def do_exit() -> None:
+            # 未修复时此处抛 ValueError
+            tc.__exit__(None, None, None)
+
+        new_ctx.run(do_exit)
+
+        # 原 context 的值不受影响
+        assert _trace_id.get() == "x-trace"
+        assert _thread_id.get() == "x-thread"
+
+    def test_async_generator_closed_in_other_task_survives(self):
+        """包裹 yield 的 async generator 在另一任务中被 aclose 不抛 ValueError"""
+
+        async def gen() -> AsyncIterator[int]:
+            async with TraceContext(trace_id="gen-trace", thread_id="gen-thread"):
+                yield 1
+
+        async def main() -> None:
+            agen = gen()
+            # 在“生产任务”中启动 generator（set 发生在该任务 context）
+            produce = asyncio.create_task(agen.__anext__())
+            await produce
+            # 在“另一个任务”中关闭（clean-up 运行于不同 context）
+            await asyncio.create_task(agen.aclose())
+
+        # 未修复时 aclose 触发 __aexit__ → ValueError
+        asyncio.run(main())

@@ -60,6 +60,7 @@ config/*
 !config/*.json.example
 docs/
 *.json
+.drafts/
 # 必需入库的 JSON 配置（放回白名单）
 !agent/agent_config.json
 !team/*/agent_config.json

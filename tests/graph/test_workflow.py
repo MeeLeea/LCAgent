@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from unittest.mock import patch
 
 import pytest
 
+from agent.turn_types import AgentTurnResult
 from cli.commands.workflow import workflow_command
 from graph.simple import (
     arun_simple_workflow,
@@ -33,7 +35,18 @@ DEFAULT_TEMPLATES: dict[str, str] = {
 
 @dataclass
 class FakeAgent:
-    """模拟 TeamAgent,不联网"""
+    """模拟 TeamAgent,不联网;节点改调 run_team_turn_with_interrupt 后,
+    统一经 ``arun_structured`` 入口记录调用并返回 ``AgentTurnResult.completed``。
+
+    summarize 节点(summarize_context 节点)的 prompt 含 ``summarize_context``
+    模板前缀(节点把模板拼到 raw 前部),据此识别后返回 ``summary_response``,
+    与原 ``asummarize_context`` 返回 summary_response 的语义对齐;其余节点
+    回退 ``response``。
+    """
+
+    # summarize_context 节点 prompt 的特征字符串(节点模板固定,稳定可识别)
+    _SUMMARIZE_MARKER: str = "你是一个工作流上下文提炼助手"
+
     name: str = "test-agent"
     response: str = "fake response"
     summary_response: str = "记忆摘要: 用户偏好中文"
@@ -42,14 +55,19 @@ class FakeAgent:
     calls: list[tuple[str, str]] = field(default_factory=list)
 
     async def ainvoke(self, task: str, config=None) -> str:
-        """异步版 invoke:记录调用并返回模拟结果(与同步版同前缀,兼容既有断言)"""
+        """异步版 invoke:记录调用并返回模拟结果(兼容 TeamAgent.ainvoke 既有调用方)"""
         self.calls.append(("invoke", task))
         return self.response
 
-    async def asummarize_context(self, memory_text: str, config=None) -> str:
-        """异步版 summarize_context:记录调用并返回模拟摘要"""
-        self.calls.append(("summarize", memory_text))
-        return self.summary_response
+    def _is_summarize_node(self, prompt: str) -> bool:
+        """识别是否为 summarize_context 节点的 prompt(含模板特征)"""
+        return self._SUMMARIZE_MARKER in prompt
+
+    def _next(self, prompt: str) -> str:
+        """按节点类型返回模拟响应:summarize 节点返回 summary_response,其余返回 response"""
+        if self._is_summarize_node(prompt):
+            return self.summary_response
+        return self.response
 
     def get_template(self, name: str) -> str:
         """懒加载模板:优先读 AGENT.md 小节,缺失回退默认模板"""
@@ -64,45 +82,16 @@ class FakeAgent:
         """占位符替换"""
         return TeamAgent.render_template(template, **kwargs)
 
-    async def aplan_task(self, task: str, context_summary: str = "", injector=None, config=None) -> str:
-        """异步版 plan_task:记录调用并返回模拟结果(与同步版同前缀,兼容既有断言)"""
-        prompt = self.render_template(
-            self.get_template("manager_plan"), task=task, context_summary=context_summary
-        )
-        if injector is not None:
-            prompt = injector.inject_into_prompt(prompt, task)
-        self.calls.append(("invoke", prompt))
-        return self.response
+    def inject_into_prompt(self, prompt: str, task: str, active_names=()) -> str:
+        """技能注入占位:测试不验证技能块,原样返回 prompt(已含渲染内容)"""
+        return prompt
 
-    async def aexecute_task(self, plan: str, injector=None, config=None) -> str:
-        """异步版 execute_task:记录调用并返回模拟结果(与同步版同前缀)"""
-        prompt = self.render_template(self.get_template("worker_exec"), plan=plan)
-        if injector is not None:
-            prompt = injector.inject_into_prompt(prompt, plan)
-        self.calls.append(("invoke", prompt))
-        return self.response
-
-    async def afinalize(
-        self,
-        task: str,
-        plan: str,
-        worker_result: str,
-        context_summary: str = "",
-        injector=None,
-        config=None,
-    ) -> str:
-        """异步版 finalize:记录调用并返回模拟结果(与同步版同前缀)"""
-        prompt = self.render_template(
-            self.get_template("terminator_final"),
-            task=task,
-            plan=plan,
-            worker_result=worker_result,
-            context_summary=context_summary,
-        )
-        if injector is not None:
-            prompt = injector.inject_into_prompt(prompt, task)
-        self.calls.append(("invoke", prompt))
-        return self.response
+    async def arun_structured(self, prompt: str, config=None) -> AgentTurnResult:
+        """节点经 run_team_turn_with_interrupt 调用的唯一入口;
+        记录 (arun_structured, prompt) 并返回 completed(self._next(prompt))
+        """
+        self.calls.append(("arun_structured", prompt))
+        return AgentTurnResult.completed(self._next(prompt))
 
 
 # ==================== 测试工作流节点 ====================
@@ -116,8 +105,10 @@ def test_summarize_context_node():
 
     assert result["context_summary"] == "记忆摘要: 项目背景A"
     assert len(manager.calls) == 1
-    assert manager.calls[0][0] == "summarize"
-    assert manager.calls[0][1] == "用户: 之前聊过项目A"
+    # 节点改调 run_team_turn_with_interrupt → arun_structured
+    assert manager.calls[0][0] == "arun_structured"
+    # prompt 含 summarize_context 模板前缀 + raw_context
+    assert "用户: 之前聊过项目A" in manager.calls[0][1]
 
 
 def test_manager_plan_node():
@@ -129,7 +120,7 @@ def test_manager_plan_node():
     
     assert result["plan"] == "计划: 步骤1、步骤2"
     assert len(manager.calls) == 1
-    assert manager.calls[0][0] == "invoke"
+    assert manager.calls[0][0] == "arun_structured"
     assert "请为以下任务制定详细的执行计划" in manager.calls[0][1]
 
 
@@ -142,7 +133,7 @@ def test_worker_exec_node():
     
     assert result["worker_result"] == "已完成步骤1和步骤2"
     assert len(worker.calls) == 1
-    assert worker.calls[0][0] == "invoke"
+    assert worker.calls[0][0] == "arun_structured"
     assert "请执行以下计划" in worker.calls[0][1]
 
 
@@ -159,7 +150,7 @@ def test_terminator_final_node():
     
     assert result["final_answer"] == "最终答案: 项目包含3个模块"
     assert len(terminator.calls) == 1
-    assert terminator.calls[0][0] == "invoke"
+    assert terminator.calls[0][0] == "arun_structured"
     prompt = terminator.calls[0][1]
     assert "原始任务" in prompt
     assert "执行计划" in prompt
@@ -323,13 +314,15 @@ def test_build_simple_workflow_with_prompt_file(tmp_path):
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
     asyncio.run(graph.ainvoke({
         "task": "任务T",
-        "raw_context": "",
+        "raw_context": "原始上下文",  # 非空 → summarize 调 helper 返回 summary_response
         "context_summary": "摘要S",
         "plan": "",
         "worker_result": "",
         "final_answer": "",
     }))
 
+    # summarize 节点(raw 非空)调 arun_structured 返回 summary_response="摘要S";
+    # manager_plan 节点经 arun_structured 注入 context_summary="摘要S"
     assert "按文件计划: 任务T" in manager.calls[1][1]
     assert "记忆块: 摘要S" in manager.calls[1][1]
     assert "按文件执行: 计划X" in worker.calls[0][1]
@@ -352,8 +345,9 @@ def test_run_simple_workflow():
     assert result["worker_result"] == "执行结果: 完成A、B、C"
     assert result["final_answer"] == "最终答案: 全部完成"
     
-    # 验证三个 Agent 都被调用(manager 承担 summarize + plan 两次调用)
-    assert len(manager.calls) == 2
+    # raw_context 默认空串 → summarize 节点短路不调 helper;
+    # manager 只剩 manager_plan 一次调用(经 arun_structured)
+    assert len(manager.calls) == 1
     assert len(worker.calls) == 1
     assert len(terminator.calls) == 1
 
@@ -425,6 +419,39 @@ def test_register_agent_tools_passthrough():
         AGENT_REGISTRY.pop("fake_worker", None)
 
 
+def test_register_agent_mcp_tools_passthrough():
+    """测试装饰器的 mcp_tools 参数原样透传到注册表(默认 None,显式声明时存列表)"""
+    from graph.registry import AGENT_REGISTRY, register_agent
+    from team.base import TeamAgent
+
+    # 显式声明 mcp_tools
+    @register_agent(
+        "fake_mcp_role",
+        "team/fake_mcp/agent_config.json",
+        tools=None,
+        mcp_tools=["write_file"],
+    )
+    class FakeMcpAgent(TeamAgent):
+        pass
+
+    try:
+        spec = AGENT_REGISTRY["fake_mcp_role"]
+        assert spec["mcp_tools"] == ["write_file"]
+        # 未声明 mcp_tools 时默认 None(向后兼容)
+    finally:
+        AGENT_REGISTRY.pop("fake_mcp_role", None)
+
+    # 不传 mcp_tools 时默认 None
+    @register_agent("fake_no_mcp", "team/fake_no_mcp/agent_config.json")
+    class FakeNoMcpAgent(TeamAgent):
+        pass
+
+    try:
+        assert AGENT_REGISTRY["fake_no_mcp"]["mcp_tools"] is None
+    finally:
+        AGENT_REGISTRY.pop("fake_no_mcp", None)
+
+
 def test_builtin_agents_registered():
     """测试内置角色(manager/worker/terminator/architect)已通过装饰器注册"""
     import team  # noqa: F401 - 触发各 agent 模块加载,完成注册
@@ -442,6 +469,145 @@ def test_builtin_agents_registered():
     assert len(AGENT_REGISTRY["worker"]["tools"]) > 0
     assert AGENT_REGISTRY["manager"]["tools"] is None
     assert AGENT_REGISTRY["terminator"]["tools"] is None
+
+    # Architect 声明文件系统类 MCP 工具(读写/编辑/列表/删除文件与目录),
+    # 本地 tools 含 request_user_confirmation(架构评审的待确认输入清单升级为
+    # LangGraph interrupt/resume 语义,见 tools/human_confirmation.py)
+    # (MCP 工具由 build_workflow 装配期同步拉取,见 test_build_workflow_mcp_tools_injection)
+    _fs_mcp_tools = [
+        "write_file", "edit_file", "list_directory", "read_file",
+        "delete_file", "create_directory", "delete_directory",
+    ]
+    _arch_tool_names = [t.name for t in (AGENT_REGISTRY["architect"]["tools"] or [])]
+    assert _arch_tool_names == ["request_user_confirmation"]
+    assert AGENT_REGISTRY["architect"]["mcp_tools"] == _fs_mcp_tools
+
+    # RTL Designer / Verification 同样声明上述文件系统类 MCP 工具 + request_user_confirmation,
+    # 让规格文档/RTL 源码/验证报告/验证计划可写入 workspace, 且待确认项可走 interrupt/resume
+    _designer_tool_names = [t.name for t in (AGENT_REGISTRY["rtl_designer"]["tools"] or [])]
+    assert _designer_tool_names == ["request_user_confirmation"]
+    assert AGENT_REGISTRY["rtl_designer"]["mcp_tools"] == _fs_mcp_tools
+    _verif_tool_names = [t.name for t in (AGENT_REGISTRY["rtl_verification"]["tools"] or [])]
+    assert _verif_tool_names == ["request_user_confirmation"]
+    assert AGENT_REGISTRY["rtl_verification"]["mcp_tools"] == _fs_mcp_tools
+
+
+def test_build_workflow_mcp_tools_injection():
+    """测试 build_workflow 装配期同步拉取声明的 MCP 工具并合并到 tools
+
+    通过 patch load_mcp_tools_by_name_sync 返回伪造工具,验证:
+    - 声明 mcp_tools 的角色,工具被合并进 build_team_agent 的 tools 参数
+    - 未声明 mcp_tools 的角色,tools 保持原样(本地 tools 或 None)
+    - MCP 加载失败(返回空)时,角色降级为纯文本模式(tools=None)
+    """
+    from graph.registry import AGENT_REGISTRY, register_agent, build_workflow
+    from team.base import TeamAgent
+    from dataclasses import dataclass
+
+    @dataclass
+    class FakeTool:
+        """最小工具桩:只携带 name,供按名筛选测试。"""
+        name: str
+
+    fake_write_file = FakeTool(name="write_file")
+
+    captured: dict = {}
+
+    # 用 fake role 测试,避免污染真实 architect 注册项
+    @register_agent(
+        "fake_mcp_inject_role",
+        "team/architect/agent_config.json",  # 复用 architect 配置避免新建文件
+        tools=None,
+        mcp_tools=["write_file"],
+    )
+    class FakeMcpInjectAgent(TeamAgent):
+        pass
+
+    # 另注册一个无 mcp_tools 的角色作对照
+    @register_agent(
+        "fake_no_mcp_inject_role",
+        "team/manager/agent_config.json",
+        tools=None,
+    )
+    class FakeNoMcpInjectAgent(TeamAgent):
+        pass
+
+    original_build = None
+    try:
+        # registry._build 内部用 `from team import build_team_agent` 取符号,
+        # 每次调用都重新从 team 包命名空间解析,因此 patch team.build_team_agent 即可拦截
+        import team as team_mod
+
+        original_build = team_mod.build_team_agent
+
+        def _spy_build(agent_class, config_file, base_dir, tools=None, **kwargs):
+            captured[agent_class.__name__] = tools
+            # 返回一个最小实例,避免真实 LLM/MCP 初始化
+            inst = object.__new__(agent_class)
+            inst.tools = tools or []
+            inst.agent_executor = None
+            return inst
+
+        team_mod.build_team_agent = _spy_build
+
+        # 还需 patch 工作流 builder,避免真实图编译
+        from graph import registry as reg_mod
+
+        original_get_spec = reg_mod._get_workflow_spec
+
+        def _fake_get_spec(name):
+            return {
+                "builder": lambda agents, checkpointer=None: type(
+                    "FakeGraph", (), {"get_graph": lambda self: type(
+                        "G", (), {"nodes": []}
+                    )()}
+                )(),
+                "runner": None,
+                "roles": ["fake_mcp_inject_role", "fake_no_mcp_inject_role"],
+                "description": "test",
+            }
+
+        reg_mod._get_workflow_spec = _fake_get_spec
+        reg_mod.WORKFLOWS["__test_mcp_inject__"] = {
+            "builder": _fake_get_spec("__test_mcp_inject__")["builder"],
+            "runner": None,
+            "roles": ["fake_mcp_inject_role", "fake_no_mcp_inject_role"],
+            "description": "test",
+        }
+
+        # Case 1: MCP 工具加载成功
+        with patch(
+            "tools.mcp_loader.load_mcp_tools_by_name_sync",
+            return_value=[fake_write_file],
+        ):
+            build_workflow("__test_mcp_inject__", checkpointer=None)
+
+        # 声明 mcp_tools 的角色: tools 含 write_file
+        assert captured.get("FakeMcpInjectAgent") is not None
+        assert len(captured["FakeMcpInjectAgent"]) == 1
+        assert captured["FakeMcpInjectAgent"][0].name == "write_file"
+        # 未声明 mcp_tools 的角色: tools 为 None(本地 tools 也为 None)
+        assert captured.get("FakeNoMcpInjectAgent") is None
+
+        # Case 2: MCP 加载失败(返回空)→ 降级纯文本模式(tools=None)
+        captured.clear()
+        with patch(
+            "tools.mcp_loader.load_mcp_tools_by_name_sync",
+            return_value=[],
+        ):
+            build_workflow("__test_mcp_inject__", checkpointer=None)
+
+        # 声明 mcp_tools 但加载失败: tools 为 None(本地 tools 也为空 → or None)
+        assert captured.get("FakeMcpInjectAgent") is None
+
+    finally:
+        if original_build is not None:
+            team_mod.build_team_agent = original_build
+        if original_get_spec is not None:
+            reg_mod._get_workflow_spec = original_get_spec
+        AGENT_REGISTRY.pop("fake_mcp_inject_role", None)
+        AGENT_REGISTRY.pop("fake_no_mcp_inject_role", None)
+        reg_mod.WORKFLOWS.pop("__test_mcp_inject__", None)
 
 
 # ==================== 测试 CLI 命令 ====================
@@ -550,8 +716,9 @@ def test_workflow_thread_isolation():
     assert result2["task"] == "任务2"
     assert result2["final_answer"] == "答案2"
     
-    # 验证两次都调用了 agent(manager 为 summarize + plan 两次调用)
-    assert len(manager.calls) == 2
+    # 验证两次都调用了 agent(raw_context 默认空 → summarize 短路,
+    # manager 只剩 manager_plan 一次调用)
+    assert len(manager.calls) == 1
     assert len(worker.calls) == 1
     assert len(terminator.calls) == 1
 
@@ -567,12 +734,13 @@ def test_run_simple_workflow_with_memory():
 
     result = asyncio.run(arun_simple_workflow(graph, "测试任务", raw_context="用户: 之前聊过偏好中文"))
 
-    # manager 两次调用:summarize + plan
-    assert manager.calls[0] == ("summarize", "用户: 之前聊过偏好中文")
-    assert manager.calls[1][0] == "invoke"
+    # manager 两次调用:summarize + plan(均经 arun_structured)
+    assert manager.calls[0][0] == "arun_structured"
+    assert "用户: 之前聊过偏好中文" in manager.calls[0][1]
+    assert manager.calls[1][0] == "arun_structured"
     assert "记忆摘要: 用户偏好中文" in manager.calls[1][1]
     # worker 只拿 plan,不注入摘要
-    assert worker.calls[0][0] == "invoke"
+    assert worker.calls[0][0] == "arun_structured"
     assert "请执行以下计划" in worker.calls[0][1]
     assert "记忆摘要" not in worker.calls[0][1]
     # terminator 注入摘要
@@ -1053,9 +1221,10 @@ def test_workflow_cross_round_compression():
     # 第一轮:无历史,不注入
     result1 = asyncio.run(arun_simple_workflow(graph, "第一轮任务", thread_id="wf-t1"))
     assert result1["final_answer"] == "最终答案: 全部完成"
-    # summarize 节点第一轮 raw_context 为空
-    assert manager.calls[0][0] == "summarize"
-    assert manager.calls[0][1] == ""
+    # summarize 节点第一轮 raw_context 为空 → 短路不调 helper;
+    # manager 只剩 manager_plan 一次调用(经 arun_structured)
+    assert len(manager.calls) == 1
+    assert manager.calls[0][0] == "arun_structured"
 
     # 第二轮:同一 thread_id,上一轮状态应注入 raw_context
     manager.calls.clear()
@@ -1068,8 +1237,8 @@ def test_workflow_cross_round_compression():
     result2 = asyncio.run(arun_simple_workflow(graph, "第二轮任务", thread_id="wf-t1"))
     assert result2["final_answer"] == "答案2"
 
-    # summarize 节点收到上一轮工作流记录
-    assert manager.calls[0][0] == "summarize"
+    # summarize 节点收到上一轮工作流记录(经 arun_structured)
+    assert manager.calls[0][0] == "arun_structured"
     assert "【上一轮工作流记录】" in manager.calls[0][1]
     assert "第一轮任务" in manager.calls[0][1]
     assert "最终答案: 全部完成" in manager.calls[0][1]
@@ -1111,7 +1280,10 @@ def test_workflow_cross_round_no_checkpointer():
 
     result = asyncio.run(arun_simple_workflow(graph, "任务", thread_id="wf-t3"))
     assert result["final_answer"] == "答案"
-    assert manager.calls[0][1] == ""  # 无历史,summarize 收到空 raw_context
+    # 无 checkpointer → 无历史,summarize 节点 raw 为空 → 短路不调 helper;
+    # manager.calls[0] 是 manager_plan 节点调用,prompt 含 manager_plan 模板内容
+    assert manager.calls[0][0] == "arun_structured"
+    assert "请为以下任务制定详细的执行计划" in manager.calls[0][1]
 
 
 # ==================== 节点产出提取（NODE_END content） ====================

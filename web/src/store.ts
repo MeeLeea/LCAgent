@@ -405,7 +405,7 @@ function handleStreamEvent(
     case 'interrupt': {
       if (!streamLast || streamLast.role !== 'assistant') return threadId
       arr[streamIdx] = { ...streamLast, streaming: false, interrupted: true }
-      const info: InterruptInfo = { prompt: ev.prompt, choices: ev.choices }
+      const info: InterruptInfo = { prompt: ev.prompt, choices: ev.choices, items: ev.items }
       set((s) => {
         const pendingInterrupts = { ...s.pendingInterrupts, [threadId]: info }
         const patch: Partial<AppState> = { pendingInterrupts }
@@ -424,6 +424,14 @@ function handleStreamEvent(
         content: streamLast.content + (streamLast.content ? '\n\n' : '') + `> ⚠️ ${ev.content}`,
       }
       commitThreadMessages(get, set, threadId, arr)
+      // 流被取消，清除残留的中断卡片
+      set((s) => {
+        const pendingInterrupts = { ...s.pendingInterrupts }
+        delete pendingInterrupts[threadId]
+        const patch: Partial<AppState> = { pendingInterrupts }
+        if (normKey(s.currentThreadId) === threadId) patch.pendingInterrupt = null
+        return patch
+      })
       ctx.finish()
       get().fetchThreads()
       break
@@ -439,6 +447,14 @@ function handleStreamEvent(
         }
         commitThreadMessages(get, set, threadId, arr)
       }
+      // 流以错误结束，清除残留的中断卡片（如 resume 后后端返回 error）
+      set((s) => {
+        const pendingInterrupts = { ...s.pendingInterrupts }
+        delete pendingInterrupts[threadId]
+        const patch: Partial<AppState> = { pendingInterrupts }
+        if (normKey(s.currentThreadId) === threadId) patch.pendingInterrupt = null
+        return patch
+      })
       ctx.finish()
       break
     case 'workflow_node': {
@@ -883,6 +899,16 @@ export const useStore = create<AppState>((set, get) => ({
     commitThreadMessages(get, set, threadId, arr)
     markStreaming(get, set, threadId, true)
 
+    // 立即清除 pendingInterrupt，使中断卡片在用户点击恢复时立即隐藏。
+    // 若恢复流后续再次被中断，interrupt 事件会重新设置 pendingInterrupt 并显示新卡片。
+    set((s) => {
+      const pendingInterrupts = { ...s.pendingInterrupts }
+      delete pendingInterrupts[threadId]
+      const patch: Partial<AppState> = { pendingInterrupts }
+      if (normKey(s.currentThreadId) === threadId) patch.pendingInterrupt = null
+      return patch
+    })
+
     // 清除上一轮的终止标记，确保恢复流的事件不被阻塞
     terminatedThreads.delete(threadId)
 
@@ -898,35 +924,45 @@ export const useStore = create<AppState>((set, get) => ({
 
   stopStreaming: () => {
     const key = normKey(get().currentThreadId)
-    // 先向后端发送显式停止信号：即使 abort 连接后后端仍在 LLM 阻塞调用
-    // （含 SDK 内部重试）期间，也能立即感知取消并中断生成。
+    // 向后端发送显式停止信号：后端取消工作流后会回送 `cancelled` SSE 事件，
+    // 由 handleStreamEvent 的 case 'cancelled' 负责最终回退 UI（清 streaming、补提示）。
+    // 此处不再立即 abort 连接或本地改写消息——按钮保持"停止生成"直到后端确认取消，
+    // 以避免"本地显示已中止、后端仍在执行"的假反馈。
     const threadId = get().currentThreadId
     if (threadId) void api.stop(threadId).catch(() => {})
     clearWatchdog(key)
-    if (abortFns[key]) abortFns[key]!()
-    delete abortFns[key]
-    // 阻止迟到事件继续写入
-    terminatedThreads.add(key)
-    set((s) => {
-      const arr = [...(s.messagesByThread[key] ?? s.messages)]
-      const lastIndex = arr.length - 1
-      const last = arr[lastIndex]
-      if (last && last.role === 'assistant' && last.streaming) {
-        arr[lastIndex] = {
-          ...last,
-          streaming: false,
-          content: last.content || '_(已中止)_',
+
+    // 安全兜底：若后端在限时内未回送 cancelled（如断网、后端未实现取消），
+    // 在此执行原始拆卸（abort 连接 + 标记终止 + 本地回写"_(已中止)_"），
+    // 确保按钮不会永久卡在"停止生成"。
+    const FALLBACK_MS = 1500
+    setTimeout(() => {
+      // 已由 cancelled 路径正常回退则无需兜底
+      if (!get().streamingThreads[key]) return
+      abortFns[key]?.()
+      delete abortFns[key]
+      terminatedThreads.add(key)
+      set((s) => {
+        const arr = [...(s.messagesByThread[key] ?? s.messages)]
+        const lastIndex = arr.length - 1
+        const last = arr[lastIndex]
+        if (last && last.role === 'assistant' && last.streaming) {
+          arr[lastIndex] = {
+            ...last,
+            streaming: false,
+            content: last.content || '_(已中止)_',
+          }
         }
-      }
-      const streamingThreads = { ...s.streamingThreads }
-      delete streamingThreads[key]
-      const patch: Partial<AppState> = {
-        streamingThreads,
-        messagesByThread: { ...s.messagesByThread, [key]: arr },
-      }
-      if (normKey(s.currentThreadId) === key) patch.messages = arr
-      return patch
-    })
+        const streamingThreads = { ...s.streamingThreads }
+        delete streamingThreads[key]
+        const patch: Partial<AppState> = {
+          streamingThreads,
+          messagesByThread: { ...s.messagesByThread, [key]: arr },
+        }
+        if (normKey(s.currentThreadId) === key) patch.messages = arr
+        return patch
+      })
+    }, FALLBACK_MS)
   },
 
   clearMessages: () => {

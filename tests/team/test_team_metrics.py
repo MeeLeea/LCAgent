@@ -6,6 +6,8 @@
 - 工具模式流式指标:on_chat_model_end(LLM)/on_tool_end/on_tool_error(工具)
 - turn 计数(astream 入口)
 - arun_structured 类型化结果:completed / cancelled 状态映射
+- UserRejectedCommandError 语义识别(对齐 turn_runners.py:52-53):
+  _astream_with_tools re-raise / arun_structured cancelled / ainvoke 转文本
 
 参考: agent/turn_runners.py 的指标提取逻辑与 _parse_turn_result 状态映射。
 """
@@ -14,11 +16,13 @@ from __future__ import annotations
 import asyncio
 from typing import ClassVar
 
+import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from langchain_core.tools import tool
 
 from agent.turn_types import AgentTurnResult
 from team.base import TeamAgent
+from tools.terminal_tools import UserRejectedCommandError
 from utils.metrics import MetricsCollector
 
 
@@ -61,12 +65,20 @@ class _FakeLLM:
 
 
 class _FakeExecutor:
-    """假 agent executor:按预设事件序列产出 astream_events"""
+    """假 agent executor:按预设事件序列产出 astream_events
 
-    def __init__(self, events: list[dict]) -> None:
+    error 不为 None 时,astream_events 在产出任意事件前直接 raise 该异常,
+    用于模拟工具内部抛 UserRejectedCommandError 等冒到 astream_events
+    调用方的异常(LangGraph 对未识别异常不转 on_tool_error 事件,直接 re-raise)
+    """
+
+    def __init__(self, events: list[dict], error=None) -> None:
         self._events = events
+        self._error = error
 
     async def astream_events(self, messages, config=None, version="v2"):
+        if self._error is not None:
+            raise self._error
         for ev in self._events:
             yield ev
 
@@ -300,3 +312,68 @@ def test_arun_structured_tool_mode_completed(monkeypatch):
     assert result.is_completed
     assert result.output == "hello world"
     assert agent.metrics.get_summary()["session"]["turn_count"] == 1
+
+
+# ── 用户拒绝危险命令语义识别(对齐 agent/turn_runners.py:52-53) ────
+
+def test_astream_with_tools_reraises_user_rejected(monkeypatch):
+    """_astream_with_tools 遇 UserRejectedCommandError 时 re-raise(不混入
+    通用"任务执行失败"错误文本),使上层 arun_structured 能单独识别为 cancelled
+    """
+    _monkeypatch_llm(monkeypatch)
+
+    executor = _FakeExecutor(
+        events=[],
+        error=UserRejectedCommandError("rm -rf /"),
+    )
+    _monkeypatch_executor(monkeypatch, executor)
+
+    agent = TeamAgent(name="t", tools=[_echo], system_prompt="sys")
+
+    with pytest.raises(UserRejectedCommandError):
+        _collect(agent._astream_with_tools("task"))
+
+
+def test_arun_structured_cancelled_on_user_rejected(monkeypatch):
+    """arun_structured 单独 catch UserRejectedCommandError → cancelled,
+    output 为"用户拒绝"语义(不混入 TASK_ERROR_PREFIX),对齐 TurnRunners 模式
+    """
+    _monkeypatch_llm(monkeypatch)
+
+    executor = _FakeExecutor(
+        events=[],
+        error=UserRejectedCommandError("rm -rf /"),
+    )
+    _monkeypatch_executor(monkeypatch, executor)
+
+    agent = TeamAgent(name="t", tools=[_echo], system_prompt="sys")
+    result = asyncio.run(agent.arun_structured("task"))
+
+    assert result.status == "cancelled"
+    assert result.is_completed is False
+    # 关键断言:不含通用"任务执行失败"前缀,而是"用户拒绝"语义
+    assert result.output is not None
+    assert "用户拒绝" in result.output or "用户已拒绝" in result.output
+    assert not result.output.startswith("任务执行失败")
+
+
+def test_ainvoke_returns_error_text_on_user_rejected(monkeypatch):
+    """ainvoke 契约返回 str 不抛异常:UserRejectedCommandError → 错误文本
+
+    工作流节点(worker_exec 等)直接 await ainvoke 不带 try/except,
+    若此处抛异常会破坏整个工作流图;故 ainvoke 须把异常转为错误文本返回。
+    """
+    _monkeypatch_llm(monkeypatch)
+
+    executor = _FakeExecutor(
+        events=[],
+        error=UserRejectedCommandError("rm -rf /"),
+    )
+    _monkeypatch_executor(monkeypatch, executor)
+
+    agent = TeamAgent(name="t", tools=[_echo], system_prompt="sys")
+    result = asyncio.run(agent.ainvoke("task"))
+
+    assert isinstance(result, str)
+    assert result.startswith("任务执行失败")
+    assert "用户拒绝" in result

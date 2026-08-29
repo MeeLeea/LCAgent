@@ -24,11 +24,13 @@ def build_skill_block(
     active_names: tuple[str, ...] = (),
     fixed_skills: tuple[str, ...] = (),
     auto_match: bool = True,
+    exclude_skills: tuple[str, ...] = (),
 ) -> str:
     """合并三来源技能并渲染为可注入 system prompt 的指引块
 
     合并去重顺序: fixed_skills + active_names + match_skills(后者仅 auto_match=True
     且 task 非空时参与),最终经 sorted 去重后交由 SkillManager.render_block 渲染。
+    exclude_skills 在三来源合并完成后统一过滤,对 fixed/active/auto_match 均生效。
 
     Args:
         sm: 技能管理器实例(持有 skills_dir)
@@ -36,9 +38,11 @@ def build_skill_block(
         active_names: 运行时手动加载的技能名(由节点函数从 state 取值传入)
         fixed_skills: 角色级固定依赖技能名(由 TeamAgent 类属性提供)
         auto_match: 是否开启任务自动匹配(False 时仅注入 fixed + active)
+        exclude_skills: 需排除的技能名(技能目录名,如 "vivado-2025.2");
+            在三来源合并去重后、渲染前统一剔除,空集合时无操作
 
     Returns:
-        技能指引块文本;三来源均空时返回空串
+        技能指引块文本;三来源均空(或被全部排除)时返回空串
     """
     # 收集三来源,保持插入序去重(后插入的同名技能不重复渲染)
     seen: set[str] = set()
@@ -55,6 +59,11 @@ def build_skill_block(
             if n not in seen:
                 seen.add(n)
                 names.append(n)
+
+    # 排除指定技能(对 fixed/active/auto_match 三来源统一生效,空集合时无操作)
+    if exclude_skills:
+        excl = set(exclude_skills)
+        names = [n for n in names if n not in excl]
 
     if not names:
         return ""

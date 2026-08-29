@@ -11,10 +11,16 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass, field
 
+from langgraph.graph import END
+
+from agent.turn_types import AgentTurnResult
 from graph.rtl_graph import (
     RTLGraphState,
+    _coverage_inclusion_ok,
+    _parse_filelist,
     architect_analyze_node,
     architect_design_node,
     architect_plan_node,
@@ -22,62 +28,78 @@ from graph.rtl_graph import (
     architect_spec_node,
     arun_rtl_graph_workflow,
     build_rtl_graph_workflow,
+    designer_file_check_node,
     designer_output_node,
     designer_spec_node,
     designer_verilog_node,
-    route_after_verification,
+    route_after_file_check,
+    route_after_sim_check,
+    sim_exec_check_node,
     summarize_context,
     verification_check_node,
     verification_passed,
     verification_plan_node,
 )
+from team.base import TeamAgent
+
+# 默认模板(与各角色类的 default_templates 一致,供 FakeRTLAgent.get_template 兜底)
+DEFAULT_TEMPLATES: dict[str, str] = {
+    "summarize_context": "你是一个工作流上下文提炼助手。",
+    "architect_plan": "请为以下芯片架构设计任务制定详细的执行计划:\n\n{task}\n\n",
+    "architect_design": "请为以下任务完成芯片架构方案设计:\n\n{task}\n\n",
+    "architect_analyze": "请对以下架构方案进行权衡分析(性能-面积-功耗PPA、风险与瓶颈):\n\n{task}\n\n",
+    "architect_review": "请从架构、RTL实现、后端物理、软件驱动、验证多维度评审以下方案:\n\n{task}\n\n",
+    "architect_spec": "请将以下架构方案整理为可直接交付RTL开发的规格文档:\n\n{task}\n\n",
+    "spec_design": "请根据以下任务完成 RTL 设计前的规格梳理与工程规划:\n\n{task}\n\n",
+    "verilog_design": "请根据以下任务与上下文输出可综合的 SystemVerilog RTL 源码:\n\n{task}\n\n",
+}
 
 
 @dataclass
 class FakeRTLAgent:
-    """模拟 TeamAgent,不联网;按方法名记录调用,支持顺序返回序列"""
+    """模拟 TeamAgent,不联网;节点改调 run_team_turn_with_interrupt 后,
+    统一经 ``arun_structured`` 入口记录调用并返回 ``AgentTurnResult.completed``。
+
+    sequence 为 verification_check 节点的按序响应(耗尽后回退 response),
+    供多轮迭代测试设置不同轮次的返回值(如 verifier 的 FAIL→PASS 序列);
+    通过 prompt 含"待验证 RTL 源码"特征识别 verification_check 节点
+    (其他节点回退 response,与原 verilog_sequence 语义一致)。
+    """
+
+    # verification_check 节点 prompt 的特征字符串(节点模板固定,稳定可识别)
+    _CHECK_PROMPT_MARKER: str = "待验证 RTL 源码"
 
     name: str = "test-agent"
     response: str = "fake response"
-    sequence: list[str] = field(default_factory=list)  # 按序弹出,耗尽后回退 response
-    verilog_sequence: list[str] = field(default_factory=list)  # verilog_design_task 专用序列
+    sequence: list[str] = field(default_factory=list)  # verification_check 专用序列
     calls: list[tuple[str, str]] = field(default_factory=list)
 
-    def _next(self, method: str) -> str:
-        seq = self.verilog_sequence if method == "verilog_design_task" else self.sequence
-        if seq:
-            return seq.pop(0)
+    def _is_check_node(self, prompt: str) -> bool:
+        """识别是否为 verification_check 节点的 prompt(含"待验证 RTL 源码"特征)"""
+        return self._CHECK_PROMPT_MARKER in prompt
+
+    def _next(self, prompt: str) -> str:
+        if self._is_check_node(prompt) and self.sequence:
+            return self.sequence.pop(0)
         return self.response
 
-    def _record(self, method: str, prompt: str) -> str:
-        self.calls.append((method, prompt))
-        return self._next(method)
+    def get_template(self, name: str) -> str:
+        """懒加载模板:复用 TeamAgent 静态解析(无 prompt_file 时回退默认模板)"""
+        return DEFAULT_TEMPLATES.get(name, "")
 
-    # ---- async 业务方法(节点改调 await agent.a*_task 后的唯一入口) ----
-    # calls 记录基础名(不带 a 前缀),保持既有断言兼容
-    async def asummarize_context(self, memory_text: str, config=None) -> str:
-        return self._record("summarize_context", memory_text)
+    def render_template(self, template: str, **kwargs) -> str:
+        """占位符替换(复用 TeamAgent 静态方法,与生产路径一致)"""
+        return TeamAgent.render_template(template, **kwargs)
 
-    async def aplan_task(self, task: str, context_summary: str = "", injector=None, config=None) -> str:
-        return self._record("plan_task", task)
+    def inject_into_prompt(self, prompt: str, task: str, active_names=()) -> str:
+        """技能注入占位:测试不验证技能块,原样返回(prompt 已含渲染内容)"""
+        return prompt
 
-    async def adesign_task(self, task: str, context_summary: str = "", injector=None, config=None) -> str:
-        return self._record("design_task", task)
-
-    async def aanalyze_task(self, task: str, context_summary: str = "", injector=None, config=None) -> str:
-        return self._record("analyze_task", task)
-
-    async def areview_task(self, task: str, context_summary: str = "", injector=None, config=None) -> str:
-        return self._record("review_task", task)
-
-    async def aspec_task(self, task: str, context_summary: str = "", injector=None, config=None) -> str:
-        return self._record("spec_task", task)
-
-    async def aspec_design_task(self, task: str, injector=None, config=None) -> str:
-        return self._record("spec_design_task", task)
-
-    async def averilog_design_task(self, task: str, injector=None, config=None) -> str:
-        return self._record("verilog_design_task", task)
+    async def arun_structured(self, task: str, config=None) -> AgentTurnResult:
+        """节点经 run_team_turn_with_interrupt 调用的唯一入口;
+        记录 (arun_structured, task) 并返回 completed(self._next(task))"""
+        self.calls.append(("arun_structured", task))
+        return AgentTurnResult.completed(self._next(task))
 
 
 def build_fake_agents(
@@ -94,7 +116,7 @@ def build_fake_agents(
         "rtl_verification": FakeRTLAgent(
             name="rtl_verification",
             response=verifier_sequence[-1] if verifier_sequence else "验证结论: PASS",
-            verilog_sequence=list(verifier_sequence or []),
+            sequence=list(verifier_sequence or []),
         ),
     }
 
@@ -129,7 +151,9 @@ def test_summarize_context_node():
     manager = FakeRTLAgent(name="manager", response="摘要: 用户偏好中文")
     result = asyncio.run(summarize_context(initial_state(raw_context="历史对话"), manager))
     assert result["context_summary"] == "摘要: 用户偏好中文"
-    assert manager.calls == [("summarize_context", "历史对话")]
+    # 节点改调 run_team_turn_with_interrupt → arun_structured,prompt 含模板+raw
+    assert manager.calls[0][0] == "arun_structured"
+    assert "历史对话" in manager.calls[0][1]
 
 
 def test_architect_plan_node():
@@ -138,7 +162,7 @@ def test_architect_plan_node():
     state = initial_state(context_summary="摘要S")
     result = asyncio.run(architect_plan_node(state, architect))
     assert result["arch_plan"] == "计划"
-    assert architect.calls[0][0] == "plan_task"
+    assert architect.calls[0][0] == "arun_structured"
     assert "设计一个 UART 模块" in architect.calls[0][1]
 
 
@@ -269,24 +293,6 @@ def test_verification_passed_empty():
     assert not verification_passed(None)
 
 
-def test_route_after_verification_passed():
-    """验证通过 → designer_output"""
-    state = initial_state(verification_report="验证结论: PASS", round=1)
-    assert route_after_verification(state) == "designer_output"
-
-
-def test_route_after_verification_fail_continues():
-    """验证未通过且未达上限 → 回 designer_verilog"""
-    state = initial_state(verification_report="验证结论: FAIL", round=1)
-    assert route_after_verification(state) == "designer_verilog"
-
-
-def test_route_after_verification_max_rounds():
-    """达轮次上限即使未通过也强制交付"""
-    state = initial_state(verification_report="验证结论: FAIL", round=3, max_rounds=3)
-    assert route_after_verification(state) == "designer_output"
-
-
 # ==================== 图构建测试 ====================
 
 def test_build_rtl_graph_workflow_nodes():
@@ -305,8 +311,9 @@ def test_build_rtl_graph_workflow_nodes():
         "designer_spec",
         "verification_plan",
         "designer_verilog",
+        "designer_file_check",
         "verification_check",
-        "designer_output",
+        "sim_exec_check",
     ]
     for node in expected:
         assert node in node_names
@@ -326,8 +333,9 @@ def test_build_rtl_graph_workflow_edges():
     assert ("architect_spec", "designer_spec") in edges
     assert ("designer_spec", "verification_plan") in edges
     assert ("verification_plan", "designer_verilog") in edges
-    assert ("designer_verilog", "verification_check") in edges
-    assert ("designer_output", "__end__") in edges
+    assert ("designer_verilog", "designer_file_check") in edges
+    assert ("designer_file_check", "verification_check") in edges
+    assert ("verification_check", "sim_exec_check") in edges
 
 
 def test_build_rtl_graph_workflow_conditional_edges():
@@ -335,8 +343,10 @@ def test_build_rtl_graph_workflow_conditional_edges():
     agents = build_fake_agents()
     graph = build_rtl_graph_workflow(agents)
     edges = {(e.source, e.target) for e in graph.get_graph().edges}
-    assert ("verification_check", "designer_output") in edges
-    assert ("verification_check", "designer_verilog") in edges
+    assert ("designer_file_check", "verification_check") in edges
+    assert ("designer_file_check", "designer_verilog") in edges
+    assert ("sim_exec_check", "__end__") in edges
+    assert ("sim_exec_check", "designer_verilog") in edges
 
 
 def test_build_rtl_graph_workflow_max_rounds_param():
@@ -345,11 +355,50 @@ def test_build_rtl_graph_workflow_max_rounds_param():
     graph = build_rtl_graph_workflow(agents, max_rounds=5)
     assert graph is not None
 
-
 # ==================== 多轮交互运行测试 ====================
 
-def test_run_rtl_graph_pass_once():
-    """验证一次通过:designer_verilog 只执行一次,直接交付"""
+
+class _FakeProc:
+    """模拟 asyncio 子进程:communicate 返回 (stdout, stderr),returncode 可控。"""
+
+    def __init__(self, rc: int):
+        self.returncode = rc
+
+    async def communicate(self):
+        return b"", b""
+
+
+def _make_workspace(tmp_path) -> str:
+    """构造最小可运行工作空间(含 filelist / start.tcl / 覆盖率报告)。"""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "src").mkdir()
+    (ws / "src" / "top.sv").write_text("module top; endmodule\n")
+    (ws / "scripts").mkdir()
+    (ws / "scripts" / "syn_filelist.f").write_text("src/top.sv\n")
+    (ws / "scripts" / "sim_filelist.f").write_text("src/top.sv\n")
+    (ws / "scripts" / "start.tcl").write_text("# mock start.tcl\n")
+    (ws / "reports").mkdir()
+    (ws / "reports" / "coverage_report.txt").write_text("coverage data\n")
+    return str(ws)
+
+
+def _patch_vivado(monkeypatch, rc_seq):
+    """monkeypatch asyncio.create_subprocess_exec:按 rc_seq 顺序返回退出码。"""
+    calls = {"n": 0}
+    seq = list(rc_seq)
+
+    async def fake(*args, **kwargs):
+        i = calls["n"]
+        calls["n"] += 1
+        rc = seq[i] if i < len(seq) else seq[-1]
+        return _FakeProc(rc)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake)
+
+
+def test_run_rtl_graph_pass_once(tmp_path, monkeypatch):
+    """验证一次通过:designer_verilog 只执行一次,仿真驱动路由直接交付。"""
     manager = FakeRTLAgent(name="manager", response="摘要: 用户偏好中文")
     architect = FakeRTLAgent(name="architect", response="架构: 单核 UART")
     designer = FakeRTLAgent(name="rtl_designer", response="module uart;")
@@ -364,10 +413,11 @@ def test_run_rtl_graph_pass_once():
         "rtl_verification": verifier,
     }
     graph = build_rtl_graph_workflow(agents)
+    ws = _make_workspace(tmp_path)
+    _patch_vivado(monkeypatch, [0])
 
-    result = asyncio.run(arun_rtl_graph_workflow(graph, "设计一个 UART 模块"))
+    result = asyncio.run(arun_rtl_graph_workflow(graph, "设计一个 UART 模块", workspace_path=ws))
 
-    assert result["final_answer"] == "module uart;"
     assert result["round"] == 1
     assert result["arch_plan"] == "架构: 单核 UART"
     assert result["arch_design"] == "架构: 单核 UART"
@@ -377,23 +427,23 @@ def test_run_rtl_graph_pass_once():
     assert result["design_spec"] == "module uart;"
     assert result["verification_plan"] == "验证结论: PASS\nRTL 无问题"
     assert result["verification_report"] == "验证结论: PASS\nRTL 无问题"
+    # 仿真通过 → sim_check_passed 为 True(路由据此进入 END)
+    assert result["sim_check_passed"] is True
 
-    # designer 调用:spec_design + verilog_design(编码) + verilog_design(交付)
     designer_calls = [c[0] for c in designer.calls]
-    assert designer_calls == ["spec_design_task", "verilog_design_task", "verilog_design_task"]
-    # verifier 调用:spec_design(计划) + verilog_design(检查)
+    assert designer_calls == ["arun_structured", "arun_structured"]
     verifier_calls = [c[0] for c in verifier.calls]
-    assert verifier_calls == ["spec_design_task", "verilog_design_task"]
+    assert verifier_calls == ["arun_structured", "arun_structured"]
 
 
-def test_run_rtl_graph_multi_round_iteration():
-    """验证 FAIL→PASS 多轮迭代:designer_verilog 执行两次,第二轮携带反馈"""
+def test_run_rtl_graph_multi_round_iteration(tmp_path, monkeypatch):
+    """验证仿真失败→成功多轮迭代:sim 第一次退出码 1,第二次 0,designer_verilog 执行两次。"""
     manager = FakeRTLAgent(name="manager", response="摘要")
     architect = FakeRTLAgent(name="architect", response="架构方案")
     designer = FakeRTLAgent(name="rtl_designer", response="module uart;")
     verifier = FakeRTLAgent(
         name="rtl_verification",
-        verilog_sequence=[
+        sequence=[
             "验证结论: FAIL\n波特率配置错误",
             "验证结论: PASS\n修改后正确",
         ],
@@ -405,23 +455,29 @@ def test_run_rtl_graph_multi_round_iteration():
         "rtl_verification": verifier,
     }
     graph = build_rtl_graph_workflow(agents, max_rounds=3)
+    ws = _make_workspace(tmp_path)
+    # 仿真第一次失败(退出码 1),第二次成功(退出码 0)→ 路由据此迭代两轮
+    _patch_vivado(monkeypatch, [1, 0])
 
-    result = asyncio.run(arun_rtl_graph_workflow(graph, "设计 UART"))
+    result = asyncio.run(arun_rtl_graph_workflow(graph, "设计 UART", workspace_path=ws))
 
     assert result["round"] == 2
-    assert result["final_answer"] == "module uart;"
-    # designer 的 verilog_design_task 被调用 3 次:两轮迭代设计 + 最终交付
-    designer_prompts = [c[1] for c in designer.calls if c[0] == "verilog_design_task"]
-    assert len(designer_prompts) == 3
-    # 首轮设计无反馈,第二轮设计携带 FAIL 反馈,交付轮拼入最终 RTL 与验证报告
+    # designer 的 verilog 类节点(designer_verilog)被调 2 次;
+    # 用 verilog_design 模板特征过滤(含"可综合...RTL 源码")
+    designer_prompts = [
+        c[1] for c in designer.calls
+        if c[0] == "arun_structured" and "可综合" in c[1]
+    ]
+    assert len(designer_prompts) == 2
+    # 首轮设计无反馈,第二轮设计携带首轮 FAIL 反馈(路由由仿真而非 LLM 报告驱动)
     assert "验证结论: FAIL" not in designer_prompts[0]
     assert "验证结论: FAIL" in designer_prompts[1]
-    assert "波特率配置错误" in designer_prompts[1]
-    assert "验证结论: PASS" in designer_prompts[2]
+    # 仿真最终通过
+    assert result["sim_check_passed"] is True
 
 
-def test_run_rtl_graph_forced_output_at_max_rounds():
-    """验证一直 FAIL 时达 max_rounds 上限强制交付(不无限循环)"""
+def test_run_rtl_graph_forced_output_at_max_rounds(tmp_path, monkeypatch):
+    """验证仿真一直失败达 max_rounds 上限强制交付(不无限循环)。"""
     manager = FakeRTLAgent(name="manager", response="摘要")
     architect = FakeRTLAgent(name="architect", response="架构方案")
     designer = FakeRTLAgent(name="rtl_designer", response="module uart;")
@@ -436,18 +492,25 @@ def test_run_rtl_graph_forced_output_at_max_rounds():
         "rtl_verification": verifier,
     }
     graph = build_rtl_graph_workflow(agents, max_rounds=3)
+    ws = _make_workspace(tmp_path)
+    # 仿真三次均失败(退出码 1)→ 达 max_rounds 后强制交付
+    _patch_vivado(monkeypatch, [1, 1, 1])
 
-    result = asyncio.run(arun_rtl_graph_workflow(graph, "设计 UART"))
+    result = asyncio.run(arun_rtl_graph_workflow(graph, "设计 UART", workspace_path=ws))
 
     # 3 次迭代后强制交付,round 达上限
     assert result["round"] == 3
-    assert result["final_answer"] == "module uart;"
-    verifier_design_calls = [c for c in verifier.calls if c[0] == "verilog_design_task"]
-    assert len(verifier_design_calls) == 3
+    assert result["sim_check_passed"] is False
+    # verifier 的 verification_check 被调 3 次(prompt 含"待验证 RTL 源码")
+    verifier_check_calls = [
+        c for c in verifier.calls
+        if c[0] == "arun_structured" and "待验证 RTL 源码" in c[1]
+    ]
+    assert len(verifier_check_calls) == 3
 
 
-def test_run_rtl_graph_with_context_memory():
-    """带记忆上下文运行:manager 提炼后注入 architect_plan"""
+def test_run_rtl_graph_with_context_memory(tmp_path, monkeypatch):
+    """带记忆上下文运行:manager 提炼后注入 architect_plan;仿真通过一次交付。"""
     manager = FakeRTLAgent(name="manager", response="摘要: 用户偏好 SystemVerilog")
     architect = FakeRTLAgent(name="architect", response="架构方案")
     designer = FakeRTLAgent(name="rtl_designer", response="module uart;")
@@ -459,16 +522,26 @@ def test_run_rtl_graph_with_context_memory():
         "rtl_verification": verifier,
     }
     graph = build_rtl_graph_workflow(agents)
+    ws = _make_workspace(tmp_path)
+    _patch_vivado(monkeypatch, [0])
 
     result = asyncio.run(
-        arun_rtl_graph_workflow(graph, "设计 UART", raw_context="之前聊过偏好 SystemVerilog")
+        arun_rtl_graph_workflow(
+            graph,
+            "设计 UART",
+            raw_context="之前聊过偏好 SystemVerilog",
+            workspace_path=ws,
+        )
     )
 
     assert result["context_summary"] == "摘要: 用户偏好 SystemVerilog"
-    # manager 调用:summarize + (无 plan_task,architect 承担计划)
-    assert manager.calls == [("summarize_context", "之前聊过偏好 SystemVerilog")]
-    # architect_plan 收到上下文摘要
-    assert architect.calls[0][0] == "plan_task"
+    # manager 调用:summarize 节点改调 arun_structured,prompt 含模板+raw
+    assert manager.calls[0][0] == "arun_structured"
+    assert "之前聊过偏好 SystemVerilog" in manager.calls[0][1]
+    # architect_plan 收到上下文摘要(经 arun_structured)
+    assert architect.calls[0][0] == "arun_structured"
+    # 仿真通过一次交付
+    assert result["sim_check_passed"] is True
 
 
 # ==================== 注册测试 ====================
@@ -502,3 +575,171 @@ def test_build_workflow_rtl_graph_via_registry():
     assert graph is not None
     for role in ("manager", "architect", "rtl_designer", "rtl_verification"):
         assert role in agents
+
+
+# ==================== 新增校验节点 / 辅助函数单元测试 ====================
+
+
+def test_parse_filelist(tmp_path):
+    """_parse_filelist 解析 .f,跳过注释/指令行,返回 .v/.sv token。"""
+    fl = tmp_path / "syn.f"
+    fl.write_text(
+        "# comment\n"
+        "src/top.sv\n"
+        "// line comment\n"
+        "+incdir+./inc\n"
+        "-f other.f\n"
+        "src/util.v\n"
+        "src/pkg.vhd  # trailing\n"
+    )
+    out = _parse_filelist(str(tmp_path), "syn.f")
+    assert out == ["src/top.sv", "src/util.v", "src/pkg.vhd"]
+
+
+def test_parse_filelist_missing(tmp_path):
+    """filelist 不存在时返回空列表。"""
+    assert _parse_filelist(str(tmp_path), "nope.f") == []
+
+
+def test_coverage_inclusion_ok(tmp_path):
+    """_coverage_inclusion_ok:syn ⊆ sim 时为 True,否则 False。"""
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "syn_filelist.f").write_text("src/a.sv\n")
+    (tmp_path / "scripts" / "sim_filelist.f").write_text("src/a.sv\nsrc/b.sv\n")
+    assert _coverage_inclusion_ok(str(tmp_path)) is True
+    (tmp_path / "scripts" / "sim_filelist.f").write_text("src/b.sv\n")
+    assert _coverage_inclusion_ok(str(tmp_path)) is False
+
+
+def test_coverage_inclusion_ok_no_syn(tmp_path):
+    """syn_filelist.f 为空/不存在时返回 False。"""
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "sim_filelist.f").write_text("src/a.sv\n")
+    assert _coverage_inclusion_ok(str(tmp_path)) is False
+
+
+def test_route_after_file_check():
+    """designer_file_check 路由:通过→verification_check;失败未达上限→回环;达上限→END。"""
+    assert route_after_file_check({"file_check_passed": True, "round": 1, "max_rounds": 3}) == "verification_check"
+    assert route_after_file_check({"file_check_passed": False, "round": 1, "max_rounds": 3}) == "designer_verilog"
+    assert route_after_file_check({"file_check_passed": False, "round": 3, "max_rounds": 3}) == END
+
+
+def test_route_after_sim_check():
+    """sim_exec_check 路由:通过→END;失败未达上限→回环;达上限→END。"""
+    assert route_after_sim_check({"sim_check_passed": True, "round": 1, "max_rounds": 3}) == END
+    assert route_after_sim_check({"sim_check_passed": False, "round": 1, "max_rounds": 3}) == "designer_verilog"
+    assert route_after_sim_check({"sim_check_passed": False, "round": 3, "max_rounds": 3}) == END
+
+
+async def _run_file_check(state, workspace):
+    agent = FakeRTLAgent()
+    config = {"configurable": {"workspace_path": workspace}} if workspace else None
+    return await designer_file_check_node(state, agent, config=config)
+
+
+def test_designer_file_check_node_pass(tmp_path):
+    """output_files 中文件均存在且非空 → file_check_passed True。"""
+    (tmp_path / "src").mkdir()
+    f = tmp_path / "src" / "top.sv"
+    f.write_text("module top; endmodule\n")
+    state = {"output_files": ["src/top.sv"]}
+    result = asyncio.run(_run_file_check(state, str(tmp_path)))
+    assert result["file_check_passed"] is True
+
+
+def test_designer_file_check_node_missing(tmp_path):
+    """output_files 含不存在文件 → file_check_passed False。"""
+    state = {"output_files": ["src/missing.sv"]}
+    result = asyncio.run(_run_file_check(state, str(tmp_path)))
+    assert result["file_check_passed"] is False
+
+
+def test_designer_file_check_node_empty_list(tmp_path):
+    """output_files 为空 → 视为通过(无文件可校验)。"""
+    state = {"output_files": []}
+    result = asyncio.run(_run_file_check(state, str(tmp_path)))
+    assert result["file_check_passed"] is True
+
+
+def test_designer_file_check_node_no_workspace(tmp_path):
+    """无 workspace 时,相对路径按 cwd 解析;绝对路径按绝对路径校验。"""
+    # 绝对路径且文件存在 → 通过
+    f = tmp_path / "abs.sv"
+    f.write_text("module x; endmodule\n")
+    state = {"output_files": [str(f)]}
+    result = asyncio.run(_run_file_check(state, None))
+    assert result["file_check_passed"] is True
+    # 相对路径(cwd 下不存在) → 失败
+    state2 = {"output_files": ["src/nope.sv"]}
+    result2 = asyncio.run(_run_file_check(state2, None))
+    assert result2["file_check_passed"] is False
+
+
+async def _run_sim_check(workspace, monkeypatch, rc=0):
+    agent = FakeRTLAgent()
+    config = {"configurable": {"workspace_path": workspace}} if workspace else None
+
+    async def fake(*args, **kwargs):
+        return _FakeProc(rc)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake)
+    return await sim_exec_check_node(dict(), agent, config=config)
+
+
+def test_sim_exec_check_node_pass(tmp_path, monkeypatch):
+    """start.tcl 存在 + vivado 退出码 0 + 覆盖率报告存在 + 包含检查通过 → 通过。"""
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "start.tcl").write_text("# tcl\n")
+    (tmp_path / "scripts" / "syn_filelist.f").write_text("src/top.sv\n")
+    (tmp_path / "scripts" / "sim_filelist.f").write_text("src/top.sv\n")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "top.sv").write_text("module top; endmodule\n")
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "reports" / "coverage_report.txt").write_text("cov\n")
+    result = asyncio.run(_run_sim_check(str(tmp_path), monkeypatch, rc=0))
+    assert result["sim_check_passed"] is True
+    assert result["sim_status"] == "PASS"
+
+
+def test_sim_exec_check_node_fail_rc(tmp_path, monkeypatch):
+    """vivado 退出码非 0 → 失败。"""
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "start.tcl").write_text("# tcl\n")
+    (tmp_path / "scripts" / "syn_filelist.f").write_text("src/top.sv\n")
+    (tmp_path / "scripts" / "sim_filelist.f").write_text("src/top.sv\n")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "top.sv").write_text("module top; endmodule\n")
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "reports" / "coverage_report.txt").write_text("cov\n")
+    result = asyncio.run(_run_sim_check(str(tmp_path), monkeypatch, rc=1))
+    assert result["sim_check_passed"] is False
+    assert result["sim_status"] == "FAIL"
+
+
+def test_sim_exec_check_node_no_start_tcl(tmp_path, monkeypatch):
+    """缺少 start.tcl → 失败(不调用 vivado)。"""
+    (tmp_path / "scripts").mkdir()
+    result = asyncio.run(_run_sim_check(str(tmp_path), monkeypatch, rc=0))
+    assert result["sim_check_passed"] is False
+    assert result["sim_status"] == "ERROR"
+
+
+def test_sim_exec_check_node_no_workspace(monkeypatch):
+    """无 workspace → 失败(ERROR),不执行 vivado。"""
+    result = asyncio.run(_run_sim_check(None, monkeypatch, rc=0))
+    assert result["sim_check_passed"] is False
+    assert result["sim_status"] == "ERROR"
+
+
+def test_sim_exec_check_node_missing_report(tmp_path, monkeypatch):
+    """覆盖率报告缺失 → 失败。"""
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "start.tcl").write_text("# tcl\n")
+    (tmp_path / "scripts" / "syn_filelist.f").write_text("src/top.sv\n")
+    (tmp_path / "scripts" / "sim_filelist.f").write_text("src/top.sv\n")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "top.sv").write_text("module top; endmodule\n")
+    # 不创建 reports/coverage_report.txt
+    result = asyncio.run(_run_sim_check(str(tmp_path), monkeypatch, rc=0))
+    assert result["sim_check_passed"] is False

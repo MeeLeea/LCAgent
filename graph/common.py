@@ -20,15 +20,21 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
-from typing import Any
+from inspect import signature
+from typing import TYPE_CHECKING, Any, Optional
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph
+from langgraph.types import interrupt
 
 from agent.compaction import CompactionConfig, LCAgentCompactionMiddleware
 from utils.events import AgentEvent
 from utils.logging_config import TraceContext
+
+if TYPE_CHECKING:
+    from team.base import TeamAgent
 
 logger = logging.getLogger(__name__)
 
@@ -239,6 +245,7 @@ async def _compaction_wrapper(
     node_fn: Callable,
     mw: LCAgentCompactionMiddleware,
     state: dict[str, Any],
+    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 须用 Optional 写法,LangGraph 注解判定仅接受该字符串形态（与 simple.py/rtl_graph.py 节点签名一致）
     *args: Any,
     **kwargs: Any,
 ) -> dict[str, Any]:
@@ -253,12 +260,20 @@ async def _compaction_wrapper(
         node_fn: 被包装的原始节点函数
         mw: compaction 中间件（含阈值与摘要 LLM）
         state: 节点输入状态
-        *args/**kwargs: 透传给节点函数的额外参数（agent/injector/config 等）
+        config: LangGraph 运行时配置（含 configurable.thread_id /
+            workspace_path 等），由框架按节点签名注入。显式声明此参数
+            使 LangGraph 能识别并注入（*args/**kwargs 形态下框架
+            无法检测到 config 参数，会跳过注入导致下游节点收到 None）
+        *args/**kwargs: 透传给节点函数的其他参数（agent/injector 等）
 
     Returns:
         节点返回 dict；若触发压缩则含更新后的 messages/summary
     """
-    result = await node_fn(state, *args, **kwargs)
+    # 检查被包装的节点函数是否接受 config 参数,有则透传,无则不传
+    # (测试用的简易节点可能无 config 参数,避免 TypeError)
+    _accepts_config = "config" in signature(node_fn).parameters
+    call_kwargs = {**kwargs, "config": config} if _accepts_config else kwargs
+    result = await node_fn(state, *args, **call_kwargs)
     new_messages = result.get("messages")
     if not new_messages:
         return result
@@ -484,3 +499,50 @@ async def _aget_previous_workflow_summary(
     if len(summary) > max_chars:
         summary = summary[:max_chars] + "\n...(上一轮工作流记录过长，已截断)"
     return summary
+
+
+async def run_team_turn_with_interrupt(
+    agent: TeamAgent,
+    prompt: str,
+    config: dict | None = None,
+) -> str:
+    """节点级助手:调 TeamAgent.arun_structured,若 interrupted 调外层
+    interrupt() 暂停外层 graph,resume 后调 aresume_structured 恢复内层,
+    循环处理多次 interrupt,最终返回 output str。
+
+    用于工作流节点把内层 TeamAgent 的 interrupt 透传给外层 graph 的
+    checkpointer:内层被 interrupt 时本函数主动调 ``langgraph.types.interrupt``
+    暂停外层 graph,外层 resume 时把用户返回值经 ``aresume_structured``
+    注入内层 agent_executor,实现"节点内嵌 interrupt"语义。
+
+    纯文本模式(agent_executor is None)时 ``arun_structured`` 直接返回
+    completed,while 循环不会进入,无需在此额外判断。
+
+    Args:
+        agent: 执行本节点任务的 TeamAgent(工具/纯文本模式皆可)
+        prompt: 节点任务文本
+        config: 外层 RunnableConfig,透传给 arun_structured/aresume_structured;
+            含 checkpointer 时其 configurable.thread_id 经 _build_run_config
+            改写为内层隔离 thread_id
+
+    Returns:
+        TeamAgent 正常完成/取消时的 output 字符串;cancelled 且 output 为空时
+        返回 ``"{TASK_ERROR_PREFIX}: 任务被取消"``
+
+    Raises:
+        AgentTurnResult 既非 completed/interrupted/cancelled 之外的异常状态
+        (理论上 AgentTurnResult.status 只有三态,此为防御性兜底)
+    """
+    from team.base import TASK_ERROR_PREFIX
+
+    turn = await agent.arun_structured(prompt, config)
+    while turn.is_interrupted:
+        # 调外层 interrupt() 暂停外层 graph,外层 resume 时把返回值作为
+        # 内层 aresume_structured 的 payload 注入 pending interrupt
+        resume_value = interrupt(turn.interrupts[0].value)
+        turn = await agent.aresume_structured(resume_value, config)
+    if turn.is_completed:
+        return turn.output or ""
+    if turn.status == "cancelled":
+        return turn.output or f"{TASK_ERROR_PREFIX}: 任务被取消"
+    raise RuntimeError(f"AgentTurnResult 未知状态: {turn.status}")

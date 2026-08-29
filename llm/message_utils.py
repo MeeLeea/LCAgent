@@ -109,19 +109,81 @@ def stringify_content(content: Any) -> str:
 
 
 def build_interrupt_event(value: Any) -> dict[str, Any]:
-    """把 ask_human / 危险命令确认的 interrupt.value 转成前端可消费的事件。
+    """把 ask_human / 危险命令确认 / 批量用户确认的 interrupt.value 转成前端可消费的事件。
+
+    支持三种 interrupt kind:
+        - ``human_choice``: 单问题单选(ask_human), prompt + 扁平 choices
+        - ``dangerous_command``: 危险命令确认(interrupt_confirm), prompt + 扁平 choices
+        - ``user_confirmation``: 多问题批量确认(request_user_confirmation), prompt 为
+          多问题拼接, 同时输出两路前端协议数据:
+          * ``choices``: 扁平聚合，每项带 ``item_id`` 供前端按问题分组渲染（向后兼容）
+          * ``items``: 结构化分组列表，每项 ``{id, question, choices: [{id, label}]}``，
+            前端可据此渲染「一个单选组 per item」（替代扁平菜单）
+
+    未识别的 value 走 stringify 兜底, prompt 为字符串化内容, choices 为空。
 
     Args:
         value: interrupt 的 value 字段
 
     Returns:
-        前端可消费的事件字典，包含 type、prompt、choices 三个字段
+        前端可消费的事件字典, 含 type/prompt/choices 三字段；
+        ``user_confirmation`` 额外含 ``items`` 字段。
+        ``user_confirmation`` 的 choices 项结构为
+        ``{item_id, id, label}``, 其余 kind 为 ``{id, label}``(无 item_id)。
+        前端按 choices 项是否有 ``item_id`` 决定渲染模式(分组 vs 单菜单)。
     """
-    if isinstance(value, dict) and value.get("kind") in ("human_choice", "dangerous_command"):
-        return make_interrupt_dict(
-            str(value.get("prompt") or "需要人工输入"),
-            value.get("choices") or [],
-        )
+    if isinstance(value, dict):
+        kind = value.get("kind")
+        if kind in ("human_choice", "dangerous_command"):
+            return make_interrupt_dict(
+                str(value.get("prompt") or "需要人工输入"),
+                value.get("choices") or [],
+            )
+        if kind == "user_confirmation":
+            items = value.get("items") or []
+            # 多问题拼成多段 prompt, 每段以 [item_id] 前缀便于前端定位
+            prompt = "\n\n".join(
+                f"[{item['id']}] {item['question']}"
+                for item in items
+                if isinstance(item, dict) and item.get("id") and item.get("question")
+            ) or "需要用户确认多个架构决策点"
+            # choices 扁平聚合, 每项带 item_id 供前端按问题分组渲染（向后兼容）。
+            # 未识别或字段缺失的 item/choice 跳过, 不让前端拿到残缺结构。
+            choices = [
+                {
+                    "item_id": item["id"],
+                    "id": choice["id"],
+                    "label": choice["label"],
+                }
+                for item in items
+                if isinstance(item, dict)
+                for choice in (item.get("choices") or [])
+                if isinstance(choice, dict) and choice.get("id") and choice.get("label")
+            ]
+            # 结构化分组：每项 {id, question, choices: [{id, label}]}，前端按 item
+            # 渲染单选组而非扁平菜单。过滤逻辑与 choices 一致（item 需含 id+question，
+            # choice 需含 id+label），并额外要求至少一个有效 choice —— 没有可选项
+            # 的 item 无法渲染单选组, 不进入分组列表。
+            structured = [
+                {
+                    "id": item["id"],
+                    "question": item["question"],
+                    "choices": [
+                        {"id": c["id"], "label": c["label"]}
+                        for c in (item.get("choices") or [])
+                        if isinstance(c, dict) and c.get("id") and c.get("label")
+                    ],
+                }
+                for item in items
+                if isinstance(item, dict)
+                and item.get("id")
+                and item.get("question")
+                if any(
+                    isinstance(c, dict) and c.get("id") and c.get("label")
+                    for c in (item.get("choices") or [])
+                )
+            ]
+            return make_interrupt_dict(prompt, choices, structured)
     return make_interrupt_dict(stringify_content(value), [])
 
 

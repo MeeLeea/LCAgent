@@ -35,7 +35,7 @@ from .models import MemoryCategory, ThreadFactItem
 from .store import ThreadMemoryStore
 
 if TYPE_CHECKING:
-    from utils.events import AgentEvent, EventType
+    from utils.events import AgentEvent
 
 logger = logging.getLogger(__name__)
 
@@ -372,16 +372,36 @@ class MemoryManager:
             "summary": summary,
         }
 
-    async def clear(self, thread_id: str) -> int:
-        """清空指定会话的长期记忆 facts。
+    async def clear(self, thread_id: str, release_lock: bool = False) -> int:
+        """清空指定会话的 thread 级长期记忆 facts（线程安全）。
+
+        为避免与会话删除 / 显式清记忆时发生竞态（防抖 flush 正在回写
+        导致记忆“复活”），执行顺序为：
+
+        1. 丢弃该 thread 未 flush 的缓冲事件（取消定时器 + 弹出 buffer），
+           防止清完后被回写；
+        2. 获取 per-thread 锁，与可能正在进行的 flush 流水线串行化；
+        3. 删除 ``(thread_id, "thread_facts")`` 命名空间下的全部 facts
+           （不影响 agent 级跨会话共享记忆）。
 
         Args:
             thread_id: 会话线程 ID
+            release_lock: 会话销毁时置 True，删除完成后释放锁池缓存，
+                避免长时间运行下锁对象泄漏
 
         Returns:
             被清除的 fact 数量
         """
-        return await self._store.clear_thread_memory(thread_id)
+        # 1. 丢弃未 flush 的缓冲事件，避免清完被回写
+        await self._write_middleware.cleanup_thread(thread_id)
+        # 2. 与可能正在进行的 flush 串行化
+        lock = await self._lock_pool.get(thread_id)
+        async with lock:
+            cleared = await self._store.clear_thread_memory(thread_id)
+        # 3. 会话销毁时释放锁缓存
+        if release_lock:
+            await self._lock_pool.cleanup(thread_id)
+        return cleared
 
     async def count_facts(self, thread_id: str) -> int:
         """统计指定会话的长期记忆条数。"""

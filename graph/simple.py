@@ -4,15 +4,18 @@
 节点进度跟踪与通用运行器已提取至 graph/common.py，本文件仅保留
 工作流状态定义、节点函数与图构建逻辑。
 
-异步化说明：
-    节点函数全部为 async，直接 await 团队 Agent 的异步业务方法
-    （aplan_task/aexecute_task/afinalize/asummarize_context，内部经 TeamAgent.astream
-    流式执行 LLM，token 增量经 config["callbacks"] 流出到外层事件流）；技能注入
-    通过 SkillInjector 在节点渲染 prompt 时追加技能指引块。
+节点执行链路说明：
+    节点函数在自身渲染 prompt（get_template + render_template + 技能注入）后，
+    调 ``run_team_turn_with_interrupt(agent, prompt, config)``（见 graph/common.py）。
+    helper 内部经 ``TeamAgent.arun_structured`` 流式执行 LLM（token 增量经
+    config["callbacks"] 流出到外层事件流）；工具内 ``interrupt()`` 时透传给
+    外层 graph 的 checkpointer，由外层 resume 恢复（对照 plan team-checkpointer-interrupt）。
+    summarize_context 节点直接把 ``summarize_context`` 模板内容拼到 prompt 前部
+    作系统指令（原 asummarize_context 内部经 _astream_messages 的 system 消息语义）。
 
 workspace 隔离说明：
     worker_exec 节点接收 LangGraph 注入的 config（含 configurable.workspace_path），
-    透传给 Worker.execute_task → self.invoke，使 Worker 工具调用受
+    透传给 Worker 的工作流 → self.invoke，使 Worker 工具调用受
     WorkspaceSecurityMW 约束（见 graph/common.arun_compiled_workflow）。
 
 会话化说明：
@@ -37,6 +40,7 @@ from graph.common import (
     _build_compaction_middleware,
     arun_compiled_workflow,
     register_nodes,
+    run_team_turn_with_interrupt,
 )
 from graph.registry import register_workflow
 from skmng.injector import SkillInjector
@@ -68,13 +72,21 @@ async def summarize_context(
 ) -> WorkflowState:
     """Manager 提炼记忆上下文,生成分发给下游节点的上下文摘要
 
-    raw_context 为空时仍调用 manager.asummarize_context（其内部短路返回空串），
-    保持调用链可观测性（测试依赖 summarize 总是被调用的行为）。
+    raw_context 为空时短路返回空串,跳过 LLM 调用(对照原
+    ManagerAgent.asummarize_context 的短路语义)。非空时把
+    ``summarize_context`` 模板内容拼到 prompt 前部作为指令(原实现经
+    _astream_messages 的 system 消息语义,helper 单 prompt 通道下合并为用户消息),
+    调 ``run_team_turn_with_interrupt`` 流式执行。
 
     config 透传(含 callbacks):使 summarize 的 LLM token 增量可流出到外层事件流。
     """
     raw = state.get("raw_context", "")
-    result = await agent.asummarize_context(raw, config)
+    # 与原 asummarize_context 一致:raw 为空时短路返回空串(不调 helper)
+    if not raw:
+        return {"context_summary": "", "messages": [AIMessage(content="")]}
+    # summarize 节点不注入技能块(原 asummarize_context 也不调 injector)
+    prompt = f"{agent.get_template('summarize_context')}\n\n{raw}"
+    result = await run_team_turn_with_interrupt(agent, prompt, config)
     return {"context_summary": result, "messages": [AIMessage(content=result)]}
 
 
@@ -84,10 +96,20 @@ async def manager_plan_node(
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 见 worker_exec_node 注释
 ) -> WorkflowState:
-    """Manager 拆解任务,生成执行计划(结合记忆上下文摘要)"""
+    """Manager 拆解任务,生成执行计划(结合记忆上下文摘要)
+
+    节点内渲染 ``manager_plan`` 模板 + 注入技能块,然后调
+    ``run_team_turn_with_interrupt`` 流式执行;技能注入 match 文本为
+    ``task``(对照原 ManagerAgent.aplan_task)。
+    """
     task = state["task"]
     summary = state.get("context_summary", "")
-    result = await agent.aplan_task(task, summary, injector, config)
+    prompt = agent.render_template(
+        agent.get_template("manager_plan"), task=task, context_summary=summary
+    )
+    if injector is not None:
+        prompt = injector.inject_into_prompt(prompt, task)
+    result = await run_team_turn_with_interrupt(agent, prompt, config)
     return {"plan": result, "messages": [AIMessage(content=result)]}
 
 
@@ -99,9 +121,13 @@ async def worker_exec_node(
 ) -> WorkflowState:
     """Worker 执行计划中的子任务。
 
-    config 由 LangGraph 按节点签名以关键字注入（含 configurable.workspace_path），
-    透传给 Worker.aexecute_task 使工具调用受 workspace 隔离约束、LLM token 增量
-    经 callbacks 流出到外层事件流。
+    节点内渲染 ``worker_exec`` 模板 + 注入技能块,然后调
+    ``run_team_turn_with_interrupt`` 流式执行;技能注入 match 文本为
+    ``plan``(对照原 WorkerAgent.aexecute_task,worker 的"任务文本"即计划)。
+
+    config 由 LangGraph 按节点签名以关键字注入（含 configurable.workspace_path）,
+    透传给 helper → arun_structured → astream,使工具调用受 workspace 隔离约束、
+    LLM token 增量经 callbacks 流出到外层事件流。
 
     注:必须用 Optional[RunnableConfig] 而非 RunnableConfig | None——模块启用
     ``from __future__ import annotations`` 后注解为字符串,仅
@@ -109,7 +135,10 @@ async def worker_exec_node(
     'RunnableConfig | None' 字符串不匹配会导致 config 静默不注入。
     """
     plan = state["plan"]
-    result = await agent.aexecute_task(plan, injector, config)
+    prompt = agent.render_template(agent.get_template("worker_exec"), plan=plan)
+    if injector is not None:
+        prompt = injector.inject_into_prompt(prompt, plan)
+    result = await run_team_turn_with_interrupt(agent, prompt, config)
     return {"worker_result": result, "messages": [AIMessage(content=result)]}
 
 
@@ -119,12 +148,26 @@ async def terminator_final_node(
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 见 worker_exec_node 注释
 ) -> WorkflowState:
-    """Terminator 汇总结果并返回最终答案(结合记忆上下文摘要)"""
+    """Terminator 汇总结果并返回最终答案(结合记忆上下文摘要)
+
+    节点内渲染 ``terminator_final`` 模板 + 注入技能块,然后调
+    ``run_team_turn_with_interrupt`` 流式执行;技能注入 match 文本为
+    ``task``(对照原 TerminatorAgent.afinalize)。
+    """
     task = state["task"]
     plan = state["plan"]
     worker_result = state["worker_result"]
     summary = state.get("context_summary", "")
-    result = await agent.afinalize(task, plan, worker_result, summary, injector, config)
+    prompt = agent.render_template(
+        agent.get_template("terminator_final"),
+        task=task,
+        plan=plan,
+        worker_result=worker_result,
+        context_summary=summary,
+    )
+    if injector is not None:
+        prompt = injector.inject_into_prompt(prompt, task)
+    result = await run_team_turn_with_interrupt(agent, prompt, config)
     return {"final_answer": result, "messages": [AIMessage(content=result)]}
 
 

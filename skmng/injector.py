@@ -46,12 +46,15 @@ class SkillInjector:
         self,
         task: str,
         active_names: Sequence[str] = (),
+        exclude_skills: Sequence[str] = (),
     ) -> str:
         """根据任务匹配技能并渲染指引块(合并 active_names + auto_match)
 
         Args:
             task: 用户任务描述(用于技能匹配)
             active_names: 手动加载的技能名(由节点函数从 state 取值传入)
+            exclude_skills: 需排除的技能名(技能目录名);透传给 core.build_skill_block,
+                在三来源合并后统一剔除,空序列时无操作
 
         Returns:
             技能指引块文本;未命中任何技能或未开启自动匹配时返回空串
@@ -62,6 +65,7 @@ class SkillInjector:
             active_names=tuple(active_names),
             fixed_skills=(),
             auto_match=self.auto_match,
+            exclude_skills=tuple(exclude_skills),
         )
 
     def inject_into_prompt(
@@ -69,6 +73,7 @@ class SkillInjector:
         prompt: str,
         task: str,
         active_names: Sequence[str] = (),
+        exclude_skills: Sequence[str] = (),
     ) -> str:
         """将技能指引块追加到 prompt 末尾(已含 skill 块时跳过)
 
@@ -76,9 +81,11 @@ class SkillInjector:
             prompt: 渲染后的节点提示词
             task: 用户任务描述
             active_names: 手动加载的技能名(由节点函数从 state 取值传入)
+            exclude_skills: 需排除的技能名(技能目录名,如 "vivado-2025.2");
+                透传给 build_skill_block,使被排除技能不进入最终指引块
 
         Returns:
             注入技能指引块后的提示词
         """
-        block = self.build_skill_block(task, active_names)
+        block = self.build_skill_block(task, active_names, exclude_skills)
         return inject_into_prompt(prompt, block)

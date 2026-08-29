@@ -187,10 +187,21 @@ class TraceContext:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        # 注意：TraceContext 常被用于包裹 async generator 的 yield。
+        # 当生成器被 aclose()/取消时，__exit__ 会在“另一个 ContextVar Context”
+        # 中执行，而 set 与 reset 必须处于同一 Context —— 此时 token 失效。
+        # 跨 Context 时原 Context 会随自身销毁被回收，此处忽略重置即可；
+        # 若强行 reset 反而会污染其它 Context，故吞掉 ValueError。
         if self._token_trace is not None:
-            _trace_id.reset(self._token_trace)
+            try:
+                _trace_id.reset(self._token_trace)
+            except ValueError:
+                pass
         if self._token_thread is not None:
-            _thread_id.reset(self._token_thread)
+            try:
+                _thread_id.reset(self._token_thread)
+            except ValueError:
+                pass
 
     async def __aenter__(self) -> Self:
         return self.__enter__()

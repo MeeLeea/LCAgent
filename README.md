@@ -298,7 +298,7 @@ LangChainAgent/
 │   ├── common.py            # 工作流通用能力：异步执行辅助 + 跨轮次记忆压缩 + workspace 透传
 │   ├── simple.py            # 监督者模式工作流（Manager→Worker→Terminator，异步节点，worker_exec 接收 config 注入 workspace）
 │   ├── pipline.py           # 流水线模式工作流（异步节点，与 simple 同构，worker_exec 接收 config 注入 workspace）
-│   ├── rtl_graph.py         # RTL 芯片设计流水线（Manager 提炼→Architect 架构→Designer 设计↔Verification 多轮验证→Designer 交付）
+│   ├── rtl_graph.py         # RTL 芯片设计流水线（Manager 提炼→Architect 架构→Designer 设计↔Verification 多轮验证→验证通过/达上限即终止(END)）
 │   └── registry.py          # 工作流/Agent 注册表与构建入口（runner 支持 workspace_path 参数）
 ├── tools/
 │   ├── __init__.py          # 本地工具注册
@@ -312,7 +312,7 @@ LangChainAgent/
 │   ├── skill_tool.py        # re-export skmng.tool（向后兼容，待删）
 │   ├── create_tools.py      # 动态生成工具代码，保存为 .py 并自动注册到 __init__.py
 │   ├── safety.py            # 安全护栏(黑名单/白名单/交互确认/路径保护)
-│   ├── mcp_loader.py        # MCP 配置管理与工具加载器
+│   ├── mcp_loader.py        # MCP 配置管理与工具加载器（含按工具名筛选加载 aload_mcp_tools_by_name / load_mcp_tools_by_name_sync）
 │   ├── mcp_pool.py          # MCP 连接池（per-server 隔离 + 健康探测 + 自动重连）
 │   ├── tool_wrapper.py      # 工具超时包装器（统一超时保护，超时返回 JSON 错误）
 │   └── scheduler_tool.py    # 定时任务工具（schedule_task/list/cancel/delete/cleanup）
@@ -369,7 +369,7 @@ LangChainAgent/
 | [graph/common.py](graph/common.py)                       | 工作流通用能力：`NodeTrackingHandler` 节点级进度回调(含 TOKEN 级流式)、`arun_compiled_workflow` 跨轮次记忆压缩 + `workspace_path` 注入 `config.configurable`（SkillInjector 已迁往 `skmng/injector.py`）                                                                        |
 | [graph/simple.py](graph/simple.py)                       | LangGraph 监督者模式工作流编排（Manager→Worker→Terminator，异步节点）；`worker_exec` 节点接收 LangGraph 注入的 config（含 `workspace_path`）透传 Worker                                                                                     |
 | [graph/pipline.py](graph/pipline.py)                     | LangGraph 流水线模式工作流编排（异步节点，与 simple 同构）；`worker_exec` 节点同样透传 workspace config                                                                                                                                    |
-| [graph/rtl_graph.py](graph/rtl_graph.py)                 | RTL 芯片设计流水线：Manager 提炼上下文→Architect 计划/设计/分析/评审/规格→Designer 规格+编码↔Verification 验证多轮交互（条件路由 + max_rounds 限轮）→Designer 交付                                                                       |
+| [graph/rtl_graph.py](graph/rtl_graph.py)                 | RTL 芯片设计流水线：Manager 提炼上下文→Architect 计划/设计/分析/评审/规格→Designer 规格+编码↔Verification 验证多轮交互（条件路由 + max_rounds 限轮）→验证通过/达上限即终止(END)                                                                       |
 | [graph/registry.py](graph/registry.py)                   | 工作流/Agent 注册表：`register_workflow` / `register_agent` / `build_workflow`；runner 统一支持 `workspace_path` 透传                                                                                                                   |
 | [tools/skills.py](tools/skills.py)                       | re-export `skmng.manager.SkillManager`（向后兼容，待删）                                                                                                                                                                                   |
 | [tools/skill_tool.py](tools/skill_tool.py)               | re-export `skmng.tool.read_skill`（向后兼容，待删）                                                                                                                                                                                       |
@@ -1001,7 +1001,7 @@ session/
 | `new_session(workspace_path=None)`    | 开启新会话（原会话保留在数据库），更新 current_session_id                          |
 | `new_workflow_session(workflow_name)` | 开启专属工作流会话（ID 含`workflow-{名称}`）                                     |
 | `aswitch_session(session_id)`         | 切换到指定会话（恢复历史 + warm workspace 缓存）                                   |
-| `adelete_session(session_id)`         | 删除会话：清 checkpoint + Store + workspace 绑定（删当前会话时自动切换到其他会话） |
+| `adelete_session(session_id)`         | 删除会话：先清该会话 **thread 级长期记忆**（与写流水线串行化，避免被防抖 flush 回写“复活”），再清 checkpoint + Store + workspace 绑定（删当前会话时自动切换到其他会话）；agent 级跨会话共享记忆不受影响 |
 | `alist_sessions(all_types=False)`     | 列出所有可见会话（checkpoint 存量 ∪ 当前会话）                                    |
 | `asummarize(session_id)`              | 返回会话统计（session_id / 消息数 / 总会话数）                                     |
 | `aget_messages(session_id)`           | 从 checkpoint 获取该会话所有消息                                                   |
@@ -1548,6 +1548,31 @@ create_tool(
 - 禁止导入高风险模块：`os`、`subprocess`、`socket`、`sys`、`pathlib`、`shutil`、`ctypes`、`importlib`、`requests`、`urllib`
 - 默认禁止覆盖已有文件（`force=True` 才可覆盖）
 
+#### 角色声明 MCP 工具
+
+工作流角色（`team/*/` 下的 `@register_agent` 装饰器）通过两种方式声明对 MCP 工具的依赖，在 `build_workflow` 装配期由 `tools.mcp_loader` 同步拉取并合并到本地 `tools`，失败时静默降级为纯文本模式（不阻断工作流）：
+
+| 声明方式 | 装饰器参数 | 加载器 | 适用场景 |
+| -------- | ---------- | ------ | -------- |
+| **按名声明** | `mcp_tools=["write_file"]` | `load_mcp_tools_by_name_sync` 遍历已启用 server 按名筛选 | 精确指定所需工具（推荐） |
+| **全量声明** | `mcp_all=True` | `load_all_mcp_tools_sync` 加载全部已启用 server 的全部工具（按名去重） | 确需全部工具，不想逐个列名 |
+
+```python
+# 按名声明（推荐，工具数可控）
+@register_agent("architect", "team/architect/agent_config.json",
+    mcp_tools=["write_file"])
+
+# 全量声明
+@register_agent("architect", "team/architect/agent_config.json",
+    mcp_all=True)
+```
+
+> ⚠️ **工具膨胀警告**：`mcp_all=True` 会挂载全部已启用 server 的全部工具到 ReAct 提示词，工具描述段膨胀会稀释 LLM 工具选择质量（实测 >15 个工具后 selection 准确率明显下降）。**建议优先用 `mcp_tools` 精确声明所需工具，`mcp_all` 仅在确需全部时使用**。
+>
+> **互斥语义**：`mcp_all=True` 与 `mcp_tools=[...]` 同时声明时，`mcp_all` 优先、`mcp_tools` 被忽略，并记 WARNING（合并结果恒等于全部，对用户无意义且可能掩盖配置错误）。
+>
+> **命名冲突**：多个 server 提供同名工具时，`load_all_mcp_tools_sync` 按 server 配置顺序（`config/mcp_servers.json` 中 `enabled_servers` 字典序）保留先到者、丢弃后到者并记 WARNING。按名加载路径（`aload_mcp_tools_by_name`）未做去重，冲突时可能返回多个同名工具——全量加载场景冲突面更大，故在 `load_all_mcp_tools_sync` 收敛。
+
 #### 本地工具 vs MCP 工具对比
 
 | 特性       | 本地工具          | MCP 工具                      |
@@ -2066,7 +2091,7 @@ Terminator (汇总结果,返回最终答案)
 
 ### 架构(rtl_graph)
 
-RTL 芯片设计流水线：`Manager` 提炼上下文 → `Architect` 五阶段架构（计划/设计/分析/评审/规格）→ `Designer` 规格+编码 ↔ `Verification` 多轮验证 → `Designer` 交付：
+RTL 芯片设计流水线：`Manager` 提炼上下文 → `Architect` 五阶段架构（计划/设计/分析/评审/规格）→ `Designer` 规格+编码 ↔ `Verification` 多轮验证 → 验证通过/达上限即终止（END）：
 
 ```
 用户任务
@@ -2085,12 +2110,10 @@ Verification (spec_design_task:验证计划)
 │  Verification (verilog_design_task:验证) │──┘
 └──────────────────────────────────────────┘
     ↓ 验证通过 / 达 max_rounds 上限
-Designer (输出最终交付文件)
-    ↓
-最终答案
+   END（终止,不再经 Designer 交付节点）
 ```
 
-- **多轮交互**：`designer_verilog` → `verification_check` 构成迭代环，由 `route_after_verification` 条件路由判定。验证报告含"验证结论: PASS"标记即交付；未通过且轮次未达 `max_rounds`（默认 3）时携带验证反馈回到 Designer 重新编码；达上限强制交付，防止死循环。
+- **多轮交互**：`designer_verilog` → `designer_file_check` → `verification_check` → `sim_exec_check` 构成迭代环，由 `route_after_file_check` / `route_after_sim_check` 条件路由判定。`designer_file_check` 校验本轮产出 RTL 文件存在且非空；`sim_exec_check` 实际执行 Vivado 仿真并检查覆盖率（`scripts/syn_filelist.f` 全部 src 被 `scripts/sim_filelist.f` 包含且报告已生成），仿真+覆盖率通过即终止（END）；失败且轮次未达 `max_rounds`（默认 3）时携带验证反馈回到 Designer 重新编码；达上限强制终止（END），防止死循环。
 - **上下文衔接**：Architect 各阶段任务文本逐级拼接上游产物（计划→设计→分析→评审→规格），Designer/Verification 基于架构规格分工，多轮迭代时第二轮起注入上一轮验证报告反馈。
 - **角色注册**：`team/__init__.py` 未导入 `rtl_designer`/`rtl_verification`，由 `rtl_graph.py` 顶部显式导入触发 `@register_agent` 注册，与 `graph.registry` 无循环导入。
 
@@ -2101,12 +2124,14 @@ Designer (输出最终交付文件)
 | **ManagerAgent**    | 任务拆解与规划 | 纯文本推理(无工具)         | `team/manager/`    |
 | **WorkerAgent**     | 执行具体子任务 | 工具模式(注入全部本地工具) | `team/worker/`     |
 | **TerminatorAgent** | 汇总结果并返回 | 纯文本推理(无工具)         | `team/terminator/` |
-| **DesignerAgent**     | RTL 设计：规格梳理/模块拆分/Filelist/RTL 编码 | 纯文本推理(无工具) | `team/rtl_designer/` |
-| **VerificationAgent** | RTL 验证：验证计划/TB·UVM 框架/覆盖率/bug 定位 | 纯文本推理(无工具) | `team/rtl_verification/` |
+| **DesignerAgent**     | RTL 设计：规格梳理/模块拆分/Filelist/RTL 编码 | 可选工具(声明 mcp_tools=["write_file"],写规格/RTL 源码) | `team/rtl_designer/` |
+| **VerificationAgent** | RTL 验证：验证计划/TB·UVM 框架/覆盖率/bug 定位 | 可选工具(声明 mcp_tools=["write_file"],写验证计划/报告/TB) | `team/rtl_verification/` |
 
 > **RTL 团队角色模型配置**：`manager`/`architect`/`rtl_designer`/`rtl_verification` 均配置为云雾提供商 `qwen3.7-max`、`max_tokens=4096`。原因：云雾网关对 `max_completion_tokens` 参数的处理存在缺陷——思考型模型（`glm-5.2`/`qwen3.7-max`）的 reasoning token 会计入该预算，复杂设计任务（RTL 编码/验证方案）思考消耗远超 `max_tokens`，触发 `finish=length` 且 `content` 为空，导致工作流节点输出空字符串。`llm/llm_client.py` 中 `CloudmistChatOpenAI` 子类将 `max_completion_tokens` 还原为 `max_tokens` 规避该缺陷（仅 `provider="yunwu"` 生效），详见该文件类文档。
 
 > **固定技能注入**：`VerificationAgent` 经 `fixed_skills: ClassVar[list[str]] = ["vivado-2025.2"]` 类属性始终注入 Vivado 技能指引（验证环境固定使用 Vivado Xsim，不依赖任务关键词自动匹配），由 `skmng.core.build_skill_block` 统一合并注入，见 `team/rtl_verification/rtl_verification.py`。
+
+> **RTL 角色 MCP 工具注入**：`ArchiAgent` / `DesignerAgent` / `VerificationAgent` 经 `@register_agent(..., mcp_tools=["write_file"])` 声明对 MCP filesystem `write_file` 工具的依赖。`build_workflow` 装配期由 `tools.mcp_loader.load_mcp_tools_by_name_sync` 同步拉取（遍历已启用 MCP server 按名筛选），拉取成功时角色切工具模式（自动挂载 `WorkspaceSecurityMW`，路径解析+逃逸校验与 Worker 一致），各自 workflow 节点的 prompt 引导 LLM 调用 `write_file` 把产出文档写入 workspace（architect 写 `arch_spec.md`、designer 写 `design_spec.md`/`rtl_code.sv`、verification 写 `verification_plan.md`/`verification_report.md`）；MCP 未配置或加载失败时静默降级为纯文本模式（仅输出正文，不写盘），不阻断工作流。声明工具名而非 server 名，解耦 server 配置变更。
 
 **轻量设计**：团队 Agent 继承 `TeamAgent` 轻量基类,不继承 `AgentCore`。相比完整智能体:
 

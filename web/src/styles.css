@@ -1234,6 +1234,54 @@ tool-group,
   border-color: var(--accent);
 }
 
+/* 分组单选模式（user_confirmation 中断） */
+.interrupt-item {
+  margin: 12px 0;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.interrupt-item:first-of-type {
+  border-top: none;
+  padding-top: 0;
+}
+
+.interrupt-question {
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+
+.interrupt-item .interrupt-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.choice-btn.selected {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.confirm-btn {
+  margin-top: 14px;
+  padding: 8px 18px;
+  border-radius: 8px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 13px;
+  transition: opacity 0.12s;
+}
+
+.confirm-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 /* ---------- 滚动条 ---------- */
 ::-webkit-scrollbar {
   width: 8px;

@@ -80,9 +80,22 @@ export interface ChatMessage {
   nodeName?: string
 }
 
+export interface InterruptItemChoice {
+  id: string
+  label: string
+}
+
+export interface InterruptItem {
+  id: string
+  question: string
+  choices: InterruptItemChoice[]
+}
+
 export interface InterruptInfo {
   prompt: string
   choices: { id: string; label: string }[]
+  /** 分组单选项：存在且非空时进入分组模式（user_confirmation），否则走扁平单选 */
+  items?: InterruptItem[]
 }
 
 /** 运行时指标 */
@@ -206,7 +219,7 @@ export type StreamEvent =
   | { type: 'token'; content: string }
   | { type: 'tool_call'; id: string; name: string; args: unknown }
   | { type: 'tool_result'; id: string; name: string; content: string }
-  | { type: 'interrupt'; prompt: string; choices: { id: string; label: string }[] }
+  | { type: 'interrupt'; prompt: string; choices: { id: string; label: string }[]; items?: InterruptItem[] }
   | { type: 'cancelled'; content: string }
   | { type: 'error'; content: string }
   | { type: 'workflow_node'; node: string; status: 'running' | 'done' | 'error'; content?: string }

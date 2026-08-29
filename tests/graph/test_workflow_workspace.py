@@ -1,7 +1,7 @@
 """工作流 workspace 隔离测试 - 验证 workspace_path 从运行器透传到 Worker 工具调用。
 
 覆盖：
-- worker_exec 节点把 LangGraph 注入的 config 透传给 Worker.execute_task
+- worker_exec 节点把 LangGraph 注入的 config 透传给 Worker.arun_structured
 - arun_compiled_workflow 把 workspace_path 注入 config.configurable
 - TeamAgent 工具模式构造最小 config(仅 workspace_path,不转发 callbacks)
 - TeamAgent._create_tool_agent 挂载 WorkspaceSecurityMW
@@ -13,33 +13,58 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import MagicMock
 
+from agent.turn_types import AgentTurnResult
 from agent.workspace_mw import WorkspaceSecurityMW
 from graph.simple import arun_compiled_workflow, worker_exec_node
 from team.base import TeamAgent
 
+# 默认模板(与 WorkerAgent.default_templates 对齐,供 CapturingWorker.get_template 兜底)
+DEFAULT_TEMPLATES: dict[str, str] = {
+    "worker_exec": "请执行以下计划:\n\n{plan}",
+}
 
-# --------------------------------------------------------------------------- #
-# 节点级:config 透传
-# --------------------------------------------------------------------------- #
+
 @dataclass
 class CapturingWorker:
-    """捕获 execute_task 收到的 config 的伪 Worker。"""
+    """捕获 arun_structured 收到的 config 的伪 Worker。
+
+    节点改调 run_team_turn_with_interrupt 后,统一经 ``arun_structured`` 入口
+    记录调用并返回 ``AgentTurnResult.completed``;config(含 workspace_path)
+    经 helper 透传给 arun_structured,据此验证 workspace 隔离生效。
+    """
 
     response: str = "done"
     received_config: dict[str, Any] | None = None
+    calls: list[tuple[str, str]] = field(default_factory=list)
 
-    async def aexecute_task(self, plan: str, injector=None, config: dict[str, Any] | None = None) -> str:
-        """异步版 execute_task(节点现直接 await 调用)"""
+    def get_template(self, name: str) -> str:
+        """懒加载模板:无 prompt_file 时回退默认模板"""
+        return DEFAULT_TEMPLATES.get(name, "")
+
+    def render_template(self, template: str, **kwargs) -> str:
+        """占位符替换(复用 TeamAgent 静态方法,与生产路径一致)"""
+        return TeamAgent.render_template(template, **kwargs)
+
+    def inject_into_prompt(self, prompt: str, task: str, active_names=()) -> str:
+        """技能注入占位:测试不验证技能块,原样返回 prompt(已含渲染内容)"""
+        return prompt
+
+    async def arun_structured(self, prompt: str, config: dict[str, Any] | None = None) -> AgentTurnResult:
+        """节点经 run_team_turn_with_interrupt 调用的唯一入口;
+        记录 (arun_structured, prompt) 并返回 completed(self.response),
+        同时捕获 config 以供断言 workspace_path 透传。
+        """
+        self.calls.append(("arun_structured", prompt))
         self.received_config = config
-        return self.response
+        return AgentTurnResult.completed(self.response)
 
 
 def test_worker_exec_node_passes_workspace_config():
-    """simple 的 worker_exec 节点:config(含 workspace_path)透传给 execute_task。"""
+    """simple 的 worker_exec 节点:config(含 workspace_path)透传给 arun_structured。"""
     worker = CapturingWorker()
     state = {"plan": "计划: 步骤1"}
     config = {"configurable": {"thread_id": "t1", "workspace_path": "C:/ws"}}
@@ -51,7 +76,7 @@ def test_worker_exec_node_passes_workspace_config():
 
 
 def test_worker_exec_node_config_default_none():
-    """未传 config 时 execute_task 收到 None(向后兼容)。"""
+    """未传 config 时 arun_structured 收到 None(向后兼容)。"""
     worker = CapturingWorker()
     state = {"plan": "计划: 步骤1"}
 
@@ -66,7 +91,7 @@ def test_real_langgraph_injects_config_into_worker_exec_node():
 
     回归保护:若节点 config 注解在 ``from __future__ import annotations`` 下
     写成字符串不匹配的形态(如 'RunnableConfig | None'),LangGraph 会跳过注入,
-    execute_task 收到 None,本测试失败。
+    arun_structured 收到 None,本测试失败。
     """
     from functools import partial
     from typing import TypedDict
@@ -151,6 +176,9 @@ def test_create_tool_agent_mounts_workspace_middleware(monkeypatch):
     agent.llm.get_chat_model.return_value = MagicMock()
     agent.tools = [MagicMock()]
     agent.system_prompt = ""
+    # _create_tool_agent 直读 self._checkpointer(未用 getattr 兜底),
+    # object.__new__ 创建的实例无此属性 → 测试显式置 None 绕过
+    agent._checkpointer = None
 
     agent._create_tool_agent()
 
@@ -253,3 +281,62 @@ def test_run_workflow_requires_workflow_sm():
         assert "workflow_sm" in str(error)
     else:
         raise AssertionError("应抛出 RuntimeError")
+
+
+# --------------------------------------------------------------------------- #
+# compaction wrapper 透传 config（回归: _compaction_wrapper 签名须用
+# Optional[RunnableConfig] 而非 RunnableConfig | None,否则 LangGraph
+# 注解判定不匹配,config 不注入,节点收到 None → 下游 aget_state 抛
+# KeyError('configurable') → 前端报"任务执行失败: 'configurable'"）
+# --------------------------------------------------------------------------- #
+def test_compaction_wrapper_passes_config_to_node():
+    """compaction wrapper 启用时,LangGraph 注入的 config 透传到被包装的节点。
+
+    回归保护:_compaction_wrapper 的 config 参数注解必须用 Optional[RunnableConfig]
+    (非 RunnableConfig | None),否则在 ``from __future__ import annotations`` 下
+    字符串注解不匹配 LangGraph 的 KWARGS_CONFIG_KEYS,config 静默不注入。
+    """
+    from functools import partial
+    from typing import Optional, TypedDict
+
+    from langchain_core.runnables import RunnableConfig
+    from langgraph.checkpoint.memory import MemorySaver
+    from langgraph.graph import END, START, StateGraph
+
+    from graph.common import _compaction_wrapper
+    class WfState(TypedDict):
+        out: str
+        messages: list
+
+    received: dict[str, Any] = {}
+
+    async def inner_node(
+        state: dict,
+        agent=None,
+        injector=None,
+        config: Optional[RunnableConfig] = None,  # noqa: UP045
+    ) -> dict:
+        received["config"] = config
+        return {"out": "done", "messages": []}
+
+    # 模拟 register_nodes 的包装链:partial 绑定 agent/injector → _compaction_wrapper
+    bound = partial(inner_node, agent=None, injector=None)
+    mw = object()  # 非 None,触发 _compaction_wrapper 包装路径
+    wrapped = partial(_compaction_wrapper, bound, mw)
+
+    graph = StateGraph(WfState)
+    graph.add_node("n", wrapped)
+    graph.add_edge(START, "n")
+    graph.add_edge("n", END)
+    compiled = graph.compile(checkpointer=MemorySaver())
+
+    asyncio.run(
+        compiled.ainvoke(
+            {"out": "", "messages": []},
+            {"configurable": {"thread_id": "t1", "workspace_path": "C:/ws"}},
+        )
+    )
+
+    assert received["config"] is not None, "LangGraph 未注入 config(_compaction_wrapper 签名注解可能不匹配)"
+    assert received["config"]["configurable"]["thread_id"] == "t1"
+    assert received["config"]["configurable"]["workspace_path"] == "C:/ws"
