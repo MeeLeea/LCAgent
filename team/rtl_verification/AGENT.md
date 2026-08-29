@@ -23,11 +23,11 @@
 > 基于 `tests/ddr/scripts/start.tcl` 的验证流程按功能分块，并统一改为 filelist 驱动的 `xvlog`/`xelab`/`xsim` 风格（与本文约束一致）。各功能块如下：
 
 1. **初始化与读取 filelist**：创建 `./reports` 目录，读取 `scripts/sim_filelist.f`（缺失则报错，禁止编造），过滤注释/空行得到待编译列表。
-2. **编译源文件**：`xvlog -i <incdirs> -f scripts/sim_filelist.f` 一次性编译全部源文件（取代旧版 `create_project`/`add_files`/`glob`）。
-3. **单 testbench 仿真集**：`xelab -top <tb>` 指定顶层，`xsim -tclbatch` 启动（取代旧版 `create_sim_set`/`set top`）。
-4. **仿真运行与覆盖率**：`xsim -tclbatch` 中 `coverage save -onexit ./reports/coverage_report.txt` + `run all`（取代旧版 `run all`/`wait_on_run`）。
-5. **批量运行**：遍历 tb 列表逐个 `run_tb`，用 `catch` 捕获错误并打印状态（取代旧版 `run_all_simulations` 的 `get_property STATUS` 判断）。
-6. **覆盖率报告汇总**：`report_coverage -file ./reports/coverage_report.txt`，收尾退出。
+2. **编译源文件**：`exec xvlog -i <incdirs> -f scripts/sim_filelist.f` 一次性编译全部源文件（取代旧版 `create_project`/`add_files`/`glob`；`xvlog`/`xelab`/`xsim` 在 Vivado batch 下为外部可执行程序，须用 `exec` 前缀调用）。
+3. **单 testbench 仿真集**：`exec xelab --incr --debug typical --relax --mt 2 -cov all -L xil_defaultlib -L uvm -L unisims_ver -L unimacro_ver -L secureip --snapshot <tb>_behav xil_defaultlib.<tb> xil_defaultlib.glbl` 指定顶层（glbl 由 `$env(XILINX_VIVADO)/data/verilog/src/glbl.v` 经 `exec xvlog` 编译进 `xil_defaultlib`；取代旧版 `create_sim_set`/`set top`），随后 `exec xsim <tb>_behav -tclbatch ./scripts/xsim_run.tcl -covdb_dir ./cov_db -log ./reports/<tb>_simulate.log` 启动。
+4. **仿真运行与覆盖率**：`xsim_run.tcl`（由 `-tclbatch` 调用，tb 名经 `set env(SIM_TB) <tb>` 由调用方传入）中 `coverage save -onexit ./cov_db/<tb>_coverage.ucdb` + `run all`，覆盖率按 tb 分文件保存于 `./cov_db`（取代旧版 `run all`/`wait_on_run`，且避免多 tb 相互覆盖）。
+5. **批量运行**：`foreach tb $testbenches` 遍历 tb 列表，用 `catch` 包裹 `xelab`+`xsim`；仿真结束后读取 `./reports/<tb>_simulate.log`，若出现 `SOME TESTS FAILED` 或 `[ERROR]` 判为 FAILED（可识别“xsim 退出码 0 但用例未过”的情形），否则 SUCCESS（取代旧版 `run_all_simulations` 的 `get_property STATUS` 判断）。
+6. **覆盖率报告汇总**：`report_coverage -file ./reports/coverage_report.txt -cov_db_dir ./cov_db`（用 `catch` 包裹，失败仅告警），收尾退出。
 
 ### 单 tb 定向回归模板（run_one.tcl，filelist 驱动）
 
@@ -44,23 +44,49 @@
 # =============================================================================
 
 set tb_name [lindex $argv 0]
-if {$tb_name eq ""} {
-    set tb_name tb_ddr5_reset_sync
+if {$tb_name eq ""} { set tb_name tb_ddr5_reset_sync }
+
+file mkdir ./reports
+file mkdir ./cov_db
+
+if {![info exists ::env(XILINX_VIVADO)]} {
+    puts "ERROR: 环境变量 XILINX_VIVADO 未设置, 无法定位 glbl.v (请通过 vivado.bat 启动)"
+    exit 1
+}
+set glbl_path [file join $::env(XILINX_VIVADO) "data/verilog/src/glbl.v"]
+if {![file exists $glbl_path]} {
+    puts "ERROR: 找不到 glbl.v: $glbl_path"
+    exit 1
 }
 
 puts "========================================"
-puts "Running single simulation: $tb_name"
+puts "\[SIM\] single: $tb_name"
 puts "========================================"
+set env(SIM_TB) $tb_name
 
-# 复用 start.tcl 已编译产物，仅重新 elaborate + 仿真
-xelab -top $tb_name -debug typical -cov all $tb_name
-xsim $tb_name -tclbatch ./scripts/xsim_run.tcl -covdb_dir ./cov_db
+set xelab_cmd [list xelab --incr --debug typical --relax --mt 2 -cov all \
+    -L xil_defaultlib -L uvm -L unisims_ver -L unimacro_ver -L secureip \
+    --snapshot ${tb_name}_behav xil_defaultlib.$tb_name xil_defaultlib.glbl]
+set xsim_cmd [list xsim ${tb_name}_behav -tclbatch ./scripts/xsim_run.tcl \
+    -covdb_dir ./cov_db -log ./reports/${tb_name}_simulate.log]
 
-puts "========================================"
-puts "Simulation finished: $tb_name"
-puts "========================================"
+if {[catch { exec {*}$xelab_cmd; exec {*}$xsim_cmd } err]} {
+    puts "ERROR: $tb_name 仿真失败: $err"
+    exit 1
+}
 
-exit
+set log_file "./reports/${tb_name}_simulate.log"
+if {[file exists $log_file]} {
+    set lf [open $log_file r]
+    set content [read $lf]
+    close $lf
+    if {[string match "*SOME TESTS FAILED*" $content] || [string match "*\[ERROR\]*" $content]} {
+        puts "FAILED: $tb_name"
+        exit 1
+    }
+}
+puts "SUCCESS: $tb_name"
+exit 0
 ```
 
 ## 环境约束（重要）
@@ -77,7 +103,7 @@ exit
 
 1. 📋验证需求梳理：从spec提取功能、接口、时钟复位、关键约束
 2. ✅验证计划Checklist：正常场景 / 边界场景 / 异常错误场景
-3. 📂文件规划：基于前端filelist，补充tb/uvm目录结构
+3. 📂文件规划：基于前端syn_filelist，补充包含tb/uvm的sim_filelist,以及tb/uvm的目录结构
 4. 📜Vivado仿真Tcl脚本：创建工程、加载文件、+incdir、编译选项、仿真、dump波形
 5. 💻Testbench / UVM框架代码：
    - 小模块输出定向SV tb；
@@ -123,6 +149,9 @@ exit
 
 - 完成验证方案规划后,使用 write_file 工具将验证计划文档写入 workspace的`doc/verification_plan.md`
 - 文件路径用相对路径(如 `doc/verification_plan.md`),由 workspace 中间件自动解析为 workspace 内绝对路径
+- 编写`scripts/sim_filelist.f`（由前端`syn_filelist.f`扩展而来，**严禁编造文件**）：
+  - 覆盖范围：纳入`src/`全部可综合 RTL 与`test/`全部 TB/UVM 文件；`glbl.v` 经 `$env(XILINX_VIVADO)/data/verilog/src/glbl.v` 显式加入；`#` 注释/空行忽略
+  - 写前校验：用 `file exists` 逐文件核验，任一缺失即显式报错并告知前端补齐；仅用于 Xsim 仿真（`xvlog -f` 编译），绝不回写综合 `syn_filelist.f`
 - write_file 完成后,仍需在回复正文输出完整文档内容供下游节点消费
 - 若 write_file 工具不可用(未加载),直接输出文档正文即可,不阻断流程
 
@@ -143,10 +172,10 @@ exit
 - 构建 Vivado 工程的 Tcl 文件使用 write_file 写入 `scripts/start.tcl`,该脚本必须按 filelist 驱动方式生成:
 
   - 先读取 `scripts/sim_filelist.f`(若文件不存在应显式报错并要求前端补齐,不得自行编造文件列表);
-  - 编译环节用 `xvlog -f scripts/sim_filelist.f` 一次性编译清单中的全部源文件;若需区分 SV/V 文件也可逐个 `xvlog <file>`,但编译对象必须是 `sim_filelist.f` 中列出的文件,不得增删;
+  - 编译环节用 `exec xvlog -f scripts/sim_filelist.f` 一次性编译清单中的全部源文件;若需区分 SV/V 文件也可逐个 `exec xvlog <file>`,但编译对象必须是 `sim_filelist.f` 中列出的文件,不得增删;
   - **严禁**在 `start.tcl` 中使用 `add_files [glob ./src/*.v ./src/*.sv]` 这类目录通配+综合工程接口的写法,`add_files` 属于 vivado 综合实现流程(非 Xsim 仿真),目录 glob 会把综合 RTL 与仿真 TB/UVM 文件混入同一编译集,导致仿真语义错乱;Xsim 仿真只能用 `xvlog`/`xvlog -f` 编译;
-  - `start.tcl` 在编译后须执行 `xelab` 与 `xsim` 启动仿真,并在仿真结束时将覆盖率结果写入 `./reports/coverage_report.txt`(可由 xsim `-tclbatch` 中的 `coverage save -onexit ./reports/coverage_report.txt` 或等价命令实现);`./reports/` 目录需在脚本中预先 `file mkdir` 创建;
-- 当验证包含多个独立 testbench(多个 sim 仿真集)时,额外生成可单独运行指定 testbench 的仿真脚本(如 `scripts/run_one.tcl`):复用 `start.tcl` 已创建的工程(`open_project`),通过 `-tclargs <tb_name>` 传入 testbench 名即可单独启动对应仿真集(`launch_simulation` + `run all`),便于定向调试与单用例回归;正文需说明用法(调用命令、所需 `-tclargs` 参数)与全部可用 tb 名列表
+  - `start.tcl` 在编译后须对每个 tb 执行 `exec xelab` 与 `exec xsim` 启动仿真；覆盖率在 `xsim -tclbatch` 脚本(`scripts/xsim_run.tcl`,于 xsim 子进程内执行,其中的 `coverage save`/`run all` 为 xsim Tcl 命令)中经 `coverage save -onexit ./cov_db/<tb>_coverage.ucdb` 按 tb 分文件保存于 `./cov_db`,全部 tb 跑完后由 `report_coverage -file ./reports/coverage_report.txt -cov_db_dir ./cov_db`(用 `catch` 包裹,失败仅告警)汇总写入 `./reports/coverage_report.txt`；`./reports/` 与 `./cov_db/` 目录需在脚本中预先 `file mkdir` 创建;
+- 当验证包含多个独立 testbench 时,额外生成可单独运行指定 testbench 的脚本 `scripts/run_one.tcl`:**不创建/打开工程**,直接复用 `start.tcl` 已编译的 xsim 工作库(默认 `xsim.dir`),通过 `-tclargs <tb_name>` 传入 testbench 名,仅重新 `exec xelab`+`exec xsim`(参数同 start.tcl)即可单独启动对应仿真,便于定向调试与单用例回归;正文需说明用法(调用命令、所需 `-tclargs` 参数)与全部可用 tb 名列表
 - start.tcl脚本或run_one.tcl在终端使用的命令，写一个`./scripts/README.md`
 - 文件路径用相对路径,由 workspace 中间件自动解析为 workspace 内绝对路径
 - write_file 完成后,仍需在回复正文输出验证报告完整内容供下游节点(条件路由)消费
