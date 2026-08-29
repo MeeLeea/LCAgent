@@ -618,7 +618,7 @@ button {
 }
 
 .chat-inner {
-  max-width: 820px;
+  max-width: 1080px;
   margin: 0 auto;
   padding: 24px 24px 16px;
   display: flex;
@@ -880,6 +880,61 @@ tool-group,
   color: var(--accent);
 }
 
+/* ---------- 工作流节点结果块 ---------- */
+.msg-node {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-elevated);
+  overflow: hidden;
+  margin-bottom: 8px;
+}
+
+.node-header {
+  width: 100%;
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  text-align: left;
+}
+
+.node-header:hover {
+  background: var(--bg-hover);
+}
+
+.node-label {
+  font-weight: 600;
+  color: var(--accent);
+  font-family: 'JetBrains Mono', 'SF Mono', Consolas, monospace;
+}
+
+.node-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  flex-shrink: 0;
+}
+
+.node-dot.done {
+  background: var(--accent);
+}
+
+.node-content {
+  padding: 10px 12px;
+  font-size: 13px;
+  color: var(--text);
+  border-top: 1px solid var(--border-soft);
+  max-height: 320px;
+  overflow-y: auto;
+}
+
 .spin {
   animation: spin 1s linear infinite;
 }
@@ -1042,8 +1097,8 @@ tool-group,
 }
 
 .input-card {
-  /* 随窗口宽度实时缩放：最小 320px → 按视口 60vw 增长 → 上限与聊天区一致 820px */
-  width: clamp(320px, 60vw, 820px);
+  /* 随窗口宽度实时缩放：最小 320px → 按视口 72vw 增长 → 上限与聊天区一致 1080px */
+  width: clamp(320px, 72vw, 1080px);
   max-width: calc(100vw - 48px);
   margin: 0 auto;
   background: var(--bg-input);
@@ -1177,6 +1232,54 @@ tool-group,
 
 .choice-btn:hover {
   border-color: var(--accent);
+}
+
+/* 分组单选模式（user_confirmation 中断） */
+.interrupt-item {
+  margin: 12px 0;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.interrupt-item:first-of-type {
+  border-top: none;
+  padding-top: 0;
+}
+
+.interrupt-question {
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+
+.interrupt-item .interrupt-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.choice-btn.selected {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.confirm-btn {
+  margin-top: 14px;
+  padding: 8px 18px;
+  border-radius: 8px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 13px;
+  transition: opacity 0.12s;
+}
+
+.confirm-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 /* ---------- 滚动条 ---------- */
@@ -1990,4 +2093,362 @@ tool-group,
 
 .char-count.warn {
   color: var(--danger);
+}
+
+/* ============================================================
+   工作目录栏（InputBar 输入框下方独立栏）
+   ============================================================ */
+.ws-bar {
+  width: clamp(320px, 72vw, 1080px);
+  max-width: calc(100vw - 48px);
+  margin: 6px auto 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ws-bar-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  flex: 0 1 auto;
+  padding: 4px 9px;
+  border-radius: 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+  transition: background 0.12s, color 0.12s;
+}
+
+.ws-bar-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.ws-bar .token-count {
+  flex-shrink: 0;
+  font-size: 13px;
+}
+
+.ws-bar-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ============================================================
+   文件检索器（WorkspacePicker modal）
+   ============================================================ */
+.ws-picker-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  animation: ws-fade-in 0.15s ease;
+}
+
+.ws-picker {
+  width: 520px;
+  max-width: 92vw;
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  animation: ws-pop-in 0.18s ease;
+}
+
+@keyframes ws-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes ws-pop-in {
+  from { opacity: 0; transform: scale(0.96) translateY(8px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+/* 标题栏 */
+.ws-picker-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.ws-picker-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.ws-picker-title svg {
+  color: var(--accent);
+}
+
+.ws-picker-close {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  transition: background 0.12s, color 0.12s;
+}
+
+.ws-picker-close:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+/* 面包屑导航 */
+.ws-picker-breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--bg);
+}
+
+.ws-picker-up {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  transition: background 0.12s, color 0.12s;
+}
+
+.ws-picker-up:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.ws-picker-up:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+.ws-picker-crumbs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px;
+  overflow: hidden;
+}
+
+.ws-crumb-root {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.ws-crumb-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.ws-crumb-sep {
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+
+.ws-crumb {
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 2px 5px;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+  white-space: nowrap;
+}
+
+.ws-crumb:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.ws-crumb.active {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* 目录列表 */
+.ws-picker-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px;
+  min-height: 180px;
+}
+
+.ws-picker-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.ws-picker-item:hover {
+  background: var(--bg-hover);
+}
+
+.ws-picker-item.selected {
+  background: var(--accent-soft);
+}
+
+.ws-item-icon {
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.ws-picker-item.selected .ws-item-icon {
+  color: var(--accent);
+}
+
+.ws-item-name {
+  flex: 1;
+  font-size: 12.5px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ws-item-enter {
+  color: var(--text-faint);
+  flex-shrink: 0;
+  padding: 3px;
+  border-radius: 4px;
+  transition: background 0.12s, color 0.12s;
+}
+
+.ws-item-enter:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.ws-item-check {
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.ws-picker-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 100%;
+  min-height: 160px;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+.ws-picker-empty svg {
+  opacity: 0.6;
+}
+
+.ws-picker-error {
+  color: var(--danger);
+}
+
+/* 底部操作栏 */
+.ws-picker-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border-soft);
+  background: var(--bg);
+}
+
+.ws-picker-selected {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex: 1;
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.ws-picker-selected svg {
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.ws-picker-selected span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ws-picker-hint {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+.ws-picker-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.ws-btn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  transition: background 0.12s, opacity 0.12s;
+}
+
+.ws-btn-ghost {
+  color: var(--text-muted);
+}
+
+.ws-btn-ghost:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.ws-btn-primary {
+  background: var(--accent);
+  color: #000;
+}
+
+.ws-btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.ws-btn-primary:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }

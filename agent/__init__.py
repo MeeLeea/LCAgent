@@ -1,24 +1,18 @@
-"""Agent模块"""
-from .llm_client import LLMClient, load_providers
-from .memory import AgentMemory
-from .agent_core import AgentCore
-from .message_utils import (
-    extract_llm_error,
-    stringify_content,
-    build_interrupt_event,
-    StreamHandler,
-)
-from .logging_config import setup_logging, TraceContext
+"""Agent模块
 
-__all__ = [
-    'LLMClient',
-    'load_providers',
-    'AgentMemory',
-    'AgentCore',
-    'extract_llm_error',
-    'stringify_content',
-    'build_interrupt_event',
-    'StreamHandler',
-    'setup_logging',
-    'TraceContext',
-]
+延迟导入 AgentCore 以避免与 session 包的循环导入：
+session/__init__ → manager → utils.events → agent/__init__ → agent_core → session
+事件模型已迁移至 utils.events，`from utils.events import AgentEvent` 不触发 agent_core。
+压缩中间件（compaction）归位于 agent 包内（agent/compaction.py），为不依赖
+agent 包内部任何子模块的叶子模块，仅引用 langchain/langgraph，agent_core 经
+`from .compaction import ...` 导入，不触发循环。
+"""
+__all__ = ['AgentCore']
+
+
+def __getattr__(name: str):
+    """延迟导入 AgentCore，避免顶层导入触发 session 循环依赖。"""
+    if name == "AgentCore":
+        from .agent_core import AgentCore
+        return AgentCore
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

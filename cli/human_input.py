@@ -1,11 +1,10 @@
 """LangGraph human-input tool and CLI pause/resume orchestration."""
 
-import asyncio
 from typing import Any
-from typing_extensions import TypedDict
 
 import langgraph.types
 from langchain_core.tools import StructuredTool
+from typing_extensions import TypedDict
 
 from .cli_menu import select_menu
 
@@ -42,12 +41,12 @@ ask_human = CallableStructuredTool.from_function(
 )
 
 
-def complete_human_input_turn(turn, render_interrupt, read_resume):
+async def complete_human_input_turn(turn, render_interrupt, read_resume):
     """循环处理人工中断，直到 LangGraph 返回最终结果。"""
     while getattr(turn, "status", None) == "interrupted":
         for interrupt in turn.interrupts:
             render_interrupt(interrupt)
-        turn = read_resume(turn.interrupts)
+        turn = await read_resume(turn.interrupts)
     return turn.output or ""
 
 
@@ -58,15 +57,15 @@ def _resume_payload_for_interrupts(interrupts, read_resume):
     return {interrupt.id: read_resume(interrupt) for interrupt in interrupts}
 
 
-def run_human_input_loop(agent, message, render_interrupt, read_resume):
+async def run_human_input_loop(agent, message, render_interrupt, read_resume):
     """启动对话并持续恢复人工中断，直到本轮完成。"""
-    turn = asyncio.run(agent.achat_structured(message))
-    return complete_human_input_turn(
+    turn = await agent.achat_structured(message)
+    return await complete_human_input_turn(
         turn,
         render_interrupt,
-        lambda interrupts: asyncio.run(agent.aresume_structured(
+        lambda interrupts: agent.aresume_structured(
             _resume_payload_for_interrupts(interrupts, read_resume)
-        )),
+        ),
     )
 
 
@@ -99,21 +98,21 @@ def read_human_resume(interrupt):
     return {"choice_id": selected}
 
 
-def run_structured_until_completion(agent, message):
+async def run_structured_until_completion(agent, message):
     """Run an Agent task and finish any human-input interruptions."""
-    turn = asyncio.run(agent.arun_structured(message))
-    return complete_human_input_turn(
+    turn = await agent.arun_structured(message)
+    return await complete_human_input_turn(
         turn,
         render_human_interrupt,
-        lambda interrupts: asyncio.run(agent.aresume_structured(
+        lambda interrupts: agent.aresume_structured(
             _resume_payload_for_interrupts(interrupts, read_human_resume)
-        )),
+        ),
     )
 
 
-def chat_until_completion(agent, message):
+async def chat_until_completion(agent, message):
     """Chat through the structured path so human interrupts can be resumed."""
-    return run_human_input_loop(
+    return await run_human_input_loop(
         agent,
         message,
         render_human_interrupt,

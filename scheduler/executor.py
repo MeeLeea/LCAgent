@@ -1,20 +1,23 @@
-# -*- coding: utf-8 -*-
 """
-任务执行桥接 - 接收数据库任务，调用 AgentCore.run() 或工作流执行
+任务执行桥接 - 接收数据库任务，调用 SessionManager.arun() 或工作流执行
 
 职责（逻辑 B 的执行端）：
-    scheduler 拿到到期任务 → executor 判断任务类型 → 调用 Agent 或工作流 → 返回结果
+    scheduler 拿到到期任务 → executor 判断任务类型 → 调用 Session 或工作流 → 返回结果
 
 设计要点：
     - 通过 agent_factory（Callable[[], AgentCore]）解耦 Agent 的创建方式，
       调度器不需要知道 LLM / MCP / 技能等初始化细节
-    - 执行是同步阻塞的（AgentCore.run 本身是同步的），调度器在线程池中调用
+    - 执行通过 SessionManager.arun()（异步），调度器用 asyncio.run 在线程池中调用
     - 捕获所有异常，返回 (success, output/error) 元组，绝不向调度器抛异常
     - 支持 workflow: 前缀: task_text 以 "workflow:" 开头时路由到多 Agent 工作流
 """
-from typing import Any, Callable, Dict, Tuple
 import asyncio
+import inspect
 import logging
+from collections.abc import Callable
+from typing import Any
+
+from utils.events import AgentEvent
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +49,12 @@ def _parse_workflow_task(task_text: str) -> tuple[str, str]:
     return workflow_name, task
 
 
-def _execute_workflow_task(task_id: Any, task_text: str) -> Tuple[bool, str]:
+async def _arun_workflow_task(task_id: Any, task_text: str) -> tuple[bool, str]:
     """
-    执行工作流任务（延迟导入 graph 模块避免循环依赖）
+    异步执行工作流任务（延迟导入 graph 模块避免循环依赖）
+
+    工作流运行器已异步化（graph.ainvoke），本协程在事件循环内 await 执行；
+    execute_task 通过 asyncio.run 在独立事件循环中调用本协程（与 Agent 任务路径一致）。
 
     Args:
         task_id: 任务 ID（用于日志）
@@ -69,7 +75,7 @@ def _execute_workflow_task(task_id: Any, task_text: str) -> Tuple[bool, str]:
     logger.info("  任务内容: %s", task[:80])
 
     try:
-        from graph.registry import run_workflow_by_name, list_workflows
+        from graph.registry import arun_workflow_by_name, list_workflows
     except ImportError as exc:
         return False, f"无法导入工作流模块: {exc}"
 
@@ -79,19 +85,24 @@ def _execute_workflow_task(task_id: Any, task_text: str) -> Tuple[bool, str]:
         return False, f"未知工作流: {workflow_name}。可用: {', '.join(available)}"
 
     # 节点进度打印（供调度器日志查看执行过程）
-    def _on_node_start(node: str) -> None:
-        logger.info("  ▸ 节点开始: %s", node)
+    def _on_node_start(event: AgentEvent) -> None:
+        logger.info("  ▸ 节点开始: %s", event.node)
 
-    def _on_node_end(node: str) -> None:
-        logger.info("  ✓ 节点完成: %s", node)
+    def _on_node_end(event: AgentEvent) -> None:
+        logger.info("  ✓ 节点完成: %s", event.node)
 
     try:
-        result = run_workflow_by_name(
+        result = await arun_workflow_by_name(
             workflow_name,
             task,
             on_node_start=_on_node_start,
             on_node_end=_on_node_end,
         )
+        # 检测 interrupt：graph.ainvoke 在 interrupt 时返回含 "__interrupt__" 键的 dict
+        # scheduler 无人在场，不接入 HITL，直接返回需人工介入提示
+        if isinstance(result, dict) and "__interrupt__" in result:
+            logger.info("  工作流 %s 被中断（需人工介入）", workflow_name)
+            return False, "工作流被中断（需人工介入），请通过 CLI/API 恢复"
         final_answer = result.get("final_answer", "")
         if not final_answer:
             return False, "工作流执行完成但未返回结果"
@@ -104,13 +115,74 @@ def _execute_workflow_task(task_id: Any, task_text: str) -> Tuple[bool, str]:
         return False, f"工作流执行异常: {exc}"
 
 
-def execute_task(task: Dict[str, Any], agent_factory: AgentFactory) -> Tuple[bool, str]:
+class _AgentCreateError(Exception):
+    """Agent 创建阶段失败的标记异常（与执行异常区分，返回不同错误提示）。"""
+
+
+async def _run_agent_task(task_text: str, agent_factory: AgentFactory) -> str:
+    """在单个事件循环内创建 Agent、通过 SessionManager 执行任务并释放资源。
+
+    关键约束：AsyncSqliteSaver 绑定创建它的事件循环，跨 loop 使用会挂起。
+    因此 factory 构造（await 若返回协程）、session_manager.arun 执行、
+    aclose 关闭必须在同一个 loop 内完成。本函数由 execute_task 用 asyncio.run 包裹执行。
+
+    Args:
+        task_text: 任务描述文本
+        agent_factory: 返回 Agent 实例的可调用对象；返回协程时自动 await
+
+    Returns:
+        执行结果字符串（可能为空）
+
+    Raises:
+        _AgentCreateError: factory 构造失败（含 async factory 抛异常）
     """
-    执行单条定时任务。
+    try:
+        agent = agent_factory()
+        if inspect.isawaitable(agent):
+            agent = await agent
+    except Exception as exc:
+        raise _AgentCreateError(str(exc)) from exc
+
+    try:
+        result = await agent.session_manager.arun(task_text)
+        return str(result) if result else ""
+    finally:
+        # 优先通过 SessionManager 关闭（刷新记忆 buffer + 释放 Agent 资源），
+        # 回退到 agent.aclose（兼容未初始化 SessionManager 的场景）
+        sm = getattr(agent, "_session_manager", None)
+        if sm is not None:
+            try:
+                aclose = getattr(sm, "aclose", None)
+                if callable(aclose):
+                    close_result = aclose()
+                    if inspect.isawaitable(close_result):
+                        await close_result
+            except Exception as exc:
+                logger.warning("SessionManager 关闭失败: %s", exc, exc_info=True)
+        else:
+            aclose = getattr(agent, "aclose", None)
+            if callable(aclose):
+                try:
+                    close_result = aclose()
+                    if inspect.isawaitable(close_result):
+                        await close_result
+                except Exception as exc:
+                    logger.warning("Agent 关闭失败: %s", exc, exc_info=True)
+        # 关闭 MemoryContext（释放 SQLite 连接等底层资源）
+        mem_ctx = getattr(agent, "_memory_context", None)
+        if mem_ctx is not None:
+            try:
+                await mem_ctx.aclose()
+            except Exception as exc:
+                logger.warning("MemoryContext 关闭失败: %s", exc, exc_info=True)
+
+
+def execute_task(task: dict[str, Any], agent_factory: AgentFactory) -> tuple[bool, str]:
+    """执行单条定时任务。
 
     根据 task_text 自动判断执行路径：
     - 以 "workflow:" 开头 → 多 Agent 工作流执行
-    - 其他 → AgentCore.run() 执行
+    - 其他 → SessionManager.arun() 执行
 
     Args:
         task:          TaskStore 返回的任务字典（含 task_text 等字段）
@@ -130,21 +202,20 @@ def execute_task(task: Dict[str, Any], agent_factory: AgentFactory) -> Tuple[boo
 
     logger.info("开始执行任务 #%d (%s): %s", task_id, task_type, task_text[:80])
 
-    # 工作流任务路由
+    # 工作流任务路由（运行器已异步化，在独立事件循环中执行）
     if _is_workflow_task(task_text):
-        return _execute_workflow_task(task_id, task_text)
+        try:
+            return asyncio.run(_arun_workflow_task(task_id, task_text))
+        except Exception as exc:
+            return False, f"工作流执行异常: {exc}"
 
     # 普通 Agent 任务
     try:
-        agent = agent_factory()
-    except Exception as exc:
-        return False, f"创建 Agent 实例失败: {exc}"
-
-    try:
-        # AgentCore.run() 返回执行结果字符串
-        result = asyncio.run(agent.arun(task_text))
+        result = asyncio.run(_run_agent_task(task_text, agent_factory))
         output = str(result) if result else "(Agent 未返回内容)"
         logger.info("任务 #%d 执行完成", task_id)
         return True, output
+    except _AgentCreateError as exc:
+        return False, f"创建 Agent 实例失败: {exc}"
     except Exception as exc:
         return False, f"Agent 执行异常: {exc}"

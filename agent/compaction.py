@@ -17,33 +17,38 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Optional
+from typing import Annotated, Any
 
 from langchain.agents.middleware import AgentMiddleware, AgentState
+from langchain.agents.middleware.types import OmitFromInput
 from langchain_core.messages import (
-    AIMessage,
     AnyMessage,
-    HumanMessage,
     SystemMessage,
     ToolMessage,
 )
 from langchain_core.messages.utils import get_buffer_string
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.runtime import Runtime
+from typing_extensions import NotRequired
 
 logger = logging.getLogger(__name__)
 
 
 class LCAgentState(AgentState):
-    """扩展 AgentState，添加增量摘要字段（随 checkpoint 持久化）。
+    """扩展 AgentState，添加增量摘要 + 活跃技能字段（随 checkpoint 持久化）。
 
-    summary 字段存储当前 thread 的历史对话摘要，
-    由 CompactionMiddleware 在 before_model 时增量更新。
+    - ``summary``: 当前 thread 的历史对话摘要，由 CompactionMiddleware 增量更新。
+    - ``active_skills``: 当前 thread 手动加载的技能名列表，由
+      ``SkillInjectionMW`` 在 model 调用时读取并注入提示词。
+      使用 ``OmitFromInput`` 防止用户输入覆盖此字段。
+
     每个 thread 拥有独立的 state，天然隔离。
     """
 
     summary: str
+    active_skills: Annotated[NotRequired[list[str]], OmitFromInput]
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,7 +68,7 @@ class CompactionConfig:
     """Prune 后保留的预览字符数"""
 
     @classmethod
-    def from_kwargs(cls, max_context_messages: int = 0, context_trim_keep: int = 12) -> "CompactionConfig":
+    def from_kwargs(cls, max_context_messages: int = 0, context_trim_keep: int = 12) -> CompactionConfig:
         """从 AgentCore 现有配置参数构建 CompactionConfig。
 
         Args:
@@ -97,7 +102,7 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
         self,
         model: Any,
         config: CompactionConfig | None = None,
-        on_compaction: Optional[Callable[[str, int, int, int, float], None]] = None,
+        on_compaction: Callable[[str, int, int, int, float], None] | None = None,
     ):
         """初始化压缩中间件
 
@@ -167,18 +172,8 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
         if not new_summary:
             return None
 
-        pruned_keep = self._prune_tool_outputs(to_keep)
-
-        return {
-            "messages": [
-                # REMOVE_ALL_MESSAGES 先清空，再写入压缩后的消息
-                # 这样 checkpoint 中旧消息被彻底移除，不再占用存储
-                _make_remove_all(),
-                SystemMessage(content=self.SUMMARY_HEADER + new_summary),
-                *pruned_keep,
-            ],
-            "summary": new_summary,
-        }
+        result, _ = self._build_compact_result(new_summary, to_keep)
+        return result
 
     # ============ 核心压缩逻辑 ============
 
@@ -198,26 +193,8 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
         if not new_summary:
             return None
 
-        pruned_keep = self._prune_tool_outputs(to_keep)
-
-        result = {
-            "messages": [
-                _make_remove_all(),
-                SystemMessage(content=self.SUMMARY_HEADER + new_summary),
-                *pruned_keep,
-            ],
-            "summary": new_summary,
-        }
-
-        # 自动触发的压缩指标回调
-        if self._on_compaction is not None:
-            messages_after = len(pruned_keep) + 1  # +1 for summary SystemMessage
-            duration_ms = (time.time() - _start) * 1000
-            try:
-                self._on_compaction("auto", len(messages), messages_after, len(new_summary), duration_ms)
-            except Exception:
-                pass
-
+        result, messages_after = self._build_compact_result(new_summary, to_keep)
+        self._notify_compaction_metric(len(messages), messages_after, len(new_summary), _start)
         return result
 
     async def _do_compact_async(self, state: dict[str, Any]) -> dict[str, Any] | None:
@@ -236,27 +213,52 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
         if not new_summary:
             return None
 
-        pruned_keep = self._prune_tool_outputs(to_keep)
-
-        result = {
-            "messages": [
-                _make_remove_all(),
-                SystemMessage(content=self.SUMMARY_HEADER + new_summary),
-                *pruned_keep,
-            ],
-            "summary": new_summary,
-        }
-
-        # 自动触发的压缩指标回调
-        if self._on_compaction is not None:
-            messages_after = len(pruned_keep) + 1  # +1 for summary SystemMessage
-            duration_ms = (time.time() - _start) * 1000
-            try:
-                self._on_compaction("auto", len(messages), messages_after, len(new_summary), duration_ms)
-            except Exception:
-                pass
-
+        result, messages_after = self._build_compact_result(new_summary, to_keep)
+        self._notify_compaction_metric(len(messages), messages_after, len(new_summary), _start)
         return result
+
+    def _build_compact_result(
+        self, new_summary: str, to_keep: list[AnyMessage]
+    ) -> tuple[dict[str, Any], int]:
+        """构造压缩结果：REMOVE_ALL 标记 + 摘要 SystemMessage + Prune 后的保留消息。
+
+        Args:
+            new_summary: 生成的增量摘要文本
+            to_keep: 待保留的近期消息列表
+
+        Returns:
+            (状态更新字典, 压缩后消息数 messages_after)
+        """
+        pruned_keep = self._prune_tool_outputs(to_keep)
+        return (
+            {
+                "messages": [
+                    # REMOVE_ALL_MESSAGES 先清空，再写入压缩后的消息
+                    # 这样 checkpoint 中旧消息被彻底移除，不再占用存储
+                    _make_remove_all(),
+                    SystemMessage(content=self.SUMMARY_HEADER + new_summary),
+                    *pruned_keep,
+                ],
+                "summary": new_summary,
+            },
+            len(pruned_keep) + 1,  # +1 for summary SystemMessage
+        )
+
+    def _notify_compaction_metric(
+        self,
+        messages_before: int,
+        messages_after: int,
+        summary_length: int,
+        start: float,
+    ) -> None:
+        """自动触发的压缩指标回调（失败不影响压缩主流程，记录后继续）。"""
+        if self._on_compaction is None:
+            return
+        duration_ms = (time.time() - start) * 1000
+        try:
+            self._on_compaction("auto", messages_before, messages_after, summary_length, duration_ms)
+        except Exception as error:
+            logger.warning("压缩指标回调失败: %s", error)
 
     # ============ 增量摘要 ============
 
@@ -381,7 +383,7 @@ def _make_remove_all():
 
 
 __all__ = [
-    "LCAgentState",
     "CompactionConfig",
     "LCAgentCompactionMiddleware",
+    "LCAgentState",
 ]

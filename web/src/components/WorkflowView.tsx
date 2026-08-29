@@ -10,7 +10,7 @@ import {
   ChevronUp,
   ChevronDown,
 } from 'lucide-react'
-import { useStore } from '../store'
+import { useStore, selectIsStreaming } from '../store'
 import { WorkflowGraph } from './WorkflowGraph'
 import type { WorkflowInfo, WorkflowNode } from '../types'
 
@@ -36,6 +36,7 @@ const STATUS_TEXT: Record<WorkflowNode['status'], string> = {
   pending: '待执行',
   running: '执行中',
   done: '已完成',
+  error: '出错',
 }
 
 const STATUS_DESC: Record<WorkflowInfo['workflow_status'], string> = {
@@ -64,7 +65,7 @@ export function WorkflowView() {
   const fetchWorkflow = useStore((s) => s.fetchWorkflow)
   const fetchWorkflows = useStore((s) => s.fetchWorkflows)
   const newWorkflowThread = useStore((s) => s.newWorkflowThread)
-  const isStreaming = useStore((s) => s.isStreaming)
+  const isStreaming = useStore(selectIsStreaming)
   const [collapsed, setCollapsed] = useState(false)
   const [panelHeight, setPanelHeight] = useState(loadPanelHeight)
   const [isResizing, setIsResizing] = useState(false)
@@ -125,7 +126,12 @@ export function WorkflowView() {
           <select
             className="workflow-select"
             value={selectValue}
-            onChange={(e) => fetchWorkflow(e.target.value, true)}
+            disabled={isStreaming}
+            onChange={(e) => {
+              const name = e.target.value
+              fetchWorkflow(name, true)
+              newWorkflowThread(name)
+            }}
             title="切换工作流"
           >
             {workflows.map((w) => (

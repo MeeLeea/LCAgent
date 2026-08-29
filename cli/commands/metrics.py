@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .types import CommandContext, CommandOutcome, HANDLED
+from .types import HANDLED, CommandContext, CommandOutcome
 
 
 def show_metrics(context: CommandContext) -> CommandOutcome:
@@ -29,12 +29,12 @@ def show_metrics(context: CommandContext) -> CommandOutcome:
     context.print("=" * 50)
 
     # 会话概览
-    context.print(f"\n--- 会话概览 ---")
+    context.print("\n--- 会话概览 ---")
     context.print(f"运行时长:   {session['duration_seconds']:.1f}s")
     context.print(f"Turn 次数:  {session['turn_count']}")
 
     # LLM 指标
-    context.print(f"\n--- LLM 调用统计 ---")
+    context.print("\n--- LLM 调用统计 ---")
     context.print(f"总调用次数:     {llm['total_calls']}")
     context.print(f"总 prompt tokens:    {llm['total_prompt_tokens']:,}")
     context.print(f"总 completion tokens: {llm['total_completion_tokens']:,}")
@@ -45,7 +45,7 @@ def show_metrics(context: CommandContext) -> CommandOutcome:
     context.print(f"总耗时:         {llm['total_duration_ms']:.0f}ms")
 
     if llm["by_provider"]:
-        context.print(f"\n  按 Provider 分组:")
+        context.print("\n  按 Provider 分组:")
         for provider, stats in llm["by_provider"].items():
             context.print(f"  [{provider}]")
             context.print(f"    调用次数: {stats['count']}")
@@ -53,12 +53,12 @@ def show_metrics(context: CommandContext) -> CommandOutcome:
             context.print(f"    耗时:     {stats['total_ms']:.0f}ms")
 
     # 工具指标
-    context.print(f"\n--- 工具执行统计 ---")
+    context.print("\n--- 工具执行统计 ---")
     context.print(f"总调用次数: {tools['total_calls']}")
     context.print(f"总耗时:     {tools['total_duration_ms']:.0f}ms")
 
     if tools["by_name"]:
-        context.print(f"\n  按工具分组:")
+        context.print("\n  按工具分组:")
         for name, stats in sorted(tools["by_name"].items(), key=lambda x: x[1]["total_ms"], reverse=True):
             context.print(f"  [{name}]")
             context.print(f"    调用次数: {stats['count']}")
@@ -69,7 +69,7 @@ def show_metrics(context: CommandContext) -> CommandOutcome:
                 context.print(f"    超时次数: {stats['timeouts']}")
 
     # 压缩指标
-    context.print(f"\n--- 压缩统计 ---")
+    context.print("\n--- 压缩统计 ---")
     context.print(f"触发次数:       {compaction['total_count']}")
     if compaction["total_count"] > 0:
         context.print(f"压缩前消息总数: {compaction['total_messages_before']}")
@@ -104,5 +104,5 @@ def metrics_command(context: CommandContext, user_input: str) -> CommandOutcome:
         context.print("\n指标已重置")
         return HANDLED
 
-    context.print(f"\n用法: metrics[:status|:reset]")
+    context.print("\n用法: metrics[:status|:reset]")
     return HANDLED

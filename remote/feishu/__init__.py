@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 
 from .remote_agent_control import run_remote_bot
 

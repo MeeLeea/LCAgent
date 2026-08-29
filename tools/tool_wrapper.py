@@ -16,15 +16,17 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, Dict, List, Set
+from inspect import signature as _signature
+from typing import Any
 
+from langchain_core.runnables.config import RunnableConfig
 from langchain_core.tools import BaseTool
 
 # 全局默认超时（秒）
 DEFAULT_TIMEOUT: float = 60.0
 
 # 按工具名覆盖超时（优先于全局默认）
-TOOL_TIMEOUTS: Dict[str, float] = {
+TOOL_TIMEOUTS: dict[str, float] = {
     "ask_human": 600.0,       # 人工交互，给 10 分钟
     "schedule_task": 120.0,   # 调度器可能需要更长
     "search": 90.0,           # 搜索可能需要多次请求
@@ -32,7 +34,7 @@ TOOL_TIMEOUTS: Dict[str, float] = {
 
 # 完全排除超时的工具（无限等待）
 # 目前为空，ask_human 通过 TOOL_TIMEOUTS 给了 600 秒上限
-NO_TIMEOUT_TOOLS: Set[str] = set()
+NO_TIMEOUT_TOOLS: set[str] = set()
 
 
 def _get_tool_timeout(tool: BaseTool, default_timeout: float | None = None) -> float | None:
@@ -81,15 +83,28 @@ def wrap_tool_with_timeout(tool: BaseTool, timeout: float | None = None) -> Base
     if getattr(tool, "_timeout_wrapped", False):
         return tool
 
-    async def _arun_with_timeout(*args: Any, **kwargs: Any) -> str:
+    # langchain-core >= 1.0: BaseTool.arun() 通过 _get_runnable_config_param() 按类型注解
+    # 检测 _arun 是否声明了 `config: RunnableConfig` 参数，只有声明了才会注入 config。
+    # 因此包装函数必须显式保留该注解（不能写成 *args/**kwargs），否则原始
+    # StructuredTool._arun(config 必填) 会报 “missing 1 required keyword-only argument: 'config'”。
+    # run_manager 同理显式透传，保持与原始 _arun 的调用契约一致。
+    async def _arun_with_timeout(
+        *args: Any,
+        config: RunnableConfig = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> str:
         try:
             if original_arun is not None:
-                coro = original_arun(*args, **kwargs)
+                coro = original_arun(*args, config=config, run_manager=run_manager, **kwargs)
             else:
                 # 同步工具放到线程池跑，再加超时
-                coro = asyncio.to_thread(original_run, *args, **kwargs)
+                run_kwargs = dict(kwargs)
+                if "config" in _signature(original_run).parameters:
+                    run_kwargs["config"] = config
+                coro = asyncio.to_thread(original_run, *args, **run_kwargs)
             return await asyncio.wait_for(coro, timeout=effective_timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # 不导入 ToolTimeoutError 以避免循环依赖（tool_wrapper ← agent ← tools）
             # 错误消息格式与 ToolTimeoutError 保持一致
             timeout_msg = f"工具 '{tool_name}' 执行超时（{effective_timeout}秒）"
@@ -111,9 +126,9 @@ def wrap_tool_with_timeout(tool: BaseTool, timeout: float | None = None) -> Base
 
 
 def wrap_tools_with_timeout(
-    tools: List[BaseTool],
+    tools: list[BaseTool],
     default_timeout: float | None = None,
-) -> List[BaseTool]:
+) -> list[BaseTool]:
     """批量包装工具列表
 
     Args:
@@ -129,8 +144,8 @@ def wrap_tools_with_timeout(
 
 __all__ = [
     "DEFAULT_TIMEOUT",
-    "TOOL_TIMEOUTS",
     "NO_TIMEOUT_TOOLS",
+    "TOOL_TIMEOUTS",
     "wrap_tool_with_timeout",
     "wrap_tools_with_timeout",
 ]

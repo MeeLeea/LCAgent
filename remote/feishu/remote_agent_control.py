@@ -9,28 +9,35 @@ LangChainAgent 飞书远程控制机器人 (lark-oapi v2)
 
 from __future__ import annotations
 
-import asyncio, json, logging, os, re, subprocess, sys, threading, traceback
-from typing import Any, Dict, Optional
+import asyncio
+import json
+import logging
+import os
+import re
+import subprocess
+import sys
+import threading
+import traceback
+from typing import Any
 
-import pyautogui
 import lark_oapi as lark
+import pyautogui
 from lark_oapi.api.im.v1.model.create_file_request import CreateFileRequest
 from lark_oapi.api.im.v1.model.create_file_request_body import CreateFileRequestBody
 from lark_oapi.api.im.v1.model.create_image_request import CreateImageRequest
 from lark_oapi.api.im.v1.model.create_image_request_body import CreateImageRequestBody
 from lark_oapi.api.im.v1.model.create_message_request import CreateMessageRequest
 from lark_oapi.api.im.v1.model.create_message_request_body import CreateMessageRequestBody
-from lark_oapi.api.im.v1.processor import P2ImMessageReceiveV1Processor
 from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
 from lark_oapi.ws import Client as LarkWSClient
 
 # ── 项目路径 ──
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, BASE_DIR)
-from main import BASE_DIR as _, LLM_FILE, AGENT_CONFIG_FILE, MEMORY_FILE, CHECKPOINT_FILE, build_agent  # noqa: E402
+from main import LLM_FILE, build_agent
 
 REMOTE_CONFIG_FILE = os.path.join(BASE_DIR, "config", "remote_control.json")
-REMOTE_THREAD_FILE = os.path.join(BASE_DIR, "memory", "remote_thread_id.txt")
+REMOTE_THREAD_FILE = os.path.join(BASE_DIR, "data", "remote_thread_id.txt")
 
 logger = logging.getLogger(__name__)
 
@@ -49,14 +56,30 @@ APP_ID, APP_SECRET, ALLOW_OPEN_ID, AGENT_PROVIDER = _load_remote_config()
 _http = lark.Client.builder().app_id(APP_ID).app_secret(APP_SECRET).log_level(lark.LogLevel.ERROR).build()
 
 # ── 全局状态 ──
-_agent: Optional[Any] = None
+_agent: Any | None = None
 _agent_lock = threading.Lock()
-_agent_info: Dict[str, Any] = {}
+_agent_info: dict[str, Any] = {}
 _processing: set[str] = set()
 _processing_lock = threading.Lock()
 _interrupt_cache: dict[str, dict] = {}
 _model_menu_cache: dict[str, list[tuple[str, str]]] = {}
 _seen_msg: set[str] = set()
+_agent_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _start_agent_loop() -> asyncio.AbstractEventLoop:
+    """确保存在一个专属长驻事件循环线程，Agent 所有 async 操作都在其上运行。"""
+    global _agent_loop
+    if _agent_loop is None or _agent_loop.is_closed():
+        _agent_loop = asyncio.new_event_loop()
+        threading.Thread(target=_agent_loop.run_forever, name="agent-loop", daemon=True).start()
+    return _agent_loop
+
+
+def _run_on_agent_loop(coro_factory, timeout: float = 300.0):
+    """在专属 agent loop 上执行 async 操作并同步等待结果。"""
+    loop = _start_agent_loop()
+    return asyncio.run_coroutine_threadsafe(coro_factory(), loop).result(timeout=timeout)
 
 # ===================== 消息发送 =====================
 
@@ -70,8 +93,8 @@ def _send_lark_msg(chat_id: str, msg_type: str, content: dict) -> None:
                           .content(json.dumps(content)).msg_type(msg_type).receive_id(chat_id).build())
             .build()
         )
-    except Exception as e:
-        logger.error("飞书发送失败: %s", e, exc_info=True)
+    except Exception:
+        logger.exception("飞书发送失败")
 
 _send_text = lambda c, t: _send_lark_msg(c, "text", {"text": t})
 
@@ -115,7 +138,7 @@ def _send_file(chat_id: str, path: str) -> bool:
         if not os.path.isfile(path):
             return _send_text(chat_id, f"❌ 文件不存在: {path}")
         if os.path.getsize(path) > 100 * 1024 * 1024:
-            return _send_text(chat_id, f"❌ 文件过大，上限 100MB")
+            return _send_text(chat_id, "❌ 文件过大，上限 100MB")
         with open(path, "rb") as f:
             resp = _http.im.v1.file.create(
                 CreateFileRequest.builder()
@@ -135,7 +158,7 @@ def _send_file(chat_id: str, path: str) -> bool:
 # ===================== Agent 生命周期 =====================
 
 def _auto_detect_provider() -> str:
-    from agent.llm_client import load_providers
+    from llm.llm_client import load_providers
     providers = load_providers(LLM_FILE)
     if not providers:
         logger.warning("无 provider，回退 zhipu")
@@ -160,52 +183,30 @@ def _has_api_key(key: str) -> bool:
         return False
 
 def start_agent() -> str:
-    """初始化或重启 Agent。在独立线程中运行以避免 asyncio 事件循环冲突。"""
+    """初始化或重启 Agent，在专属长驻事件循环中构造异步资源。"""
     global _agent, _agent_info
     try:
-        # 在独立线程中构建 Agent，解决 MCP 加载的 asyncio.run() 与 WS 事件循环冲突
-        result_container: list[tuple] = []
-        error_container: list[Exception] = []
-
-        def _build():
+        async def _astart_agent():
+            agent, llm = await build_agent(_auto_detect_provider(), process_type="feishu")
+            agent.verbose = False
+            # 非交互环境：危险命令确认改为通过 LangGraph interrupt 抛给飞书交互，而不是终端 input()
+            import tools.safety as _safety
+            _safety.set_confirm_backend(_safety.interrupt_confirm)
+            tid = _load_remote_thread_id()
+            if tid:
+                await agent.session.aswitch_session(tid)
+                agent.set_current_session(tid)
+            else:
+                _save_remote_thread_id(agent.session.current_session_id)
+            # 主动修复可能残留的孤儿 tool_calls（上次中断可能遗留）
             try:
-                # 为 MCP 异步加载创建独立事件循环
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                tid = _load_remote_thread_id()
-                agent, llm = build_agent(_auto_detect_provider(), process_type="feishu")
-                agent.verbose = False
-                # 非交互环境：危险命令确认改为通过 LangGraph interrupt 抛给飞书交互，而不是终端 input()
-                import tools.safety as _safety
-                _safety.set_confirm_backend(_safety.interrupt_confirm)
-                if tid:
-                    agent.memory.switch_thread(tid)
-                else:
-                    _save_remote_thread_id(agent.memory.thread_id)
-                # 主动修复可能残留的孤儿 tool_calls（上次中断可能遗留）
-                try:
-                    loop.run_until_complete(
-                        agent._arepair_rejected_tool_calls(agent._invoke_config())
-                    )
-                    agent._clear_pending_interrupt()
-                except Exception as error:
-                    logger.warning("修复孤儿 tool_call 失败: %s", error, exc_info=True)
-                result_container.append((agent, llm, agent.memory.thread_id))
-            except Exception as e:
-                error_container.append(e)
-            finally:
-                loop.close()
+                await agent._arepair_rejected_tool_calls(agent._invoke_config())
+                await agent._aclear_pending_interrupt()
+            except Exception as error:
+                logger.warning("修复孤儿 tool_call 失败: %s", error, exc_info=True)
+            return agent, llm, agent.session.current_session_id
 
-        t = threading.Thread(target=_build, daemon=True)
-        t.start()
-        t.join(timeout=30)
-
-        if error_container:
-            raise error_container[0]
-        if not result_container:
-            raise RuntimeError("Agent 初始化超时（30s）")
-
-        agent, llm, tid = result_container[0]
+        agent, llm, tid = _run_on_agent_loop(_astart_agent, timeout=30)
         with _agent_lock:
             _agent = agent
             _agent_info = {"provider": llm.provider, "model": llm.model, "status": "running"}
@@ -230,9 +231,9 @@ def _save_remote_thread_id(tid: str) -> None:
 # ===================== 文件自动发送 =====================
 
 _FIND_PATTERNS = [
-    (re.compile(r"""(?:['"\s]|^)([\w\-\\\/:.]+\.(?:png|jpg|jpeg|gif|bmp))(?:['"\s]|$)""", re.I), _send_image_file),
+    (re.compile(r"""(?:['"\s]|^)([\w\-\\\/:.]+\.(?:png|jpg|jpeg|gif|bmp))(?:['"\s]|$)""", re.IGNORECASE), _send_image_file),
     (re.compile(r"""(?:['"\s]|^)([\w\-\\\/:.]+\.(?:pdf|docx?|xlsx?|pptx?|txt|csv|log|json|
-        yaml|yml|py|js|ts|html|css|zip|rar|7z|tar|gz|exe|msi))(?:['"\s]|$)""", re.I | re.X), _send_file),
+        yaml|yml|py|js|ts|html|css|zip|rar|7z|tar|gz|exe|msi))(?:['"\s]|$)""", re.IGNORECASE | re.VERBOSE), _send_file),
 ]
 
 def _auto_send_files(chat_id: str, text: str) -> int:
@@ -251,9 +252,11 @@ def _auto_send_files(chat_id: str, text: str) -> int:
 
 def _clear_pending_interrupt(agent: Any) -> None:
     """清理未完成的中断，确保 checkpoint 干净。"""
+    async def _cleanup():
+        await agent._arepair_rejected_tool_calls(agent._invoke_config())
+        await agent._aclear_pending_interrupt()
     try:
-        asyncio.run(agent._arepair_rejected_tool_calls(agent._invoke_config()))
-        agent._clear_pending_interrupt()
+        _run_on_agent_loop(_cleanup, timeout=60)
     except Exception as e:
         logger.warning("中断清理失败: %s", e, exc_info=True)
     _interrupt_cache.clear()
@@ -304,8 +307,12 @@ def _resume_interrupt(chat_id: str, content: str) -> None:
     else:
         payload = {"text": content}
     try:
-        _handle_turn_result(chat_id, agent, asyncio.run(agent.aresume_structured(payload)),
-                            getattr(agent, "_pending_interrupt_mode", "chat"))
+        async def _resume_with_mode():
+            mode = await agent._get_store().aget_interrupt_mode(agent.session.current_session_id)
+            turn = await agent.aresume_structured(payload)
+            return turn, mode or "chat"
+        turn, interrupt_mode = _run_on_agent_loop(_resume_with_mode)
+        _handle_turn_result(chat_id, agent, turn, interrupt_mode)
     except Exception as e:
         _send_text(chat_id, f"❌ 恢复失败: {e}")
         _clear_pending_interrupt(agent)
@@ -324,28 +331,28 @@ HELP_TEXT = (
 def _handle_threads(chat_id: str, arg: str = "") -> None:
     agent = get_agent()
     if not agent: return _send_text(chat_id, "⚠️ 请先启动agent")
-    mem = agent.memory
+    sess = agent.session
 
     if not arg or arg == "列表":
-        threads = mem.list_threads()
-        cur = mem.thread_id
+        threads = _run_on_agent_loop(lambda: sess.alist_sessions())
+        cur = sess.current_session_id
         if not threads:
             return _send_text(chat_id, "没有已保存的会话")
         lines = [f"📋 {len(threads)} 个会话：", ""]
         for t in threads:
-            msgs = len(mem.get_messages()) if t == cur else 0  # 只统计当前线程
+            _ = len(_run_on_agent_loop(sess.aget_messages)) if t == cur else 0  # 只统计当前线程
             lines.append(f"  • {t}{' ← 当前' if t == cur else ''}")
         _send_text(chat_id, "\n".join(lines))
     elif arg.startswith("切换 "):
         tid = arg.split(maxsplit=1)[1].strip()
-        if mem.switch_thread(tid):
+        if _run_on_agent_loop(lambda: sess.aswitch_session(tid)):
             _save_remote_thread_id(tid)
             _send_text(chat_id, f"✅ 已切换到 {tid}")
         else:
             _send_text(chat_id, f"⚠️ 会话不存在: {tid}，发送「会话列表」查看")
     else:
-        lines = [f"📋 当前: {mem.thread_id}", f"  总会话数: {len(mem.list_threads())}"]
-        info = mem.summarize()
+        lines = [f"📋 当前: {sess.current_session_id}", f"  总会话数: {len(_run_on_agent_loop(lambda: sess.alist_sessions()))}"]
+        info = _run_on_agent_loop(sess.asummarize)
         lines.append(f"  当前消息数: {info.get('checkpoint_messages', 0)}")
         _send_text(chat_id, "\n".join(lines))
 
@@ -354,10 +361,14 @@ def _handle_status(chat_id: str) -> None:
     if not info: return _send_text(chat_id, "Agent 未启动")
     if info["status"] == "error": return _send_text(chat_id, f"❌ {info.get('error')}")
     agent = get_agent()
-    _send_text(chat_id, (
-        f"📊 {info['status']} | {info.get('provider')} / {info.get('model')}"
-        + (f" | 工具:{len(agent.tools)} 步骤:{len(agent.execution_history)}" if agent else "")
-    ))
+    extra = ""
+    if agent:
+        try:
+            history = _run_on_agent_loop(lambda: agent.session_manager.aget_execution_history(), timeout=5)
+            extra = f" | 工具:{len(agent.tools)} 步骤:{len(history)}"
+        except Exception:
+            extra = f" | 工具:{len(agent.tools)}"
+    _send_text(chat_id, f"📊 {info['status']} | {info.get('provider')} / {info.get('model')}{extra}")
 
 def _handle_stop(chat_id: str) -> None:
     if chat_id in _interrupt_cache:
@@ -372,7 +383,7 @@ def _handle_model_menu(chat_id: str, inp: str = "") -> None:
     agent = get_agent()
     if not agent: return _send_text(chat_id, "⚠️ 请先启动agent")
     if not inp:  # 列出菜单
-        from agent.llm_client import load_providers
+        from llm.llm_client import load_providers
         try: providers = load_providers(LLM_FILE)
         except Exception as e: return _send_text(chat_id, f"❌ {e}")
         flat = [(k, m) for k, v in providers.items() for m in v.get("models", [])]
@@ -398,13 +409,20 @@ def _handle_model_menu(chat_id: str, inp: str = "") -> None:
 def _do_switch(chat_id: str, agent, pk: str, mn: str) -> None:
     old = f"{agent.llm.provider}: {agent.llm.model}"
     try:
-        if agent.llm.provider != pk:
-            from cli.commands.provider import create_llm
-            agent.llm = create_llm(pk, LLM_FILE)
-            if agent.llm.model != mn: agent.llm.switch_model(mn)
-        else:
-            agent.llm.switch_model(mn)
-        agent.agent_executor = agent._create_agent_executor()
+        def _switch() -> None:
+            if agent.llm.provider != pk:
+                from cli.commands.provider import create_llm
+                # 采样参数由 LLMClient 内部从全局 agent_config.json 读取，无需外部传参
+                agent.llm = create_llm(pk, LLM_FILE)
+                if agent.llm.model != mn: agent.llm.switch_model(mn)
+            else:
+                agent.llm.switch_model(mn)
+            agent.agent_executor = agent._create_agent_executor()
+
+        async def _switch_async() -> None:
+            _switch()
+
+        _run_on_agent_loop(lambda: _switch_async())
         with _agent_lock: _agent_info.update(provider=agent.llm.provider, model=agent.llm.model)
         _send_text(chat_id, f"✅ {old} → {pk}: {mn}")
     except Exception as e:
@@ -426,7 +444,7 @@ def _agent_task(chat_id: str, method: str, payload: str) -> None:
             agent = get_agent()
             if not agent: return _send_text(chat_id, "⚠️ 请先启动agent")
             _clear_pending_interrupt(agent)
-            turn = asyncio.run(agent.arun_structured(payload)) if method == "run" else asyncio.run(agent.achat_structured(payload))
+            turn = _run_on_agent_loop(lambda: agent.arun_structured(payload)) if method == "run" else _run_on_agent_loop(lambda: agent.achat_structured(payload))
             _handle_turn_result(chat_id, agent, turn, method)
         except Exception as e:
             _send_text(chat_id, f"❌ {e}")
@@ -490,7 +508,7 @@ def _dispatch(chat_id: str, content: str) -> None:
         p = content.split(maxsplit=1)[1] if " " in content else ""
         return _send_file(chat_id, p) if p else _send_text(chat_id, "用法: 文件 <路径>")
     if low.startswith("cmd "):                     return _exec_cmd_or_ps(chat_id, content[4:].strip(), True)
-    if low.startswith("ps ") or low.startswith("ps\n"):
+    if low.startswith(("ps ", "ps\n")):
         return _exec_cmd_or_ps(chat_id, content[3:].strip(), False)
     if low in ("帮助", "help", "?", "？"):         return _send_text(chat_id, HELP_TEXT)
 
@@ -518,7 +536,7 @@ def _dispatch(chat_id: str, content: str) -> None:
 # ===================== 入口 =====================
 
 def run_remote_bot() -> None:
-    from agent.logging_config import setup_logging
+    from utils.logging_config import setup_logging
     setup_logging()
     # 启动 banner（保持 print，面向用户）
     print("=" * 45, "\n  LangChainAgent 飞书远程控制", "\n" + "=" * 45)

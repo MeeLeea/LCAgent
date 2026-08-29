@@ -36,7 +36,7 @@ SQLite (status=pending) ◄─── 共享数据库 ────► 线程池 (
 ```
 
 - **逻辑 A（对话阶段）**：Agent 解析用户意图，算出 `execute_time` 或 `cron_expr`，调用 `schedule_task` 工具写入 SQLite，然后直接回复"任务已登记"。Agent 不等待、不 sleep。
-- **逻辑 B（后台调度）**：独立的调度器进程周期性查询数据库中到期的一次性任务，通过原子抢占后提交到线程池并发执行。周期任务由 APScheduler 的 CronTrigger 在精确时间点触发。executor 根据任务文本自动路由：以 `workflow:` 开头的任务调用多 Agent 工作流执行，其余通过 `agent_factory` 创建新的 AgentCore 实例执行。
+- **逻辑 B（后台调度）**：独立的调度器进程周期性查询数据库中到期的一次性任务，通过原子抢占后提交到线程池并发执行。周期任务由 APScheduler 的 CronTrigger 在精确时间点触发。executor 根据任务文本自动路由：以 `workflow:` 开头的任务调用多 Agent 工作流执行，其余通过 `agent_factory` 创建新的 AgentCore 实例，经 SessionManager.arun() 执行（三层架构：Agent 执行 → Session 调度 → Memory 沉淀）。
 
 ## 模块结构
 
@@ -44,7 +44,7 @@ SQLite (status=pending) ◄─── 共享数据库 ────► 线程池 (
 scheduler/
 ├── __init__.py      # 包导出（TaskStore, execute_task, SchedulerEngine）
 ├── store.py         # SQLite 持久化层（CRUD + 原子抢占 + 重试逻辑）
-├── executor.py      # 执行桥接（agent_factory → AgentCore.run()）
+├── executor.py      # 执行桥接（agent_factory → SessionManager.arun()）
 ├── engine.py        # APScheduler 调度引擎（轮询 + cron + 线程池）
 └── run.py           # 独立进程入口（读 config/scheduler_config.json）
 
@@ -61,7 +61,7 @@ config/
 | 模块 | 职责 |
 |------|------|
 | `store.py` | SQLite 任务存储，线程安全。提供 CRUD、到期查询、原子抢占（`claim_task`）、失败重试回退 |
-| `executor.py` | 桥接函数 `execute_task(task, agent_factory)`，自动判断任务类型：以 `workflow:` 开头的路由到多 Agent 工作流（`run_workflow_by_name`），其余调用 `agent_factory()` 创建 Agent 实例后执行 `agent.run(task_text)`，捕获所有异常 |
+| `executor.py` | 桥接函数 `execute_task(task, agent_factory)`，自动判断任务类型：以 `workflow:` 开头的路由到多 Agent 工作流（`run_workflow_by_name`），其余调用 `agent_factory()` 创建 Agent 实例后通过 `session_manager.arun(task_text)` 执行（三层架构），捕获所有异常 |
 | `engine.py` | 调度核心。一次性任务通过 `IntervalTrigger` 轮询，周期任务通过 `CronTrigger` 精确触发。到期任务提交到 `ThreadPoolExecutor` 并发执行 |
 | `run.py` | 命令行入口。加载配置文件 → 构造 `agent_factory` → 预加载 `team` 模块触发 Agent/工作流注册 → 启动 `SchedulerEngine`（阻塞模式） |
 | `scheduler_tool.py` | 三个 `@tool` 函数供 Agent 在对话中调用：`schedule_task`、`list_scheduled_tasks`、`cancel_scheduled_task` |
@@ -74,7 +74,7 @@ config/
 
 ```json
 {
-    "db_path": "memory/scheduled_tasks.sqlite",
+    "db_path": "data/scheduled_tasks.sqlite",
     "poll_interval": 30,
     "timezone": "Asia/Shanghai",
     "max_retries": 3,
@@ -86,7 +86,7 @@ config/
 
 | 字段 | 说明 | 默认值 |
 |------|------|--------|
-| `db_path` | SQLite 数据库路径，相对路径锚定项目根 | `memory/scheduled_tasks.sqlite` |
+| `db_path` | SQLite 数据库路径，相对路径锚定项目根 | `data/scheduled_tasks.sqlite` |
 | `poll_interval` | 一次性任务轮询间隔（秒） | `30` |
 | `timezone` | cron 触发器时区 | `Asia/Shanghai` |
 | `max_retries` | 单次任务最大重试次数 | `3` |
@@ -116,7 +116,7 @@ all_tools = [
 ```python
 from tools.scheduler_tool import configure
 
-configure(db_path="memory/scheduled_tasks.sqlite")
+configure(db_path="data/scheduled_tasks.sqlite")
 ```
 
 ### 4. 启动调度器
@@ -139,7 +139,7 @@ python -m scheduler.run
 [Scheduler] LLM 已就绪: zhipu / glm-4-flash
 [Scheduler] 已注册 Agent: cmodeler, manager, reviewer, spec_analyst, terminator, verifier, worker
 [Scheduler] 可用工作流: pipline, simple, systemc_cmodel
-[Scheduler] 数据库: .../memory/scheduled_tasks.sqlite
+[Scheduler] 数据库: .../data/scheduled_tasks.sqlite
 [Scheduler] 任务执行线程池已创建（max_workers=5）
 [Scheduler] 已注册一次性任务轮询（间隔 30s）
 [Scheduler] 调度引擎已启动
@@ -390,7 +390,7 @@ schedule_task(
 
 ```python
 from scheduler import TaskStore, SchedulerEngine
-from agent.llm_client import LLMClient
+from llm.llm_client import LLMClient
 from agent import AgentCore
 
 # 1. 准备 agent_factory
@@ -400,7 +400,7 @@ def agent_factory():
     return AgentCore(llm_client=llm, name="LCAgent", ...)
 
 # 2. 创建引擎（非阻塞模式，嵌入主进程后台线程）
-store = TaskStore("memory/scheduled_tasks.sqlite")
+store = TaskStore("data/scheduled_tasks.sqlite")
 engine = SchedulerEngine(
     task_store=store,
     agent_factory=agent_factory,
@@ -428,7 +428,7 @@ engine.stop()
 
 ## 数据库表结构
 
-`memory/scheduled_tasks.sqlite` 中的 `scheduled_tasks` 表：
+`data/scheduled_tasks.sqlite` 中的 `scheduled_tasks` 表：
 
 | 字段 | 类型 | 说明 |
 |------|------|------|

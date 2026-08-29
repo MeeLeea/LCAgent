@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .types import CommandContext, CommandOutcome, HANDLED, JsonValue
+from .types import HANDLED, CommandContext, CommandOutcome, JsonValue
 
 
 def show_safety(context: CommandContext) -> CommandOutcome:

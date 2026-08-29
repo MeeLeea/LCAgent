@@ -9,13 +9,11 @@
 """
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
 import os
 from typing import TYPE_CHECKING
 
-from agent.llm_client import LLMClient
+from llm.llm_client import LLMClient
 
 if TYPE_CHECKING:
     from agent.agent_core import AgentCore
@@ -91,8 +89,8 @@ async def arebuild_agent_from_team_dir(
     扫描 team/ 定位目标角色目录,读取其 agent_config.json 与 AGENT.md,
     复用现有构建链把主 AgentCore 切换为该角色的提示词/LLM:
 
-    - 仅提示词变化 → 走 _update_system_prompt(),不重建 Graph(约快 100x)
-    - provider/model 变化 → 重建 LLMClient 并走 _arebuild_agent_executor()
+    - 仅提示词变化 → 重建 executor（system_prompt 已改为静态字符串）
+    - provider/model 变化 → 重建 LLMClient 并重建 executor
 
     整个过程就地修改传入的 AgentCore 实例,不返回新对象。
 
@@ -113,7 +111,7 @@ async def arebuild_agent_from_team_dir(
     prompt_path = os.path.join(role_dir, "AGENT.md")
 
     # 2. 读取角色配置与提示词(复用现有能力)
-    from agent.config import load_agent_config
+    from llm.config import load_agent_config
     from team.base import TeamAgent
 
     config = load_agent_config(config_path)
@@ -124,20 +122,23 @@ async def arebuild_agent_from_team_dir(
     # 剥离 ## workflow:* 小节,只取角色系统提示词
     role_prompt, _templates = TeamAgent.parse_prompt_sections(content)
 
-    # provider/model 不在 load_agent_config 的 DEFAULTS 白名单内,
-    # 需从原始 JSON 直接读取(缺省则沿用当前 LLM)
-    def _read_raw_cfg() -> dict:
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return {}
-
-    raw_cfg: dict = await asyncio.to_thread(_read_raw_cfg)
-
+    # provider/model 经 load_agent_config 的 cfg.update(data) 透传(cfg 不过滤键)，
+    # 直接读取即可。
     # 3. 判断是否需要切换 LLM(provider/model 变化)
-    target_provider = (raw_cfg.get("provider") or agent.llm.provider).lower()
-    target_model = raw_cfg.get("model") or agent.llm.model
+    #    目标 provider：角色显式配置优先，否则沿用当前 LLM 的 provider。
+    target_provider = (config.get("provider") or agent.llm.provider).lower()
+    #    目标 model：角色显式配置优先；未配置时回退到「目标 provider」在
+    #    llm_config.json 中声明的默认 model，而非沿用当前 LLM 的 model。
+    #    否则从 yunwu(qwen3.7-max) 切到 zhipu(model=null) 时，会把旧 provider 的
+    #    model 误带到新 provider，触发网关 400「modelCode：不存在」。
+    configured_model = config.get("model")
+    if configured_model:
+        target_model = configured_model
+    else:
+        from llm.llm_client import load_providers
+
+        _providers = load_providers(agent.llm.config_file)
+        target_model = _providers.get(target_provider, {}).get("model")
     llm_changed = (
         target_provider != agent.llm.provider or target_model != agent.llm.model
     )
@@ -150,17 +151,21 @@ async def arebuild_agent_from_team_dir(
 
         if llm_changed:
             # LLM 变化:重建 LLMClient + 重建 executor
+            # 采样参数来源：角色级 agent_config.json（load_agent_config 已合并 DEFAULTS，
+            # 未显式配置时自动落到 DEFAULTS 默认值）
+            temperature = config.get("temperature")
+            max_tokens = config.get("max_tokens")
             agent.llm = LLMClient(
                 provider=target_provider,
                 model=target_model,
                 config_file=agent.llm.config_file,
-                temperature=agent.llm.temperature,
-                max_tokens=agent.llm.max_tokens,
+                temperature=temperature,
+                max_tokens=max_tokens,
             )
-            await agent._arebuild_agent_executor(task)
+            await agent._arebuild_agent_executor()
         else:
-            # 仅提示词变化:更新系统提示词,不重建 Graph
-            agent._update_system_prompt(task)
+            # 仅提示词变化:重建 executor 以使用新的 system_prompt
+            await agent._arebuild_agent_executor()
 
     if agent.verbose:
         logger.info(

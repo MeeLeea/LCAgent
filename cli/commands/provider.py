@@ -6,11 +6,11 @@ import json
 import os
 import sys
 
-from .types import CommandContext, CommandOutcome, HANDLED, LlmLike
+from .types import HANDLED, CommandContext, CommandOutcome, LlmLike
 
 
 def select_provider(config_file: str, select_menu) -> str:
-    from agent.llm_client import load_providers
+    from llm.llm_client import load_providers
 
     providers = load_providers(config_file)
     # 环境变量和本地配置文件任一提供密钥，都应在菜单中标记为已配置。
@@ -27,16 +27,17 @@ def select_provider(config_file: str, select_menu) -> str:
 
 
 def create_llm(provider: str, config_file: str) -> LlmLike:
-    from agent.llm_client import LLMClient
+    from llm.llm_client import LLMClient
 
     try:
+        # 采样参数由 LLMClient 内部从全局 agent_config.json 读取，无需外部传参
         return LLMClient(provider=provider, config_file=config_file)
     except ValueError as error:
         print(f"\n错误: {error}")
         sys.exit(1)
 
 
-def switch_provider(context: CommandContext, user_input: str) -> CommandOutcome:
+async def switch_provider(context: CommandContext, user_input: str) -> CommandOutcome:
     # 无参数时进入菜单；带参数时直接切换，二者最终走同一替换流程。
     if user_input.lower() == "switch":
         providers = context.list_providers()
@@ -49,7 +50,7 @@ def switch_provider(context: CommandContext, user_input: str) -> CommandOutcome:
         new_provider = user_input[7:].strip().lower()
     try:
         new_llm = context.create_llm(new_provider)
-        context.replace_llm(new_llm)
+        await context.replace_llm(new_llm)
         info = context.agent.llm.get_info()
         context.print(f"\n已切换到: {info['provider_name']} ({info['model']})")
     except SystemExit:
@@ -59,7 +60,7 @@ def switch_provider(context: CommandContext, user_input: str) -> CommandOutcome:
     return HANDLED
 
 
-def choose_model(context: CommandContext) -> CommandOutcome:
+async def choose_model(context: CommandContext) -> CommandOutcome:
     info = context.agent.llm.get_info()
     models = context.agent.llm.list_models()
     selected = context.select_menu(
@@ -73,10 +74,10 @@ def choose_model(context: CommandContext) -> CommandOutcome:
     if selected == context.agent.llm.model:
         context.print(f"\n模型未变: {context.agent.llm.model}")
         return HANDLED
-    return _switch_model(context, str(selected))
+    return await _switch_model(context, str(selected))
 
 
-def switch_model(context: CommandContext, user_input: str) -> CommandOutcome:
+async def switch_model(context: CommandContext, user_input: str) -> CommandOutcome:
     low = user_input.lower()
     if low.startswith("model:"):
         new_model = user_input[6:].strip()
@@ -87,13 +88,13 @@ def switch_model(context: CommandContext, user_input: str) -> CommandOutcome:
         context.print("用法: model:<模型名>  或  model <模型名>")
         context.print("示例: model:glm-4-flash")
         return HANDLED
-    return _switch_model(context, new_model)
+    return await _switch_model(context, new_model)
 
 
-def _switch_model(context: CommandContext, model: str) -> CommandOutcome:
+async def _switch_model(context: CommandContext, model: str) -> CommandOutcome:
     try:
         context.agent.llm.switch_model(model)
-        context.replace_llm(context.agent.llm)
+        await context.replace_llm(context.agent.llm)
         info = context.agent.llm.get_info()
         context.print(f"\n已切换模型: {info['model']} (提供商: {info['provider_name']})")
     except (AttributeError, KeyError, RuntimeError, ValueError) as error:

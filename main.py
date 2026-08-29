@@ -4,29 +4,30 @@ LangChain Agent 项目入口 - 支持多提供商(智谱/千问/DeepSeek/Kimi) +
 
 from __future__ import annotations
 
+import asyncio
 import os
 
 try:
-    import readline
+    import readline  # noqa: F401 - 为交互式 CLI 提供历史/方向键支持
 except ImportError:
     pass
 
 from agent import AgentCore
-from agent.config import load_agent_config, resolve_path
-from agent.logging_config import setup_logging
-from tools import safety as safety_module
 from cli.cli_menu import select_menu
 from cli.commands import CommandContext, dispatch_command
 from cli.commands.core import show_ready
 from cli.commands.provider import create_llm, select_provider
 from cli.human_input import chat_until_completion, run_structured_until_completion
+from llm.config import load_agent_config, resolve_path
+from memory import MemoryContext
+from tools import safety as safety_module
+from utils.logging_config import setup_logging
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LLM_FILE = os.path.join(BASE_DIR, "config", "llm_config.json")
 MCP_CONFIG_FILE = os.path.join(BASE_DIR, "config", "mcp_servers.json")
 AGENT_CONFIG_FILE = os.path.join(BASE_DIR, "agent", "agent_config.json")
-MEMORY_FILE = os.path.join(BASE_DIR, "memory", "memory.json")
-CHECKPOINT_FILE = os.path.join(BASE_DIR, "memory", "checkpoints.sqlite")
+CHECKPOINT_FILE = os.path.join(BASE_DIR, "data", "checkpoints_async.sqlite")
 
 
 def render_print(value: str = "") -> None:
@@ -35,7 +36,7 @@ def render_print(value: str = "") -> None:
         print(line.strip())
 
 
-def build_agent(provider: str, process_type: str = None) -> tuple[AgentCore, object]:
+async def build_agent(provider: str, process_type: str | None = None) -> tuple[AgentCore, object]:
     """根据提供商和运行时配置初始化 LLM 与 Agent。
     
     Args:
@@ -43,9 +44,10 @@ def build_agent(provider: str, process_type: str = None) -> tuple[AgentCore, obj
         process_type: 进程类型标识(feishu/None)，用于多进程隔离。
                       CLI 模式传 None(单进程不需要隔离)
     """
-    from agent.llm_client import load_providers as list_providers
+    from llm.llm_client import load_providers as list_providers
     
     print(f"\n初始化 {list_providers(LLM_FILE)[provider]['name']} 客户端...")
+    # 采样参数由 LLMClient 内部从全局 agent_config.json 读取，无需外部传参
     llm = create_llm(provider, LLM_FILE)
     print("加载运行时配置...")
     config = load_agent_config(AGENT_CONFIG_FILE)
@@ -54,12 +56,18 @@ def build_agent(provider: str, process_type: str = None) -> tuple[AgentCore, obj
     skills_dir = resolve_path(config["skills_dir"], BASE_DIR)
     mcp_config_file = resolve_path(config["mcp_config_file"], BASE_DIR)
     print("初始化Agent(含MCP工具加载 + Checkpoint 持久化)...")
-    agent = AgentCore(
+    # 三层架构：先创建 MemoryContext（记忆基础设施），再创建 AgentCore（纯执行内核）
+    memory_ctx = await MemoryContext.acreate(
+        checkpoint_file=CHECKPOINT_FILE,
+        short_term_size=config["latest_msg_cnt"],
+        use_sqlite=True,
+        process_type=process_type,
+        llm_getter=lambda: llm,
+        # 记忆链路参数由 memory/config.py 统一管理，不再经 agent_config.json 配置
+    )
+    agent = await AgentCore.acreate(
         llm_client=llm,
         name=config["name"],
-        memory_size=config["memory_size"],
-        long_term_memory_file=MEMORY_FILE,
-        checkpoint_file=CHECKPOINT_FILE,
         max_iterations=config["max_iterations"],
         verbose=config["verbose"],
         mcp_config_file=mcp_config_file,
@@ -72,14 +80,31 @@ def build_agent(provider: str, process_type: str = None) -> tuple[AgentCore, obj
         agent_prompt_file=agent_prompt_file,
         max_execution_history=config.get("max_execution_history", 100),
         tool_timeout=config.get("tool_timeout", 120),
+        short_term_size=config.get("latest_msg_cnt", 10),
+        checkpointer=memory_ctx.checkpointer,
+        store=memory_ctx.store,
+        extra_middleware=[memory_ctx.read_middleware],
+        initial_thread_id=memory_ctx.thread_id,
+        async_conn=memory_ctx.async_conn,
     )
+    # 注入 MemoryManager → SessionManager 懒初始化时会自动接收
+    agent.set_memory_manager(memory_ctx.memory_manager)
+    agent._memory_context = memory_ctx  # 供 aclose 时关闭 SQLite 连接
+    # 动态绑定：记忆组件直接读取 agent 当前 LLM，切换 provider 后自动同步
+    memory_ctx.bind_llm(lambda: agent.llm)
     return agent, llm
 
 
 def make_context(agent: AgentCore) -> CommandContext:
     """组装命令分发器所需的运行时依赖。"""
-    from agent.llm_client import load_providers as list_providers
-    
+    from llm.llm_client import load_providers as list_providers
+    from session.manager import create_workflow_session_manager
+
+    # workflow 链路统一门面：与 chat 门面共享 SessionRegistry / MemoryManager，
+    # 使 workflow 命令经同一套锁/记忆/事件流设施执行。
+    mm = getattr(agent.session_manager, "memory", None)
+    workflow_sm = create_workflow_session_manager(agent.session, memory=mm)
+
     # 命令模块只依赖该上下文，便于在测试中替换输入、菜单、LLM 和安全后端。
     return CommandContext(
         agent=agent,
@@ -94,10 +119,11 @@ def make_context(agent: AgentCore) -> CommandContext:
         run_structured_until_completion=run_structured_until_completion,
         chat_until_completion=chat_until_completion,
         safety_backend=safety_module,
+        workflow_sm=workflow_sm,
     )
 
 
-def main() -> None:
+async def main() -> None:
     """运行交互式命令行主循环。"""
     setup_logging()
     # 启动 banner（保持 print，面向用户）
@@ -105,26 +131,33 @@ def main() -> None:
     print("  LC Agent (基于LangChain框架)")
     print("=" * 50)
     provider = select_provider(LLM_FILE, select_menu)
-    agent, _ = build_agent(provider)
+    agent, _ = await build_agent(provider)
     context = make_context(agent)
     show_ready(context)
 
-    while True:
-        try:
-            user_input = input("\n你: ").strip()
-            if not user_input:
-                continue
-            outcome = dispatch_command(context, user_input)
-            if outcome.should_break:
+    try:
+        while True:
+            try:
+                user_input = (await asyncio.to_thread(input, "\n你: ")).strip()
+                if not user_input:
+                    continue
+                outcome = await dispatch_command(context, user_input)
+                if outcome.should_break:
+                    break
+            except KeyboardInterrupt:
+                print("\n\n程序被中断，再见!")
                 break
-        except KeyboardInterrupt:
-            print("\n\n程序被中断，再见!")
-            break
-        # CLI 最外层兜底只负责保持会话可用；业务模块仍应捕获具体异常。
-        except Exception as error:  # noqa: BROAD_EXCEPT_OK - CLI boundary keeps the session alive.
-            print(f"\n错误: {error}")
-            print("请重试...")
+            # CLI 最外层兜底只负责保持会话可用；业务模块仍应捕获具体异常。
+            except Exception as error:
+                print(f"\n错误: {error}")
+                print("请重试...")
+    finally:
+        await agent.session_manager.aclose()
+        # 关闭 MemoryContext（释放 SQLite 连接等底层资源）
+        mem_ctx = getattr(agent, "_memory_context", None)
+        if mem_ctx is not None:
+            await mem_ctx.aclose()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

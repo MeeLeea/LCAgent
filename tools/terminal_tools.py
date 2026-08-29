@@ -2,21 +2,22 @@
 终端工具 - 允许智能体运行终端命令、Python 脚本、PowerShell/CMD 脚本
 使用 LangChain @tool 装饰器，支持 .py / .ps1 / .bat 文件
 """
-from langchain_core.tools import tool
-from langgraph.errors import GraphInterrupt
-from typing import Dict, Any, Optional
 import os
+import platform
+import re
 import shutil
 import subprocess
 import sys
-import platform
-import re
+from typing import Any
+
+from langchain_core.tools import tool
+from langgraph.errors import GraphInterrupt
 
 from .safety import check_command, check_exec, confirm
 
-
 # Windows 默认超时（秒），防止命令卡死
 DEFAULT_TIMEOUT = 60
+MAX_OUTPUT_CHARS = 10000  # 超长输出截断，避免回传给 LLM 时占用过多 token
 
 # 覆盖常见命令行参数、环境变量和 Authorization Bearer 形式；只替换值，保留命令结构供用户判断。
 SENSITIVE_COMMAND_PATTERNS = (
@@ -40,7 +41,7 @@ class UserRejectedCommandError(RuntimeError):
         super().__init__("用户拒绝执行危险命令")
 
 
-def _truncate(text: str, max_chars: int = 4000) -> str:
+def _truncate(text: str, max_chars: int = MAX_OUTPUT_CHARS) -> str:
     """截断超长输出，避免回传给 LLM 时占用过多 token"""
     if not text:
         return text
@@ -57,7 +58,7 @@ def _redact_command(command: str) -> str:
     return redacted
 
 
-def _guard_command(command: str) -> Optional[Dict[str, Any]]:
+def _guard_command(command: str) -> dict[str, Any] | None:
     """
     命令安全护栏: 在执行前检查
     - deny  -> 返回错误字典(不执行)
@@ -71,18 +72,17 @@ def _guard_command(command: str) -> Optional[Dict[str, Any]]:
             "error": f"命令被安全策略拦截: {reason}",
             "command": command,
         }
-    if status == "confirm":
-        if not confirm(
-            f"⚠ 检测到危险命令 [{reason}]\n"
-            f"待执行命令：{_redact_command(command)}\n"
-            "确认执行? [y/N]: "
-        ):
-            # 普通失败结果会被 ReAct 模型当作可重试错误；异常交给 AgentCore 终止本轮。
-            raise UserRejectedCommandError(command)
+    if status == "confirm" and not confirm(
+        f"⚠ 检测到危险命令 [{reason}]\n"
+        f"待执行命令：{_redact_command(command)}\n"
+        "确认执行? [y/N]: "
+    ):
+        # 普通失败结果会被 ReAct 模型当作可重试错误；异常交给 AgentCore 终止本轮。
+        raise UserRejectedCommandError(command)
     return None
 
 
-def _guard_exec(file_path: str) -> Optional[Dict[str, Any]]:
+def _guard_exec(file_path: str) -> dict[str, Any] | None:
     """
     脚本执行安全护栏(运行任意 .py/.ps1/.bat 本质危险)
     """
@@ -93,15 +93,14 @@ def _guard_exec(file_path: str) -> Optional[Dict[str, Any]]:
             "error": f"执行被安全策略拦截: {reason}",
             "file_path": file_path,
         }
-    if status == "confirm":
-        if not confirm(f"⚠ {reason} [{file_path}]\n确认执行? [y/N]: "):
-            # 与 shell 命令保持一致：拒绝后终止整轮，而不是返回可重试错误。
-            raise UserRejectedCommandError(file_path)
+    if status == "confirm" and not confirm(f"⚠ {reason} [{file_path}]\n确认执行? [y/N]: "):
+        # 与 shell 命令保持一致：拒绝后终止整轮，而不是返回可重试错误。
+        raise UserRejectedCommandError(file_path)
     return None
 
 
 @tool
-def run_shell(command: str, cwd: Optional[str] = None, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:
+def run_shell(command: str, cwd: str | None = None, timeout: int = DEFAULT_TIMEOUT) -> dict[str, Any]:
     """
     运行 Shell 命令（跨平台）。
     在 Windows 上使用 PowerShell，在 Linux/Mac 上使用 bash/sh。
@@ -142,7 +141,8 @@ def run_shell(command: str, cwd: Optional[str] = None, timeout: int = DEFAULT_TI
             text=True,
             timeout=timeout,
             encoding="utf-8",
-            errors="replace"
+            errors="replace",
+            check=False,
         )
 
         return {
@@ -184,7 +184,7 @@ def run_shell(command: str, cwd: Optional[str] = None, timeout: int = DEFAULT_TI
 
 
 @tool
-def run_python(file_path: str, script_args: str = "", cwd: Optional[str] = None, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:
+def run_python(file_path: str, script_args: str = "", cwd: str | None = None, timeout: int = DEFAULT_TIMEOUT) -> dict[str, Any]:
     """
     运行 Python 脚本文件（.py）。
     使用当前 Python 解释器执行，可传递命令行参数。
@@ -231,18 +231,17 @@ def run_python(file_path: str, script_args: str = "", cwd: Optional[str] = None,
             text=True,
             timeout=timeout,
             encoding="utf-8",
-            errors="replace"
+            errors="replace",
+            check=False,
         )
 
-        return {
-            "success": proc.returncode == 0,
-            "returncode": proc.returncode,
-            "stdout": _truncate(proc.stdout),
-            "stderr": _truncate(proc.stderr) or None,
-            "file_path": abs_path,
-            "script_args": script_args or None,
-            "cwd": cwd
-        }
+        if proc.returncode != 0:
+            return {
+                "success": False,
+                "error": f"脚本执行失败 (exit {proc.returncode}): {proc.stderr.strip()}",
+                "stdout": proc.stdout,
+                "file_path": file_path
+            }
 
     except subprocess.TimeoutExpired:
         return {
@@ -265,7 +264,7 @@ def run_python(file_path: str, script_args: str = "", cwd: Optional[str] = None,
 
 
 @tool
-def run_cmd(file_path: str, script_args: str = "", cwd: Optional[str] = None, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:
+def run_cmd(file_path: str, script_args: str = "", cwd: str | None = None, timeout: int = DEFAULT_TIMEOUT) -> dict[str, Any]:
     """
     运行 CMD/PowerShell 脚本文件（.bat / .cmd / .ps1）。
     自动根据扩展名选择解释器：
@@ -302,7 +301,6 @@ def run_cmd(file_path: str, script_args: str = "", cwd: Optional[str] = None, ti
             cmd = ["cmd", "/c", abs_path]
             if script_args:
                 cmd.extend(script_args.split())
-            script_type = "bat"
         elif ext == ".ps1":
             # PowerShell 脚本
             cmd = [
@@ -314,7 +312,6 @@ def run_cmd(file_path: str, script_args: str = "", cwd: Optional[str] = None, ti
             ]
             if script_args:
                 cmd.extend(script_args.split())
-            script_type = "ps1"
         else:
             return {
                 "success": False,
@@ -329,19 +326,16 @@ def run_cmd(file_path: str, script_args: str = "", cwd: Optional[str] = None, ti
             text=True,
             timeout=timeout,
             encoding="utf-8",
-            errors="replace"
+            errors="replace",
+            check=False,
         )
 
-        return {
-            "success": proc.returncode == 0,
-            "returncode": proc.returncode,
-            "stdout": _truncate(proc.stdout),
-            "stderr": _truncate(proc.stderr) or None,
-            "file_path": abs_path,
-            "script_args": script_args or None,
-            "script_type": script_type,
-            "cwd": cwd
-        }
+        if proc.returncode != 0:
+            return {
+                "success": False,
+                "error": f"命令执行失败 (exit {proc.returncode}): {proc.stderr.strip()}",
+                "stdout": proc.stdout
+            }
 
     except subprocess.TimeoutExpired:
         return {

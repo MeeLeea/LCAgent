@@ -1,9 +1,8 @@
 {
   "servers": {
-    "workspace": {
-      "transport": "stdio",
-      "command": "python",
-      "args": ["tools/workspace_tool.py"],
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "D:\\work"],
       "enabled": true
     }
   }

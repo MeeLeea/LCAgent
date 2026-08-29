@@ -4,16 +4,18 @@
 
 - 配置驱动的多 LLM 提供商（见 `config/llm_config.json`），运行时可切换提供商/模型
 - 本地工具调用（搜索、文件读写、计算、终端命令、文件打开、技能读取）
-- **MCP Server 工具动态加载**（已预置 workspace 文件夹管理服务，可扩展任意 MCP 服务）
-- **LangGraph Checkpoint 持久化**（SQLite 自动保存，程序重启可恢复对话）
+- **MCP Server 工具动态加载**（可扩展任意 MCP 服务）
+- **LangGraph Checkpoint 持久化**（服务器异步运行时使用 `data/checkpoints_async.sqlite`，程序重启可恢复对话）
 - **LangGraph Human-in-the-loop**（`ask_human` 暂停图执行，CLI 结构化选择后 `Command(resume)` 继续）
-- 长期记忆管理（compress 压缩摘要）与长上下文自动裁剪
+- 长期记忆管理（两级作用域：agent 级跨会话共享 user_fact/lesson，thread 级会话隔离 conv/business；compress 压缩摘要）与长上下文自动裁剪
 - **长上下文压缩中间件**（增量摘要 + 工具输出 Prune，摘要随 checkpoint 持久化、per-thread 隔离；`before_model` 自动触发或 `compact` 命令手动触发）
 - **MCP 连接池**（per-server 隔离、健康探测、单 server 自动重连，替代全量重载）
 - 多会话隔离（thread_id 机制，方向键菜单切换/删除/导出）
+- **并发多会话**（per-thread 锁 + 独立编译图 + 按线程中断状态，Web 多标签页/多客户端可同时对话互不阻塞，详见「异步 Public API → 并发多会话」）
 - 命令模式下的会话切换会优先保持当前会话，不会因为菜单参数不兼容而失败
 - 安全护栏（危险终端命令拦截/确认、路径保护）
 - **全套异步 Public API**（`arun` / `achat` / `aresume` / `arun_structured` / `achat_structured` 等）
+- **生成停止即时生效**（`POST /api/stop` 显式取消信号，per-thread 隔离；前端点击停止后即使后端正阻塞在 LLM 调用或 SDK 内部 429/5xx 自动重试期间也能立即中断；同时取消该会话待处理的记忆沉淀，防止停止后后台仍发起 LLM fact 抽取）
 - **运行时指标收集**（LLM 调用 / 工具执行 / 压缩统计，`metrics` 命令查询）
 - **结构化日志**（trace_id / thread_id 上下文注入，asyncio 安全）
 - **工具超时保护**与**统一异常层次**（`LCAgentError` 及其子类）
@@ -36,31 +38,31 @@
   - [核心概念：三种模式](#核心概念三种模式)
   - [记忆系统（Memory）](#记忆系统memory)
     - [设计架构](#设计架构)
+    - [两级作用域（agent 级 / thread 级）](#两级作用域agent-级--thread-级)
     - [上下文注入机制（重要）](#上下文注入机制重要)
-      - [`react:` 和 `chat()` → 只用 checkpoint](#react-和-chat--只用-checkpoint)
-      - [`cot:` → checkpoint + memory.json](#cot--checkpoint--memoryjson)
+      - [`react:` 和 `chat()` → 事件驱动写入 + prompt 注入读取](#react-和-chat--事件驱动写入--prompt-注入读取)
+      - [`cot:` → 仅短期记忆](#cot--仅短期记忆)
       - [技能指引与长上下文摘要的注入](#技能指引与长上下文摘要的注入)
       - [对比表](#对比表)
     - [两层存储对比](#两层存储对比)
     - [三种模式的记忆行为](#三种模式的记忆行为)
     - [Checkpoint 持久化原理](#checkpoint-持久化原理)
-    - [长期记忆触发原理](#长期记忆触发原理)
+    - [长期记忆写入流水线](#长期记忆写入流水线)
     - [为什么 cot 不写入 checkpoint](#为什么-cot-不写入-checkpoint)
     - [文件位置](#文件位置)
-    - [会话(Thread)管理](#会话thread管理)
     - [记忆管理命令](#记忆管理命令)
     - [压缩长期记忆（compress）](#压缩长期记忆compress)
       - [工作流程](#工作流程)
       - [压缩提示词](#压缩提示词)
       - [使用示例](#使用示例)
-      - [压缩后的 memory.json 格式](#压缩后的-memoryjson-格式)
+      - [压缩后的 Store 格式](#压缩后的-store-格式)
       - [特点与注意事项](#特点与注意事项)
     - [记忆相关 API](#记忆相关-api)
+  - [会话管理（Session）](#会话管理session)
   - [工具系统（Tools）](#工具系统tools)
     - [1. 本地工具（Local Tools）](#1-本地工具local-tools)
     - [2. MCP 工具（MCP Server Tools）](#2-mcp-工具mcp-server-tools)
       - [已注册的 MCP Server](#已注册的-mcp-server)
-      - [workspace MCP Server 提供的工具](#workspace-mcp-server-提供的工具)
       - [MCP 配置文件](#mcp-配置文件)
       - [MCP 管理命令](#mcp-管理命令)
     - [3. 技能阅读（Skills）](#3-技能阅读skills)
@@ -221,27 +223,63 @@ LangChainAgent/
 │   └── scheduler_config.json# 定时任务调度配置
 ├── scheduler/               # 定时任务调度模块
 │   ├── store.py             # SQLite CRUD + 原子抢占
-│   ├── executor.py          # AgentCore.run() 执行桥接
+│   ├── executor.py          # AgentCore 异步执行桥接(acreate/arun/aclose 单 loop)
 │   ├── engine.py            # APScheduler 引擎
 │   └── run.py               # 独立进程入口
-├── memory/                  # 运行时数据库目录（自动生成）
-│   ├── checkpoints.sqlite   # Checkpoint 持久化数据库
-│   ├── memory.json          # 长期记忆文件（用于 compress 摘要）
+├── data/                  # 运行时数据库目录（自动生成）
+│   ├── checkpoints_async.sqlite # Checkpoint 持久化数据库 + 长期记忆 Store（同一文件）
 │   └── scheduled_tasks.sqlite# 定时任务数据库
+├── memory/                 # 记忆模块（三层架构 Memory 层，与 agent 平级）
+│   ├── __init__.py         # 包导出
+│   ├── agent_memory.py     # AgentMemory：checkpointer + Store 基础设施
+│   ├── config.py           # Memory 配置默认值
+│   ├── context.py          # MemoryContext：统一工厂（入口程序调用）
+│   ├── lock_pool.py        # ThreadMemoryLockPool：per-thread 并发锁池
+│   ├── manager.py          # MemoryManager：统一门面（召回/消费/压缩/清理）
+│   ├── middleware.py       # 读写中间件（防抖 buffer + Fact 抽取 + prompt 注入）
+│   ├── models.py           # 数据模型与事件分类判定（MemoryCategory / ThreadFactItem，含 scope 字段）
+│   └── store.py            # ThreadMemoryStore：Store 业务封装（agent 级 + thread 级两级 namespace）
 ├── agent/
 │   ├── __init__.py
 │   ├── agent_config.json    # Agent 运行时参数
 │   ├── AGENT.md             # Agent 核心系统提示词（行为规则）
 │   ├── llm_client.py        # 统一大模型封装（多提供商 + 多模型）
 │   ├── config.py            # 运行时配置加载(agent/agent_config.json)
-│   ├── memory.py            # AgentMemory：checkpoint + 长期记忆 + 会话管理
-│   ├── compaction.py        # 长上下文压缩中间件（增量摘要 + 工具输出 Prune）
-│   ├── metrics.py           # 运行时指标收集（LLM/工具/压缩统计，线程安全）
-│   ├── logging_config.py    # 结构化日志（trace_id/thread_id 上下文注入）
-│   ├── exceptions.py        # 统一异常层次（LCAgentError 及其子类）
 │   ├── message_utils.py     # LLM 异常信息提取（中文化错误提示）
-│   └── agent_core.py        # Agent 核心调度：run/chat/cot 三种模式 + HITL + 异步 API
+│   ├── agent_core.py        # Agent 核心调度主类：构造/生命周期/共享工具方法（多继承聚合入口）
+│   ├── session_mgmt.py      # SessionMgmt Mixin：会话/Store/中断状态管理
+│   ├── mcp_tools.py         # McpTools Mixin：MCP 工具加载
+│   ├── graph_builder.py     # GraphBuilder Mixin：executor 构建/重建 + LLM 切换
+│   ├── streaming.py         # Streaming Mixin：事件流引擎（arun/aresume_events）
+│   ├── interrupts.py        # Interrupts Mixin：中断检查/恢复命令/拒绝处理
+│   ├── turn_runners.py      # TurnRunners Mixin：结构化执行入口（arun/achat/aresume_structured）
+│   ├── turn_types.py        # AgentTurnResult（结构化执行结果类型）
+│   ├── tool_error_mw.py     # ToolExecutionErrorMW：工具错误反思纠错中间件
+│   ├── workspace_mw.py      # WorkspaceSecurityMW：工作空间安全中间件
+│   ├── compaction.py        # LangGraph 上下文压缩中间件（增量摘要 + 工具输出 Prune + 保留近期消息）
+│   └── role_sw.py           # 团队角色切换（唯一实现/入口）
+├── skmng/                    # 技能管理统一包（收敛原 tools/skills+skill_tool+graph/common:SkillInjector+agent/skill_mw+skill_ops+team/base:PromptInjector）
+│   ├── __init__.py          # 聚合导出 SkillManager/SkillInjector/SkillInjectionMW/SkillOps/read_skill/PromptInjector/build_skill_block/inject_into_prompt
+│   ├── manager.py           # SkillManager：扫描/匹配/渲染本地技能（原 tools/skills.py）
+│   ├── tool.py              # read_skill 工具：LLM 自助读取技能指引（原 tools/skill_tool.py）
+│   ├── core.py              # 统一注入核心：build_skill_block 三来源合并（fixed_skills+active_names+auto_match）+ inject_into_prompt 防重复
+│   ├── protocols.py         # PromptInjector 协议（独立放置，防 team→graph 循环依赖）
+│   ├── injector.py          # SkillInjector：工作流节点 prompt 层注入器（改调 core 三来源合并）
+│   ├── middleware.py        # SkillInjectionMW：agent 层 model 调用前注入中间件（改调 core）
+│   └── ops.py               # SkillOps Mixin：技能加载/清理 + 手动压缩（原 agent/skill_ops.py，供 AgentCore 多继承）
+├── utils/                   # 通用工具（与业务解耦，供 agent/graph/session 等共用）
+│   ├── events.py            # 标准化执行事件模型（AgentEvent / EventType，含节点进度事件）
+│   ├── exceptions.py        # 统一异常层次（LCAgentError 及其子类）
+│   ├── logging_config.py    # 结构化日志（trace_id/thread_id 上下文注入）
+│   └── metrics.py           # 运行时指标收集（LLM/工具/压缩统计，线程安全）
+├── session/                 # 会话管理模块（三层架构 Session 层）
+│   ├── context.py           # SessionContext：单会话运行时上下文（session_id + config + checkpointer）
+│   ├── store.py             # SessionStore：基于 LangGraph Store 的 per-session 瞬态状态
+│   ├── registry.py          # SessionRegistry：会话生命周期管理（生成/查询/删除/消息读取）
+│   ├── workspace_store.py   # WorkspaceStore：session_id ↔ workspace_path 映射
+│   └── manager.py           # SessionManager：对外门面 & 会话调度（封装 Agent + Memory）
 ├── team/                    # 多 Agent 团队协作模块
+│   ├── base.py              # TeamAgent 轻量基类(工具模式挂错误纠错+workspace 中间件+超时;内建技能注入)
 │   ├── __init__.py          # 导出 ManagerAgent/WorkerAgent/TerminatorAgent
 │   ├── factory.py           # 团队 Agent 工厂函数
 │   ├── manager/             # Manager Agent（任务拆解）
@@ -257,7 +295,11 @@ LangChainAgent/
 │       ├── agent_config.json
 │       └── AGENT.md
 ├── graph/                   # LangGraph 工作流编排
-│   └── simple.py            # 监督者模式工作流（Manager→Worker→Terminator）
+│   ├── common.py            # 工作流通用能力：异步执行辅助 + 跨轮次记忆压缩 + workspace 透传
+│   ├── simple.py            # 监督者模式工作流（Manager→Worker→Terminator，异步节点，worker_exec 接收 config 注入 workspace）
+│   ├── pipline.py           # 流水线模式工作流（异步节点，与 simple 同构，worker_exec 接收 config 注入 workspace）
+│   ├── rtl_graph.py         # RTL 芯片设计流水线（Manager 提炼→Architect 架构→Designer 设计↔Verification 多轮验证→验证通过/达上限即终止(END)）
+│   └── registry.py          # 工作流/Agent 注册表与构建入口（runner 支持 workspace_path 参数）
 ├── tools/
 │   ├── __init__.py          # 本地工具注册
 │   ├── search.py            # 联网搜索工具(Tavily API)
@@ -266,14 +308,13 @@ LangChainAgent/
 │   ├── terminal_tools.py    # 终端命令工具（shell/python/bat/ps1,含安全护栏）
 │   ├── get_local_time.py    # 获取本地时间工具
 │   ├── open_file.py         # 文件打开工具（系统默认程序/DB Browser）
-│   ├── skills.py            # SkillManager（扫描/匹配/渲染技能）
-│   ├── skill_tool.py        # read_skill 工具（LLM 自助读取技能指引）
+│   ├── skills.py            # re-export skmng.manager（向后兼容，待删）
+│   ├── skill_tool.py        # re-export skmng.tool（向后兼容，待删）
 │   ├── create_tools.py      # 动态生成工具代码，保存为 .py 并自动注册到 __init__.py
 │   ├── safety.py            # 安全护栏(黑名单/白名单/交互确认/路径保护)
-│   ├── mcp_loader.py        # MCP 配置管理与工具加载器
+│   ├── mcp_loader.py        # MCP 配置管理与工具加载器（含按工具名筛选加载 aload_mcp_tools_by_name / load_mcp_tools_by_name_sync）
 │   ├── mcp_pool.py          # MCP 连接池（per-server 隔离 + 健康探测 + 自动重连）
 │   ├── tool_wrapper.py      # 工具超时包装器（统一超时保护，超时返回 JSON 错误）
-│   ├── workspace_tool.py    # 工作目录管理 MCP Server
 │   └── scheduler_tool.py    # 定时任务工具（schedule_task/list/cancel/delete/cleanup）
 ├── cli/
 │   ├── __init__.py
@@ -291,64 +332,56 @@ LangChainAgent/
 │       ├── safety.py        # 安全策略命令
 │       ├── workflow.py      # 工作流命令（workflow / workflow:<name> <task>）
 │       └── execution.py     # json / react / cot / 普通对话
-├── tests/                   # 单元测试(pytest；含 1 个在线连通性测试)
-│   ├── conftest.py
-│   ├── test_config.py
-│   ├── test_safety.py
-│   ├── test_skills.py
-│   ├── test_search.py
-│   ├── test_terminal.py
-│   ├── test_memory.py
-│   ├── test_cli_commands.py
-│   ├── test_human_input.py
-│   ├── test_scheduler.py
-│   ├── test_workflow.py
-│   ├── test_agent_core_regressions.py
-│   ├── test_config_templates.py
-│   ├── test_calculator.py
-│   ├── test_api.py
-│   ├── test_llm_client.py
-│   ├── test_message_utils.py
-│   ├── test_compaction.py
-│   ├── test_create_tool.py
-│   ├── test_graph_rebuild.py
-│   ├── test_mcp_pool.py
-│   ├── test_threads_preview.py
-│   ├── test_metrics.py
-│   ├── test_tool_wrapper.py
-│   ├── test_logging_config.py
-│   ├── test_exceptions_and_close.py
-│   ├── test_provider_models.py        # 在线连通性测试(需 API Key)
-│   └── test_workspace_tool_path_protection.py
+├── tests/                   # 单元测试(pytest；含 1 个在线连通性测试)，按被测功能分子目录
+│   ├── conftest.py          # 共享 fixture（safety 缓存重置）与 --provider 选项
+│   ├── agent/               # Agent 核心：HITL 中断/恢复、并发会话隔离、graph 重建、workspace 中间件
+│   ├── api/                 # API Server：健康检查、会话管理、SSE 流式聊天、命令执行
+│   ├── cli/                 # CLI 命令分发、workspace 命令、会话菜单预览
+│   ├── config/              # 运行时配置：默认值合并、路径解析、agent.md prompt 加载
+│   ├── graph/               # 工作流图：simple/pipline/rtl、工作流 memory/compaction/workspace 透传
+│   ├── llm/                 # LLM 客户端重试、异常信息提取、提供商模型(在线连通性，需 API Key)
+│   ├── memory/              # 记忆：AgentMemory、MemoryManager、ThreadMemoryStore、读写中间件
+│   ├── scheduler/           # 定时任务：TaskStore CRUD、原子抢占、执行器与调度引擎
+│   ├── session/             # 会话存储、WorkspaceStore 映射、WorkflowAdapter
+│   ├── team/                # 团队：TeamAgent 基类、角色切换与 LLM 重建
+│   ├── tools/               # 工具：calculator/create_tool/terminal/safety/search/MCP/包装器
+│   └── utils/               # 公共组件：events/metrics/logging/exceptions
 └── exports/                 # 对话导出目录(运行 export 命令时生成)
 ```
 
 ### 模块职责
 
-| 模块                                                    | 职责                                                                                                                        |
-| ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| [main.py](main.py)                                       | 交互式命令行入口 + Agent 构建接口                                                                                           |
-| [agent/llm_client.py](agent/llm_client.py)               | 从`config/llm_config.json` 读取提供商配置，支持运行时切换提供商/模型                                                      |
-| [agent/config.py](agent/config.py)                       | 加载`agent/agent_config.json`，统一运行时配置                                                                             |
-| [agent/memory.py](agent/memory.py)                       | 双层记忆：Checkpoint（自动）+ memory.json（手动）+ 对话导出                                                                 |
-| [agent/compaction.py](agent/compaction.py)               | 长上下文压缩中间件：增量摘要 + 工具输出 Prune + 保留近期消息，摘要随 checkpoint 持久化、per-thread 隔离                      |
-| [agent/metrics.py](agent/metrics.py)                     | `MetricsCollector`：线程安全的运行时指标收集（LLM 调用 / 工具执行 / 压缩统计）                                            |
-| [agent/logging_config.py](agent/logging_config.py)       | 结构化日志：`contextvars` 实现 trace_id / thread_id 异步安全注入                                                          |
-| [agent/exceptions.py](agent/exceptions.py)               | 统一异常层次：`LCAgentError` 基类及 MCP/超时/压缩/中断/状态等子类                                                         |
-| [agent/agent_core.py](agent/agent_core.py)               | Agent 核心：`run()` / `chat()` / `cot()` 三种模式 + 全套异步 API + `AgentTurnResult` 结构化暂停/恢复 + 技能注入 + 压缩/裁剪 |
-| [team/](team/)                                           | 多 Agent 团队协作：ManagerAgent（拆解）/ WorkerAgent（执行）/ TerminatorAgent（汇总）+ 工厂函数                             |
-| [graph/simple.py](graph/simple.py)                       | LangGraph 监督者模式工作流编排（Manager→Worker→Terminator）                                                               |
-| [tools/skills.py](tools/skills.py)                       | `SkillManager`：扫描/匹配/渲染本地技能                                                                                    |
-| [tools/skill_tool.py](tools/skill_tool.py)               | `read_skill` 工具：LLM 在任务中自助读取技能指引                                                                           |
-| [tools/mcp_pool.py](tools/mcp_pool.py)                   | `MCPPool`：per-server 连接管理 + 健康探测 + 自动重连，替代全量重载                                                        |
-| [tools/tool_wrapper.py](tools/tool_wrapper.py)           | 工具超时包装：统一超时保护，超时返回 JSON 错误而非抛异常                                                                    |
-| [tools/](tools/)                                         | 本地工具 + MCP 工具加载 + 技能管理                                                                                          |
-| [cli/cli_menu.py](cli/cli_menu.py)                       | 通用终端方向键选择菜单                                                                                                      |
-| [cli/human_input.py](cli/human_input.py)                 | `ask_human` 工具、interrupt 展示和循环恢复编排                                                                            |
-| [cli/commands/dispatcher.py](cli/commands/dispatcher.py) | 按兼容顺序匹配命令并路由到领域处理器                                                                                        |
-| [cli/commands/types.py](cli/commands/types.py)           | 命令依赖上下文、活动 LLM 状态和分发结果类型                                                                                 |
-| [cli/commands/](cli/commands/)                           | 会话、记忆、模型、MCP、技能、安全及 Agent 执行命令                                                                          |
-| [scheduler/](scheduler/)                                 | 定时任务调度：TaskStore（SQLite CRUD）、SchedulerEngine（APScheduler 轮询）、独立进程入口                                   |
+| 模块                                                    | 职责                                                                                                                                                                                                                                       |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [main.py](main.py)                                       | 交互式命令行入口 + Agent 构建接口                                                                                                                                                                                                          |
+| [agent/llm_client.py](agent/llm_client.py)               | 从`config/llm_config.json` 读取提供商配置，支持运行时切换提供商/模型                                                                                                                                                                     |
+| [agent/config.py](agent/config.py)                       | 加载`agent/agent_config.json`，统一运行时配置                                                                                                                                                                                            |
+| [memory/](memory/)                                       | 三层架构 Memory 层：`AgentMemory`（checkpointer + Store 基础设施）/ `MemoryContext`（统一工厂，透传 `process_type` / `max_agent_facts`）/ `MemoryManager`（统一门面，含 agent 级召回接口）/ `ThreadMemoryStore`（Store 业务封装，agent 级 + thread 级两级 namespace）/ 读写中间件（防抖 + Fact 抽取 + 两级路由 + prompt 注入）/ per-thread 锁池 |
+| [agent/compaction.py](agent/compaction.py)               | 长上下文压缩中间件：增量摘要 + 工具输出 Prune + 保留近期消息，摘要随 checkpoint 持久化、per-thread 隔离                                                                                                                                    |
+| [utils/events.py](utils/events.py)                       | 标准化执行事件模型：`AgentEvent`（frozen dataclass）+ `EventType` 枚举（含 TOKEN/TOOL_*/INTERRUPT/ERROR/DONE/NODE_*）+ SSE dict 序列化，三层架构唯一通信载体                                                        |
+| [utils/metrics.py](utils/metrics.py)                     | `MetricsCollector`：线程安全的运行时指标收集（LLM 调用 / 工具执行 / 压缩统计）                                                                                                                                                           |
+| [utils/logging_config.py](utils/logging_config.py)       | 结构化日志：`contextvars` 实现 trace_id / thread_id 异步安全注入                                                                                                                                                                         |
+| [utils/exceptions.py](utils/exceptions.py)               | 统一异常层次：`LCAgentError` 基类及 MCP/超时/压缩/中断/状态等子类                                                                                                                                                                        |
+| [agent/](agent/)                                         | Agent 核心按职责拆分：`agent_core.py`（主类，构造/生命周期/共享工具方法）+ 6 个 Mixin（`session_mgmt`/`mcp_tools`/`graph_builder`/`streaming`/`interrupts`/`turn_runners`）+ `turn_types.py`（`AgentTurnResult`）+ 2 个中间件（`tool_error_mw`/`workspace_mw`）+ `role_sw.py`（团队角色切换唯一实现）；技能相关 Mixin/中间件已迁入 `skmng/` 包 |
+| [session/](session/)                                     | 三层架构 Session 层：`SessionContext`（单会话运行时上下文）/ `SessionStore`（per-session 瞬态状态）/ `SessionRegistry`（生命周期管理）/ `WorkspaceStore`（工作空间映射）/ `SessionManager`（对外门面 & 会话调度）                |
+| [team/](team/)                                           | 多 Agent 团队协作：ManagerAgent（拆解）/ WorkerAgent（执行）/ TerminatorAgent（汇总）+ 工厂函数                                                                                                                                            |
+| [skmng/](skmng/)                                         | 技能管理统一包：`SkillManager`（扫描/匹配/渲染）+ `SkillInjector`（工作流节点注入器）+ `SkillInjectionMW`（agent 层中间件）+ `SkillOps`（Mixin）+ `core.py`（三来源合并核心）+ `protocols.py`（PromptInjector 协议）+ `read_skill` 工具 |
+| [graph/common.py](graph/common.py)                       | 工作流通用能力：`NodeTrackingHandler` 节点级进度回调(含 TOKEN 级流式)、`arun_compiled_workflow` 跨轮次记忆压缩 + `workspace_path` 注入 `config.configurable`（SkillInjector 已迁往 `skmng/injector.py`）                                                                        |
+| [graph/simple.py](graph/simple.py)                       | LangGraph 监督者模式工作流编排（Manager→Worker→Terminator，异步节点）；`worker_exec` 节点接收 LangGraph 注入的 config（含 `workspace_path`）透传 Worker                                                                                     |
+| [graph/pipline.py](graph/pipline.py)                     | LangGraph 流水线模式工作流编排（异步节点，与 simple 同构）；`worker_exec` 节点同样透传 workspace config                                                                                                                                    |
+| [graph/rtl_graph.py](graph/rtl_graph.py)                 | RTL 芯片设计流水线：Manager 提炼上下文→Architect 计划/设计/分析/评审/规格→Designer 规格+编码↔Verification 验证多轮交互（条件路由 + max_rounds 限轮）→验证通过/达上限即终止(END)                                                                       |
+| [graph/registry.py](graph/registry.py)                   | 工作流/Agent 注册表：`register_workflow` / `register_agent` / `build_workflow`；runner 统一支持 `workspace_path` 透传                                                                                                                   |
+| [tools/skills.py](tools/skills.py)                       | re-export `skmng.manager.SkillManager`（向后兼容，待删）                                                                                                                                                                                   |
+| [tools/skill_tool.py](tools/skill_tool.py)               | re-export `skmng.tool.read_skill`（向后兼容，待删）                                                                                                                                                                                       |
+| [tools/mcp_pool.py](tools/mcp_pool.py)                   | `MCPPool`：per-server 连接管理 + 健康探测 + 自动重连，替代全量重载                                                                                                                                                                       |
+| [tools/tool_wrapper.py](tools/tool_wrapper.py)           | 工具超时包装：统一超时保护，超时返回 JSON 错误而非抛异常                                                                                                                                                                                   |
+| [tools/](tools/)                                         | 本地工具 + MCP 工具加载 + 技能管理                                                                                                                                                                                                         |
+| [cli/cli_menu.py](cli/cli_menu.py)                       | 通用终端方向键选择菜单                                                                                                                                                                                                                     |
+| [cli/human_input.py](cli/human_input.py)                 | `ask_human` 工具、interrupt 展示和循环恢复编排                                                                                                                                                                                           |
+| [cli/commands/dispatcher.py](cli/commands/dispatcher.py) | 按兼容顺序匹配命令并路由到领域处理器                                                                                                                                                                                                       |
+| [cli/commands/types.py](cli/commands/types.py)           | 命令依赖上下文、活动 LLM 状态和分发结果类型                                                                                                                                                                                                |
+| [cli/commands/](cli/commands/)                           | 会话、记忆、模型、MCP、技能、安全及 Agent 执行命令                                                                                                                                                                                         |
+| [scheduler/](scheduler/)                                 | 定时任务调度：TaskStore（SQLite CRUD）、SchedulerEngine（APScheduler 轮询）、独立进程入口                                                                                                                                                  |
 
 ### agent/llm_client.py 主要 API
 
@@ -374,7 +407,7 @@ LangChainAgent/
 | `qwen`     | 通义千问        | `DASHSCOPE_API_KEY` | `Qwen2.5-7B-Instruct` |
 | `deepseek` | DeepSeek        | `DEEPSEEK_API_KEY`  | `deepseek-chat`       |
 | `kimi`     | Kimi (Moonshot) | `MOONSHOT_API_KEY`  | `kimi-k3`             |
-| `yunwu`    | 云雾            | `YUNWU_API_KEY`     | `gpt-5.5`             |
+| `yunwu`    | 云雾            | `YUNWU_API_KEY`     | `glm-5.2`             |
 
 ---
 
@@ -396,69 +429,150 @@ Agent 有三种执行模式，对应三种不同的交互入口：
 
 ### 设计架构
 
-Agent 采用 **LangGraph Checkpoint + 长期记忆** 双层设计，由 [agent/memory.py](agent/memory.py) 的 `AgentMemory` 类实现：
+记忆系统为独立的 **三层架构 Memory 层**（[memory/](memory/)，与 `agent/` `session/` 平级），由 [memory/manager.py](memory/manager.py) 的 `MemoryManager` 作为统一门面，底层封装 **LangGraph Checkpoint（短期）+ BaseStore 长期记忆（facts）** 双层存储：
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                       AgentMemory                              │
-│                                                                │
-│  ┌───────────────────────────┐  ┌─────────────────────────┐  │
-│  │   Checkpoint (自动)        │  │   长期记忆 (手动)         │  │
-│  │   SQLite 持久化            │  │   memory.json            │  │
-│  │                           │  │                           │  │
-│  │   • Agent 每步执行后自动写 │  │   • 仅 important=True 写入│  │
-│  │   • 完整状态(消息+工具调用)│  │   • 仅 react/cot 触发     │  │
-│  │   • 按 thread_id 隔离      │  │   • 用于 compress 摘要    │  │
-│  │   • 程序重启可恢复         │  │   • 跨会话保留关键信息    │  │
-│  └───────────────────────────┘  └─────────────────────────┘  │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│            memory/ 包（三层架构 Memory 层，与 agent 平级）         │
+│                                                                  │
+│  统一门面  MemoryManager  ── recall / recall_agent / consume_event│
+│                                                                  │
+│  ┌────────────────────────┐  ┌──────────────────────────────┐   │
+│  │  Checkpoint (自动)      │  │  长期记忆 Store (事件驱动)    │   │
+│  │  AsyncSqliteSaver      │  │  AsyncSqliteStore             │   │
+│  │  checkpoints_async.sql │  │  两级 namespace：             │   │
+│  │  (MemoryContext 注入)  │  │  • agent 级                   │   │
+│  │                        │  │    (agent_key,"global_facts") │   │
+│  │  • Agent 每步执行后自动写│  │    user_fact / lesson         │   │
+│  │  • 完整状态(消息+工具调用)│  │    跨会话共享                 │   │
+│  │  • 按 thread_id 隔离    │  │  • thread 级                  │   │
+│  │  • 程序重启可恢复       │  │    (thread_id,"thread_facts") │   │
+│  │                        │  │    conv / business            │   │
+│  │                        │  │    仅当前会话可见              │   │
+│  │                        │  │  • 写: 防抖→分类路由→LLM 抽取 │   │
+│  │                        │  │  • 读: 两级聚合注入 SystemMsg │   │
+│  │                        │  │  • 去重(agent 优先)+LRU 淘汰  │   │
+│  └────────────────────────┘  └──────────────────────────────┘   │
+│                                                                  │
+│  基础设施: AgentMemory(checkpointer+Store) / MemoryContext(工厂)  │
+│           ThreadMemoryLockPool(per-thread 锁) / models.py(分类)  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-> 在此双层之上，还有一层 **Compaction 压缩中间件**（[agent/compaction.py](agent/compaction.py)）负责控制**单会话内的上下文长度**：当 checkpoint 恢复的消息数超过阈值时，`before_model` 自动把旧消息增量摘要成 `state.summary`（随 checkpoint 持久化、per-thread 隔离），并 Prune 过长的历史工具输出，无需新开 thread。详见[可观测性与可靠性 → 长上下文压缩中间件](#长上下文压缩中间件compaction)。
+> **agent_key**：`process_type or "default"`，由 `MemoryContext` 经 `ThreadMemoryStore` 构造参数透传，用于隔离不同进程（server / scheduler / feishu）的 agent 级记忆，防止多进程同库串号。
+
+**数据流**（读写分离，两级作用域）：
+
+```
+写: SessionManager 消费 AgentEvent 流（submit_user_message / consume_event）
+     → 非阻塞投递到 WriteMiddleware 防抖 buffer（20s 窗口）
+     → LLM Fact 抽取（content + category + confidence）
+     → 无效过滤 / 两级 existing 去重（agent 优先）
+     → 按 category 路由作用域：
+         • user_fact / lesson → agent namespace（跨会话共享）
+         • conv / business    → thread namespace（会话隔离）
+     → 分流批量写入 → 分流 LRU 淘汰
+         • agent 级超 200 条（memory_max_agent_facts）淘汰
+         • thread 级超 50 条（memory_max_facts_per_thread）淘汰
+
+读: ThreadMemoryReadMiddleware.awrap_model_call（每个 model 调用前）
+     → 并行 query_agent_facts() + query_facts(thread_id)
+     → 合并 + content 精确去重（agent 优先，保留 agent 级版本）
+     → 按 create_time 升序，截取 recall_limit（默认 10）条
+     → 格式化为文本追加到 SystemMessage（【长期记忆】块）
+     → 非阻塞 touch 更新 last_used_at（按 scope 分发到两级 namespace）
+```
+
+**组件职责**：
+
+| 组件                            | 文件                                            | 职责                                                                                                                                 |
+| ------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `MemoryManager`               | [memory/manager.py](memory/manager.py)           | 统一门面：`recall` / `recall_text`（thread 级）+ `recall_agent` / `recall_agent_text` / `count_agent_facts` / `clear_agent_facts`（agent 级）+ `submit_user_message` / `consume_event` / `compress` / `clear` / `flush_all` |
+| `MemoryContext`               | [memory/context.py](memory/context.py)           | 统一工厂：入口程序（main/api/scheduler）调用`acreate()` 组装全部组件，透传 `process_type` / `max_agent_facts`，暴露 checkpointer / store / read_middleware / memory_manager |
+| `AgentMemory`                 | [memory/agent_memory.py](memory/agent_memory.py) | checkpointer（`AsyncSqliteSaver`）+ 长期记忆 Store（`AsyncSqliteStore`）基础设施；`process_type` 用于 thread_id 前缀与 agent 级记忆多进程隔离 |
+| `ThreadMemoryStore`           | [memory/store.py](memory/store.py)               | Store 业务封装：thread 级 facts 增/查/批量写/LRU 淘汰/摘要替换/会话级清空；新增 agent 级方法族（`query_agent_facts` / `save_agent_facts_batch` / `count_agent_facts` / `clear_agent_facts` / `prune_agent_facts` / `touch_agent_fact`），构造参数含 `max_agent_facts` / `process_type` |
+| `ThreadMemoryWriteMiddleware` | [memory/middleware.py](memory/middleware.py)     | 写服务：事件接收 + 防抖 buffer + Fact 抽取流水线（非 AgentMiddleware）；按 `category` 路由到 agent / thread 两级作用域 |
+| `ThreadMemoryReadMiddleware`  | [memory/middleware.py](memory/middleware.py)     | 读中间件（AgentMiddleware）：`awrap_model_call` 并行读取两级 facts，合并去重（agent 优先）后注入 SystemMessage |
+| `ThreadMemoryLockPool`        | [memory/lock_pool.py](memory/lock_pool.py)       | per-thread`asyncio.Lock` 池：串行化同一 thread 的写入，不同 thread 并行                                                            |
+| `models.py`                   | [memory/models.py](memory/models.py)             | `MemoryCategory` / `ThreadFactItem`（含 `scope` 字段：`thread` / `agent`）/ `MemoryInputEvent` / `judge_long_term_memory` 分类判定 |
+| `config.py`                   | [memory/config.py](memory/config.py)             | 运行时参数默认值（buffer 延迟 / 上限 / thread 级 fact 上限 / agent 级 fact 上限 / 召回条数） |
+
+> 除此之外还有一层 **Compaction 压缩中间件**（[agent/compaction.py](agent/compaction.py)）负责控制**单会话内的上下文长度**：当 checkpoint 恢复的消息数超过阈值时，`before_model` 自动把旧消息增量摘要成 `state.summary`（随 checkpoint 持久化、per-thread 隔离），并 Prune 过长的历史工具输出，无需新开 thread。注意这与记忆系统的 `compress` 命令是两回事（前者压缩会话上下文，后者压缩长期记忆 facts）。详见[可观测性与可靠性 → 长上下文压缩中间件](#长上下文压缩中间件compaction)。
+
+### 两级作用域（agent 级 / thread 级）
+
+长期记忆 facts 按 `category` 自动分流到两级 Store namespace，既保留会话隔离，又让"用户事实 / 经验教训"跨会话沉淀：
+
+| 作用域 | namespace | 写入的 category | 可见范围 | LRU 上限（配置键） |
+| ------ | --------- | --------------- | -------- | ------------------ |
+| **agent 级** | `(agent_key, "global_facts")` | `user_fact` / `lesson` | 同一 `agent_key` 下的所有会话共享 | `memory_max_agent_facts`（默认 200） |
+| **thread 级** | `(thread_id, "thread_facts")` | `conv` / `business` / 兜底 | 仅当前 `thread_id` 可见 | `memory_max_facts_per_thread`（默认 50） |
+
+**`agent_key` 来源**：`agent_key = process_type or "default"`。`process_type` 由 `MemoryContext.acreate(..., process_type=...)` → `ThreadMemoryStore(process_type=...)` 透传，用于隔离不同进程（CLI / API / 调度器 / 飞书）的 agent 级记忆，避免多进程同库串号。
+
+**读取侧聚合**（每次 LLM 调用前）：
+
+```
+awrap_model_call
+   ↓ asyncio.gather(query_agent_facts(), query_facts(thread_id))
+   ↓ 合并 + content 精确去重（agent 级优先，保留 agent 级版本）
+   ↓ 按 create_time 升序，截取 recall_limit（默认 10）条
+   ↓ 注入 SystemMessage（【长期记忆】块）
+   ↓ 非阻塞 touch：agent 级调 touch_agent_fact，thread 级调 touch_fact
+```
+
+**写入侧路由**（防抖 + LLM 抽取后）：
+
+- 抽取结果中 `category ∈ {user_fact, lesson}` → 组装 `scope="agent"` 的 `ThreadFactItem`，写入 agent namespace，触发 `prune_agent_facts()`；
+- 抽取结果中 `category ∈ {conv, business}` 或非法回退为 `conv` → 组装 `scope="thread"` 的 `ThreadFactItem`，写入 thread namespace，触发 `prune_facts(thread_id)`；
+- 去重基准同时读取两级 existing，按 `content` 精确比对，agent 级优先（避免同一条 fact 跨作用域重复）。
+
+> **写入路径不变**：事件筛选（`is_memory_worthy`：DONE / TOOL_RESULT 且 content 非空）→ 防抖 20s → `judge_long_term_memory` 规则分类 → LLM 抽取 → 按分类路由到 agent / thread 作用域 → 去重 → 写入 → LRU 淘汰。本次分层只改变了"写到哪一级 namespace"和"读时如何聚合"，未改变前置流水线。
 
 ### 上下文注入机制（重要）
 
 一个常见疑问：**Agent 在对话时，历史消息从哪里来？** 答案取决于模式。
 
-#### `react:` 和 `chat()` → 只用 checkpoint
+#### `react:` 和 `chat()` → 事件驱动写入 + prompt 注入读取
+
+Agent 模式下，LLM 上下文由 **checkpoint 恢复的历史消息 + ReadMiddleware 注入的长期记忆 facts** 共同组成：
 
 ```python
-# run() / chat()
-result = self.agent_executor.invoke(
-    {"messages": [HumanMessage(content=task)]},   # ← 只传当前这一条
-    config=self.memory.get_config()               # ← 传 thread_id
-)
+# arun_events()：graph 恢复 checkpoint 历史
+config = self._invoke_config(thread_id)          # {"configurable": {"thread_id": ...}}
+async for ev in self._arun_graph_events({"messages": [HumanMessage(content=message)]}, config, ...)
 ```
 
-- 调用时**只传当前这条新消息**
-- 历史消息由 **LangGraph 从 checkpoint 自动恢复**（按 thread_id 取出该会话所有历史消息，拼到新消息前面）
-- **memory.json 完全不参与** LLM 上下文
+- **历史消息**：LangGraph 从 checkpoint 自动恢复（按 thread_id 取出该会话所有历史消息，拼到新消息前面）
+- **长期记忆**：`ThreadMemoryReadMiddleware` 在每个 model 调用前（`awrap_model_call`）并行读取 **agent 级 + thread 级** facts，合并去重（agent 优先）后格式化为文本追加到 SystemMessage，随请求一起发给 LLM
+- **写入路径**：SessionManager 在事件流消费时调用 `submit_user_message()` / `consume_event()` 非阻塞投递，经防抖 + LLM 抽取后按 `category` 路由到 agent / thread 两级 Store namespace
 
 ```
 invoke(新消息, thread_id)
    ↓
-LangGraph: 从 checkpoint 读该 thread 的全部历史
-   ↓
-[历史消息1, 历史消息2, ..., 新消息] → 传给 LLM
+[历史消息1, ..., 新消息] + SystemMessage(【长期记忆】块) → 传给 LLM
    ↓
 LLM 回复 → 写回 checkpoint
+   ↓
+DONE / TOOL_RESULT 事件 → SessionManager.consume_event() → 防抖 → LLM 抽取 → 按 category 路由 agent/thread 两级 Store
 ```
 
-#### `cot:` → checkpoint + memory.json
+#### `cot:` → 仅短期记忆
 
 ```python
-# cot()
-context = self.memory.get_short_term() + self.memory.get_long_term(3)
+# acot()（异步）
+short_term = await self.session.aget_short_term()   # ← 仅 checkpointer 的短期历史
 response = self.llm.chat_with_history(
     user_input=task,
-    history=context,   # ← 短期(checkpoint) + 长期(memory.json)
+    history=short_term,
+    system_prompt=system_prompt,
     ...
 )
 ```
 
-- `get_short_term()` → 从 **checkpoint** 取当前 thread 的消息（转 dict）
-- `get_long_term(3)` → 从 **memory.json** 取最近 3 条长期记忆
-- 两者拼接后作为 history 传给 LLM
+- `session.aget_short_term()` → 从 **SessionRegistry**（封装 checkpointer）取当前会话的消息（转 dict）
+- **不经过 Agent 执行**、不触发读写中间件，因此长期记忆 facts **不参与** cot 的上下文
+- cot 的输入输出也不消费（提交）到记忆流水线
 
 #### 技能指引与长上下文摘要的注入
 
@@ -472,58 +586,75 @@ self.agent_executor = self._create_agent_executor(
 
 因此除了 checkpoint 历史外，system prompt 还可能包含：
 
-| 来源         | 触发方式                                  | 说明                                              |
-| ------------ | ----------------------------------------- | ------------------------------------------------- |
-| 手动技能     | `skill:<name>`                          | 后续对话都会注入该技能指引，直到`skill:clear`   |
-| 自动匹配技能 | `auto_match_skills=true`                | 根据任务与技能描述的关键词重叠度自动注入相关技能  |
-| 长上下文压缩 | 消息数超 `max_messages` 时 `before_model` 自动触发 | 由 Compaction 中间件增量摘要旧消息，写入 `state.summary`（随 checkpoint 持久化、per-thread 隔离），无需新开 thread |
+| 来源         | 触发方式                                              | 说明                                                                                                                |
+| ------------ | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| 长期记忆     | 事件驱动自动沉淀，model 调用前注入                    | ReadMiddleware 注入 Store facts（`【长期记忆】` 块）                                                              |
+| 手动技能     | `skill:<name>`                                      | 后续对话都会注入该技能指引，直到`skill:clear`                                                                     |
+| 自动匹配技能 | `auto_match_skills=true`                            | 根据任务与技能描述的关键词重叠度自动注入相关技能                                                                    |
+| 长上下文压缩 | 消息数超`max_messages` 时 `before_model` 自动触发 | 由 Compaction 中间件增量摘要旧消息，写入`state.summary`（随 checkpoint 持久化、per-thread 隔离），无需新开 thread |
 
 #### 对比表
 
-| 模式       | checkpoint  | memory.json    | 技能指引  | 长上下文压缩 | 说明                             |
-| ---------- | ----------- | -------------- | --------- | ------------ | -------------------------------- |
-| `react:` | ✅ 自动注入 | ❌ 不参与      | ✅ 可注入 | ✅ 中间件触发 | LangGraph 自动恢复该 thread 历史 |
-| 普通对话   | ✅ 自动注入 | ❌ 不参与      | ✅ 可注入 | ✅ 中间件触发 | 同上，但不打印步骤、不存长期     |
-| `cot:`   | ✅ 手动取   | ✅ 取最近 3 条 | ❌ 不注入 | ❌ 不触发    | 绕过 Agent，纯 LLM 推理          |
+| 模式       | checkpoint  | Store facts | 技能指引  | 长上下文压缩  | 说明                                    |
+| ---------- | ----------- | ----------- | --------- | ------------- | --------------------------------------- |
+| `react:` | ✅ 自动恢复 | ✅ 自动注入 | ✅ 可注入 | ✅ 中间件触发 | `is_run_mode=True`，DONE 事件标记重要 |
+| 普通对话   | ✅ 自动恢复 | ✅ 自动注入 | ✅ 可注入 | ✅ 中间件触发 | 不标记重要，写入照常（事件驱动）        |
+| `cot:`   | ✅ 手动取   | ❌ 不参与   | ❌ 不注入 | ❌ 不触发     | 绕过 Agent，纯 LLM 推理，不写长期       |
 
-> ⚠️ **重要副作用**：由于 `react:` 和普通对话**不读 memory.json**，意味着你在会话 A 里用 `react:` 做的事（已存入 memory.json），切到会话 B 再用 `react:` 时，**LLM 看不到**会话 A 的关键信息。只有 `cot:` 模式或 `compress` 命令才会读 memory.json。也就是说 **memory.json 的跨会话"记忆"能力目前只对 cot 生效**。
+> ⚠️ **作用域分层（重要）**：长期记忆按 `category` 自动分流到两级 namespace：
+> - **agent 级**（`namespace=(agent_key, "global_facts")`，跨会话共享）：`user_fact`（用户事实偏好）/ `lesson`（经验教训）。`agent_key = process_type or "default"`，同一进程的所有会话共享，体现长期记忆跨会话价值；切到新 thread 后这部分 facts 仍会被 ReadMiddleware 召回。
+> - **thread 级**（`namespace=(thread_id, "thread_facts")`，会话隔离）：`conv`（重要对话）/ `business`（业务实体）。仅当前会话可见，切到新 thread 后不再注入。
+>
+> 读取侧每次 LLM 调用前聚合两级 facts，按 `content` 精确去重（agent 优先保留），按 `create_time` 升序截取 `recall_limit`（默认 10）条注入 SystemMessage。
 
 ### 两层存储对比
 
-| 类型                 | 存储方式                               | 触发时机                   | 保存内容                           | 持久化  | 用途                              |
-| -------------------- | -------------------------------------- | -------------------------- | ---------------------------------- | ------- | --------------------------------- |
-| **Checkpoint** | `memory/checkpoints.sqlite` (SQLite) | Agent 每步执行后自动       | 完整状态(消息+工具调用链+中间变量) | ✅ 永久 | 程序重启恢复对话、多会话隔离      |
-| **长期记忆**   | `memory/memory.json` (JSON)          | 手动标记`important=True` | 仅 react/cot 的最终结果            | ✅ 永久 | 跨会话保留关键决策、用于 compress |
+| 类型                 | 存储方式                                   | 触发时机                               | 保存内容                                 | 作用域（namespace）                                                              | 持久化  | 用途                                      |
+| -------------------- | ------------------------------------------ | -------------------------------------- | ---------------------------------------- | -------------------------------------------------------------------------------- | ------- | ----------------------------------------- |
+| **Checkpoint** | `data/checkpoints_async.sqlite` (SQLite) | Agent 每步执行后自动                   | 完整状态(消息+工具调用链+中间变量)       | per-thread（按 `thread_id`）                                                     | ✅ 永久 | 程序重启恢复对话、多会话隔离              |
+| **长期记忆**   | 同一 SQLite 文件（`AsyncSqliteStore`）   | 事件驱动 + LLM 抽取（防抖 20s 后批量） | facts（content + category + confidence） | 两级：agent 级 `(agent_key, "global_facts")`（user_fact/lesson）+ thread 级 `(thread_id, "thread_facts")`（conv/business） | ✅ 永久 | 跨会话共享关键信息 + 会话隔离业务事实、注入 prompt、compress |
 
 ### 三种模式的记忆行为
 
-| 模式           | 调用方法   | 写入 Checkpoint | 写入 memory.json | 说明                          |
-| -------------- | ---------- | --------------- | ---------------- | ----------------------------- |
-| `react:任务` | `run()`  | ✅ 自动         | ✅ 手动触发      | ReAct 结果重要，永久保存      |
-| `cot:任务`   | `cot()`  | ❌ 不写         | ✅ 手动触发      | CoT 不走 Agent，仅存结论      |
-| 普通输入       | `chat()` | ✅ 自动         | ❌ 不写          | 闲聊仅存 checkpoint，用完即丢 |
+| 模式           | 调用方法                          | 写入 Checkpoint | 写入长期记忆 Store                    | 说明                                       |
+| -------------- | --------------------------------- | --------------- | ------------------------------------- | ------------------------------------------ |
+| `react:任务` | `arun_events(is_run_mode=True)` | ✅ 自动         | ✅ 事件驱动（用户消息标记 important） | ReAct 结果重要，DONE 事件标记 is_important |
+| `cot:任务`   | `acot()`                        | ❌ 不写         | ❌ 不写                               | CoT 绕过 Agent，纯 LLM 推理，无事件流      |
+| 普通输入       | `achat_stream()`                | ✅ 自动         | ✅ 事件驱动（不标记 important）       | 对话同样参与记忆抽取，只是不强调重要       |
 
-> **关键区别**：Checkpoint 由 LangGraph 自动管理，无需手动干预；长期记忆需显式传 `metadata={"important": True}` 才会写入 `memory.json`。
+> **关键区别**：Checkpoint 由 LangGraph 自动管理，无需手动干预；长期记忆由**事件驱动流水线**自动沉淀（分类判定 + LLM 抽取 + 两级去重 + 按 `category` 路由到 agent / thread 作用域），`important` 标记只是提高"值得评估"的优先级，不再决定是否写入。
 
 ### Checkpoint 持久化原理
 
-Agent 创建时传入 `checkpointer`，LangGraph 在每次 `invoke()` 后自动保存状态到 SQLite：
+checkpointer 由入口程序（[main.py](main.py) / [api/server.py](api/server.py) / [scheduler/run.py](scheduler/run.py)）通过 `MemoryContext.acreate()` 创建后注入 `AgentCore`，LangGraph 在每次执行后自动保存状态到 SQLite：
 
 ```python
-# agent/agent_core.py
-agent = create_react_agent(
-    model=chat_model,
-    tools=self.tools,
-    prompt=self._get_system_prompt(),
-    checkpointer=self.memory.get_checkpointer(),  # ← 自动持久化
+# main.py：先创建 MemoryContext，再注入 AgentCore
+memory_ctx = await MemoryContext.acreate(
+    checkpoint_file=CHECKPOINT_FILE,
+    llm_getter=lambda: llm,
+    ...
 )
-
-# 调用时传 thread_id,LangGraph 自动恢复该会话历史
-result = self.agent_executor.invoke(
-    {"messages": [HumanMessage(content=task)]},
-    config=self.memory.get_config()  # {"configurable": {"thread_id": "..."}}
+agent = await AgentCore.acreate(
+    llm_client=llm,
+    checkpointer=memory_ctx.checkpointer,            # ← 自动持久化
+    store=memory_ctx.store,                          # ← 长期记忆 Store
+    extra_middleware=[memory_ctx.read_middleware],   # ← 长期记忆读取中间件
+    initial_thread_id=memory_ctx.thread_id,
+    async_conn=memory_ctx.async_conn,
 )
+agent.set_memory_manager(memory_ctx.memory_manager)  # ← 注入 MemoryManager
 ```
+
+创建 `AgentCore` 后，还需把记忆组件的 LLM 来源动态绑定到当前 Agent（三个入口 `main.py` / `api/server.py` / `scheduler/run.py` 均已内置）：
+
+```python
+memory_ctx.bind_llm(lambda: agent.llm)  # 记忆组件直接读取 agent 当前 LLM
+```
+
+这样**运行时切换提供商/模型**（API `/api/providers/switch`、CLI `switch` 命令、team 角色切换）后，记忆链路（事实抽取 / 召回 / 压缩）会跟随 `agent.llm` 同步切换，避免记忆抽取仍使用启动时的旧 `LLMClient` 向旧提供商发请求。
+
+调用时传 thread_id，LangGraph 自动恢复该会话历史（`_invoke_config` 构造 `{"configurable": {"thread_id": ...}}`）。
 
 **核心能力**：
 
@@ -535,138 +666,113 @@ result = self.agent_executor.invoke(
 | 完整状态保存 | 保存消息、工具调用链、中间变量(不止文本)                                       |
 | 图暂停/恢复  | `ask_human` 触发 interrupt 后，用同一 `thread_id` 的 checkpoint 继续当前图 |
 
-### 长期记忆触发原理
+### 长期记忆写入流水线
 
-Checkpoint 是自动全量保存，长期记忆是**手动精选**——只有 `important=True` 的内容才写入：
+长期记忆不再是"手动标记 important"的简单追加，而是**事件驱动 + LLM 抽取**的完整流水线。写入在 [memory/middleware.py](memory/middleware.py) 的 `ThreadMemoryWriteMiddleware` 中实现：
 
-```python
-# agent/memory.py
-def add(self, role, content, metadata=None):
-    # 只在 important=True 时才写入 memory.json
-    if metadata and metadata.get("important", False):
-        self.long_term_memory.append(item)
-        self._save_long_term_memory()
-    # 普通(非important)由 checkpoint 自动处理,这里不再存
+```
+submit_event(thread_id, role, content, important)   # SessionManager 非阻塞调用
+   ↓ 投递到防抖 buffer（同 thread 新事件重置 20s 计时）
+   ↓ 限流：单 thread buffer 上限 30 条
+   ↓
+_a_run_pipeline()  （buffer 超时后批量处理）
+   ↓
+① 分类判定  judge_long_term_memory(MemoryInputEvent)
+   ↓ 非 SKIP 的事件进入下一步
+② LLM Fact 抽取  _a_extract_facts()
+   ↓ 从原始消息提取 {"content", "category", "confidence"} JSON 列表
+③ 无效内容过滤（空 content 丢弃）
+④ 两级 existing 去重（同时读 query_agent_facts + query_facts(thread_id)，
+   按 content 精确比对，agent 级优先，避免跨作用域重复）
+⑤ 按 category 路由作用域并分流组装 ThreadFactItem：
+     • user_fact / lesson → scope="agent"，写入 agent namespace
+     • conv / business / 兜底 → scope="thread"，写入 thread namespace
+⑥ 分流批量写入：
+     • save_agent_facts_batch(agent_items) → ThreadMemoryStore（agent namespace）
+     • save_facts_batch(thread_id, thread_items) → ThreadMemoryStore（thread namespace）
+   ↓
+⑦ 分流 LRU 淘汰：
+     • prune_agent_facts()：agent 级超 memory_max_agent_facts（默认 200）时淘汰
+     • prune_facts(thread_id)：thread 级超 memory_max_facts_per_thread（默认 50）时淘汰
 ```
 
-在 [agent/agent_core.py](agent/agent_core.py) 中：
+**事件来源**：SessionManager 消费 AgentEvent 流时调用：
 
 ```python
-# run() 和 cot() 模式 - 存长期
-self.memory.add("user", task)
-self.memory.add("assistant", output, {"important": True})  # ← 触发持久化
-
-# chat() 模式 - 不存长期(由 checkpoint 自动保存)
-self.memory.add("user", message)
-self.memory.add("assistant", output)  # ← 无 important,不写 memory.json
+# session/manager.py（achat_stream / arun_stream 中）
+if self._memory is not None:
+    await self._memory.submit_user_message(tid, message, important=is_run_mode)
+    # 执行过程中：
+    if event.is_memory_worthy:          # DONE / TOOL_RESULT 事件
+        await self._memory.consume_event(event)
 ```
+
+- `is_run_mode=True`（`react:` 模式）→ 用户消息标记 `important=True`
+- `DONE` / `TOOL_RESULT` 事件（`AgentEvent.is_memory_worthy`）→ 提交给记忆流水线评估
+- `TOKEN` / `TOOL_CALL` / `INTERRUPT` 事件不单独提交
+
+**分类判定**（[memory/models.py](memory/models.py) 的 `judge_long_term_memory`）：
+
+| 分类                       | 取值          | 作用域           | 判定条件                                                  |
+| -------------------------- | ------------- | ---------------- | --------------------------------------------------------- |
+| `USER_FACT`              | `user_fact` | **agent 级**（跨会话共享） | 用户告知的个人信息、习惯、偏好                            |
+| `LESSON_EXPERIENCE`      | `lesson`    | **agent 级**（跨会话共享） | 工具踩坑、稳定推理结论、不可行方案（同类失败 ≥2 次）     |
+| `BUSINESS_ENTITY`        | `business`  | **thread 级**（会话隔离） | 项目配置、关键路径、接口、长期目标                        |
+| `IMPORTANT_CONVERSATION` | `conv`      | **thread 级**（会话隔离） | 用户显式说"记住"、重要技术决策                            |
+| `SKIP`                   | `skip`      | 不写入            | 临时资源 / 未确认猜想 / 一次性子任务 / 单次失败 → 不写入 |
+
+> **LLM 抽取是第二道闸门**：分类判定只决定"值得评估"，最终是否入库由 LLM 从原始对话中抽取结构化事实决定，并附带 `category` 与 `confidence`（置信度），无效分类回退为 `conv`（走 thread 级）。
 
 ### 为什么 cot 不写入 checkpoint
 
-`cot()` 方法直接调用 `self.llm.chat_with_history()`，**绕过了 `agent_executor.invoke()`**，因此 checkpoint 不会记录。这是设计上的选择：
+`acot()` 方法直接调用 `self.llm.chat_with_history()`，**绕过了 `agent_executor`（LangGraph 执行）**，因此 checkpoint 不会记录。这是设计上的选择：
 
 - **cot 的语义**：纯推理，不调用工具
 - **避免被 Agent 拦截**：走 Agent 通道 LLM 可能自己决定调用工具，违背 cot 初衷
-- **checkpoint 是为 Agent 设计的**：cot 没有工具调用链，用 memory.json 存结论即可
+- **checkpoint 是为 Agent 设计的**：cot 没有工具调用链，也没有事件流，无需沉淀
 
-**副作用**：cot 之间无法续接(第二次 cot 看不到第一次 cot 的对话)，只能通过 memory.json 的长期记忆间接看到摘要。
+**副作用**：cot 之间无法续接（第二次 cot 看不到第一次 cot 的对话），只能用 `session.aget_short_term()` 手动取历史作为上下文。
 
 ### 文件位置
 
-由 [main.py](main.py) 配置：
+由 [main.py](main.py) 配置 checkpoint 文件路径；长期记忆与会话工作目录映射均**复用同一 SQLite 文件**，按表隔离：
 
 ```python
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CHECKPOINT_FILE = os.path.join(BASE_DIR, "memory", "checkpoints.sqlite")  # Checkpoint 数据库
-MEMORY_FILE = os.path.join(BASE_DIR, "memory", "memory.json")            # 长期记忆
+CHECKPOINT_FILE = os.path.join(BASE_DIR, "data", "checkpoints_async.sqlite")
 ```
 
-| 文件                          | 格式      | 内容                                |
-| ----------------------------- | --------- | ----------------------------------- |
-| `memory/checkpoints.sqlite` | SQLite    | Agent 执行状态(按 thread_id 隔离)   |
-| `memory/memory.json`        | JSON 数组 | react/cot 的最终结果(用于 compress) |
+所有持久化数据集中在**单一 SQLite 文件** `data/checkpoints_async.sqlite` 中：
 
-`memory.json` 文件格式：
+| 表 / 数据                    | 管理者               | 内容                                                               |
+| ---------------------------- | -------------------- | ------------------------------------------------------------------ |
+| `checkpoints` / `writes` | `AsyncSqliteSaver` | Agent 执行状态（消息 + 工具调用链，按`thread_id` 隔离）          |
+| LangGraph Store 表           | `AsyncSqliteStore` | 长期记忆 facts（两级 namespace：agent 级 `(agent_key, "global_facts")` 跨会话共享 + thread 级 `(thread_id, "thread_facts")` 会话隔离，替代旧`memory.json`） |
+| `session_workspaces`       | `WorkspaceStore`   | `session_id ↔ workspace_path` 映射（多会话工作目录隔离）        |
 
-```json
-[
-  {
-    "role": "user",
-    "content": "react:帮我搜索Python教程",
-    "timestamp": "2026-07-06T10:30:00.123456",
-    "metadata": {"important": true}
-  },
-  {
-    "role": "assistant",
-    "content": "已为你找到以下Python教程...",
-    "timestamp": "2026-07-06T10:30:02.654321",
-    "metadata": {"important": true}
-  }
-]
-```
-
-> 两个文件都会**自动创建父目录**，无需手动建 `memory/` 文件夹。
+> **长期记忆存储**：长期记忆由 LangGraph `BaseStore`（`AsyncSqliteStore`，见 [memory/store.py](memory/store.py) 的 `ThreadMemoryStore`）管理，与 checkpoint 复用同一 SQLite 文件，按**两级 namespace**天然实现分层隔离：
+> - **agent 级**：`(agent_key, "global_facts")`，存放 `user_fact` / `lesson`，跨会话共享；`agent_key = process_type or "default"`，多进程隔离防串号。
+> - **thread 级**：`(thread_id, "thread_facts")`，存放 `conv` / `business`，仅当前会话可见。
 >
-> **查看 checkpoints.sqlite**：可用 [DB Browser for SQLite](https://sqlitebrowser.org/dl/) 打开，或让 Agent 调用 `open_sqlite` 工具自动打开。
+> `compress` 命令现改为对 thread 级 Store 中的 facts 做摘要替换（`replace_with_summary`），不影响 agent 级记忆。
 
-### 会话(Thread)管理
+> checkpoint 与 Store 各持有**独立的 `aiosqlite` 连接**（均启用 WAL 模式 + `busy_timeout=10000`），支持多进程（CLI / API / 调度器 / 飞书）并发读写。
 
-基于 checkpoint 的 `thread_id` 机制，支持多会话管理：
-
-| 命令                   | 作用                                               | 示例                            |
-| ---------------------- | -------------------------------------------------- | ------------------------------- |
-| `thread`             | 方向键选择切换会话(显示第一条用户消息与消息数预览) | `thread`                      |
-| `thread:new`         | 开启新会话(原会话保留)                             | `thread:new`                  |
-| `thread:delete <id>` | 删除指定会话(二次确认,不可恢复)                    | `thread:delete thread-abc123` |
-
-> 切换会话统一走 `thread` 方向键菜单，无需手动输入 thread_id。
+> `data/` 父目录会在首次连接时**自动创建**，无需手动建文件夹。
 >
-> 在 `thread` 菜单中，使用方向键移动高亮项，按 `Enter` 切换会话，按 `Esc` 取消；按 `Ctrl+D` 可删除当前高亮会话。删除前会要求输入 `y` 或 `yes` 确认。
->
-> 菜单中每个会话直接用第一条用户消息作为标题（超长自动截断），不调用 LLM，因此会话再多也不会卡顿。
-
-**示例**：
-
-```
-你: thread
- 选择会话 (共 2 个,↑↓ 选择,Enter 切换)
-  (↑↓ 选择, Enter 切换, Ctrl+D 删除, Esc 取消)
-    thread-a4d099d2  [6 条消息]
-  ❯ thread-b1dc3b2a  [0 条消息] (当前)
-----------------------------------------
-(按 Enter 切换)
-
-你: thread:new
-已开启新会话: thread-c7e8f1a3
-原会话 thread-a4d099d2 已保留,可用 'thread' 切回
-
-你: thread:delete thread-a4d099d2
-确认删除会话 'thread-a4d099d2'? 此操作不可恢复 [y/N]: y
-已删除会话: thread-a4d099d2
-```
-
-在会话菜单中删除高亮会话的操作示例：
-
-```
-你: thread
-  (↑↓ 选择, Enter 切换, Ctrl+D 删除, Esc 取消)
-  ❯ thread-b1dc3b2a  [0 条消息] (当前)
-
-确认删除会话 'thread-b1dc3b2a'? 此操作不可恢复 [y/N]: y
-已删除会话: thread-b1dc3b2a
-```
+> **查看 SQLite 内容**：可用 [DB Browser for SQLite](https://sqlitebrowser.org/dl/) 打开，或让 Agent 调用 `open_sqlite` 工具自动打开。
 
 ### 记忆管理命令
 
-| 命令                        | 作用                                 |
-| --------------------------- | ------------------------------------ |
-| `clear` 或 `clear long` | 清空长期记忆 + 删除`memory.json`   |
-| `clear short`             | 清空当前会话(开启新 thread 替代删除) |
-| `clear all`               | 全部清空                             |
-| `compress` 或 `压缩`    | 压缩长期记忆(LLM 摘要后替换原内容)   |
-| `thread`                  | 方向键选择切换会话                   |
-| `thread:new`              | 开启新会话                           |
-| `thread:delete <id>`      | 删除指定会话(二次确认)               |
+| 命令                        | 作用                                                    |
+| --------------------------- | ------------------------------------------------------- |
+| `clear` 或 `clear long` | 清空当前线程的长期记忆 facts（`MemoryManager.clear`） |
+| `clear short`             | 清空当前会话(开启新 thread 替代删除)                    |
+| `clear all`               | 全部清空（长期 facts + 新会话）                         |
+| `compress` 或 `压缩`    | 压缩长期记忆(LLM 摘要后替换单个摘要 fact)               |
+| `thread`                  | 方向键选择切换会话                                      |
+| `thread:new`              | 开启新会话                                              |
+| `thread:delete <id>`      | 删除指定会话(二次确认)                                  |
 
 用 `info` 命令可查看记忆状态：
 
@@ -678,32 +784,31 @@ API地址:    https://api.deepseek.com
 
 --- 记忆状态 ---
 当前会话:   thread-a4d099d2
-Checkpoint: sqlite → D:\work\LangChainAgent\memory\checkpoints.sqlite
+Checkpoint: sqlite → D:\work\LangChainAgent\data\checkpoints_async.sqlite
 已存消息:   8 条
-长期记忆:   5 条
+长期记忆:   5 条 (thread 级，会话隔离)
+agent 级记忆: 12 条 (跨会话共享)
 总会话数:   2
 ```
 
 ### 压缩长期记忆（compress）
 
-随着 `react:` / `cot:` 不断积累，`memory.json` 会越来越大。`compress` 命令通过 LLM 把所有长期记忆压缩成一份摘要，再写回 `memory.json`。
+随着对话不断积累，thread 级 Store 中的 facts 会越来越多（单 thread 上限 `memory_max_facts_per_thread` 默认 50 条，超出 LRU 淘汰；agent 级另有 `memory_max_agent_facts` 默认 200 条上限）。`compress` 命令通过 LLM 把当前 thread 的 facts 压缩成一份摘要，再替换为**单条摘要 fact**。
 
-> **注意**：compress 只压缩 `memory.json`，不影响 `checkpoints.sqlite`。
+> **注意**：compress 只压缩**当前 thread 级长期记忆 facts**（`conv` / `business`），不影响 checkpoint（完整对话历史保留在 `checkpoints_async.sqlite`），也不影响 agent 级记忆（`user_fact` / `lesson` 跨会话共享，需通过 `MemoryManager.clear_agent_facts` 单独清空）。
 
 #### 工作流程
 
 ```
-memory.json (N条原始记忆)
+Store facts (N条原始记忆)
        ↓
-拼接为文本 + 压缩提示词
+MemoryManager.compress(thread_id) 拼接为文本 + 压缩提示词
        ↓
-发送给 LLM
+LLM 生成摘要（阻塞调用放入 asyncio.to_thread，不阻塞事件循环）
        ↓
-LLM 生成摘要
+ThreadMemoryStore.replace_with_summary(thread_id, summary)
        ↓
-用摘要替换原 N 条记忆（变成 1 条）
-       ↓
-保存回 memory.json
+删除全部旧 facts → 写入 1 条摘要 fact（category=conv, confidence=1.0）
 ```
 
 #### 压缩提示词
@@ -731,67 +836,235 @@ LLM 生成摘要
 --- 摘要内容 ---
 - 用户要求创建 LangChainAgent 项目
 - 已通过 config/llm_config.json 配置多个 LLM 提供商
-- 添加了 MCP workspace 工具（6 个文件夹管理工具）
 - 修复了 StructuredTool 同步调用问题
 - ...
---- 已保存到 memory.json ---
+--- 已保存到长期记忆 Store ---
 ```
 
-#### 压缩后的 memory.json 格式
+#### 压缩后的 Store 格式
 
-```json
-[
-  {
-    "role": "system",
-    "content": "[历史记忆摘要 2026-07-06T12:00:00]\n- 用户要求创建...\n- 已配置...",
-    "timestamp": "2026-07-06T12:00:00",
-    "metadata": {
-      "important": true,
-      "type": "summary",
-      "original_count": 8,
-      "original_chars": 4523,
-      "compressed_chars": 687
-    }
-  }
-]
-```
+摘要作为单条 `ThreadFactItem` 写入 thread 级 Store（namespace `(thread_id, "thread_facts")`，`scope="thread"`）：
 
-`metadata` 中保留了压缩前的条数和字符数，便于追溯。
+| 字段           | 值                            |
+| -------------- | ----------------------------- |
+| `content`    | `[历史记忆摘要]\n{summary}` |
+| `category`   | `conv`（重要对话）          |
+| `confidence` | `1.0`                       |
+| `scope`      | `thread`（会话隔离）         |
+| `fact_id`    | 新生成的 uuid hex             |
+
+`MemoryManager.compress()` 返回 `{"success", "original_count", "original_chars", "compressed_chars", "summary"}`，其中保留压缩前的条数与字符数，便于追溯。
 
 #### 特点与注意事项
 
-| 特性              | 说明                                                    |
-| ----------------- | ------------------------------------------------------- |
-| 保留关键信息      | system prompt 要求 LLM 保留用户意图、决策、事实         |
-| 结构化输出        | 按主题分条，便于后续查阅                                |
-| 可追溯            | `metadata` 保存原始条数和字符数                       |
-| 可多次压缩        | 再次`compress` 会对已有摘要再压缩                     |
-| LLM 失败不丢数据  | 调用失败则原记忆不变，不会写回                          |
-| **不可逆**  | 压缩后原条目无法恢复，建议重要数据先备份`memory.json` |
-| 不影响 checkpoint | 只压缩 memory.json，checkpoints.sqlite 保留完整历史     |
+| 特性              | 说明                                                               |
+| ----------------- | ------------------------------------------------------------------ |
+| 保留关键信息      | system prompt 要求 LLM 保留用户意图、决策、事实                    |
+| 结构化输出        | 按主题分条，便于后续查阅                                           |
+| 可追溯            | 返回`original_count` / `original_chars` / `compressed_chars` |
+| 可多次压缩        | 再次`compress` 会对已有摘要 fact 再压缩                          |
+| LLM 失败不丢数据  | 调用失败则原 facts 不变，不会替换                                  |
+| **不可逆**  | 压缩后原 facts 无法恢复，重要数据可先用`export` 备份             |
+| 不影响 checkpoint | 只压缩 thread 级 Store facts，checkpoints_async.sqlite 保留完整历史          |
+| 不影响 agent 级记忆 | 只压缩 thread 级（`conv` / `business`），agent 级（`user_fact` / `lesson`）跨会话共享，不参与压缩 |
 
-> 💡 **建议**：在长期记忆较多时（如 50+ 条）使用，平时少量记忆无需压缩。
+> 💡 **建议**：在 thread 级长期记忆较多时（如 `memory_max_facts_per_thread` 默认 50 条上限附近）使用，平时少量记忆无需压缩。
 
 ### 记忆相关 API
 
-| 方法                                 | 说明                                                      |
-| ------------------------------------ | --------------------------------------------------------- |
-| `get_checkpointer()`               | 获取 checkpointer 实例(传给 create_react_agent)           |
-| `get_config()`                     | 返回`{"configurable": {"thread_id": ...}}`(传给 invoke) |
-| `get_messages()`                   | 从 checkpoint 获取当前 thread 的所有消息                  |
-| `get_short_term(limit)`            | 从 checkpoint 取消息转为 dict 格式                        |
-| `get_long_term(limit)`             | 获取最近 N 条长期记忆                                     |
-| `get_all_context(long_term_limit)` | 获取完整上下文(长期+短期)                                 |
-| `add(role, content, metadata)`     | 添加记忆，`important=True` 触发写 memory.json           |
-| `new_thread()`                     | 开启新会话                                                |
-| `switch_thread(thread_id)`         | 切换到指定会话(代码层 API,CLI 用`thread` 菜单)          |
-| `delete_thread(thread_id)`         | 删除指定会话(删当前会话时自动切换到其他会话)              |
-| `list_threads()`                   | 列出所有会话 ID                                           |
-| `export_thread(thread_id, fmt)`    | 导出指定会话为可读文本/Markdown                           |
-| `clear_short_term()`               | 开启新会话(替代删除)                                      |
-| `clear_long_term()`                | 清空长期记忆并删除文件                                    |
-| `summarize()`                      | 返回记忆统计信息(含 thread_id、消息数、会话数)            |
-| `compress_memory()`                | 压缩长期记忆（LLM 摘要后替换原内容）                      |
+记忆系统的对外接口分三层：**入口程序 → `MemoryContext`（工厂）→ `MemoryManager`（门面）→ `ThreadMemoryStore`（存储）**。SessionManager 是上层唯一调用方，Agent 不直接触碰记忆组件。
+
+#### MemoryContext（统一工厂，入口程序使用）
+
+| 成员                                 | 说明                                                                             |
+| ------------------------------------ | -------------------------------------------------------------------------------- |
+| `await MemoryContext.acreate(...)` | 异步创建全部记忆组件（checkpointer + Store + 锁池 + 读写中间件 + MemoryManager） |
+| `ctx.checkpointer`                 | LangGraph checkpointer（传给`AgentCore` / `SessionRegistry`）                |
+| `ctx.store`                        | LangGraph`BaseStore`（传给 `create_agent(store=...)`）                       |
+| `ctx.read_middleware`              | `ThreadMemoryReadMiddleware`（传给 `extra_middleware`）                      |
+| `ctx.thread_id`                    | 初始会话线程 ID                                                                  |
+| `ctx.async_conn`                   | 异步 SQLite 连接（供 SessionRegistry 共享）                                      |
+| `ctx.memory_manager`               | `MemoryManager` 实例（注入 SessionManager）                                    |
+| `await ctx.aclose()`               | 刷新记忆 buffer、关闭中间件、释放 SQLite 连接                                    |
+
+#### MemoryManager（统一门面，SessionManager 使用）
+
+**thread 级**（会话隔离）：
+
+| 方法                                                               | 说明                                                                                    |
+| ------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
+| `await recall(thread_id, limit=None)`                            | 召回该 thread 的长期记忆 facts（按创建时间升序，截取最近 limit 条，默认 10）            |
+| `await recall_text(thread_id, limit=None)`                       | 召回并格式化为文本片段（`【长期记忆】` 块，供注入 prompt）                            |
+| `await submit_user_message(thread_id, content, important=False)` | 提交用户消息到写中间件（非阻塞，防抖）                                                  |
+| `await consume_event(event)`                                     | 消费 AgentEvent（`is_memory_worthy` 的 DONE / TOOL_RESULT），提交到写中间件（非阻塞） |
+| `await compress(thread_id)`                                      | 压缩该 thread 长期记忆（LLM 摘要替换为单条 fact，仅作用于 thread 级）                                       |
+| `await clear(thread_id)`                                         | 清空该 thread 全部 facts，返回清除数量                                                  |
+| `await count_facts(thread_id)`                                   | 统计该 thread 的 fact 条数                                                              |
+| `await flush_all()`                                              | 立即处理所有 buffer 事件（Agent 关闭前调用）                                            |
+| `await shutdown()`                                               | 关闭写中间件（取消定时器、清理 buffer）                                                 |
+
+**agent 级**（跨会话共享，`user_fact` / `lesson`）：
+
+| 方法                                          | 说明                                                                                                          |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `await recall_agent(limit=None)`            | 召回 agent 级长期记忆 facts（跨会话共享，按 `create_time` 升序，截取最近 `limit` 条；不进行 touch 更新，LRU 依赖 `prune_agent_facts`） |
+| `await recall_agent_text(limit=None)`       | 召回 agent 级记忆并格式化为文本片段（`【长期记忆】` 块）                                                       |
+| `await count_agent_facts()`                 | 统计 agent 级长期记忆条数                                                                                      |
+| `await clear_agent_facts()`                 | 清空 agent 级全部长期记忆，返回清除数量                                                                        |
+
+#### ThreadMemoryReadMiddleware（读，LangGraph 中间件）
+
+| 方法                                   | 说明                                                                                                             |
+| -------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `awrap_model_call(request, handler)` | 每个 model 调用前从 Store 读取该 thread facts，组装为`【长期记忆】` 文本块追加到 SystemMessage，再调用 handler |
+
+#### ThreadMemoryStore（存储封装，底层）
+
+构造参数：`max_facts`（thread 级 LRU 上限，默认 `memory_max_facts_per_thread=50`）/ `max_agent_facts`（agent 级 LRU 上限，默认 `memory_max_agent_facts=200`）/ `process_type`（进程类型标识，决定 `agent_key`，`None` 时取 `"default"`）。
+
+**thread 级方法**：
+
+| 方法                                                     | 说明                                            |
+| -------------------------------------------------------- | ----------------------------------------------- |
+| `await query_facts(thread_id)`                         | 读取该 thread 全部 facts（按 create_time 升序） |
+| `await save_fact / save_facts_batch(thread_id, items)` | 写入单条 / 批量 facts（按 fact_id 幂等覆盖）    |
+| `await prune_facts(thread_id)`                         | LRU 淘汰（超 max_facts 后删除最久未使用）       |
+| `await touch_fact(thread_id, fact_id)`                 | 更新 last_used_at（读取时非阻塞触发）           |
+| `await clear_thread_memory(thread_id)`                 | 清空该 thread 全部 facts                        |
+| `await replace_with_summary(thread_id, summary)`       | 删除全部 facts 后写入单条摘要 fact              |
+
+**agent 级方法族**（跨会话共享，namespace `(agent_key, "global_facts")`）：
+
+| 方法                                          | 说明                                                          |
+| --------------------------------------------- | ------------------------------------------------------------- |
+| `await query_agent_facts()`                 | 读取 agent 级全部 facts（按 create_time 升序）                |
+| `await save_agent_facts_batch(items)`       | 批量写入 agent 级 facts（按 fact_id 幂等覆盖）                |
+| `await prune_agent_facts()`                 | agent 级 LRU 淘汰（超 `max_agent_facts` 后删除最久未使用）    |
+| `await touch_agent_fact(fact_id)`           | 更新 agent 级 fact 的 last_used_at                            |
+| `await count_agent_facts()`                 | 统计 agent 级 fact 条数                                       |
+| `await clear_agent_facts()`                 | 清空 agent 级全部 facts                                       |
+
+#### SessionManager 委托接口（对外推荐入口）
+
+| 方法                                | 说明                                                                    |
+| ----------------------------------- | ----------------------------------------------------------------------- |
+| `await aget_memory_summary()`     | 记忆状态统计（thread_id / checkpoint 消息数 / 长期记忆条数 `long_term_count` / **agent 级长期记忆条数 `agent_fact_count`** / 总会话数） |
+| `await acompress_memory()`        | 压缩当前线程长期记忆（阻塞 LLM 调用放入`asyncio.to_thread`，仅作用于 thread 级）          |
+| `await aclear_long_term_memory()` | 清空当前线程长期记忆（仅 thread 级；agent 级需调 `MemoryManager.clear_agent_facts`） |
+
+---
+
+## 会话管理（Session）
+
+会话（Session / Thread）是对话隔离的基本单元，每个会话对应一个 `thread_id`（即 session_id），历史消息、工具调用链、执行历史、挂起中断等状态按会话隔离并持久化。早期会话管理内嵌在 `AgentMemory` 中，现已抽离为独立的 `session/` 模块（三层架构）：`SessionRegistry` 负责生命周期、`SessionStore` 负责瞬态状态、`SessionManager` 作为对外门面。
+
+### 架构总览
+
+```
+session/
+├── context.py          # SessionContext：单会话运行时上下文（session_id + config + checkpointer）
+├── store.py            # SessionStore：基于 LangGraph Store 的 per-session 瞬态状态
+├── registry.py         # SessionRegistry：会话生命周期管理（生成/查询/删除/消息读取）
+├── workspace_store.py  # WorkspaceStore：session_id ↔ workspace_path 映射
+└── manager.py          # SessionManager：对外门面 & 会话调度（封装 Agent + Memory）
+```
+
+| 组件                | 职责                                                                                                                |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `SessionContext`  | 单个会话的运行时上下文（session_id + LangGraph config + checkpointer）                                              |
+| `SessionStore`    | 基于 LangGraph Store 的 per-session 瞬态状态：`execution_history`（执行历史）/ `pending_interrupts`（挂起中断） |
+| `SessionRegistry` | 会话生命周期管理（生成/查询/删除/消息读取），桥接 checkpointer 与 Store                                             |
+| `WorkspaceStore`  | `session_id ↔ workspace_path` 映射（多会话工作目录隔离）                                                         |
+| `SessionManager`  | 对外门面 & 会话调度（封装 Agent + Memory），承接所有流式/并发/记忆调度                                              |
+
+> **设计要点**：`AgentCore` 实例只持有不可变配置 + 共享的编译图 / Store / checkpointer，可安全在多会话间复用；所有会话级可变状态通过 `session_id` 显式隔离（`active_skills` 等放入 `LCAgentState` 随 checkpoint per-thread 持久化）。
+
+### Session ID 生成
+
+`SessionRegistry.generate_session_id()` 生成会话 ID，格式为 `[进程类型-][workflow-工作流名-]thread-8位随机`：
+
+| 示例                              | 说明                                                                          |
+| --------------------------------- | ----------------------------------------------------------------------------- |
+| `thread-a4d099d2`               | 普通会话                                                                      |
+| `workflow-simple-thread-abc123` | 专属工作流会话（`workflow-{名称}-thread-{后缀}`）                           |
+| `server-thread-...`             | 带`process_type` 前缀（多进程隔离，server/scheduler/feishu 各进程前缀不同） |
+
+- `is_workflow_session(session_id)` / `workflow_name_of(session_id)`：判断并反解工作流会话。
+- `current_session_id` 是 **CLI 单会话语义**的当前指针；**并发场景必须显式传 `session_id`**，不依赖该共享指针。
+
+### 会话生命周期（SessionRegistry API）
+
+`agent.session`（`AgentCore.session` 属性）暴露 `SessionRegistry`：
+
+| 方法                                    | 说明                                                                               |
+| --------------------------------------- | ---------------------------------------------------------------------------------- |
+| `new_session(workspace_path=None)`    | 开启新会话（原会话保留在数据库），更新 current_session_id                          |
+| `new_workflow_session(workflow_name)` | 开启专属工作流会话（ID 含`workflow-{名称}`）                                     |
+| `aswitch_session(session_id)`         | 切换到指定会话（恢复历史 + warm workspace 缓存）                                   |
+| `adelete_session(session_id)`         | 删除会话：先清该会话 **thread 级长期记忆**（与写流水线串行化，避免被防抖 flush 回写“复活”），再清 checkpoint + Store + workspace 绑定（删当前会话时自动切换到其他会话）；agent 级跨会话共享记忆不受影响 |
+| `alist_sessions(all_types=False)`     | 列出所有可见会话（checkpoint 存量 ∪ 当前会话）                                    |
+| `asummarize(session_id)`              | 返回会话统计（session_id / 消息数 / 总会话数）                                     |
+| `aget_messages(session_id)`           | 从 checkpoint 获取该会话所有消息                                                   |
+| `aget_short_term(session_id, limit)`  | 取最近 N 条消息转 dict 格式（兼容旧 API）                                          |
+| `aexport_session(session_id, fmt)`    | 导出会话为可读文本（`text`）或 Markdown（`markdown`）                          |
+| `aclose()`                            | 关闭 checkpointer 持有的 SQLite 连接                                               |
+
+### 工作空间绑定（Workspace）
+
+每个会话可绑定一个工作空间目录（文件与执行类工具被限制在该目录内），由 `WorkspaceStore` 持久化：
+
+| 方法                                      | 说明                                                                  |
+| ----------------------------------------- | --------------------------------------------------------------------- |
+| `aset_workspace(path, session_id=None)` | 设置/修改会话工作空间（缓存 + DB 双写）                               |
+| `aget_workspace(session_id=None)`       | 获取会话工作空间路径（缓存优先，未命中查 DB）                         |
+| `aclear_workspace(session_id=None)`     | 清除会话工作空间绑定（`True`=原绑定存在已清除）                     |
+| `awarm_workspace(session_id)`           | 进程重启后从 DB 加载 workspace 到缓存，使`get_context()` 同步读命中 |
+
+> 路径校验（`_validate_workspace_path`）：必须为**已存在的目录**的绝对路径；禁止宿主根目录、用户主目录、系统目录（Windows `C:\Windows` / `System32`）。
+
+CLI 命令 `workspace` / `workspace <路径>` / `workspace:clear` 即对应上述 API；`get_context()` 读取 `SessionContext` 供每次图执行注入。
+
+**工作流（workflow）同样受 workspace 隔离**：`workflow` 命令从会话上下文提取 `workspace_path` → 经运行器（`arun_workflow_by_name` → `arun_compiled_workflow`）注入 `config.configurable` → LangGraph 按节点签名注入 `worker_exec` 节点 → 透传 `Worker.execute_task`，使 Worker 的工具调用经 `WorkspaceSecurityMW` 路径解析与逃逸校验（`team/base.py::_create_tool_agent` 对工具型 Agent 挂载该中间件）。未绑定 workspace 的会话自动降级为不受限（`workspace_path=None`）。
+
+HTTP API（[api/server.py](api/server.py)）同样暴露三个 RESTful 端点，供 Web 前端调用：
+
+| 方法       | 路径                                   | 对应 CLI             | 说明                                                     |
+| ---------- | -------------------------------------- | -------------------- | -------------------------------------------------------- |
+| `GET`    | `/api/threads/{thread_id}/workspace` | `workspace`        | 查询绑定（`workspace` 字段为 `null` 表示未绑定）     |
+| `POST`   | `/api/threads/{thread_id}/workspace` | `workspace <路径>` | 设置/修改绑定，body`{"path": "..."}`；路径非法返回 400 |
+| `DELETE` | `/api/threads/{thread_id}/workspace` | `workspace:clear`  | 清除绑定，返回`{"cleared": true/false}`                |
+
+### SessionManager 门面
+
+`AgentCore.session_manager`（懒初始化）是上层流量的统一入口，封装 Agent + Memory：
+
+- **流式接口**：`achat_stream` / `aresume_stream` / `arun_stream`，产出 SSE 事件（`token` / `tool_call` / `tool_result` / `interrupt` / `cancelled` / `error` / `done` / `workflow_node` / `workflow_status`）。其中 `workflow_node`（NODE_START/END/ERROR → status `running`/`done`/`error`）在 `done` 时携带该节点产出 `content`，前端在会话窗口渲染节点结果块
+  - **`tool_call` / `tool_result` id 一致性**：LangChain 的 `on_tool_start` / `on_tool_end` 事件 data 不含 `tool_call_id`，`agent_core._arun_graph_events` 借助 `on_chat_model_end` 的 `AIMessage.tool_calls` 与事件 `run_id` 建立桥接，保证两个事件的 `id` 一致（兜底回退到事件 `name`），前端按 `id` 关联工具卡片与其结果
+- **非流式接口**：`achat` / `aresume` / `arun`，收集全部 token 为最终文本
+- **会话管理委托**：`new_session` / `new_workflow_session` / `set_current_session` / `current_session_id` / `alist_sessions` / `aswitch_session` / `adelete_session` / `aget_messages` / `aexport_session` / `asummarize`
+- **记忆管理委托**：`aget_memory_summary` / `acompress_memory` / `aclear_long_term_memory`
+- **执行历史**：`aget_execution_history` / `aclear_history`
+- **上下文压缩**：`manually_compact(force, thread_id)`
+- **生命周期**：`aclose()`（刷新记忆 buffer + 释放 Agent 资源）
+
+**per-thread 并发锁**（`SessionManager._thread_locks`）：
+
+- 同一 `thread_id` 的请求持有同一把 `asyncio.Lock`，严格串行，保证 checkpoint 读写一致；
+- 不同 `thread_id` 各自独立锁，可同时流式对话互不阻塞。
+
+> ⚠️ **初始化顺序**：首次访问 `session_manager` 前必须先调用 `set_memory_manager()` 注入 MemoryManager，否则 SessionManager 将在**无记忆功能**下初始化（重试会抛 `RuntimeError`）。
+
+### 与 CLI 的关系
+
+| 命令                                        | 作用                                                                                   |
+| ------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `thread`                                  | 方向键菜单切换会话（显示首条用户消息预览 + 消息数；Enter 切换、Ctrl+D 删除、Esc 取消） |
+| `thread:new`                              | 开启新会话（原会话保留，可随时切回）                                                   |
+| `thread:delete <id>`                      | 删除指定会话（二次确认，不可恢复；删当前会话自动切换到其他会话）                       |
+| `export` 或 `export:<thread_id> [路径]` | 导出对话为 Markdown（默认存`exports/`）                                              |
+| `workspace <路径>` / `workspace:clear`  | 绑定/清除当前会话工作空间                                                              |
+
+> **存储位置**：会话历史在 `data/checkpoints_async.sqlite` 的 `checkpoints` / `writes` 表（按 `thread_id` 隔离）；工作空间映射在 `session_workspaces` 表；执行历史与挂起中断写入 LangGraph Store（瞬态，随会话删除清理）。详见[记忆系统 → 文件位置](#文件位置)。
 
 ---
 
@@ -817,21 +1090,21 @@ Agent 的工具分为两类：
 
 使用 LangChain `@tool` 装饰器定义，启动时直接加载：
 
-| 工具               | 文件                                              | 功能                                                                                                                                                             | 参数                                                                              |
-| ------------------ | ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
-| `search`         | [tools/search.py](tools/search.py)                 | 联网搜索(Tavily API)                                                                                                                                             | `query`, `num_results`, `search_depth`                                      |
-| `read_file`      | [tools/file_tool.py](tools/file_tool.py)           | 读取文件                                                                                                                                                         | `file_path`                                                                     |
-| `write_file`     | [tools/file_tool.py](tools/file_tool.py)           | 写入文件                                                                                                                                                         | `file_path`, `content`, `mode`                                              |
-| `calculate`      | [tools/calculator.py](tools/calculator.py)         | 数学计算                                                                                                                                                         | `expression`                                                                    |
-| `run_shell`      | [tools/terminal_tools.py](tools/terminal_tools.py) | 执行 shell 命令                                                                                                                                                  | `command`, `cwd`, `timeout`                                                 |
-| `run_python`     | [tools/terminal_tools.py](tools/terminal_tools.py) | 执行 Python 脚本文件                                                                                                                                             | `file_path`, `script_args`, `cwd`, `timeout`                              |
-| `run_cmd`        | [tools/terminal_tools.py](tools/terminal_tools.py) | 执行 Shell / .bat / .ps1 脚本文件                                                                                                                                | `file_path`, `script_args`, `cwd`, `timeout`                              |
-| `get_local_time` | [tools/get_local_time.py](tools/get_local_time.py) | 获取本地时间                                                                                                                                                     | 无                                                                                |
-| `open_file`      | [tools/open_file.py](tools/open_file.py)           | 用系统默认/指定程序打开文件或文件夹                                                                                                                              | `file_path`, `app_path`                                                       |
-| `open_sqlite`    | [tools/open_file.py](tools/open_file.py)           | 用 DB Browser for SQLite 打开 .sqlite/.db                                                                                                                        | `file_path`                                                                     |
-| `read_skill`     | [tools/skill_tool.py](tools/skill_tool.py)         | 读取本地技能(SKILL.md)的指引正文                                                                                                                                 | `skill_name`(可空)                                                              |
+| 工具               | 文件                                              | 功能                                                                                                                                                                                                                                                                                                                                                     | 参数                                                                                         |
+| ------------------ | ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `search`         | [tools/search.py](tools/search.py)                 | 联网搜索(Tavily API)                                                                                                                                                                                                                                                                                                                                     | `query`, `num_results`, `search_depth`                                                 |
+| `read_file`      | [tools/file_tool.py](tools/file_tool.py)           | 读取文件                                                                                                                                                                                                                                                                                                                                                 | `file_path`                                                                                |
+| `write_file`     | [tools/file_tool.py](tools/file_tool.py)           | 写入文件                                                                                                                                                                                                                                                                                                                                                 | `file_path`, `content`, `mode`                                                         |
+| `calculate`      | [tools/calculator.py](tools/calculator.py)         | 数学计算                                                                                                                                                                                                                                                                                                                                                 | `expression`                                                                               |
+| `run_shell`      | [tools/terminal_tools.py](tools/terminal_tools.py) | 执行 shell 命令                                                                                                                                                                                                                                                                                                                                          | `command`, `cwd`, `timeout`                                                            |
+| `run_python`     | [tools/terminal_tools.py](tools/terminal_tools.py) | 执行 Python 脚本文件                                                                                                                                                                                                                                                                                                                                     | `file_path`, `script_args`, `cwd`, `timeout`                                         |
+| `run_cmd`        | [tools/terminal_tools.py](tools/terminal_tools.py) | 执行 Shell / .bat / .ps1 脚本文件                                                                                                                                                                                                                                                                                                                        | `file_path`, `script_args`, `cwd`, `timeout`                                         |
+| `get_local_time` | [tools/get_local_time.py](tools/get_local_time.py) | 获取本地时间                                                                                                                                                                                                                                                                                                                                             | 无                                                                                           |
+| `open_file`      | [tools/open_file.py](tools/open_file.py)           | 用系统默认/指定程序打开文件或文件夹                                                                                                                                                                                                                                                                                                                      | `file_path`, `app_path`                                                                  |
+| `open_sqlite`    | [tools/open_file.py](tools/open_file.py)           | 用 DB Browser for SQLite 打开 .sqlite/.db                                                                                                                                                                                                                                                                                                                | `file_path`                                                                                |
+| `read_skill`     | [skmng/tool.py](skmng/tool.py)                     | 读取本地技能(SKILL.md)的指引正文                                                                                                                                                                                                                                                                                                                         | `skill_name`(可空)                                                                         |
 | `create_tool`    | [tools/create_tools.py](tools/create_tools.py)     | 动态生成工具代码并保存为 .py 文件（默认保存到 tools/ 目录并自动注册到 tools/__init__.py；tool_logic 支持含 f-string/多行字符串的代码，内容行不会被误缩进）。安全边界：工具名须为合法 Python 标识符、路径限制在 tools/ 目录内禁止逃逸、默认禁止覆盖已有文件（`force=True` 可覆盖）、生成源码经 AST 校验禁止导入 os/subprocess/socket 等高风险模块 | `tool_name`, `tool_description`, `args_spec`, `tool_logic`, `tool_path`, `force` |
-| `ask_human`      | [cli/human_input.py](cli/human_input.py)           | 暂停 LangGraph 图并请求人工结构化选择                                                                                                                            | `prompt`, `choices`                                                           |
+| `ask_human`      | [cli/human_input.py](cli/human_input.py)           | 暂停 LangGraph 图并请求人工结构化选择                                                                                                                                                                                                                                                                                                                    | `prompt`, `choices`                                                                      |
 
 > `open_sqlite` 会自动查找 DB Browser for SQLite 路径（环境变量 `SQLITE_BROWSER_PATH` → 常见安装位置 → `shutil.which`），找不到则返回下载链接。Linux 下安装 `sqlitebrowser` 包即可使用。
 
@@ -843,22 +1116,8 @@ Agent 的工具分为两类：
 
 | Server 名称    | 工具数 | 传输方式 | 说明                                                |
 | -------------- | ------ | -------- | --------------------------------------------------- |
-| `workspace`  | 6      | stdio    | 文件夹创建/删除/移动/复制/列举（Python 实现）       |
 | `filesystem` | -      | stdio    | 可选官方文件系统服务（需手动添加/启用，需 Node.js） |
 | `fetch`      | -      | stdio    | 可选官方网页抓取服务（需手动添加/启用，需 Node.js） |
-
-#### workspace MCP Server 提供的工具
-
-由 [tools/workspace_tool.py](tools/workspace_tool.py) 实现，基于 `FastMCP`：
-
-| 工具                      | 功能              | 参数                            |
-| ------------------------- | ----------------- | ------------------------------- |
-| `create_workspace`      | 创建文件夹        | `folder_name`, `parent_dir` |
-| `get_current_workspace` | 获取当前工作目录  | 无                              |
-| `list_directory`        | 列出目录内容      | `path`                        |
-| `delete_workspace`      | 删除文件夹        | `folder_path`, `recursive`  |
-| `move_workspace`        | 移动/重命名文件夹 | `src_path`, `dest_path`     |
-| `copy_workspace`        | 复制文件夹        | `src_path`, `dest_path`     |
 
 #### MCP 配置文件
 
@@ -866,14 +1125,7 @@ Agent 的工具分为两类：
 
 ```json
 {
-    "servers": {
-        "workspace": {
-            "transport": "stdio",
-            "command": "python",
-            "args": ["tools/workspace_tool.py"],
-            "enabled": true
-        }
-    }
+    "servers": {}
 }
 ```
 
@@ -915,13 +1167,14 @@ Agent 可以在任务中**阅读并使用这些技能指引**，支持三种方�
 
 #### 已注册的技能（本地）
 
-由 [tools/skills.py](tools/skills.py) 的 `SkillManager` 扫描 `.agents/skills/` 自动发现：
+由 [skmng/manager.py](skmng/manager.py) 的 `SkillManager` 扫描 `.agents/skills/` 自动发现：
 
 | 技能            | 说明                                   |
 | --------------- | -------------------------------------- |
 | `find-skills` | 发现并安装 agent skills                |
 | `git-commit`  | 从 git diff 生成双语提交信息并执行提交 |
 | `pptx`        | 创建/读取/编辑`.pptx` 演示文稿       |
+| `vivado-2025.2` | Vivado 2025.2 FPGA 工程自动化构建（综合→实现→比特流，`run_skill.tcl` 一键流程） |
 
 > 中文任务通过内置中→英关键词扩展（如 提交→commit/git、演示→ppt/slides）实现与英文描述的匹配。
 
@@ -1096,7 +1349,7 @@ CONFIRM           ❌ deny          ⚠️ confirm       ⚠️ confirm
 - **方法 2**：使用 `safety:confirm off` 暂时关闭确认（不推荐，风险高）
 - **方法 3**：在确认提示时输入 `y` 或 `yes` 允许执行
 
-### 工具调用机制
+### 5. 工具调用机制
 
 Agent 基于 **LangGraph `create_react_agent`** 实现，工具调用流程：
 
@@ -1116,7 +1369,30 @@ LLM 决定是否调用工具
 
 若调用的是 `ask_human`，工具不会立即返回普通观察结果，而是通过 LangGraph interrupt 暂停图执行。CLI 收集选择后调用 `resume_structured()`，用 `Command(resume=...)` 把选择送回同一图状态，再继续后续工具调用或生成最终回复。
 
-### System Prompt 强化
+#### 工具异常处理
+
+工具内部抛异常时（MCP 崩溃、路径解析 bug、权限错误等），分两层处理：
+
+**Layer 4：`ToolExecutionErrorMW`（工具执行层，LLM 反思纠错）**
+
+基于 langchain 内置 `ToolErrorMiddleware`，挂载在 `create_agent` 中间件链最外层（`agent/tool_error_mw.py`）。在 `wrap_tool_call`/`awrap_tool_call` 拦截层捕获工具执行异常，转换为 `ToolMessage(status="error")` **进入图状态**——这是 LLM 下一轮 ReAct 循环真正读到的内容：
+
+- **所有工具异常统一转换**：任意异常类型（`FileNotFoundError` / `OSError` / `PermissionError` / MCP 错误等）都不再逃逸终止流，而是成为错误 `ToolMessage`，图继续执行，LLM 有机会反思后重试
+- **点名异常类型**：按 langchain 官方建议，错误内容包含异常类型名 + 安全消息（而非裸异常细节），避免泄露内部信息
+- **动态 workspace 提示**：从 `request.runtime.config` 读取当前会话 workspace 根目录，附加"基于工作空间根目录使用相对路径、去除重复目录前缀"的提示（未绑定 workspace 时省略）
+- **反思指令**：末尾固定附加"请反思失败原因（参数是否正确、路径是否有效、前置条件是否满足），修正后重试"，触发 ReAct 反思-修正循环
+- 不捕获 `GraphBubbleUp` 控制流信号（interrupt / 父命令必须继续传播）；`max_iterations`（默认 25）兜底防止无限重试
+
+**事件流层（前端展示）**
+
+`AgentCore._arun_graph_events` 的事件循环处理 `on_tool_error` 事件（LangGraph 在工具异常时不发射 `on_tool_end`，改发射 `on_tool_error`）：
+
+- **单工具异常**：`on_tool_error` → 映射为 `TOOL_RESULT` 事件（content 以 `[工具执行失败]` 前缀标记），前端工具卡片显示失败状态；异常逃逸到 `except Exception` → 发 `ERROR` 事件终止流
+- **并行工具异常**：第一个工具崩后 Pregel 立即 `raise`，其余已 `on_tool_start` 但未 `on_tool_end`/`on_tool_error` 的 tool_call（孤儿）在 `except` 块中补发失败 `TOOL_RESULT`，避免前端工具卡片永远卡在"执行中"
+
+设计决策：工具失败发 `TOOL_RESULT`（携带错误信息）而非 `ERROR`——`ERROR` 是终止事件会中断整个流，而工具失败应让 LLM 看到错误并调整策略（ReAct 模式标准行为）。异常最终仍会逃逸到 `except Exception` 发 `ERROR` 终止流（因 Pregel 的 `_panic_or_proceed` 在第一个工具崩后立即 raise，无法继续执行后续节点）。
+
+### 6. System Prompt 强化
 
 为确保 LLM 主动调用工具而非拒绝，system prompt 中明确要求：
 
@@ -1126,14 +1402,13 @@ LLM 决定是否调用工具
 3. 你确实拥有这些工具的能力，工具会在用户本地执行
 4. 创建文件、脚本、文件夹默认位置是 ./tests/
 5. 如果用户要保存内容到文件，直接调用 write_file 工具
-6. 如果用户要创建目录，直接调用 create_workspace 工具
+6. 如果用户要创建目录，直接调用终端工具
 7. 测试/运行脚本时直接调用终端工具
 8. 危险命令会被安全策略拦截或要求确认
 9. 专业任务应优先用 read_skill 读取相关技能指引
 10. 需要人工确认、选择或补充信息时，应调用 ask_human 并提供结构化 choices
 ```
-
-### 5. 扩展工具
+### 7. 扩展工具
 
 #### 方式 1：添加本地工具
 
@@ -1219,6 +1494,85 @@ if __name__ == "__main__":
 
 运行 `mcp:reload` 即可加载。
 
+#### 方式 3：动态生成工具
+
+除手动编写外，Agent 还可通过内置元工具 [`create_tool`](tools/create_tools.py) **动态生成新的本地工具**：它按统一模板生成 `@tool` 装饰器工具源码，保存为 `.py` 文件，并自动注册到 `tools/__init__.py`。
+
+**参数说明：**
+
+| 参数                 | 类型           | 说明                                                                            |
+| -------------------- | -------------- | ------------------------------------------------------------------------------- |
+| `tool_name`        | `str`        | 工具函数名，必须匹配`[A-Za-z][A-Za-z0-9_]*` 且不能以下划线开头                |
+| `tool_description` | `str`        | 工具文档字符串，说明能力、用途、适用场景                                        |
+| `args_spec`        | `str`        | 参数定义说明，分号`;` 分隔，每项格式 `参数名:参数类型=参数说明`             |
+| `tool_logic`       | `str`        | 工具主体业务逻辑（函数体内部实现代码，不要写函数定义/装饰器）                   |
+| `tool_path`        | `str \| None` | 保存路径，可传目录或`.py` 文件；为空默认保存到 `tools/` 下 `tool_name.py` |
+| `force`            | `bool`       | 是否覆盖已存在文件，默认`False` 禁止覆盖                                      |
+
+`args_spec` 示例：`file_path:str=本地文件路径;encoding:str=utf-8文件编码，可选`
+
+**返回结构：**
+
+```python
+{
+    "success": True,           # 是否生成成功
+    "tool_name": "read_markdown_file",
+    "source_code": "...",      # 生成的完整源码
+    "file_path": "...",        # 保存的文件路径
+    "registered": True,        # 是否已自动注册到 tools/__init__.py
+    "message": "工具代码已保存到 ...，并已注册到 tools/__init__.py"
+}
+```
+
+失败时返回 `{"success": False, "error": "工具生成失败：...", ...}`。
+
+**调用示例：**
+
+```
+create_tool(
+    tool_name="read_markdown_file",
+    tool_description="读取本地 Markdown 文件并返回文本内容，用于文档解析",
+    args_spec="file_path:str=本地 Markdown 文件路径;encoding:str=utf-8文件编码，可选",
+    tool_logic="""with open(file_path, 'r', encoding=encoding) as f:
+    result = f.read()"""
+)
+```
+
+生成后代码自动保存到 `tools/read_markdown_file.py` 并注册到 `tools/__init__.py` 的 `all_tools`，重启后 Agent 即可调用。
+
+**安全边界：**
+
+- 工具名必须是合法 Python 标识符且不能以下划线开头
+- 保存路径限制在 `tools/` 目录内，禁止路径逃逸
+- 生成源码经 `ast.parse` 语法校验
+- 禁止导入高风险模块：`os`、`subprocess`、`socket`、`sys`、`pathlib`、`shutil`、`ctypes`、`importlib`、`requests`、`urllib`
+- 默认禁止覆盖已有文件（`force=True` 才可覆盖）
+
+#### 角色声明 MCP 工具
+
+工作流角色（`team/*/` 下的 `@register_agent` 装饰器）通过两种方式声明对 MCP 工具的依赖，在 `build_workflow` 装配期由 `tools.mcp_loader` 同步拉取并合并到本地 `tools`，失败时静默降级为纯文本模式（不阻断工作流）：
+
+| 声明方式 | 装饰器参数 | 加载器 | 适用场景 |
+| -------- | ---------- | ------ | -------- |
+| **按名声明** | `mcp_tools=["write_file"]` | `load_mcp_tools_by_name_sync` 遍历已启用 server 按名筛选 | 精确指定所需工具（推荐） |
+| **全量声明** | `mcp_all=True` | `load_all_mcp_tools_sync` 加载全部已启用 server 的全部工具（按名去重） | 确需全部工具，不想逐个列名 |
+
+```python
+# 按名声明（推荐，工具数可控）
+@register_agent("architect", "team/architect/agent_config.json",
+    mcp_tools=["write_file"])
+
+# 全量声明
+@register_agent("architect", "team/architect/agent_config.json",
+    mcp_all=True)
+```
+
+> ⚠️ **工具膨胀警告**：`mcp_all=True` 会挂载全部已启用 server 的全部工具到 ReAct 提示词，工具描述段膨胀会稀释 LLM 工具选择质量（实测 >15 个工具后 selection 准确率明显下降）。**建议优先用 `mcp_tools` 精确声明所需工具，`mcp_all` 仅在确需全部时使用**。
+>
+> **互斥语义**：`mcp_all=True` 与 `mcp_tools=[...]` 同时声明时，`mcp_all` 优先、`mcp_tools` 被忽略，并记 WARNING（合并结果恒等于全部，对用户无意义且可能掩盖配置错误）。
+>
+> **命名冲突**：多个 server 提供同名工具时，`load_all_mcp_tools_sync` 按 server 配置顺序（`config/mcp_servers.json` 中 `enabled_servers` 字典序）保留先到者、丢弃后到者并记 WARNING。按名加载路径（`aload_mcp_tools_by_name`）未做去重，冲突时可能返回多个同名工具——全量加载场景冲突面更大，故在 `load_all_mcp_tools_sync` 收敛。
+
 #### 本地工具 vs MCP 工具对比
 
 | 特性       | 本地工具          | MCP 工具                      |
@@ -1252,19 +1606,19 @@ if __name__ == "__main__":
 
 触发方式：
 
-| 触发方式 | 入口                                            | 阈值行为                                       |
-| -------- | ----------------------------------------------- | ---------------------------------------------- |
-| 自动     | `before_model` / `abefore_model` 中间件         | 消息数 > `max_messages`（默认 50）时触发       |
+| 触发方式 | 入口                                                | 阈值行为                                              |
+| -------- | --------------------------------------------------- | ----------------------------------------------------- |
+| 自动     | `before_model` / `abefore_model` 中间件         | 消息数 >`max_messages`（默认 50）时触发             |
 | 手动     | `AgentCore.manually_compact()` / `compact` 命令 | `force=True` 跳过阈值，仍需消息数 > `keep_recent` |
 
 `CompactionConfig` 关键参数（`agent/compaction.py`）：
 
-| 参数                     | 默认 | 说明                             |
-| ------------------------ | ---- | -------------------------------- |
-| `max_messages`         | 50   | 触发压缩的消息数阈值             |
-| `keep_recent`          | 20   | 保留最近 N 条消息（原样保留）    |
-| `max_tool_output_chars` | 200 | 工具输出超过此长度则触发 Prune   |
-| `tool_prune_preview`   | 100  | Prune 后保留的预览字符数         |
+| 参数                      | 默认 | 说明                           |
+| ------------------------- | ---- | ------------------------------ |
+| `max_messages`          | 50   | 触发压缩的消息数阈值           |
+| `keep_recent`           | 20   | 保留最近 N 条消息（原样保留）  |
+| `max_tool_output_chars` | 200  | 工具输出超过此长度则触发 Prune |
+| `tool_prune_preview`    | 100  | Prune 后保留的预览字符数       |
 
 > 可用 `CompactionConfig.from_kwargs(max_context_messages, context_trim_keep)` 从 AgentCore 现有配置参数构建。
 
@@ -1288,13 +1642,13 @@ await pool.close()                 # 关闭所有连接
 
 ### 运行时指标（Metrics）
 
-[`agent/metrics.py`](agent/metrics.py) 的 `MetricsCollector` 挂在 `AgentCore.metrics` 上，**线程安全**，追踪三类核心指标：
+[`utils/metrics.py`](utils/metrics.py) 的 `MetricsCollector` 挂在 `AgentCore.metrics` 上，**线程安全**，追踪三类核心指标：
 
-| 类别     | 记录方法                            | 汇总内容                                             |
-| -------- | ----------------------------------- | ---------------------------------------------------- |
+| 类别     | 记录方法                                               | 汇总内容                                               |
+| -------- | ------------------------------------------------------ | ------------------------------------------------------ |
 | LLM 调用 | `record_llm_call` / `extract_and_record_llm_usage` | 次数、prompt/completion/total tokens、按 provider 分组 |
-| 工具执行 | `record_tool_call`                | 次数、耗时（min/max/avg）、失败/超时次数，按工具名分组 |
-| 压缩统计 | `record_compaction`               | 触发次数、压缩前后消息数、节省消息数、摘要长度       |
+| 工具执行 | `record_tool_call`                                   | 次数、耗时（min/max/avg）、失败/超时次数，按工具名分组 |
+| 压缩统计 | `record_compaction`                                  | 触发次数、压缩前后消息数、节省消息数、摘要长度         |
 
 - token 优先从 `AIMessage.response_metadata` 的 `usage_metadata` 提取，缺失时用字符数 `/4` 粗估（`estimate_tokens`）。
 - `get_summary()` 返回结构化字典；`reset()` 清空所有指标。
@@ -1302,10 +1656,10 @@ await pool.close()                 # 关闭所有连接
 
 ### 结构化日志（Logging）
 
-[`agent/logging_config.py`](agent/logging_config.py) 提供 **trace_id / thread_id 上下文注入**，基于 `contextvars` 实现 asyncio 安全传递：
+[`utils/logging_config.py`](utils/logging_config.py) 提供 **trace_id / thread_id 上下文注入**，基于 `contextvars` 实现 asyncio 安全传递：
 
 ```python
-from agent.logging_config import setup_logging, TraceContext
+from utils.logging_config import setup_logging, TraceContext
 
 setup_logging(level=logging.INFO)  # 程序入口调用一次（幂等），日志输出到 stderr（不污染 stdout 工具输出）
 
@@ -1327,7 +1681,7 @@ with TraceContext(trace_id="req-123", thread_id="thread-abc"):
 
 ### 统一异常层次
 
-[`agent/exceptions.py`](agent/exceptions.py) 定义分层异常，便于上层精准 `catch`：
+[`utils/exceptions.py`](utils/exceptions.py) 定义分层异常，便于上层精准 `catch`：
 
 ```
 LCAgentError                    ← 所有 LCAgent 异常的基类（含 detail 字段）
@@ -1344,17 +1698,34 @@ LCAgentError                    ← 所有 LCAgent 异常的基类（含 detail 
 
 `AgentCore` 提供全套异步公开方法（[`agent/agent_core.py`](agent/agent_core.py)），供飞书远程控制、调度器等异步入口调用；CLI 命令层亦已全面迁移到异步 API。
 
-| 方法                          | 说明                                                       |
-| ----------------------------- | ---------------------------------------------------------- |
-| `await arun(task)`          | Agent 模式执行任务，返回最终文本                           |
-| `await achat(message)`      | 普通对话模式，返回最终文本                                 |
-| `await aresume(payload)`    | 恢复被 `ask_human` 中断的会话（`Command(resume=...)`）   |
-| `await arun_structured(task)` / `await achat_structured(message)` | 返回 `AgentTurnResult`（含 HITL 结构化中断信息） |
-| `await aswitch_llm(llm_client)` | 运行时切换 LLM 提供商/模型                              |
-| `await arebuild_from_team_dir(agent_name, *, task="")` | 按 `team/<角色>/` 文件夹名切换主对话 Agent 的角色（读取该目录的 `agent_config.json` + `AGENT.md`，仅提示词变化时不重建 Graph，provider/model 变化时重建 LLM 与 executor） |
-| `await areload_mcp_tools()` | 通过 MCP 连接池重载工具并按需重建 Graph                    |
-| `await manually_compact(force=False)` | 手动触发上下文压缩，返回状态更新字典或 `None`    |
-| `await aclose()`            | 释放资源（MCP 连接、checkpoint 等）的生命周期收尾          |
+| 方法                                                                                                  | 说明                                                                                                                                                                           |
+| ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `await arun(task)`                                                                                  | Agent 模式执行任务，返回最终文本                                                                                                                                               |
+| `await achat(message)`                                                                              | 普通对话模式，返回最终文本                                                                                                                                                     |
+| `await aresume(payload)`                                                                            | 恢复被`ask_human` 中断的会话（`Command(resume=...)`）                                                                                                                      |
+| `await arun_structured(task, thread_id=None)` / `await achat_structured(message, thread_id=None)` | 返回`AgentTurnResult`（含 HITL 结构化中断信息）；`thread_id` 显式指定目标会话                                                                                              |
+| `await aswitch_llm(llm_client)`                                                                     | 运行时切换 LLM 提供商/模型                                                                                                                                                     |
+| `await role_sw.arebuild_agent_from_team_dir(agent, agent_name, *, task="")` | 按`team/<角色>/` 文件夹名切换主对话 Agent 的角色（读取该目录的 `agent_config.json` + `AGENT.md`，仅提示词变化时不重建 Graph，provider/model 变化时重建 LLM 与 executor） |
+| `await areload_mcp_tools()`                                                                         | 通过 MCP 连接池重载工具并按需重建 Graph                                                                                                                                        |
+| `await manually_compact(force=False, thread_id=None)`                                               | 手动触发上下文压缩，返回状态更新字典或`None`；`thread_id` 指定目标会话                                                                                                     |
+| `await aclose()`                                                                                    | 释放资源（MCP 连接、checkpoint 等）的生命周期收尾                                                                                                                              |
+
+### 并发多会话（Per-thread 并发）
+
+`thread_id` 显式贯穿整个异步调用链（`arun_structured` / `achat_structured` / `aresume_structured` / `astream_chat` / `astream_resume` / `manually_compact`），配合 HTTP 服务端实现**真正的并发多会话**：
+
+| 层                 | 隔离机制                                                                                                                                                        |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 锁                 | 普通对话 / 恢复 / 压缩走**per-thread 锁**（`api/server.py::_thread_lock`），不同会话互不阻塞、同会话严格排队；管理型命令/会话切换仍走全局 `chat_lock` |
+| 编译图（executor） | `_executor_for(thread_id)` 为每个线程缓存独立 compiled graph + `SystemMessage`（LRU 上限 `_MAX_THREAD_EXECUTORS=50`），技能提示词互不覆盖                 |
+| 中断状态           | `_pending_interrupts` 按 thread_id 记录 HITL 挂起中断，恢复/清理只作用于目标线程，杜绝跨会话串线                                                              |
+| config             | `_config_for(thread_id)` 构建含 `configurable.thread_id` 的 LangGraph config，`thread_id=None` 时兼容无参旧调用                                           |
+
+行为要点：
+
+- **同会话串行**：同一 `thread_id` 的请求持有同一把锁，仍严格按到达顺序执行，保证 checkpoint 读写一致。
+- **跨会话并发**：不同 `thread_id` 各自持有独立锁，可同时流式对话，互不阻塞。
+- **缓存淘汰**：超过 `_MAX_THREAD_EXECUTORS` 时淘汰最久未使用的线程图；运行中的流持有旧 executor 对象引用，不受淘汰影响。
 
 ---
 
@@ -1403,7 +1774,7 @@ Agent 在对话中通过以下 `@tool` 函数与调度系统交互：
 ```python
 from tools.scheduler_tool import configure
 
-configure(db_path="memory/scheduled_tasks.sqlite")
+configure(db_path="data/scheduled_tasks.sqlite")
 ```
 
 **2. 启动后台调度器**（独立进程，与主对话进程分离）
@@ -1429,10 +1800,15 @@ Agent 会自动处理，无需记忆参数。示例：
 ```
 scheduler/
 ├── store.py       # SQLite CRUD + 原子抢占 + 重试
-├── executor.py    # agent_factory → AgentCore.run() 执行桥接
+├── executor.py    # agent_factory → AgentCore.acreate/arun/aclose 异步执行桥接
+                    # （在单个事件循环内完成构造+执行+释放，适配 AsyncSqliteSaver 绑定创建时 loop 的约束）
 ├── engine.py      # APScheduler 引擎（轮询一次性 + cron 周期 + 线程池）
-└── run.py         # 独立进程入口
+└── run.py         # 独立进程入口（make_agent_factory 返回 async factory）
 ```
+
+> **异步执行**：`make_agent_factory` 是 `async` 工厂，`_run_agent_task` 在同一个事件循环内完成
+> `await AgentCore.acreate()` → `await agent.arun()` → `await agent.aclose()`。因为
+> `AsyncSqliteSaver` 绑定创建它的事件循环，跨 loop 使用会挂起，因此整个 task 生命周期不可拆到不同线程。
 
 详细技术文档见 [scheduler/README.md](scheduler/README.md)。
 
@@ -1521,6 +1897,10 @@ AgentTurnResult.status = "completed" → 输出最终答案
 
 [cli/human_input.py](cli/human_input.py) 提供了一组辅助函数，把「invoke → 渲染 → 收集 → resume」封装成循环：
 
+> **全异步**：以下辅助函数均为 `async`（`await agent.arun_structured(...)` 等），CLI 入口
+> `main.py` 以 `asyncio.run(main())` 建立**单个长驻事件循环**，REPL、命令分发
+> （`dispatch_command`）、HITL 循环全部在该 loop 内完成，不自行创建/关闭临时事件循环。
+
 | 函数                                                   | 作用                                                  |
 | ------------------------------------------------------ | ----------------------------------------------------- |
 | `run_human_input_loop(agent, message, render, read)` | 启动对话并持续恢复 interrupt，直到本轮完成            |
@@ -1566,6 +1946,8 @@ resume = {
 ```
 
 `_resume_payload_for_interrupts` 会自动区分这两种情况：单 interrupt 直接传值，多 interrupt 按 `interrupt.id` 映射，避免答案错配。
+
+**服务端/Web 异步路径同样自动处理多中断**：`aresume_events`（`/api/chat/resume`）与 `aresume_structured` 在构造 `Command(resume=...)` 前会先调用 `_abuild_resume_command` 读取当前 checkpoint 的挂起中断列表——若存在多个 pending interrupt，会把裸值 payload 自动映射为 `{interrupt.id: payload}`，避免 LangGraph 抛出 "When there are multiple pending interrupts, you must specify the interrupt id when resuming"；若调用方已传入 `{interrupt_id: value}` 映射（如 CLI 的 `_resume_payload_for_interrupts`），则原样透传。单个 interrupt 时保持裸值形式，向后兼容。
 
 **多轮暂停**也支持：恢复后若又遇到新的 `ask_human`，`complete_human_input_turn` 会继续循环处理，直到 `status == "completed"`。例如一个图节点里连续两次 `ask_human`，需要两次 resume 才能完成。
 
@@ -1637,53 +2019,57 @@ output = chat_until_completion(agent, "需要人工选择时请先问我")
 | **同一 AgentCore 实例** | `resume_structured` 要求在同一个 `AgentCore` 实例中调用，跨实例恢复不支持                            |
 | **跨线程拒绝**          | `resume_structured` 校验 `thread_id`，跨线程恢复会抛 `ValueError`                                  |
 | **与 cot 无关**         | `cot()` 模式不走 LangGraph，不会触发 interrupt；HITL 仅对 `run_structured`/`chat_structured` 生效  |
-| **测试覆盖**            | [tests/test_human_input.py](tests/test_human_input.py) 覆盖了 interrupt、resume、并行选择、线程隔离等场景 |
+| **测试覆盖**            | [tests/agent/test_human_input.py](tests/agent/test_human_input.py) 覆盖了 interrupt、resume、并行选择、线程隔离等场景 |
 
 ---
 
 ## 交互命令参考
 
-| 命令                                        | 说明                                                                       |
-| ------------------------------------------- | -------------------------------------------------------------------------- |
-| `react:任务`                              | Agent 模式，自动调用工具，打印步骤，存长期记忆                             |
-| `cot:任务`                                | 链式思考模式，纯推理不调用工具                                             |
-| `switch:提供商名`                         | 运行时切换 LLM 提供商（如`switch:deepseek`）                             |
-| `model`                                   | 方向键选择切换当前提供商的模型                                             |
-| `model:<name>`                            | 直接切换模型（如`model:glm-4-flash`）                                    |
-| `help`                                    | 查看完整命令说明                                                           |
-| `info`                                    | 查看当前模型和记忆状态(含 thread_id、会话数)                               |
-| `tools`                                   | 查看可用工具列表（含 MCP 工具）                                            |
-| `clear [long\|short\|all]`                  | 清理记忆（默认 long）                                                      |
-| `compress` 或 `压缩`                    | 压缩长期记忆（LLM 摘要后替换原内容）                                       |
+| 命令                                        | 说明                                                                         |
+| ------------------------------------------- | ---------------------------------------------------------------------------- |
+| `react:任务`                              | Agent 模式，自动调用工具，打印步骤，存长期记忆                               |
+| `cot:任务`                                | 链式思考模式，纯推理不调用工具                                               |
+| `switch:提供商名`                         | 运行时切换 LLM 提供商（如`switch:deepseek`）                               |
+| `model`                                   | 方向键选择切换当前提供商的模型                                               |
+| `model:<name>`                            | 直接切换模型（如`model:glm-4-flash`）                                      |
+| `help`                                    | 查看完整命令说明                                                             |
+| `info`                                    | 查看当前模型和记忆状态(含 thread_id、会话数)                                 |
+| `tools`                                   | 查看可用工具列表（含 MCP 工具）                                              |
+| `clear [long\|short\|all]`                  | 清理记忆（默认 long）                                                        |
+| `compress` 或 `压缩`                    | 压缩长期记忆（LLM 摘要后替换原内容）                                         |
 | `compact`                                 | 手动压缩当前会话上下文（增量摘要 + 工具输出 Prune，`force=True` 跳过阈值） |
-| `metrics` 或 `metrics:status`           | 查看运行时指标（LLM 调用 / 工具执行 / 压缩统计）                          |
-| `metrics:reset`                           | 重置所有运行时指标                                                         |
-| `log`                                     | 查看当前日志级别（方向键选择切换）                                         |
-| `log:<级别>`                              | 直接切换日志级别（debug\|info\|warning\|error\|critical）                 |
-| `thread`                                  | 方向键选择切换会话(显示消息数预览);`Enter` 切换, `Ctrl+D` 删除高亮会话 |
-| `thread:new`                              | 开启新会话(原会话保留)                                                     |
-| `thread:delete <id>`                      | 删除指定会话(二次确认,不可恢复)                                            |
-| `mcp`                                     | 查看 MCP Server 状态                                                       |
-| `mcp:reload`                              | 重新加载 MCP 工具                                                          |
-| `mcp:add <name> ...`                      | 添加 MCP Server                                                            |
-| `mcp:remove <name>`                       | 删除 MCP Server                                                            |
-| `mcp:toggle <name> <on\|off>`              | 启用/禁用 MCP Server                                                       |
-| `skill` 或 `skills`                     | 查看所有本地可用技能                                                       |
-| `skill:<name>`                            | 将某技能加载进当前会话(注入 system prompt)                                 |
-| `skill:<name> <任务>`                     | 加载技能并立即以 Agent 模式执行该任务(如`skill:git-commit 提交README`)   |
-| `skill:clear`                             | 清空手动加载的技能                                                         |
-| `role` 或 `roles`                       | 方向键选择切换团队角色(扫描 `team/` 下的可用角色)                          |
-| `role:<name>`                             | 直接切换到指定团队角色(如`role:manager`)                                 |
-| `role:<name> <任务>`                      | 切换角色并立即以 Agent 模式执行该任务                                      |
-| `safety`                                  | 查看当前安全策略                                                           |
-| `safety:mode <blacklist\|whitelist>`       | 切换安全模式                                                               |
-| `safety:confirm <on\|off>`                 | 开关危险命令确认                                                           |
-| `workflow`                                | 列出可用的多 Agent 工作流                                                  |
-| `workflow:<name> <任务>`                  | 运行指定工作流（如`workflow:simple 帮我分析项目结构`）                   |
-| `export` 或 `export:<thread_id> [路径]` | 导出对话为 Markdown(默认存`exports/`)                                    |
-| `json:<任务>`                             | 让 Agent 以 JSON 对象返回结果并解析展示                                    |
-| `quit` / `exit`                         | 退出                                                                       |
-| 其他输入                                    | 普通对话模式（也支持工具调用，但不打印步骤）                               |
+| `metrics` 或 `metrics:status`           | 查看运行时指标（LLM 调用 / 工具执行 / 压缩统计）                             |
+| `metrics:reset`                           | 重置所有运行时指标                                                           |
+| `log`                                     | 查看当前日志级别（方向键选择切换）                                           |
+| `log:<级别>`                              | 直接切换日志级别（debug\|info\|warning\|error\|critical）                    |
+| `thread`                                  | 方向键选择切换会话(显示消息数预览);`Enter` 切换, `Ctrl+D` 删除高亮会话   |
+| `thread:new`                              | 开启新会话(原会话保留)                                                       |
+| `thread:delete <id>`                      | 删除指定会话(二次确认,不可恢复)                                              |
+| `mcp`                                     | 查看 MCP Server 状态                                                         |
+| `mcp:reload`                              | 重新加载 MCP 工具                                                            |
+| `mcp:add <name> ...`                      | 添加 MCP Server                                                              |
+| `mcp:remove <name>`                       | 删除 MCP Server                                                              |
+| `mcp:toggle <name> <on\|off>`              | 启用/禁用 MCP Server                                                         |
+| `skill` 或 `skills`                     | 查看所有本地可用技能                                                         |
+| `skill:<name>`                            | 将某技能加载进当前会话(注入 system prompt)                                   |
+| `skill:<name> <任务>`                     | 加载技能并立即以 Agent 模式执行该任务(如`skill:git-commit 提交README`)     |
+| `skill:clear`                             | 清空手动加载的技能                                                           |
+| `role` 或 `roles`                       | 方向键选择切换团队角色(扫描`team/` 下的可用角色)                           |
+| `role:<name>`                             | 直接切换到指定团队角色(如`role:manager`)                                   |
+| `role:<name> <任务>`                      | 切换角色并立即以 Agent 模式执行该任务                                        |
+| `safety`                                  | 查看当前安全策略                                                             |
+| `safety:mode <blacklist\|whitelist>`       | 切换安全模式                                                                 |
+| `safety:confirm <on\|off>`                 | 开关危险命令确认                                                             |
+| `workflow`                                | 列出可用的多 Agent 工作流                                                    |
+| `workflow:<name> <任务>`                  | 运行指定工作流（如`workflow:simple 帮我分析项目结构`）                     |
+| `workspace`                               | 查看当前会话绑定的工作空间目录                                               |
+| `workspace <路径>`                        | 为当前会话绑定/修改工作空间（文件与执行类工具将被限制在该目录内）            |
+| `workspace:clear`                         | 清除当前会话的工作空间绑定                                                   |
+| `workspace:help`                          | 显示 workspace 命令帮助                                                      |
+| `export` 或 `export:<thread_id> [路径]` | 导出对话为 Markdown(默认存`exports/`)                                      |
+| `json:<任务>`                             | 让 Agent 以 JSON 对象返回结果并解析展示                                      |
+| `quit` / `exit`                         | 退出                                                                         |
+| 其他输入                                    | 普通对话模式（也支持工具调用，但不打印步骤）                                 |
 
 ---
 
@@ -1691,7 +2077,7 @@ output = chat_until_completion(agent, "需要人工选择时请先问我")
 
 项目支持基于 LangGraph 的多 Agent 团队协作，采用**监督者模式**（Supervisor Pattern）编排。
 
-### 架构
+### 架构(simple)
 
 ```
 用户任务
@@ -1703,6 +2089,34 @@ Worker (执行子任务)
 Terminator (汇总结果,返回最终答案)
 ```
 
+### 架构(rtl_graph)
+
+RTL 芯片设计流水线：`Manager` 提炼上下文 → `Architect` 五阶段架构（计划/设计/分析/评审/规格）→ `Designer` 规格+编码 ↔ `Verification` 多轮验证 → 验证通过/达上限即终止（END）：
+
+```
+用户任务
+    ↓
+Manager (summarize_context,提炼记忆上下文)
+    ↓
+Architect (plan_task → design_task → analyze_task → review_task → spec_task)
+    ↓
+Designer (spec_design_task:规格梳理 + Filelist)
+    ↓
+Verification (spec_design_task:验证计划)
+    ↓
+┌──────────────────────────────────────────┐
+│  Designer (verilog_design_task:RTL 编码) │◄─┐
+│     ↓                                    │  │ 未通过且未达上限
+│  Verification (verilog_design_task:验证) │──┘
+└──────────────────────────────────────────┘
+    ↓ 验证通过 / 达 max_rounds 上限
+   END（终止,不再经 Designer 交付节点）
+```
+
+- **多轮交互**：`designer_verilog` → `designer_file_check` → `verification_check` → `sim_exec_check` 构成迭代环，由 `route_after_file_check` / `route_after_sim_check` 条件路由判定。`designer_file_check` 校验本轮产出 RTL 文件存在且非空；`sim_exec_check` 实际执行 Vivado 仿真并检查覆盖率（`scripts/syn_filelist.f` 全部 src 被 `scripts/sim_filelist.f` 包含且报告已生成），仿真+覆盖率通过即终止（END）；失败且轮次未达 `max_rounds`（默认 3）时携带验证反馈回到 Designer 重新编码；达上限强制终止（END），防止死循环。
+- **上下文衔接**：Architect 各阶段任务文本逐级拼接上游产物（计划→设计→分析→评审→规格），Designer/Verification 基于架构规格分工，多轮迭代时第二轮起注入上一轮验证报告反馈。
+- **角色注册**：`team/__init__.py` 未导入 `rtl_designer`/`rtl_verification`，由 `rtl_graph.py` 顶部显式导入触发 `@register_agent` 注册，与 `graph.registry` 无循环导入。
+
 ### 团队角色
 
 | Agent                     | 职责           | 工具能力                   | 配置                 |
@@ -1710,15 +2124,36 @@ Terminator (汇总结果,返回最终答案)
 | **ManagerAgent**    | 任务拆解与规划 | 纯文本推理(无工具)         | `team/manager/`    |
 | **WorkerAgent**     | 执行具体子任务 | 工具模式(注入全部本地工具) | `team/worker/`     |
 | **TerminatorAgent** | 汇总结果并返回 | 纯文本推理(无工具)         | `team/terminator/` |
+| **DesignerAgent**     | RTL 设计：规格梳理/模块拆分/Filelist/RTL 编码 | 可选工具(声明 mcp_tools=["write_file"],写规格/RTL 源码) | `team/rtl_designer/` |
+| **VerificationAgent** | RTL 验证：验证计划/TB·UVM 框架/覆盖率/bug 定位 | 可选工具(声明 mcp_tools=["write_file"],写验证计划/报告/TB) | `team/rtl_verification/` |
+
+> **RTL 团队角色模型配置**：`manager`/`architect`/`rtl_designer`/`rtl_verification` 均配置为云雾提供商 `qwen3.7-max`、`max_tokens=4096`。原因：云雾网关对 `max_completion_tokens` 参数的处理存在缺陷——思考型模型（`glm-5.2`/`qwen3.7-max`）的 reasoning token 会计入该预算，复杂设计任务（RTL 编码/验证方案）思考消耗远超 `max_tokens`，触发 `finish=length` 且 `content` 为空，导致工作流节点输出空字符串。`llm/llm_client.py` 中 `CloudmistChatOpenAI` 子类将 `max_completion_tokens` 还原为 `max_tokens` 规避该缺陷（仅 `provider="yunwu"` 生效），详见该文件类文档。
+
+> **固定技能注入**：`VerificationAgent` 经 `fixed_skills: ClassVar[list[str]] = ["vivado-2025.2"]` 类属性始终注入 Vivado 技能指引（验证环境固定使用 Vivado Xsim，不依赖任务关键词自动匹配），由 `skmng.core.build_skill_block` 统一合并注入，见 `team/rtl_verification/rtl_verification.py`。
+
+> **RTL 角色 MCP 工具注入**：`ArchiAgent` / `DesignerAgent` / `VerificationAgent` 经 `@register_agent(..., mcp_tools=["write_file"])` 声明对 MCP filesystem `write_file` 工具的依赖。`build_workflow` 装配期由 `tools.mcp_loader.load_mcp_tools_by_name_sync` 同步拉取（遍历已启用 MCP server 按名筛选），拉取成功时角色切工具模式（自动挂载 `WorkspaceSecurityMW`，路径解析+逃逸校验与 Worker 一致），各自 workflow 节点的 prompt 引导 LLM 调用 `write_file` 把产出文档写入 workspace（architect 写 `arch_spec.md`、designer 写 `design_spec.md`/`rtl_code.sv`、verification 写 `verification_plan.md`/`verification_report.md`）；MCP 未配置或加载失败时静默降级为纯文本模式（仅输出正文，不写盘），不阻断工作流。声明工具名而非 server 名，解耦 server 配置变更。
 
 **轻量设计**：团队 Agent 继承 `TeamAgent` 轻量基类,不继承 `AgentCore`。相比完整智能体:
 
-- **无会话记忆/checkpoint**:单轮任务执行,不需要持久化历史(但工作流会在外层注入当前会话记忆,见「记忆注入机制」)
+- **无会话记忆/checkpoint**:TeamAgent 自身单轮执行、不管理历史(但工作流会在外层注入当前会话记忆,见「记忆注入机制」;跨轮次记忆由工作流图 checkpointer 承载,见「异步化与跨轮次压缩」)
 - **按需工具注入**:Manager/Terminator 纯 LLM 推理,Worker 注入工具列表后用 `create_agent` 构建轻量 ReAct 循环
-- **快速构建**:不加载 MCP Server、不扫描技能目录、不创建 SQLite checkpointer
+- **工具超时 + 错误纠错**:工具经 `tools.tool_wrapper.wrap_tools_with_timeout` 包裹超时保护(防卡死,默认 60 秒+工具级覆盖如 `ask_human` 600 秒);executor 挂载 `ToolExecutionErrorMW`(工具异常转 `ToolMessage(status="error")` + 反思指令,LLM 可读到报错修正重试)与 `WorkspaceSecurityMW`(workspace 路径解析 + 逃逸校验),与主 Agent 的工具执行质量对齐
+- **快速构建**:不加载 MCP Server、不创建 SQLite checkpointer
+- **内建技能注入**:持有 `SkillManager`(`skills_dir` 参数指定目录,默认 `.agents/skills`),`build_skill_block`/`inject_into_prompt` 转发 `skmng.core`(满足 `PromptInjector` 协议),三来源合并(角色级 `fixed_skills` 类属性 + 运行时 `active_names` + 自动匹配);工作流节点可直接以角色实例为注入器,无需外部构造
+- **类型化执行结果**:`arun_structured` 返回 `AgentTurnResult`(completed / cancelled,复用 `agent/turn_types.py`),调用方可区分"正常完成"与"LLM 失败",工作流节点可据此重试/降级;`ainvoke`/`astream` 保持返回字符串契约不变
+- **运行时指标**:`metrics` 惰性收集器(与 `AgentCore.metrics` 同构)——LLM 调用 token 用量(流式事件与纯文本通道自动提取)、工具执行计数/失败/超时、turn 计数,经 `get_summary()` 汇总
 - **能力边界清晰**:规划/汇总角色不暴露危险工具(如 `run_shell`),Worker 才拥有工具执行能力
 - **自带 LLM 配置**:每个 agent 的 `agent_config.json` 里配置 `provider` + `model`,TeamAgent 内部创建 LLMClient
-- **可定制 LLM 采样参数**:子类可通过类属性或 `__init__` 参数覆盖 `temperature`/`max_tokens`(如 WorkerAgent 用 `temperature=0.3` 提升执行确定性、`max_tokens=4096` 放宽输出上限)
+- **可定制 LLM 采样参数**:`temperature`/`max_tokens` 采用**分层隔离**配置——非团队场景（主对话/调度器/API）默认值统一在 `llm/config.py` 的 `DEFAULTS` 管理，`LLMClient` 内部自动读取全局 `agent/agent_config.json`（含 DEFAULTS 兜底），外部无需传参；团队角色在其自身 `team/<角色>/agent_config.json` 中配置（如 WorkerAgent 用 `temperature=0.3` 提升执行确定性、`max_tokens=4096` 放宽输出上限），角色未配置时回退 DEFAULTS，**不读取全局自定义值**；子类也可通过类属性或 `__init__` 参数覆盖
+
+### 异步化与跨轮次压缩
+
+工作流节点已全面异步化,`TeamAgent` 提供 `ainvoke`/`astream` 异步能力,节点直接 `await` 角色类 async 业务方法并透传 LangGraph `config`(callbacks 通道)实现 TOKEN 级流式;同时具备技能注入与跨轮次记忆压缩能力:
+
+- **异步节点执行 + TOKEN 流式**:`simple.py` / `rtl_graph.py` 的业务节点(`summarize`/`manager_plan`/`worker_exec`/`terminator_final` 及 RTL 各节点)全部为 `async`,直接 `await` 角色类 async 业务方法(`asummarize_context`/`aplan_task`/`aexecute_task`/`afinalize` 等)并透传 LangGraph 注入的 `config: Optional[RunnableConfig]`。`TeamAgent`(`team/base.py`)提供 `ainvoke`(`astream` 聚合)/`astream` 异步能力:`_astream_with_tools` 经 `agent_executor.astream_events(version="v2")` 过滤 `on_chat_model_stream`;`_astream_pure_text` 经 chat model `astream`。因同事件循环执行,callbacks 自然透传——`NodeTrackingHandler.on_chat_model_stream` 捕获 LLM token 增量转发为 `AgentEvent.token`,`WorkflowAdapter._on_token` 闭包补 `thread_id`/`role="assistant"`/`trace_id` 后注入事件流,实现节点执行期间的 TOKEN 级流式(空块自动过滤)。同步业务方法与 `ainvoke_team_agent()` 兼容辅助已移除,统一走 async 链路。
+- **技能注入(SkillInjector)**:`build_simple_workflow` 接受 `skills_dir` / `auto_match_skills` 参数,构建时创建 `skmng.injector.SkillInjector`(改调 `skmng.core.build_skill_block` 三来源合并:角色级 `fixed_skills` + 运行时 `active_names` + 自动匹配)。节点渲染 prompt 后调用 `inject_into_prompt()` 把命中技能(`match_skills(task)`)的指引块追加到 prompt 末尾,已含技能块时跳过(防重复)。`TeamAgent` 亦内建同等能力(`build_skill_block` / `inject_into_prompt` 转发 `skmng.core`,满足 `PromptInjector` 协议)——节点可直接以角色实例为注入器,无需外部构造;`team/factory.py` 会把角色 `agent_config.json` 的 `skills_dir` / `auto_match_skills` / `tool_timeout` 透传给 TeamAgent。
+- **消息通道压缩(compaction)**:`simple.py` / `rtl_graph.py` / `pipline.py` 的 `WorkflowState` / `RTLGraphState` 新增 `messages`(LangGraph `add_messages` 通道)与 `summary` 字段,每个业务节点产出追加一条 `AIMessage`。`build_*_workflow` 接受 `compaction_config` 参数,经 `graph/common.py` 的 `_build_compaction_middleware` 构造中间件,再由 `register_nodes` 工厂统一包装节点(`wrap_node_with_compaction`):消息累计超过阈值(默认 50)时调用 `arun_compaction(force=True)` 把历史消息压缩为增量摘要并入 `summary`,防止长会话撑爆上下文。`compaction_config=None` 且 agent 无 LLM 时静默禁用。
+- **跨轮次上下文延续**:统一入口(CLI/API)经 `WorkflowAdapter`(`session/workflow_adapter.py`)执行——运行前从 workflow 专属会话的 checkpoint `messages` 通道读取历史节点产出(预览最多 5 条、每条截断 200 字符,拼为 `【历史执行记录】` 块),叠加 `MemoryManager.recall_text` 的长期记忆,合并注入 `raw_context`,实现多轮运行间的上下文延续。直接调用 `arun_simple_workflow` + `thread_id` 时,旧的 `_aget_previous_workflow_summary()`(checkpoint 摘要)仍可用(已标记 deprecated,待消息通道完全接管后移除)。
 
 ### 状态隔离机制
 
@@ -1728,17 +2163,17 @@ Terminator (汇总结果,返回最终答案)
 
 工作流运行期间可实时感知节点执行进度（CLI 打印 + Web 前端节点高亮）：
 
-- **节点级回调**：`run_simple_workflow` 接受可选 `on_node_start` / `on_node_end` 回调（接收节点名）。内部通过 LangGraph 的 `config["callbacks"]` 注入 `NodeTrackingHandler`（位于 `graph/common.py`），利用节点执行时 `metadata["langgraph_node"]` 字段识别业务节点（哨兵节点与内部 agent 子图会被过滤），在节点开始/结束/异常时触发回调。不传回调时零额外开销。
+- **节点级回调**：`arun_simple_workflow` 接受可选 `on_node_start` / `on_node_end` / `on_node_error` 回调（接收 `AgentEvent`，其中 NODE_START / NODE_END / NODE_ERROR 事件携带 `node` 节点名；NODE_END 额外携带 `content` —— 该节点的产出文本，从节点返回值的 `messages` 通道提取，供前端渲染节点结果块）。内部通过 LangGraph 的 `config["callbacks"]` 注入 `NodeTrackingHandler`（位于 `graph/common.py`），利用节点执行时 `metadata["langgraph_node"]` 字段识别业务节点（哨兵节点与内部 agent 子图会被过滤），在节点开始/结束/异常时构造 `AgentEvent` 并触发回调。不传回调时零额外开销。
 - **CLI 场景**：`run_workflow` 把节点状态打印到终端（`▸ 节点开始: manager_plan` / `✓ 节点完成: manager_plan`）。
-- **Web 场景**：`CommandContext.workflow_event_cb` 把结构化事件（`workflow_node` / `workflow_status`）经 `/api/chat` 的 SSE 流实时推送；服务端将管理型命令的 `dispatch_command` 放到后台线程执行、输出经 `asyncio.Queue` 实时转发，前端 `WorkflowView` 据此高亮节点卡片与流程图。
+- **Web 场景**：`CommandContext.workflow_event_cb` 把结构化事件（`workflow_node` / `workflow_status`）经 `/api/chat` 的 SSE 流实时推送；服务端将管理型命令的 `dispatch_command` 放到后台线程执行、输出经 `asyncio.Queue` 实时转发，前端 `WorkflowView` 据此高亮节点卡片与流程图。`workflow_node` 的 `done` 状态携带该节点产出（`content` 字段）时，前端在**会话窗口**追加一条带节点名标签的可折叠节点结果块（`web/src/components/Message.tsx` 的 `nodeName` 分支），使节点间的 message/result 可见；节点内 LLM 增量仍经 `token` 事件实时流式展示。
 
 ### 记忆注入机制
 
-工作流把当前 CLI 会话的记忆注入任务上下文,并在结束后写回,形成记忆闭环:
+工作流经统一 `SessionManager` 门面(`workflow_sm`,绑定 `WorkflowAdapter`)执行,记忆闭环由门面自动承载:
 
-1. **记忆提取**:`run_workflow` 调用 `build_memory_context` 从 `context.agent.memory` 提取当前会话短期记忆与长期记忆,拼装为文本(超 `MAX_RAW_CONTEXT_CHARS` 自动截断)。
+1. **记忆提取**:`WorkflowAdapter._build_raw_context` 执行前从 workflow 专属会话的 checkpoint `messages` 通道读取历史节点产出(预览最多 5 条、每条 200 字符),叠加 `MemoryManager.recall_text` 的长期记忆,合并注入 `raw_context`(超长自动截断)。
 2. **Manager 总结分发**:工作流首个节点 `summarize` 调用 `ManagerAgent.summarize_context` 把原始记忆提炼成上下文摘要,存入 `WorkflowState.context_summary`。下游仅 `manager_plan` 与 `terminator_final` 节点注入该摘要,`worker_exec` 不注入(靠 plan 承接记忆)。
-3. **写回闭环**:工作流结束后,`_record_workflow_result` 把 `workflow:<name> <task>`(HumanMessage)与 `final_answer`(AIMessage)写入当前会话 checkpoint。
+3. **写回闭环**:`workflow_sm.arun_stream` 内部自动执行——运行前 `submit_user_message(task, important=True)` 把任务写入长期记忆;结束后消费 DONE 事件(`consume_event`)沉淀最终答案,无需命令层手工写回。
 
 ### 工作流提示词外置
 
@@ -1750,8 +2185,10 @@ Terminator (汇总结果,返回最终答案)
 | `## workflow:summarize_context` | `team/manager/AGENT.md`    | `summarize_context` 的 system prompt             |
 | `## workflow:worker_exec`       | `team/worker/AGENT.md`     | Worker 执行子任务的用户消息模板                    |
 | `## workflow:terminator_final`  | `team/terminator/AGENT.md` | Terminator 汇总结果的用户消息模板(内含记忆摘要段)  |
+| `## workflow:spec_design`       | `team/rtl_designer/AGENT.md`、`team/rtl_verification/AGENT.md` | 设计/验证需求梳理与工程规划模板(环节 1-4)        |
+| `## workflow:verilog_design`    | `team/rtl_designer/AGENT.md`、`team/rtl_verification/AGENT.md` | RTL 编码 / Testbench·UVM 框架模板(环节 5-9)      |
 
-模板用 `{task}`/`{plan}`/`{worker_result}`/`{context_summary}` 占位,运行时以 `TeamAgent.render_template` 做字符串替换(即使模板含 JSON 花括号也不会报错)。各节点在需要时经 `TeamAgent.get_template(name)` 懒加载对应小节(首次读取后缓存),缺失回退各角色类的 `default_templates` 默认模板。加载/解析逻辑见 `team/base.py`;角色系统提示词在 `team/factory.py` 构建 TeamAgent 时经 `TeamAgent.parse_prompt_sections` 剥离工作流小节,避免模板混入 system prompt。
+模板用 `{task}`/`{plan}`/`{worker_result}`/`{context_summary}` 占位,运行时以 `TeamAgent.render_template` 做字符串替换(即使模板含 JSON 花括号也不会报错)。各节点在需要时经 `TeamAgent.get_template(name)` 加载对应小节(与系统提示词共用 __init__ 的一次解析缓存,不重复读文件),缺失回退各角色类的 `default_templates` 默认模板。加载/解析逻辑见 `team/base.py`;角色系统提示词在 `TeamAgent.__init__` 自动经 `parse_prompt_sections` 从 `prompt_file` 解析并剥离工作流小节,避免模板混入 system prompt(显式传入 `system_prompt` 时优先)。
 
 ### 使用方式
 
@@ -1769,8 +2206,6 @@ Terminator (汇总结果,返回最终答案)
 
 ```
 构建工作流: simple
-初始化团队 Agent(Manager/Worker/Terminator)...
-工作流 simple 构建完成
 
 执行任务: 帮我分析 LCAgent 项目的目录结构
 --------------------------------------------------
@@ -1798,31 +2233,44 @@ Terminator (汇总结果,返回最终答案)
 #### 2. 编程接口
 
 ```python
+import asyncio
 from graph.registry import build_workflow
-from graph.simple import run_simple_workflow
+from graph.simple import arun_simple_workflow
 
-# 方式1: 构建并运行
+# 方式1: 构建并运行(异步接口)
 graph, agents = build_workflow("simple")
-result = run_simple_workflow(graph, "帮我分析项目结构")
+result = asyncio.run(arun_simple_workflow(graph, "帮我分析项目结构"))
 print(result["final_answer"])
 
 # 可选: 手动传入记忆上下文(经 Manager 总结后注入 plan/final 节点)
-result = run_simple_workflow(graph, "帮我分析项目结构", raw_context="用户: 之前聊过项目背景")
+result = asyncio.run(arun_simple_workflow(
+    graph, "帮我分析项目结构",
+    raw_context="用户: 之前聊过项目背景",
+))
 
 # 可选: 节点进度回调(节点开始/结束时触发,接收节点名,用于进度跟踪)
-result = run_simple_workflow(
+result = asyncio.run(arun_simple_workflow(
     graph,
     "帮我分析项目结构",
     on_node_start=lambda node: print(f"节点开始: {node}"),
     on_node_end=lambda node: print(f"节点完成: {node}"),
-)
+))
 
-# 方式2: 通过 CLI 层封装(带打印提示)
+# 可选: 跨轮次记忆压缩(需 checkpointer 编译的图 + 显式 thread_id,
+# 同一 thread 多轮运行,第二轮自动注入【上一轮工作流记录】)
+from langgraph.checkpoint.memory import MemorySaver
+graph2, agents2 = build_workflow("simple", checkpointer=MemorySaver())
+r1 = asyncio.run(arun_simple_workflow(graph2, "第一轮任务", thread_id="wf-1"))
+r2 = asyncio.run(arun_simple_workflow(graph2, "第二轮任务", thread_id="wf-1"))
+
+# 方式2: 通过 CLI 层封装(带打印提示,经统一 workflow_sm 门面执行)
 from cli.commands.workflow import run_workflow
 from cli.commands.types import CommandContext
 
-# 需要构造 CommandContext(简化示例,实际使用中从 main.py 获取)
-result = run_workflow(context, "simple", "帮我分析项目结构")
+# 需要构造 CommandContext(简化示例,实际使用中从 main.py 的 make_context 获取)。
+# context.workflow_sm 必须注入(create_workflow_session_manager 构建,与 chat 门面
+# 共享 SessionRegistry / MemoryManager),否则 run_workflow 抛 RuntimeError。
+result = asyncio.run(run_workflow(context, "simple", "帮我分析项目结构"))
 ```
 
 ### 扩展工作流
@@ -1839,14 +2287,25 @@ from tools import all_tools
 
 @register_agent("my_agent", "team/my_agent/agent_config.json", tools=all_tools)
 class MyAgent(TeamAgent):
-    temperature = 0.3
-    max_tokens = 4096
     default_templates = {"my_node": "模板..."}
 ```
 
 ```
 # team/my_agent/AGENT.md        — 角色系统提示词 + ## workflow:小节
-# team/my_agent/agent_config.json — LLM 配置(provider/model/prompt_file 等)
+# team/my_agent/agent_config.json — LLM 配置(provider/model/temperature/max_tokens/prompt_file 等)
+# 采样参数建议配置在 agent_config.json(角色级,缺省回退 DEFAULTS),无需改代码类属性
+```
+
+```
+// team/my_agent/agent_config.json
+{
+    "name": "my_agent",
+    "provider": "zhipu",
+    "model": "glm-4-flash",
+    "temperature": 0.3,
+    "max_tokens": 4096,
+    "agent_prompt_file": "team/my_agent/AGENT.md"
+}
 ```
 
 然后在 `team/__init__.py` 中添加导入即可,`@register_agent` 装饰器会在模块加载时自动注册。
@@ -1861,12 +2320,20 @@ class MyAgent(TeamAgent):
 
 ```python
 # graph/my_workflow.py
+from graph.common import NodeSpec, register_nodes, _build_compaction_middleware
 from graph.registry import register_workflow
 
 def build_my_workflow(agents: dict) -> StateGraph:
     my_agent = agents["my_agent"]
+    injector = SkillInjector(...)  # 可选:技能注入
+    compaction_mw = _build_compaction_middleware(my_agent)  # None 时禁用压缩
     builder = StateGraph(MyWorkflowState)
-    builder.add_node("step1", lambda state: step1_node(state, my_agent))
+    # 声明式注册:NodeSpec(name, fn, role) 三步合一
+    # 节点函数第二参数统一为 agent: TeamAgent(register_nodes 内部 partial 绑定)
+    register_nodes(
+        builder, agents, injector, compaction_mw,
+        [NodeSpec("step1", step1_node, role="my_agent")],
+    )
     builder.add_edge(START, "step1")
     builder.add_edge("step1", END)
     return builder.compile()
@@ -1875,11 +2342,13 @@ def build_my_workflow(agents: dict) -> StateGraph:
 register_workflow(
     name="my_flow",
     builder=build_my_workflow,
-    runner=run_my_workflow,          # 可选,缺失时回退到 run_simple_workflow
+    runner=run_my_workflow,          # 可选,缺失时回退到 arun_simple_workflow
     roles=["my_agent"],              # 可选,声明依赖角色(仅构建这些角色)
     description="我的自定义工作流",  # 可选,CLI 列表展示用
 )
 ```
+
+> ⚠️ **必须用 `register_nodes`/`functools.partial` 而非 `lambda` 绑定 agent 实例**:`partial` 保留 async 函数的 coroutine 特征(LangGraph 据此判定节点为异步并 `await`),`lambda` 会返回未 await 的 coroutine 导致 `InvalidUpdateError`。
 
 `graph/registry.py` 底部 `_load_builtin_workflows()` 在 registry 首次 import 时加载 `graph.simple` / `graph.pipline`,触发其自注册;新增内置工作流时在该函数中补充 import 即可。
 
@@ -1891,7 +2360,7 @@ from graph.registry import register_workflow
 register_workflow(
     name="my_flow",
     builder=build_my_workflow,
-    runner=run_my_workflow,          # 可选,缺失时回退到 run_simple_workflow
+    runner=run_my_workflow,          # 可选,缺失时回退到 arun_simple_workflow
     roles=["my_agent"],              # 可选,声明依赖角色(仅构建这些角色)
     description="我的自定义工作流",  # 可选,CLI 列表展示用
 )
@@ -1899,13 +2368,13 @@ register_workflow(
 
 #### register_workflow 参数说明
 
-| 参数 | 必填 | 说明 |
-| ---- | ---- | ---- |
-| `name` | 是 | 工作流名称(CLI 以 `workflow:<name> <任务>` 调用) |
-| `builder` | 是 | 构建函数 `build_xxx(agents: dict) -> StateGraph` |
-| `runner` | 否 | 运行函数 `run_xxx(graph, task, ...) -> dict`,缺失时回退 `run_simple_workflow` |
-| `roles` | 否 | 声明依赖角色列表,仅构建这些角色;缺失时构建全部已注册角色 |
-| `description` | 否 | 工作流描述,CLI `workflow` 列表展示用 |
+| 参数            | 必填 | 说明                                                                             |
+| --------------- | ---- | -------------------------------------------------------------------------------- |
+| `name`        | 是   | 工作流名称(CLI 以`workflow:<name> <任务>` 调用)                                |
+| `builder`     | 是   | 构建函数`build_xxx(agents: dict) -> StateGraph`                                |
+| `runner`      | 否   | 运行函数`run_xxx(graph, task, ...) -> dict`,缺失时回退 `run_simple_workflow` |
+| `roles`       | 否   | 声明依赖角色列表,仅构建这些角色;缺失时构建全部已注册角色                         |
+| `description` | 否   | 工作流描述,CLI`workflow` 列表展示用                                            |
 
 CLI 会自动识别新工作流：`workflow:my_flow <任务>`。
 
@@ -1930,18 +2399,14 @@ CLI 会自动识别新工作流：`workflow:my_flow <任务>`。
         kimi       (Kimi (Moonshot))
 ----------------------------------------
 
-[MCP] workspace: 加载了 6 个工具
-[MCP] 已加载 6 个工具: create_workspace, get_current_workspace, ...
+[MCP] 已加载 0 个工具
 
 Agent 已就绪！
 当前提供商: DeepSeek
 当前模型:   deepseek-chat
 
 本地工具: search, read_file, write_file, calculate, run_shell, ...
-MCP工具:  create_workspace, get_current_workspace, ...
-
-你: 在 D:\work 下创建一个叫 my_project 的文件夹
-助手: 已为你创建文件夹 my_project，路径：D:\work\my_project
+MCP工具:
 ```
 
 ### 2. 三种执行模式
@@ -1995,7 +2460,7 @@ API地址:    https://api.deepseek.com
 
 --- 记忆状态 ---
 当前会话:   thread-a4d099d2
-Checkpoint: sqlite → D:\work\LangChainAgent\memory\checkpoints.sqlite
+Checkpoint: sqlite → D:\work\LangChainAgent\data\checkpoints_async.sqlite
 已存消息:   8 条
 长期记忆:   2 条
 总会话数:   1
@@ -2045,7 +2510,7 @@ Agent 调用 `ask_human` 暂停图执行，等待人工选择后继续：
 已导出会话 thread-b1dc3b2a 到 我的导出/backup.md
 ```
 
-由 [agent/memory.py](agent/memory.py) 的 `AgentMemory.export_thread()` 实现，将 checkpoint 中的对话渲染为可读 Markdown。
+由 [session/registry.py](session/registry.py) 的 `SessionRegistry.aexport_session()` 实现，将 checkpoint 中的对话渲染为可读 Markdown。
 
 ### 7. JSON 模式
 
@@ -2072,10 +2537,10 @@ Agent 按要求**只输出一个合法 JSON 对象**（不含 ``` 标记与解�
 你: mcp
 MCP Servers:
 ------------------------------------------------------------
-  [✓启用] workspace (stdio)
-           python tools/workspace_tool.py
+  [✓启用] fetch (stdio)
+           npx -y @modelcontextprotocol/server-fetch
 ------------------------------------------------------------
-已加载 MCP 工具数: 6
+已加载 MCP 工具数: 0
 ```
 
 ### 9. 退出
@@ -2092,89 +2557,112 @@ MCP Servers:
 ## 代码使用示例
 
 ```python
+import asyncio
+from memory import MemoryContext
 from agent import AgentCore
-from agent.llm_client import LLMClient
+from llm.llm_client import LLMClient
 
-# 创建客户端和Agent
-llm = LLMClient(provider="deepseek", config_file="config/llm_config.json")
-agent = AgentCore(
-    llm_client=llm,
-    name="LCAgent",                                    # Agent 名称（默认 LCAgent）
-    memory_size=10,
-    long_term_memory_file="memory/memory.json",        # 长期记忆(用于 compress)
-    checkpoint_file="memory/checkpoints.sqlite",       # Checkpoint 持久化
-    max_iterations=15,
-    mcp_config_file="config/mcp_servers.json",
-    enable_mcp=True,
-    skills_dir=".agents/skills",
-    auto_match_skills=True,
-    max_context_messages=0,                           # 0=关闭长上下文裁剪
-    context_trim_keep=12
-)
+async def main() -> None:
+    # 创建客户端
+    llm = LLMClient(provider="deepseek", config_file="config/llm_config.json")
+
+    # 三层架构：先创建 MemoryContext（记忆基础设施），再创建 AgentCore（纯执行内核）
+    memory_ctx = await MemoryContext.acreate(
+        checkpoint_file="data/checkpoints_async.sqlite",  # Checkpoint + 长期记忆 Store（同一 SQLite 文件）
+        llm_getter=lambda: llm,                            # 供 LLM 抽取/压缩记忆使用（支持热切换）
+        short_term_size=10,
+        buffer_delay_seconds=20,                           # 记忆防抖窗口（秒）
+        max_buffer_messages=30,                            # 单 thread 防抖 buffer 上限
+        max_facts_per_thread=50,                           # 单 thread 最大 fact 条数（thread 级 LRU 淘汰）
+        max_agent_facts=200,                               # agent 级（跨会话共享）最大 fact 条数（agent 级 LRU 淘汰）
+        process_type=None,                                 # 进程类型标识（None→"default"；server/scheduler/feishu 多进程隔离 agent 级记忆）
+        recall_limit=10,                                   # 召回默认条数上限（聚合 agent 级 + thread 级后截取）
+    )
+
+    agent = await AgentCore.acreate(
+        llm_client=llm,
+        name="LCAgent",                                    # Agent 名称（默认 LCAgent）
+        max_iterations=15,
+        mcp_config_file="config/mcp_servers.json",
+        enable_mcp=True,
+        skills_dir=".agents/skills",
+        auto_match_skills=True,
+        max_context_messages=0,                           # 0=关闭长上下文裁剪
+        context_trim_keep=12,
+        checkpointer=memory_ctx.checkpointer,             # ← checkpoint 持久化
+        store=memory_ctx.store,                           # ← 长期记忆 Store
+        extra_middleware=[memory_ctx.read_middleware],    # ← 长期记忆读取中间件
+        initial_thread_id=memory_ctx.thread_id,
+        async_conn=memory_ctx.async_conn,
+    )
+    agent.set_memory_manager(memory_ctx.memory_manager)   # ← 注入 MemoryManager（SessionManager 懒初始化时接收）
 
 # 内置变量：agent.name 与 agent.llm（LLM 是 Agent 的内置变量）
-print(agent.name)   # -> LCAgent
-print(agent.llm.get_info())  # 直接通过 agent.llm 访问当前 LLM 客户端
+    print(agent.name)   # -> LCAgent
+    print(agent.llm.get_info())  # 直接通过 agent.llm 访问当前 LLM 客户端
 
-# 普通对话（自动判断是否调用工具，自动写 checkpoint，不存长期记忆）
-response = agent.chat("帮我创建一个叫 test 的文件夹")
+    # 普通对话（自动写 checkpoint；事件驱动沉淀长期记忆，经防抖 + LLM 抽取后入库）
+    response = await agent.achat("帮我创建一个叫 test 的文件夹")
 
-# Agent模式（自动调用工具，打印步骤，写 checkpoint + 存长期记忆）
-result = agent.run("计算 123 * 456 并把结果写入 result.txt")
+    # Agent模式（自动调用工具，打印步骤，写 checkpoint；用户消息标记 important，DONE 事件标记 is_important）
+    result = await agent.arun("计算 123 * 456 并把结果写入 result.txt")
 
-# CoT模式（纯推理，不调用工具，不写 checkpoint，存长期记忆）
-result = agent.cot("分析机器学习的应用场景")
+    # CoT模式（纯推理，不调用工具，不写 checkpoint，不沉淀长期记忆）
+    result = agent.cot("分析机器学习的应用场景")
 
-# Human-in-the-loop 结构化入口：chat_structured/run_structured 返回 AgentTurnResult
-turn = agent.chat_structured("需要人工选择时请先问我")
-while turn.is_interrupted:
-    # 单个 interrupt 可直接 resume；并行多个 interrupt 要按 interrupt.id 提交映射
-    if len(turn.interrupts) == 1:
-        resume = {"choice_id": "approve"}
-    else:
-        resume = {
-            interrupt.id: {"choice_id": "approve"}
-            for interrupt in turn.interrupts
-        }
-    # CLI 中由 select_menu 生成选择；Esc 会向 Agent 发送 {"cancelled": True}
-    turn = agent.resume_structured(resume)
-print(turn.output)
+    # Human-in-the-loop 结构化入口：achat_structured/arun_structured 返回 AgentTurnResult
+    turn = await agent.achat_structured("需要人工选择时请先问我")
+    while turn.is_interrupted:
+        # 单个 interrupt 可直接 resume；并行多个 interrupt 要按 interrupt.id 提交映射
+        if len(turn.interrupts) == 1:
+            resume_body = {"choice_id": "approve"}
+        else:
+            resume_body = {
+                interrupt.id: {"choice_id": "approve"}
+                for interrupt in turn.interrupts
+            }
+        # CLI 中由 select_menu 生成选择；Esc 会向 Agent 发送 {"cancelled": True}
+        turn = await agent.aresume_structured(resume_body)
+    print(turn.output)
 
-# 切换LLM提供商
-from agent.llm_client import LLMClient
-new_llm = LLMClient(provider="qwen", config_file="config/llm_config.json")
-agent.switch_llm(new_llm)
+    # 切换LLM提供商
+    new_llm = LLMClient(provider="qwen", config_file="config/llm_config.json")
+    await agent.aswitch_llm(new_llm)
 
-# 切换模型(同一提供商内)
-llm.switch_model("glm-4-flash")    # 切到 glm-4-flash
-print(llm.list_models())           # 查看当前提供商的可用模型
-agent.switch_llm(llm)              # 重建 Agent 以使用新模型
+    # 切换模型(同一提供商内)
+    llm.switch_model("glm-4-flash")    # 切到 glm-4-flash
+    print(llm.list_models())           # 查看当前提供商的可用模型
+    await agent.aswitch_llm(llm)       # 重建 Agent 以使用新模型
 
-# 会话管理
-agent.memory.new_thread()                    # 开启新会话
-agent.memory.switch_thread("thread-abc123")  # 切换到已有会话
-agent.memory.delete_thread("thread-xxx")     # 删除指定会话
-print(agent.memory.list_threads())           # 列出所有会话
-print(agent.memory.export_thread(fmt="markdown"))  # 导出当前会话为 Markdown 文本
+    # 会话管理（已迁移至 agent.session，异步接口）
+    agent.session.new_session()                            # 开启新会话
+    await agent.session.aswitch_session("thread-abc123")   # 切换到已有会话
+    await agent.session.adelete_session("thread-xxx")      # 删除指定会话
+    print(await agent.session.alist_sessions())            # 列出所有会话
+    print(await agent.session.aexport_session(fmt="markdown"))  # 导出当前会话为 Markdown 文本
 
-# 记忆管理
-agent.memory.clear_long_term()   # 清空长期记忆
-agent.memory.clear_short_term()  # 开启新会话(替代删除)
-print(agent.memory.summarize())  # 查看记忆统计(含 thread_id、消息数)
+    # 记忆管理（经 SessionManager 委托 MemoryManager）
+    await agent.session_manager.aclear_long_term_memory()   # 清空当前线程长期记忆
+    print(await agent.session.asummarize())    # 查看会话统计(含 session_id、消息数)
 
-# 压缩长期记忆
-result = agent.compress_memory()
-print(f"压缩率: {1 - result['compressed_chars']/result['original_chars']:.1%}")
+    # 压缩长期记忆（LLM 摘要后替换为单条 fact）
+    result = await agent.session_manager.acompress_memory()
+    print(f"压缩率: {1 - result['compressed_chars']/result['original_chars']:.1%}")
 
-# MCP 工具管理
-agent.reload_mcp_tools()         # 重新加载 MCP 工具
-print(agent.get_available_tools())  # 查看所有工具
+    # MCP 工具管理
+    await agent.areload_mcp_tools()  # 重新加载 MCP 工具
+    print(agent.get_available_tools())  # 查看所有工具
 
-# 技能管理
-print(agent.list_skills())       # 列出所有本地技能
-agent.load_skill("git-commit")   # 手动加载技能到当前会话
-agent.clear_skills()             # 清空手动加载的技能
-agent.set_auto_match(False)      # 关闭任务自动匹配
+    # 技能管理
+    print(agent.list_skills())       # 列出所有本地技能
+    await agent.aload_skill("git-commit")  # 手动加载技能到当前会话
+    await agent.aclear_skills()      # 清空手动加载的技能
+    agent.set_auto_match(False)      # 关闭任务自动匹配
+
+    await agent.aclose()             # 释放异步资源
+    await memory_ctx.aclose()        # 刷新记忆 buffer、关闭中间件、释放 SQLite 连接
+
+asyncio.run(main())
 ```
 
 ## 运行时配置
@@ -2185,21 +2673,36 @@ agent.set_auto_match(False)      # 关闭任务自动匹配
 
 原先硬编码在 `main.py` 的运行时参数已外置到此文件，由 [agent/config.py](agent/config.py) 的 `load_agent_config` 加载并与默认值合并（缺省键不报错）。
 
-| 键                       | 类型 | 默认值                      | 说明                                                  |
-| ------------------------ | ---- | --------------------------- | ----------------------------------------------------- |
-| `name`                 | str  | `LCAgent`                 | Agent 名称（可通过`agent.name` 访问）               |
-| `max_iterations`       | int  | 15                          | 单次`invoke` 最大推理步数（即 `recursion_limit`） |
-| `skills_dir`           | str  | `.agents/skills`          | 技能目录（相对项目根或绝对路径）                      |
-| `auto_match_skills`    | bool | true                        | 任务自动匹配并注入相关技能                            |
-| `enable_mcp`           | bool | true                        | 是否加载 MCP 工具                                     |
-| `memory_size`          | int  | 10                          | 兼容旧 API 的记忆容量                                 |
-| `verbose`              | bool | true                        | 是否打印详细过程                                      |
-| `mcp_config_file`      | str  | `config/mcp_servers.json` | MCP 配置文件（相对项目根或绝对路径）                  |
-| `max_context_messages` | int  | 0                           | 长上下文裁剪阈值（0 = 关闭）                          |
-| `context_trim_keep`    | int  | 12                          | 裁剪时保留的最近消息条数                              |
-| `agent_prompt_file`    | str  | `agent/AGENT.md`          | Agent 核心提示词文件路径（相对项目根或绝对路径）      |
+| 键                        | 类型 | 默认值                      | 说明                                                          |
+| ------------------------- | ---- | --------------------------- | ------------------------------------------------------------- |
+| `name`                  | str  | `LCAgent`                 | Agent 名称（可通过`agent.name` 访问）                       |
+| `max_iterations`        | int  | 15                          | 单次`invoke` 最大推理步数（即 `recursion_limit`）         |
+| `skills_dir`            | str  | `.agents/skills`          | 技能目录（相对项目根或绝对路径）                              |
+| `auto_match_skills`     | bool | true                        | 任务自动匹配并注入相关技能                                    |
+| `enable_mcp`            | bool | true                        | 是否加载 MCP 工具                                             |
+| `verbose`               | bool | true                        | 是否打印详细过程                                              |
+| `mcp_config_file`       | str  | `config/mcp_servers.json` | MCP 配置文件（相对项目根或绝对路径）                          |
+| `agent_prompt_file`     | str  | `agent/AGENT.md`          | Agent 核心提示词文件路径（相对项目根或绝对路径）              |
+| `max_execution_history` | int  | 100                         | 执行历史最大条数                                              |
+| `max_context_messages`  | int  | 0                           | 长上下文裁剪阈值（0 = 关闭）                                  |
+| `context_trim_keep`     | int  | 12                          | 裁剪时保留的最近消息条数                                      |
+| `tool_timeout`          | int  | 120                         | 工具调用超时（秒）                                            |
+| `temperature`           | float | 0.7                        | LLM 采样温度（主对话/调度器/API 默认；团队角色分层配置于自身 `agent_config.json`，缺省回退 DEFAULTS） |
+| `max_tokens`            | int  | 8192                        | LLM 最大生成 token 数（覆盖来源同 `temperature`）             |
+| `latest_msg_cnt`        | int  | 10                          | 短期上下文窗口消息条数：取最近 N 条消息（传递给`SessionRegistry.aget_short_term`） |
 
-修改后重启 `main.py` 即可生效。
+> **采样参数分层隔离**：团队场景只用 `team/<角色>/agent_config.json`（`temperature`/`max_tokens` 经 `build_team_agent` 解析后作为显式参数传入，未配置时回退 `llm/config.py` 的 `DEFAULTS`，**不读取全局自定义值**）；非团队场景（主对话/调度器/API/飞书）由 `LLMClient` 内部自动读取全局 `agent/agent_config.json`（含 DEFAULTS 兜底），外部无需传参。显式构造参数（`LLMClient(..., temperature=...)` / `build_team_agent(..., temperature=...)`）始终优先。
+
+**Memory 层配置**（由 [memory/config.py](memory/config.py) 统一管理，**不写入** `agent_config.json`，修改后重启 `main.py` 生效）：
+
+| 键                              | 类型 | 默认值 | 说明                                   |
+| ------------------------------- | ---- | ------ | -------------------------------------- |
+| `memory_buffer_delay_seconds` | int  | 20     | 记忆写入防抖延迟（秒）                 |
+| `memory_max_buffer_messages`  | int  | 30     | 防抖 buffer 最大消息数（超出强制刷新） |
+| `memory_max_facts_per_thread` | int  | 50     | 单线程最大 fact 条数（thread 级 LRU 淘汰上限；对应 `conv` / `business` 类） |
+| `memory_max_agent_facts`      | int  | 200    | agent 级（跨会话共享）最大 fact 条数（agent 级 LRU 淘汰上限；对应 `user_fact` / `lesson` 类） |
+| `memory_recall_limit`         | int  | 10     | 召回长期记忆时的默认条数上限（聚合 agent 级 + thread 级去重后截取，同时约束每次 LLM 调用注入的 fact 条数） |
+| `session_enable_memory`       | bool | true   | SessionManager 是否启用长期记忆处理    |
 
 #### Agent 核心提示词（`agent/AGENT.md`）
 
@@ -2212,7 +2715,7 @@ Agent 的核心系统提示词（行为规则）已从 `agent_config.json` 中�
 
 自定义 Agent 行为规则时，直接编辑 `agent/AGENT.md` 即可，无需修改代码或 JSON 配置。
 
-> **注意**：`agent_prompt_file` 指定的 AGENT.md 同时也承载工作流提示词模板（`## workflow:*` 小节）。构建 TeamAgent 时（`team/factory.py`）会经 `TeamAgent.parse_prompt_sections` 剥离这些小节，避免模板内容混入 system prompt（详见「工作流提示词外置」）。
+> **注意**：`agent_prompt_file` 指定的 AGENT.md 同时也承载工作流提示词模板（`## workflow:*` 小节）。构建 TeamAgent 时（`team/factory.py`）只需传 `prompt_file`，`TeamAgent.__init__` 会自动经 `parse_prompt_sections` 剥离这些小节并解析出 system prompt，避免模板内容混入（详见「工作流提示词外置」）。
 
 #### 长上下文裁剪（Long-Context Trimming）
 
@@ -2265,14 +2768,7 @@ Agent 的核心系统提示词（行为规则）已从 `agent_config.json` 中�
 
 ```json
 {
-  "servers": {
-    "workspace": {
-      "transport": "stdio",
-      "command": "python",
-      "args": ["tools/workspace_tool.py"],
-      "enabled": true
-    }
-  }
+  "servers": {}
 }
 ```
 
@@ -2366,7 +2862,7 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 
 ```json
 {
-  "db_path": "memory/scheduled_tasks.sqlite",
+  "db_path": "data/scheduled_tasks.sqlite",
   "poll_interval": 30,
   "timezone": "Asia/Shanghai",
   "max_retries": 3,
@@ -2376,15 +2872,15 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 }
 ```
 
-| 键                | 类型         | 默认值                            | 说明                                               |
-| ----------------- | ------------ | --------------------------------- | -------------------------------------------------- |
-| `db_path`       | string       | `memory/scheduled_tasks.sqlite` | 任务数据库路径（相对项目根）                       |
-| `poll_interval` | int          | 30                                | 轮询间隔（秒），调度器每隔此时间检查是否有到期任务 |
-| `timezone`      | string       | `Asia/Shanghai`                 | 任务时区，影响 cron 表达式解析                     |
-| `max_retries`   | int          | 3                                 | 任务执行失败最大重试次数                           |
-| `max_workers`   | int          | 5                                 | 并发执行任务的最大工作线程数                       |
-| `provider`      | string\|null | null                              | 调度器使用的 LLM 服务商标识（null = 默认）         |
-| `blocking`      | bool         | true                              | 是否阻塞主进程（`false` 时调度器在后台运行）     |
+| 键                | 类型         | 默认值                          | 说明                                               |
+| ----------------- | ------------ | ------------------------------- | -------------------------------------------------- |
+| `db_path`       | string       | `data/scheduled_tasks.sqlite` | 任务数据库路径（相对项目根）                       |
+| `poll_interval` | int          | 30                              | 轮询间隔（秒），调度器每隔此时间检查是否有到期任务 |
+| `timezone`      | string       | `Asia/Shanghai`               | 任务时区，影响 cron 表达式解析                     |
+| `max_retries`   | int          | 3                               | 任务执行失败最大重试次数                           |
+| `max_workers`   | int          | 5                               | 并发执行任务的最大工作线程数                       |
+| `provider`      | string\|null | null                            | 调度器使用的 LLM 服务商标识（null = 默认）         |
+| `blocking`      | bool         | true                            | 是否阻塞主进程（`false` 时调度器在后台运行）     |
 
 ---
 
@@ -2394,40 +2890,46 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 
 ### 离线单元测试
 
-| 测试文件                                      | 覆盖内容                                                         |
-| --------------------------------------------- | ---------------------------------------------------------------- |
-| `tests/test_config.py`                      | 运行时配置：默认值合并、路径解析                                 |
-| `tests/test_config_templates.py`            | 配置模板验证：.example 文件完整性检查                            |
-| `tests/test_safety.py`                      | 安全护栏：黑名单拒绝、白名单放行、危险命令确认、路径保护         |
-| `tests/test_skills.py`                      | `SkillManager`：列出/读取/匹配(中→英别名)/渲染技能            |
-| `tests/test_search.py`                      | `search` 工具：无 Key 降级、Tavily 返回结构(mock)              |
-| `tests/test_cli_commands.py`                | CLI 命令分发：路由优先级、状态变更和各领域处理器                 |
-| `tests/test_human_input.py`                 | LangGraph HITL：interrupt、恢复、并行选择和线程隔离              |
-| `tests/test_terminal.py`                    | 终端工具：输出截断、护栏拒绝、安全执行(mock subprocess)          |
-| `tests/test_calculator.py`                  | 计算器工具：表达式求值、错误处理                                 |
-| `tests/test_memory.py`                      | `AgentMemory`：长期记忆、会话管理(SQLite)                      |
-| `tests/test_agent_core_regressions.py`      | Agent 核心回归：HITL 恢复、会话隔离、技能匹配、长上下文裁剪等    |
-| `tests/test_scheduler.py`                   | 定时任务调度：TaskStore CRUD、原子抢占、重试逻辑                 |
-| `tests/test_workspace_tool_path_protection.py` | 工作目录工具：路径保护、越界检测                             |
-| `tests/test_api.py`                         | API Server：端点路由、流式聊天、命令执行（FastAPI TestClient）   |
-| `tests/test_message_utils.py`               | LLM 异常信息提取：429/5xx/鉴权/未知错误的中文提示                |
-| `tests/test_llm_client.py`                  | 瞬时错误自动重试：should_retry 判定与重试行为                    |
-| `tests/test_compaction.py`                  | 长上下文压缩中间件：增量摘要、工具输出 Prune、安全切割           |
-| `tests/test_create_tool.py`                 | `create_tool` 动态生成工具代码并自动注册到 `tools/__init__.py` |
-| `tests/test_graph_rebuild.py`               | Graph 重建：MCP 工具变化触发重建、技能变化不重建                 |
-| `tests/test_mcp_pool.py`                    | `MCPPool` 连接池：连接管理、健康探测、重连（mock 注入）        |
-| `tests/test_threads_preview.py`             | 会话菜单预览：首条用户消息提取与截断                             |
-| `tests/test_workflow.py`                    | 监督者模式工作流编排：Manager→Worker→Terminator 模板            |
-| `tests/test_metrics.py`                     | `MetricsCollector`：LLM/工具/压缩指标记录、token 提取与汇总    |
-| `tests/test_tool_wrapper.py`                | 工具超时包装：超时返回 JSON、按工具名覆盖、无限等待排除          |
-| `tests/test_logging_config.py`              | 结构化日志：trace_id/thread_id 上下文注入、TraceContext 恢复    |
-| `tests/test_exceptions_and_close.py`        | 异常层次与生命周期：`LCAgentError` 子类、`aclose()` 资源释放  |
+| 测试文件                                 | 覆盖内容                                                                                |
+| ---------------------------------------- | --------------------------------------------------------------------------------------- |
+| `tests/config/test_config.py`          | 运行时配置：默认值合并、路径解析                                                        |
+| `tests/config/test_config_templates.py` | 配置模板验证：.example 文件完整性检查                                                    |
+| `tests/tools/test_safety.py`           | 安全护栏：黑名单拒绝、白名单放行、危险命令确认、路径保护                                |
+| `tests/tools/test_skills.py`           | `SkillManager`：列出/读取/匹配(中→英别名)/渲染技能（经 `tools/skills.py` re-export 测旧路径）                                    |
+| `tests/skmng/test_core.py`             | `skmng.core`：build_skill_block 三来源合并去重、inject_into_prompt 防重复、auto_match=False 行为、fixed_skills 独立注入                                    |
+| `tests/tools/test_search.py`           | `search` 工具：无 Key 降级、Tavily 返回结构(mock)                                      |
+| `tests/cli/test_cli_commands.py`       | CLI 命令分发：路由优先级、状态变更和各领域处理器                                        |
+| `tests/agent/test_human_input.py`      | LangGraph HITL：interrupt、恢复、并行选择和线程隔离                                     |
+| `tests/tools/test_terminal.py`         | 终端工具：输出截断、护栏拒绝、安全执行(mock subprocess)                                 |
+| `tests/tools/test_calculator.py`       | 计算器工具：表达式求值、错误处理                                                        |
+| `tests/memory/test_memory.py`          | memory/ 包`AgentMemory`：checkpointer + Store 基础设施的初始化、SQLite/acreate/aclose |
+| `tests/agent/test_agent_core_regressions.py` | Agent 核心回归：HITL 恢复、会话隔离、技能匹配、长上下文裁剪等                      |
+| `tests/scheduler/test_scheduler.py`    | 定时任务调度：TaskStore CRUD、原子抢占、重试逻辑                                        |
+| `tests/api/test_api.py`                | API Server：端点路由、流式聊天、命令执行（FastAPI TestClient）                          |
+| `tests/llm/test_message_utils.py`      | LLM 异常信息提取：429/5xx/鉴权/未知错误的中文提示                                       |
+| `tests/llm/test_llm_client.py`         | 瞬时错误自动重试：should_retry 判定与重试行为                                           |
+| `tests/llm/test_llm_client_config.py`  | LLMClient 采样参数默认值来源：显式参数 > 全局配置 > DEFAULTS 兜底                      |
+| `tests/agent/test_compaction.py`       | 长上下文压缩中间件：增量摘要、工具输出 Prune、安全切割                                  |
+| `tests/tools/test_create_tool.py`      | `create_tool` 动态生成工具代码并自动注册到 `tools/__init__.py`                       |
+| `tests/agent/test_graph_rebuild.py`    | Graph 重建：MCP 工具变化触发重建、技能变化不重建                                        |
+| `tests/tools/test_mcp_pool.py`         | `MCPPool` 连接池：连接管理、健康探测、重连（mock 注入）                                |
+| `tests/cli/test_threads_preview.py`    | 会话菜单预览：首条用户消息提取与截断                                                    |
+| `tests/graph/test_workflow.py`         | 监督者模式工作流编排：Manager→Worker→Terminator 模板                                  |
+| `tests/team/test_sampling_config.py`   | 团队 Agent 采样参数：角色级/全局优先级与显式参数覆盖                                   |
+| `tests/team/test_team_tools.py`        | TeamAgent 工具模式：超时参数归一、中间件链挂载(ToolExecutionErrorMW + WorkspaceSecurityMW) |
+| `tests/team/test_team_skills.py`       | TeamAgent 技能内建：build_skill_block/inject_into_prompt 转发 skmng.core、PromptInjector 协议兼容、active_names 透传       |
+| `tests/team/test_team_metrics.py`      | TeamAgent 指标与类型化结果：LLM/tool/turn 指标收集、arun_structured 状态映射           |
+| `tests/utils/test_metrics.py`          | `MetricsCollector`：LLM/工具/压缩指标记录、token 提取与汇总                           |
+| `tests/tools/test_tool_wrapper.py`     | 工具超时包装：超时返回 JSON、按工具名覆盖、无限等待排除                                 |
+| `tests/utils/test_logging_config.py`   | 结构化日志：trace_id/thread_id 上下文注入、TraceContext 恢复                            |
+| `tests/utils/test_exceptions_and_close.py` | 异常层次与生命周期：`LCAgentError` 子类、`aclose()` 资源释放                       |
+| `tests/utils/test_events.py`           | 事件模型：`AgentEvent` NODE_* 工厂方法、to_sse_dict workflow_node 映射、is_terminal 排除 |
 
 ### 在线连通性测试
 
-| 测试文件 | 覆盖内容 |
-| -------- | -------- |
-| `tests/test_provider_models.py` | 真实调用各提供商 `chat/completions`，校验配置的模型当前是否可用（需 API Key） |
+| 测试文件                          | 覆盖内容                                                                       |
+| --------------------------------- | ------------------------------------------------------------------------------ |
+| `tests/llm/test_provider_models.py` | 真实调用各提供商`chat/completions`，校验配置的模型当前是否可用（需 API Key） |
 
 > 该文件不在默认离线测试集内，通常**单独运行**（见下文 `--provider` 用法）。失败一般表示某个模型在服务商端不可用或密钥无效，并非代码问题。
 
@@ -2451,30 +2953,30 @@ uv run pytest tests/ -v
 
 ```bash
 # Linux / macOS
-.venv/bin/pytest tests/test_safety.py
+.venv/bin/pytest tests/tools/test_safety.py
 
 # Windows
-.\.venv\Scripts\pytest.exe tests/test_safety.py
+.\.venv\Scripts\pytest.exe tests/tools/test_safety.py
 ```
 
 **运行单个测试函数：**
 
 ```bash
 # Linux / macOS
-.venv/bin/pytest tests/test_safety.py::test_blacklist_blocks_commands
+.venv/bin/pytest tests/tools/test_safety.py::test_blocklist_curl_pipe_sh
 
 # Windows
-.\.venv\Scripts\pytest.exe tests/test_safety.py::test_blacklist_blocks_commands
+.\.venv\Scripts\pytest.exe tests/tools/test_safety.py::test_blocklist_curl_pipe_sh
 ```
 
 **显示详细输出（-v）和打印信息（-s）：**
 
 ```bash
 # Linux / macOS
-.venv/bin/pytest -v -s tests/test_memory.py
+.venv/bin/pytest -v -s tests/memory/test_memory.py
 
 # Windows
-.\.venv\Scripts\pytest.exe -v -s tests/test_memory.py
+.\.venv\Scripts\pytest.exe -v -s tests/memory/test_memory.py
 ```
 
 **运行特定模式匹配的测试：**
@@ -2490,12 +2992,32 @@ pytest -k "memory or thread"
 **只检测指定提供商（在线连通性测试）：**
 
 ```bash
-uv run pytest tests/test_provider_models.py --provider kimi -v
+uv run pytest tests/llm/test_provider_models.py --provider kimi -v
 ```
 
 > 不传 `--provider` 时检测 `config/llm_config.json` 中配置的**全部**提供商；传入未知提供商会直接报 UsageError。
 
 测试配置见 `pytest.ini`（`pythonpath = .` 保证 `import tools`/`import agent` 可用；`testpaths = tests` 指定默认收集目录；`addopts = -q` 默认静默模式），`conftest.py` 提供安全配置缓存隔离的 autouse fixture。
+
+### 静态检查（ruff）
+
+```bash
+# uv 方式（推荐）
+uv run ruff check .
+```
+
+项目在 `pyproject.toml` 中固化了两项约束，保证结果可复现：
+
+- **锁版本**：dev 依赖固定 `ruff>=0.16,<0.17`，避免升级引入新默认规则导致检查结果漂移。
+- **默认规则集**：不显式 `select`，沿用 ruff 0.16 默认规则集（仅配置 `line-length = 100`、`target-version = "py314"`、排除目录）。默认规则已包含 `UP`/`B`/`SIM`/`S`/`DTZ` 等质量规则；显式全选会额外激活大量中文标点/魔法数噪音规则（如 `RUF002`、`PLR2004`），故不采用。
+
+**有意忽略的规则：**
+
+| 规则                               | 原因                                                                                                                    |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `BLE001`（盲捕获 `Exception`） | agent 工具层 / API 边界 / 调度作业需捕获一切异常并转成错误信息返回给 LLM/用户或记日志，属有意设计；收窄会让错误处理退化 |
+
+涉及宽异常捕获的代码不写 `# noqa`，由上述项目级 `ignore = ["BLE001"]` 统一裁决。
 
 ---
 
@@ -2506,7 +3028,7 @@ uv run pytest tests/test_provider_models.py --provider kimi -v
 - LangGraph 1.x（`create_react_agent`、自定义 `AgentMiddleware` 压缩中间件）
 - LangGraph Checkpoint（`langgraph-checkpoint-sqlite`，同步/异步 SQLite 持久化）
 - langchain-mcp-adapters 0.3+（MCP 工具适配）
-- mcp 1.9+ / fastmcp 2.x（FastMCP Server）
+- mcp 1.9+
 - tenacity 9.x（LLM 瞬时错误自动重试）
 - OpenAI SDK（用于 OpenAI 兼容接口）
 - Tavily Python SDK（联网搜索）

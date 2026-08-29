@@ -10,6 +10,18 @@ from langchain.tools import tool
 
 # 默认工具存放目录：create_tools.py 的同级目录
 DEFAULT_TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Python 3.12+ (PEP 701) 引入了 f-string 专用 token 类型；
+# Python 3.10/3.11 中 f-string 被当作普通 STRING 处理，getattr 安全回退。
+_STRING_TOKEN_TYPES: Final[frozenset[int]] = frozenset(
+    t for t in (
+        tokenize.STRING,
+        getattr(tokenize, "FSTRING_START", None),
+        getattr(tokenize, "FSTRING_END", None),
+        getattr(tokenize, "FSTRING_MIDDLE", None),
+    )
+    if t is not None
+)
 DANGEROUS_IMPORTS: Final[frozenset[str]] = frozenset(
     {
         "ctypes",
@@ -142,7 +154,7 @@ def _multiline_string_rows(body: str) -> set[int]:
     try:
         tokens = tokenize.generate_tokens(io.StringIO(body).readline)
         for token in tokens:
-            if token.type not in (tokenize.STRING, tokenize.FSTRING_START, tokenize.FSTRING_END, tokenize.FSTRING_MIDDLE):
+            if token.type not in _STRING_TOKEN_TYPES:
                 continue
             start_row, end_row = token.start[0], token.end[0]
             if end_row > start_row:
@@ -192,7 +204,7 @@ def create_tool(
 
     Args:
         tool_name: 工具函数名，仅小写字母、下划线，例如 "read_markdown_file"
-        tool_description: 工具文档字符串，说明能力、用途、适用场景
+        tool_description: 工具文档字符串，说明能力、用途、适用场景，清晰列出工具的边界条件
         args_spec: 参数定义说明，每个参数格式：参数名:参数类型=参数说明
                    示例："file_path:str=本地文件路径;encoding:str=utf-8文件编码，可选"
         tool_logic: 工具主体业务逻辑（函数内部实现代码，不要写函数定义、装饰器）

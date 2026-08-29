@@ -2,13 +2,14 @@
 联网搜索工具 - 基于 Tavily Search API
 使用 LangChain @tool 装饰器；未配置 Key 时优雅降级(明确提示,不返回假数据)
 """
-from langchain_core.tools import tool
-from typing import Dict, Any, Optional
-import os
 import json
+import os
+from typing import Any
+
+from langchain_core.tools import tool
 
 
-def _get_tavily_key() -> Optional[str]:
+def _get_tavily_key() -> str | None:
     """获取 Tavily API Key: 优先环境变量,回退 llm_config.json 的 tavily.api_key"""
     key = os.environ.get("TAVILY_API_KEY")
     if key:
@@ -23,13 +24,13 @@ def _get_tavily_key() -> Optional[str]:
             with open(cfg, "r", encoding="utf-8") as f:
                 data = json.load(f)
             return data.get("tavily", {}).get("api_key")
-        except (json.JSONDecodeError, IOError):
+        except (OSError, json.JSONDecodeError):
             return None
     return None
 
 
 @tool
-def search(query: str, num_results: int = 5, search_depth: str = "basic") -> Dict[str, Any]:
+def search(query: str, num_results: int = 5, search_depth: str = "basic") -> dict[str, Any]:
     """
     联网搜索工具,基于 Tavily Search API 搜索互联网上的实时信息。
 

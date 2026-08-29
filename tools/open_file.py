@@ -2,13 +2,13 @@
 文件打开工具 - 使用LangChain @tool装饰器
 用系统默认程序或指定程序(如 DB Browser for SQLite)打开文件
 """
-from langchain_core.tools import tool
-from typing import Dict, Any, Optional
 import os
-import sys
-import subprocess
 import shutil
+import subprocess
+import sys
+from typing import Any
 
+from langchain_core.tools import tool
 
 # 默认的程序映射(按文件扩展名)
 # 值为 None 表示用系统默认程序打开;指定路径则用该程序打开
@@ -28,7 +28,7 @@ DEFAULT_APPS = {
 
 
 @tool
-def open_file(file_path: str, app_path: Optional[str] = None) -> Dict[str, Any]:
+def open_file(file_path: str, app_path: str | None = None) -> dict[str, Any]:
     """
     打开文件工具。用系统默认程序或指定程序打开文件。
     常用于:
@@ -57,7 +57,7 @@ def open_file(file_path: str, app_path: Optional[str] = None) -> Dict[str, Any]:
                 "success": True,
                 "path": file_path,
                 "type": "directory",
-                "message": f"已在文件管理器中打开文件夹"
+                "message": "已在文件管理器中打开文件夹"
             }
 
         # 文件存在性检查
@@ -98,7 +98,7 @@ def open_file(file_path: str, app_path: Optional[str] = None) -> Dict[str, Any]:
                 "success": True,
                 "path": file_path,
                 "type": "file",
-                "message": f"已用系统默认程序打开文件"
+                "message": "已用系统默认程序打开文件"
             }
 
     except Exception as e:
@@ -131,7 +131,7 @@ def _open_with_app(app_path: str, file_path: str):
 
 
 @tool
-def open_sqlite(file_path: str) -> Dict[str, Any]:
+def open_sqlite(file_path: str) -> dict[str, Any]:
     """
     专门打开 SQLite 数据库文件的工具(用 DB Browser for SQLite)。
     如果未配置 DB Browser 路径,会尝试常见安装位置自动查找。
@@ -192,7 +192,7 @@ def open_sqlite(file_path: str) -> Dict[str, Any]:
             "success": True,
             "path": file_path,
             "app": app_path,
-            "message": f"已用 DB Browser for SQLite 打开数据库"
+            "message": "已用 DB Browser for SQLite 打开数据库"
         }
 
     except Exception as e:

@@ -24,12 +24,14 @@ import json
 import logging
 import os
 import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from functools import lru_cache
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 logger = logging.getLogger("api.server")
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -40,15 +42,16 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+
 from agent import AgentCore
-from agent.message_utils import stringify_content  # 消息内容序列化
-from agent.config import load_agent_config, resolve_path
-from agent.llm_client import LLMClient, load_providers
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
-from tools import safety as safety_module
 from cli.commands import CommandContext, dispatch_command
-from cli.cli_menu import select_menu
 from cli.commands.provider import create_llm
+from llm.config import load_agent_config, resolve_path
+from llm.llm_client import LLMClient, load_providers
+from llm.message_utils import stringify_content  # 消息内容序列化
+from memory import MemoryContext
+from tools import safety as safety_module
 
 # --------------------------------------------------------------------------- #
 # 路径常量（与 main.py 保持一致）
@@ -57,17 +60,16 @@ LLM_FILE = os.path.join(BASE_DIR, "config", "llm_config.json")
 MCP_CONFIG_FILE = os.path.join(BASE_DIR, "config", "mcp_servers.json")
 AGENT_CONFIG_FILE = os.path.join(BASE_DIR, "agent", "agent_config.json")
 SERVER_CONFIG_FILE = os.path.join(BASE_DIR, "config", "server_config.json")
-MEMORY_FILE = os.path.join(BASE_DIR, "memory", "memory.json")
-CHECKPOINT_FILE = os.path.join(BASE_DIR, "memory", "checkpoints.sqlite")
+CHECKPOINT_FILE = os.path.join(BASE_DIR, "data", "checkpoints_async.sqlite")
 WEB_DIST = os.path.join(BASE_DIR, "web", "dist")
 
 
-def load_server_config() -> Dict[str, Any]:
+def load_server_config() -> dict[str, Any]:
     """加载服务端口配置（config/server_config.json）。
 
     文件不存在或解析失败时回退到默认值（127.0.0.1:8000），不抛异常。
     """
-    defaults: Dict[str, Any] = {"host": "127.0.0.1", "port": 8000}
+    defaults: dict[str, Any] = {"host": "127.0.0.1", "port": 8000}
     if not os.path.exists(SERVER_CONFIG_FILE):
         return defaults
     try:
@@ -78,32 +80,125 @@ def load_server_config() -> Dict[str, Any]:
                 defaults["host"] = data["host"]
             if isinstance(data.get("port"), int):
                 defaults["port"] = data["port"]
-    except (json.JSONDecodeError, IOError):
+    except (OSError, json.JSONDecodeError):
         pass
     return defaults
 
 # --------------------------------------------------------------------------- #
 # 全局状态
 # --------------------------------------------------------------------------- #
-agent: Optional[AgentCore] = None
-llm: Optional[LLMClient] = None
+agent: AgentCore | None = None
+llm: LLMClient | None = None
+_startup_provider: str | None = None
+# workflow 链路统一门面（绑定 WorkflowAdapter）：全局单例保证 per-thread 锁
+# 跨请求共享；不主动 aclose（SessionManager.aclose 会 shutdown 共享 MemoryManager）
+workflow_sm: Any = None
 # 串行化对话轮次：AgentCore 是有状态单例，同一时刻只能跑一轮。
+# 全局管理锁：管理型命令/管理接口串行（dispatch_command 会操作共享管理状态）
 chat_lock = asyncio.Lock()
 
+# per-thread 锁：普通对话/恢复/压缩按会话并发，同会话内串行
+# 不同会话各自持有独立锁，互不阻塞；同一会话的请求仍严格排队
+_thread_locks: dict[str, asyncio.Lock] = {}
+_THREAD_LOCKS_MAX = 200
 
-def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
+# per-thread 停止信号：前端 POST /api/stop 置位对应 Event，
+# 流式生成器在 LLM 阻塞调用期间也能感知取消，立即中断执行（含 openai 内部重试）。
+# 流结束时在生成器 finally 中移除，防止长期运行后内存无限增长。
+_cancel_events: dict[str, asyncio.Event] = {}
+
+
+def _cancel_event_for(thread_id: str) -> asyncio.Event:
+    """获取指定会话的停止信号 Event（不存在则创建并清空）。
+
+    同一会话的请求受 per-thread 锁串行化，因此同 thread 不会并发持有
+    两个流，get-or-create + 流结束清理即可保证信号状态正确。
+    """
+    ev = _cancel_events.get(thread_id)
+    if ev is None:
+        ev = asyncio.Event()
+        _cancel_events[thread_id] = ev
+    else:
+        ev.clear()
+    return ev
+
+
+def _signal_cancel(thread_id: str) -> bool:
+    """置位指定会话的停止信号；无进行中流时返回 False（幂等）。"""
+    ev = _cancel_events.get(thread_id)
+    if ev is None:
+        return False
+    ev.set()
+    logger.info("收到停止 [%s]，请求中止生成", thread_id)
+    return True
+
+
+async def _cancel_pending_memory(thread_id: str) -> None:
+    """取消指定会话待处理的记忆沉淀（防抖 buffer 与定时器）。
+
+    用户点击停止后，本次被取消对话的事件残料不应再触发后台 LLM
+    fact 抽取，否则停止生效后仍会出现 openai 重试请求（如 429）。
+    已启动的抽取线程无法中断，但能阻止新的抽取任务启动。
+    """
+    if agent is None:
+        return
+    mem_ctx = getattr(agent, "_memory_context", None)
+    if mem_ctx is None:
+        return
+    mem_manager = getattr(mem_ctx, "memory_manager", None)
+    if mem_manager is None:
+        return
+    write_middleware = getattr(mem_manager, "write_middleware", None)
+    if write_middleware is None:
+        return
+    await write_middleware.cleanup_thread(thread_id)
+
+
+def _thread_lock(thread_id: str) -> asyncio.Lock:
+    """获取指定会话的专用锁（不存在则创建）。
+
+    单线程事件循环内 get-or-create 是原子的，无需额外加锁。
+    超过容量上限时淘汰未持锁的旧锁，防止长期运行后内存无限增长。
+    """
+    lock = _thread_locks.get(thread_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _thread_locks[thread_id] = lock
+        if len(_thread_locks) > _THREAD_LOCKS_MAX:
+            _prune_thread_locks()
+    return lock
+
+
+def _prune_thread_locks() -> None:
+    """清理未持有且过量的 per-thread 锁。"""
+    if len(_thread_locks) <= _THREAD_LOCKS_MAX:
+        return
+    idle = [tid for tid, lock in _thread_locks.items() if not lock.locked()]
+    excess = len(_thread_locks) - _THREAD_LOCKS_MAX
+    for tid in idle[:excess]:
+        del _thread_locks[tid]
+
+
+async def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
     """根据提供商初始化 LLM 与 Agent（逻辑与 main.py 一致，去掉 CLI 打印）。"""
+    # 采样参数由 LLMClient 内部从全局 agent_config.json 读取，无需外部传参
     new_llm = LLMClient(provider=provider, config_file=LLM_FILE)
     cfg = load_agent_config(AGENT_CONFIG_FILE)
     agent_prompt_file = cfg.get("agent_prompt_file")
     skills_dir = resolve_path(cfg["skills_dir"], BASE_DIR)
     mcp_config_file = resolve_path(cfg["mcp_config_file"], BASE_DIR)
-    new_agent = AgentCore(
+    # 三层架构：先创建 MemoryContext（记忆基础设施），再创建 AgentCore（纯执行内核）
+    memory_ctx = await MemoryContext.acreate(
+        checkpoint_file=CHECKPOINT_FILE,
+        short_term_size=cfg["latest_msg_cnt"],
+        use_sqlite=True,
+        process_type="server",
+        llm_getter=lambda: new_llm,
+        # 记忆链路参数由 memory/config.py 统一管理，不再经 agent_config.json 配置
+    )
+    new_agent = await AgentCore.acreate(
         llm_client=new_llm,
         name=cfg["name"],
-        memory_size=cfg["memory_size"],
-        long_term_memory_file=MEMORY_FILE,
-        checkpoint_file=CHECKPOINT_FILE,
         max_iterations=cfg["max_iterations"],
         verbose=cfg["verbose"],
         mcp_config_file=mcp_config_file,
@@ -116,8 +211,51 @@ def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
         agent_prompt_file=agent_prompt_file,
         max_execution_history=cfg.get("max_execution_history", 100),
         tool_timeout=cfg.get("tool_timeout", 120),
+        short_term_size=cfg.get("latest_msg_cnt", 10),
+        checkpointer=memory_ctx.checkpointer,
+        store=memory_ctx.store,
+        extra_middleware=[memory_ctx.read_middleware],
+        initial_thread_id=memory_ctx.thread_id,
+        async_conn=memory_ctx.async_conn,
     )
+    # 注入 MemoryManager → SessionManager 懒初始化时会自动接收
+    new_agent.set_memory_manager(memory_ctx.memory_manager)
+    new_agent._memory_context = memory_ctx  # 供 aclose 时关闭 SQLite 连接
+    # 动态绑定：记忆组件直接读取 agent 当前 LLM，切换 provider 后自动同步
+    # （修复 /api/providers/switch 后记忆抽取仍用启动时旧 LLMClient 的问题）
+    memory_ctx.bind_llm(lambda: new_agent.llm)
     return new_agent, new_llm
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """在 FastAPI 生命周期内创建和释放 Agent 资源。"""
+    global agent, llm, workflow_sm
+    provider = _startup_provider or pick_default_provider()
+    logger.info("初始化提供商: %s", provider)
+    agent, llm = await build_agent(provider)
+    # workflow 链路统一门面：与 chat 门面共享 SessionRegistry / MemoryManager
+    from session.manager import create_workflow_session_manager
+
+    workflow_sm = create_workflow_session_manager(
+        agent.session, memory=agent.session_manager.memory
+    )
+    safety_module.set_confirm_backend(safety_module.interrupt_confirm)
+    info = llm.get_info()
+    logger.info("模型: %s / %s", info["provider_name"], info["model"])
+    logger.info("工具: %s", ", ".join(agent.get_available_tools()))
+    try:
+        yield
+    finally:
+        if agent is not None:
+            await agent.session_manager.aclose()
+            # 关闭 MemoryContext（释放 SQLite 连接等底层资源）
+            mem_ctx = getattr(agent, "_memory_context", None)
+            if mem_ctx is not None:
+                await mem_ctx.aclose()
+        agent = None
+        llm = None
+        workflow_sm = None
 
 
 def pick_default_provider() -> str:
@@ -129,16 +267,16 @@ def pick_default_provider() -> str:
     return "zhipu" if "zhipu" in providers else (next(iter(providers), "zhipu"))
 
 
-def serialize_messages(messages: List[Any]) -> List[Dict[str, Any]]:
+def serialize_messages(messages: list[Any]) -> list[dict[str, Any]]:
     """把 LangGraph 消息对象序列化为前端可消费的 JSON。"""
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for m in messages:
         if isinstance(m, SystemMessage):
             continue
         if isinstance(m, HumanMessage):
             out.append({"role": "user", "content": stringify_content(m.content)})
         elif isinstance(m, AIMessage):
-            entry: Dict[str, Any] = {
+            entry: dict[str, Any] = {
                 "role": "assistant",
                 "content": stringify_content(m.content),
             }
@@ -159,9 +297,9 @@ def serialize_messages(messages: List[Any]) -> List[Dict[str, Any]]:
     return out
 
 
-def thread_summary(thread_id: str) -> Dict[str, Any]:
+async def thread_summary(thread_id: str) -> dict[str, Any]:
     """单个会话的摘要信息（消息数 + 预览 + 会话类型）。"""
-    msgs = agent.memory.get_messages(thread_id=thread_id) if agent else []
+    msgs = await agent.session.aget_messages(session_id=thread_id) if agent else []
     preview = ""
     for m in msgs:
         if isinstance(m, HumanMessage):
@@ -169,16 +307,16 @@ def thread_summary(thread_id: str) -> Dict[str, Any]:
             break
     if not preview and msgs:
         preview = stringify_content(msgs[-1].content).strip().replace("\n", " ")[:50]
-    summary: Dict[str, Any] = {
+    summary: dict[str, Any] = {
         "thread_id": thread_id,
         "message_count": len(msgs),
         "preview": preview,
         "type": "chat",
     }
     # 专属工作流会话：标注类型并带上绑定的工作流名，前端据此区分展示
-    if agent and agent.memory.is_workflow_thread(thread_id):
+    if agent and agent.session.is_workflow_session(thread_id):
         summary["type"] = "workflow"
-        summary["workflow_name"] = agent.memory.workflow_name_of(thread_id)
+        summary["workflow_name"] = agent.session.workflow_name_of(thread_id)
     return summary
 
 
@@ -187,17 +325,18 @@ def thread_summary(thread_id: str) -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 class ChatRequest(BaseModel):
     message: str
-    thread_id: Optional[str] = None
+    thread_id: str | None = None
 
 
 class CreateThreadRequest(BaseModel):
-    type: Optional[str] = "chat"
-    workflow_name: Optional[str] = None
+    type: str | None = "chat"
+    workflow_name: str | None = None
+    workspace_path: str | None = None
 
 
 class ResumeRequest(BaseModel):
-    payload: Dict[str, Any]
-    thread_id: Optional[str] = None
+    payload: dict[str, Any]
+    thread_id: str | None = None
 
 
 class SwitchProviderRequest(BaseModel):
@@ -210,23 +349,31 @@ class SwitchModelRequest(BaseModel):
 
 class CommandRequest(BaseModel):
     command: str
-    thread_id: Optional[str] = None
+    thread_id: str | None = None
+
+
+class StopRequest(BaseModel):
+    thread_id: str | None = None
 
 
 class SwitchRoleRequest(BaseModel):
     role: str
-    task: Optional[str] = None
+    task: str | None = None
 
 
 class SafetyUpdateRequest(BaseModel):
-    mode: Optional[str] = None
-    confirm_dangerous: Optional[bool] = None
+    mode: str | None = None
+    confirm_dangerous: bool | None = None
+
+
+class SetWorkspaceRequest(BaseModel):
+    path: str
 
 
 # --------------------------------------------------------------------------- #
 # FastAPI 应用
 # --------------------------------------------------------------------------- #
-app = FastAPI(title="LangChainAgent API", version="1.0.0")
+app = FastAPI(title="LangChainAgent API", version="1.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -243,7 +390,7 @@ async def health():
         "status": "ok",
         "provider": info.get("provider"),
         "model": info.get("model"),
-        "thread_id": agent.memory.thread_id if agent else None,
+        "thread_id": agent.session.current_session_id if agent else None,
     }
 
 
@@ -273,8 +420,9 @@ async def get_providers():
 async def switch_provider(req: SwitchProviderRequest):
     logger.info("切换提供商: %s", req.provider)
     async with chat_lock:
-        global agent, llm
+        global llm
         try:
+            # 采样参数由 LLMClient 内部从全局 agent_config.json 读取，无需外部传参
             new_llm = LLMClient(provider=req.provider, config_file=LLM_FILE)
         except Exception as e:
             logger.error("切换失败: %s", e)
@@ -329,7 +477,10 @@ async def switch_role(req: SwitchRoleRequest):
     logger.info("切换团队角色: %s", req.role)
     async with chat_lock:
         try:
-            await agent.arebuild_from_team_dir(req.role, task=req.task or "")
+            # 直接调用 role_sw 模块入口,就地把 AgentCore 切换为目标角色
+            from agent.role_sw import arebuild_agent_from_team_dir
+
+            await arebuild_agent_from_team_dir(agent, req.role, task=req.task or "")
         except KeyError as e:
             from agent.role_sw import get_available_team_roles
 
@@ -360,6 +511,10 @@ def _workflow_snapshot(name: str) -> dict:
     节点状态为初始 pending；运行时的实时进度由 /api/chat 的 SSE 事件
     (workflow_node / workflow_status)推送，前端据此更新本快照的节点状态。
 
+    从全局 agent.session 获取 checkpointer 注入 build_workflow，使图编译带持久化，
+    与 CLI 执行路径保持一致。缓存仅存储结构 JSON（nodes/edges），
+    checkpointer 不影响图结构，因此 lru_cache 按 name 缓存安全。
+
     Args:
         name: 工作流名称
 
@@ -371,7 +526,12 @@ def _workflow_snapshot(name: str) -> dict:
     """
     from graph.registry import build_workflow
 
-    graph, _ = build_workflow(name)
+    # 从全局 agent 获取 checkpointer（API 层持久化注入）
+    checkpointer = None
+    if agent is not None:
+        checkpointer = getattr(agent.session, "checkpointer", None)
+
+    graph, _ = build_workflow(name, checkpointer=checkpointer)
 
     graph_obj = graph.get_graph()
     nodes = [
@@ -416,29 +576,40 @@ async def list_workflows():
 @app.get("/api/threads")
 async def list_threads():
     """列出所有会话（按消息数倒序，便于最近活跃的靠前）。"""
-    ids = agent.memory.list_threads() if agent else []
-    summaries = [thread_summary(tid) for tid in ids]
+    ids = await agent.session.alist_sessions() if agent else []
+    summaries = [await thread_summary(tid) for tid in ids]
     summaries.sort(key=lambda x: x["message_count"], reverse=True)
-    return {"threads": summaries, "current": agent.memory.thread_id if agent else None}
+    return {"threads": summaries, "current": agent.session.current_session_id if agent else None}
 
 
 @app.post("/api/threads")
-async def create_thread(req: Optional[CreateThreadRequest] = None):
-    """新建会话，返回 thread_id。type=workflow 时创建专属工作流会话。"""
+async def create_thread(req: CreateThreadRequest | None = None):
+    """新建会话，返回 thread_id。
+
+    type=workflow 时创建专属工作流会话。
+    workspace_path 指定会话绑定的外部工作空间路径（可选，用于多会话工作目录隔离）。
+    """
     async with chat_lock:
         if req and req.type == "workflow":
             workflow_name = req.workflow_name or "simple"
-            tid = agent.memory.new_workflow_thread(workflow_name)
+            tid = agent.session.new_workflow_session(
+                workflow_name,
+                workspace_path=req.workspace_path if req else None,
+            )
+            agent.set_current_session(tid)
         else:
-            tid = agent.memory.new_thread()
-    logger.info("创建会话: %s", tid)
+            tid = agent.session.new_session(
+                workspace_path=req.workspace_path if req else None,
+            )
+            agent.set_current_session(tid)
+    logger.info("创建会话: %s (workspace=%s)", tid, req.workspace_path if req else None)
     return {"thread_id": tid}
 
 
 @app.delete("/api/threads/{thread_id}")
 async def delete_thread(thread_id: str):
     logger.info("删除会话: %s", thread_id)
-    ok = agent.memory.delete_thread(thread_id)
+    ok = await agent.session.adelete_session(thread_id)
     if not ok:
         logger.warning("删除失败: %s", thread_id)
         raise HTTPException(status_code=404, detail="会话不存在或删除失败")
@@ -447,12 +618,88 @@ async def delete_thread(thread_id: str):
 
 @app.get("/api/threads/{thread_id}/messages")
 async def get_thread_messages(thread_id: str):
-    msgs = agent.memory.get_messages(thread_id=thread_id) if agent else []
+    msgs = await agent.session.aget_messages(session_id=thread_id) if agent else []
     return {"thread_id": thread_id, "messages": serialize_messages(msgs)}
 
 
-def _sse(data: Dict[str, Any]) -> str:
+def _sse(data: dict[str, Any]) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+async def _drain_events(
+    source: AsyncIterator[dict[str, Any]],
+    queue: asyncio.Queue[dict[str, Any] | None],
+    thread_id: str,
+) -> None:
+    """消费事件源并把事件放入队列；流结束或异常时放入 None 哨兵。
+
+    单独跑在 asyncio.Task 中，使外层主循环能用取消信号竞速等待，
+    从而在 LLM 阻塞调用（含 SDK 内部重试）期间也能立即中断。
+    """
+    try:
+        async for ev in source:
+            queue.put_nowait(ev)
+    except asyncio.CancelledError:
+        queue.put_nowait(None)
+        raise
+    except Exception as e:
+        logger.error("异常 [%s]: %s", thread_id, e)
+        queue.put_nowait({"type": "error", "content": f"内部错误: {e}"})
+    finally:
+        queue.put_nowait(None)
+
+
+async def _forward_stream_with_cancel(
+    source: AsyncIterator[dict[str, Any]],
+    cancel_event: asyncio.Event,
+    request: Request,
+    thread_id: str,
+    enrich_done: bool = True,
+) -> AsyncIterator[str]:
+    """把事件源转为 SSE 字符串，支持停止信号 / 客户端断开即时中断。
+
+    - 停止信号（前端 POST /api/stop 置位 cancel_event）优先竞速响应，
+      即使事件源正阻塞在 LLM 调用中也能立即取消（runner.cancel 传播
+      CancelledError），随后返回 cancelled 事件。
+    - 客户端断开（request.is_disconnected）在每个事件产出后检查，
+      保留原有语义。
+    """
+    queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+    runner = asyncio.create_task(_drain_events(source, queue, thread_id))
+    cancel_waiter = asyncio.create_task(cancel_event.wait())
+    try:
+        while True:
+            getter = asyncio.create_task(queue.get())
+            done, _ = await asyncio.wait(
+                {getter, cancel_waiter},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if cancel_waiter in done and cancel_event.is_set():
+                getter.cancel()
+                logger.info("客户端停止 [%s]，中止流式输出", thread_id)
+                yield _sse({"type": "cancelled", "content": "用户已停止生成。"})
+                break
+            ev = getter.result()
+            if ev is None:
+                logger.info("完成 [%s]", thread_id)
+                break
+            if cancel_event.is_set() or await request.is_disconnected():
+                if cancel_event.is_set():
+                    logger.info("客户端停止 [%s]，中止流式输出", thread_id)
+                    yield _sse({"type": "cancelled", "content": "用户已停止生成。"})
+                else:
+                    logger.info("客户端断开 [%s]，中止流式输出", thread_id)
+                break
+            yield _sse(_enrich_done(ev)) if enrich_done else _sse(ev)
+    finally:
+        if not cancel_waiter.done():
+            cancel_waiter.cancel()
+        if not runner.done():
+            runner.cancel()
+            try:
+                await runner
+            except asyncio.CancelledError:
+                pass
 
 
 def _get_total_tokens() -> int:
@@ -466,7 +713,7 @@ def _get_total_tokens() -> int:
         return 0
 
 
-def _enrich_done(ev: Dict[str, Any]) -> Dict[str, Any]:
+def _enrich_done(ev: dict[str, Any]) -> dict[str, Any]:
     """为 done 事件附加 total_tokens，前端据此更新输入栏 token 计数"""
     if ev.get("type") == "done":
         ev["total_tokens"] = _get_total_tokens()
@@ -526,7 +773,7 @@ def _is_execution_command(command: str) -> bool:
         command: 去掉了前导 ``/`` 的命令字符串
 
     Returns:
-        是否为执行型命令。是则走 astream_chat 流式通道，否则走 dispatch_command 管理通道。
+        是否为执行型命令。是则走 session_manager.achat_stream 流式通道，否则走 dispatch_command 管理通道。
     """
     low = command.lower()
     if low.startswith(("json:", "react:", "cot:")):
@@ -551,135 +798,215 @@ def _unsupported_runner(agent_obj: object, text: str) -> str:
 
 
 # 双方共用：捕获执行型命令统一走流式，其余走管理型 dispatch_command
+@app.post("/api/stop")
+async def stop(req: StopRequest):
+    """请求停止指定会话的生成（幂等）。
+
+    前端点击停止按钮时先调用本接口置位 per-thread 取消信号，再 abort 连接。
+    取消信号会在 LLM 阻塞调用（含 SDK 内部重试）期间被感知，立即中断生成。
+    同时取消该会话待处理的记忆沉淀，避免停止后后台仍发起 LLM fact 抽取。
+    """
+    tid = req.thread_id or (agent.session.current_session_id if agent else "")
+    signalled = _signal_cancel(tid)
+    if signalled:
+        await _cancel_pending_memory(tid)
+    return {"stopped": signalled, "thread_id": tid}
+
+
 @app.post("/api/chat")
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, request: Request):
     """SSE 流式聊天。支持普通对话和命令执行（如 /skill:pptx <task>、/json:、/react: 等）。"""
 
     async def event_stream():
-        async with chat_lock:
-            tid = req.thread_id
-            if tid:
-                agent.memory.thread_id = tid
-            else:
-                tid = agent.memory.new_thread()
-                yield _sse({"type": "thread_created", "thread_id": tid})
-            preview = req.message.strip().replace("\n", " ")[:50]
-            logger.info("收到聊天 [%s]: %s", tid, preview)
-            
-            # 检测是否为命令（以 / 开头）
-            message = req.message.strip()
-            # 专属工作流会话：未显式以 / 开头时，自动包装为 /workflow:<name> 命令执行
-            if agent.memory.is_workflow_thread(tid):
-                workflow_name = agent.memory.workflow_name_of(tid)
-                if workflow_name and not message.startswith('/'):
-                    message = f"/workflow:{workflow_name} {message}"
-                    logger.info("工作流会话 [%s] 自动包装命令: %s", tid, message)
-            if message.startswith('/'):
-                # 命令模式：通过 dispatch_command 处理
-                command = message.lstrip('/')
-                logger.info("检测到命令 [%s]: %s", tid, command)
-                
-                # 文本输出包装器：管理型命令的输出包成 token 事件
-                output_buffer = []
-                # 管理型命令实时输出队列：print 输出与工作流结构化事件入队，主循环边收边推，
-                # 避免 dispatch_command 长耗时（如工作流）运行期间前端收不到任何进度
-                output_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
-                # help 命令需要全量输出做表格转换，禁用实时推送，最后统一推送表格
-                is_help = command.lower() == "help"
+        # 确定会话 ID（new_thread 在事件循环内原子执行，无需加锁）
+        is_new_thread = req.thread_id is None
+        tid = req.thread_id if req.thread_id else agent.session.new_session()
+        agent.set_current_session(tid)
 
-                def capture_output(text: str):
-                    output_buffer.append(text)
-                    if not is_help:
-                        output_queue.put_nowait(("print", text))
+        message = req.message.strip()
 
-                def emit_workflow_event(event: dict[str, str]):
-                    """工作流节点/整体状态事件：实时转发给前端 SSE"""
-                    output_queue.put_nowait(("event", event))
+        # 专属工作流会话：未显式以 / 开头时，自动包装为 /workflow:<name> 命令执行
+        if agent.session.is_workflow_session(tid):
+            workflow_name = agent.session.workflow_name_of(tid)
+            if workflow_name and not message.startswith('/'):
+                message = f"/workflow:{workflow_name} {message}"
+                logger.info("工作流会话 [%s] 自动包装命令: %s", tid, message)
 
-                try:
-                    context = CommandContext(
-                        agent=agent,
-                        print_fn=capture_output,
-                        input_fn=lambda prompt="": "",  # 不支持交互输入
-                        select_menu=lambda title, choices: choices[0] if choices else "",
-                        create_llm=lambda provider: create_llm(provider, LLM_FILE),
-                        list_providers=lambda: load_providers(LLM_FILE),
-                        run_structured_until_completion=_unsupported_runner,  # 嵌套执行返回明确提示,不静默 None
-                        chat_until_completion=_unsupported_runner,  # 同上
-                        safety_backend=safety_module,
-                        base_dir=BASE_DIR,
-                        config_file=AGENT_CONFIG_FILE,
-                        mcp_config_file=MCP_CONFIG_FILE,
-                        workflow_event_cb=emit_workflow_event,
-                    )
-                    
-                    # 执行型命令（json:/react:/cot:/skill:<task>）走流式通道
-                    is_execution = _is_execution_command(command)
-                    
-                    if is_execution:
-                        # 执行型命令：走流式 runner
-                        logger.info("执行型命令 [%s]，走流式通道", tid)
-                        # 把命令原文传给 astream_chat（它会自动匹配技能）
-                        async for ev in agent.astream_chat(command):
-                            yield _sse(_enrich_done(ev))
-                        logger.info("完成 [%s]", tid)
-                        return
-                    else:
-                        # 管理型命令：dispatch_command 放后台线程执行，print 输出/工作流事件
-                        # 经队列实时推送，保证长耗时命令（如 workflow）运行期间前端持续收到进度
-                        logger.info("管理型命令 [%s]", tid)
+        # 区分命令类型：
+        # - 执行型命令（json:/react:/cot:/skill:<task>）与普通对话走流式通道，用 per-thread 锁（并发多会话）
+        # - 管理型命令走 dispatch_command，用全局锁（其内部会切换/新建当前会话等共享管理状态）
+        command_mode = message.startswith('/')
+        command = message.lstrip('/') if command_mode else ""
+        is_management = command_mode and not _is_execution_command(command)
+        lock = chat_lock if is_management else _thread_lock(tid)
 
-                        def _run_dispatch() -> None:
-                            """后台线程执行 dispatch_command，结果/异常经队列送回主循环"""
-                            try:
-                                outcome = dispatch_command(context, command)
-                                output_queue.put_nowait(("outcome", outcome))
-                            except Exception as e:
-                                logger.error("命令执行异常 [%s]: %s", tid, e)
-                                output_queue.put_nowait(("error", e))
+        preview = message.replace("\n", " ")[:50]
+        logger.info("收到聊天 [%s]: %s", tid, preview)
 
-                        dispatch_task = asyncio.create_task(asyncio.to_thread(_run_dispatch))
-
-                        # 实时消费队列：print → token 事件；workflow 事件 → 结构化 SSE 事件
-                        outcome = None
-                        while True:
-                            kind, payload = await output_queue.get()
-                            if kind == "print":
-                                yield _sse({"type": "token", "content": payload})
-                            elif kind == "event":
-                                yield _sse(payload)
-                            elif kind == "outcome":
-                                outcome = payload
-                                break
-                            else:  # error
-                                yield _sse({"type": "error", "content": f"命令执行失败: {payload}"})
-                                return
-
-                        await dispatch_task  # 确保后台线程完全退出
-
-                        # help 命令：全量输出统一转表格后推送（实时通道已跳过）
-                        if is_help:
-                            output = _format_help_as_table("\n".join(output_buffer))
-                            if output:
-                                yield _sse({"type": "token", "content": output})
-
-                        yield _sse({"type": "done", "total_tokens": _get_total_tokens()})
-                        logger.info("命令完成 [%s]: %s", tid, outcome)
-                        return
-                        
-                except Exception as e:
-                    logger.error("命令执行异常 [%s]: %s", tid, e)
-                    yield _sse({"type": "error", "content": f"命令执行失败: {e}"})
-                    return
-            
-            # 普通对话模式
+        async with lock:
+            # per-thread 停止信号：POST /api/stop 置位后在 LLM 阻塞期间也能感知
+            cancel_event = _cancel_event_for(tid)
             try:
-                async for event in agent.astream_chat(req.message):
-                    yield _sse(_enrich_done(event))
-                logger.info("完成 [%s]", tid)
-            except Exception as e:
-                logger.error("异常 [%s]: %s", tid, e)
-                yield _sse({"type": "error", "content": f"内部错误: {e}"})
+                if is_new_thread:
+                    yield _sse({"type": "thread_created", "thread_id": tid})
+
+                if command_mode:
+                    # 命令模式：通过 dispatch_command 处理
+                    logger.info("检测到命令 [%s]: %s", tid, command)
+                    
+                    # 文本输出包装器：管理型命令的输出包成 token 事件
+                    output_buffer = []
+                    # 管理型命令实时输出队列：print 输出与工作流结构化事件入队，主循环边收边推，
+                    # 避免 dispatch_command 长耗时（如工作流）运行期间前端收不到任何进度
+                    output_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+                    # help 命令需要全量输出做表格转换，禁用实时推送，最后统一推送表格
+                    is_help = command.lower() == "help"
+
+                    def capture_output(text: str):
+                        output_buffer.append(text)
+                        if not is_help:
+                            output_queue.put_nowait(("print", text))
+
+                    def emit_workflow_event(event: dict[str, str]):
+                        """工作流节点/整体状态事件：实时转发给前端 SSE"""
+                        output_queue.put_nowait(("event", event))
+
+                    try:
+                        context = CommandContext(
+                            agent=agent,
+                            print_fn=capture_output,
+                            input_fn=lambda prompt="": "",  # 不支持交互输入
+                            select_menu=lambda title, choices: choices[0] if choices else "",
+                            create_llm=lambda provider: create_llm(provider, LLM_FILE),
+                            list_providers=lambda: load_providers(LLM_FILE),
+                            run_structured_until_completion=_unsupported_runner,  # 嵌套执行返回明确提示,不静默 None
+                            chat_until_completion=_unsupported_runner,  # 同上
+                            safety_backend=safety_module,
+                            base_dir=BASE_DIR,
+                            config_file=AGENT_CONFIG_FILE,
+                            mcp_config_file=MCP_CONFIG_FILE,
+                            workflow_event_cb=emit_workflow_event,
+                            workflow_sm=workflow_sm,
+                        )
+                        
+                        # 执行型命令（json:/react:/cot:/skill:<task>）走流式通道
+                        if _is_execution_command(command):
+                            # 执行型命令：走流式 runner，显式传 thread_id 保证多会话隔离
+                            logger.info("执行型命令 [%s]，走流式通道", tid)
+                            # 把命令原文传给 achat_stream（它会自动匹配技能）
+                            async for sse in _forward_stream_with_cancel(
+                                agent.session_manager.achat_stream(command, thread_id=tid),
+                                cancel_event,
+                                request,
+                                tid,
+                            ):
+                                yield sse
+                            return
+                        else:
+                            # 管理型命令：dispatch_command 在当前事件循环执行，print 输出/工作流事件
+                            # 经队列实时推送，保证长耗时命令（如 workflow）运行期间前端持续收到进度
+                            logger.info("管理型命令 [%s]", tid)
+
+                            async def _run_dispatch() -> None:
+                                """执行 dispatch_command，结果/异常经队列送回主循环"""
+                                try:
+                                    outcome = await dispatch_command(context, command)
+                                    output_queue.put_nowait(("outcome", outcome))
+                                except Exception as e:
+                                    logger.error("命令执行异常 [%s]: %s", tid, e)
+                                    output_queue.put_nowait(("error", e))
+
+                            dispatch_task = asyncio.create_task(_run_dispatch())
+
+                            # 实时消费队列：print → token 事件；workflow 事件 → 结构化 SSE 事件
+                            # cancel_event 竞速任务一次性创建，与队列 get 一同竞速，使前端停止信号
+                            # （POST /api/stop 置位 cancel_event）立即可见，消除 wait_for 的 ~2s 延迟
+                            # （对照 _forward_stream_with_cancel:673-681）
+                            outcome = None
+                            cancel_waiter = asyncio.create_task(cancel_event.wait())
+                            try:
+                                while True:
+                                    # 停止信号：前端 POST /api/stop 置位后及时中止命令执行
+                                    if cancel_event.is_set():
+                                        logger.info("客户端停止 [%s]，中止命令输出", tid)
+                                        dispatch_task.cancel()
+                                        try:
+                                            await dispatch_task
+                                        except asyncio.CancelledError:
+                                            pass
+                                        yield _sse({"type": "cancelled", "content": "用户已停止生成。"})
+                                        return
+                                    # 客户端断开检测：前端 abort 后及时释放锁，避免新请求被阻塞
+                                    if await request.is_disconnected():
+                                        logger.info("客户端断开 [%s]，中止命令输出", tid)
+                                        dispatch_task.cancel()
+                                        try:
+                                            await dispatch_task
+                                        except asyncio.CancelledError:
+                                            pass
+                                        return
+                                    # 竞速：队列有项 或 cancel_event 置位，先到先得（FIRST_COMPLETED）
+                                    getter = asyncio.create_task(output_queue.get())
+                                    done, _ = await asyncio.wait(
+                                        {getter, cancel_waiter},
+                                        return_when=asyncio.FIRST_COMPLETED,
+                                    )
+                                    # 停止信号胜出 → 取消 getter，下一轮顶部 cancel 分支统一处理
+                                    if cancel_waiter in done and cancel_event.is_set():
+                                        if not getter.done():
+                                            getter.cancel()
+                                        continue
+                                    # 队列项就绪
+                                    kind, payload = getter.result()
+                                    if kind == "print":
+                                        yield _sse({"type": "token", "content": payload})
+                                    elif kind == "event":
+                                        yield _sse(payload)
+                                    elif kind == "outcome":
+                                        outcome = payload
+                                        break
+                                    else:  # error
+                                        yield _sse({"type": "error", "content": f"命令执行失败: {payload}"})
+                                        return
+                            finally:
+                                if not cancel_waiter.done():
+                                    cancel_waiter.cancel()
+
+                            await dispatch_task  # 确保命令任务完全退出
+
+                            # help 命令：全量输出统一转表格后推送（实时通道已跳过）
+                            if is_help:
+                                output = _format_help_as_table("\n".join(output_buffer))
+                                if output:
+                                    yield _sse({"type": "token", "content": output})
+
+                            yield _sse({"type": "done", "total_tokens": _get_total_tokens()})
+                            logger.info("命令完成 [%s]: %s", tid, outcome)
+                            return
+                            
+                    except Exception as e:
+                        logger.error("命令执行异常 [%s]: %s", tid, e)
+                        yield _sse({"type": "error", "content": f"命令执行失败: {e}"})
+                        return
+                
+                # 普通对话模式（显式传 thread_id 实现多会话隔离）
+                try:
+                    async for sse in _forward_stream_with_cancel(
+                        agent.session_manager.achat_stream(message, thread_id=tid),
+                        cancel_event,
+                        request,
+                        tid,
+                    ):
+                        yield sse
+                except Exception as e:
+                    logger.error("异常 [%s]: %s", tid, e)
+                    yield _sse({"type": "error", "content": f"内部错误: {e}"})
+            finally:
+                # 流因停止信号取消结束时，清理该会话待处理的记忆沉淀，
+                # 防止 20s 防抖窗口到期后仍触发后台 LLM fact 抽取（停止后不应再请求）
+                if cancel_event.is_set():
+                    await _cancel_pending_memory(tid)
+                _cancel_events.pop(tid, None)
 
     return StreamingResponse(
         event_stream(),
@@ -693,22 +1020,32 @@ async def chat(req: ChatRequest):
 
 
 @app.post("/api/chat/resume")
-async def chat_resume(req: ResumeRequest):
+async def chat_resume(req: ResumeRequest, request: Request):
     """SSE 流式恢复被 ask_human 中断的会话。"""
 
     async def event_stream():
-        async with chat_lock:
-            if req.thread_id:
-                agent.memory.thread_id = req.thread_id
-            tid = req.thread_id or agent.memory.thread_id
-            logger.info("恢复会话 [%s]", tid)
+        # 恢复必须带 thread_id（前端在会话被中断时已知线程）；缺失时回退当前会话
+        tid = req.thread_id or agent.session.current_session_id
+        logger.info("恢复会话 [%s]", tid)
+        async with _thread_lock(tid):
+            cancel_event = _cancel_event_for(tid)
             try:
-                async for event in agent.astream_resume(req.payload):
-                    yield _sse(event)
-                logger.info("恢复完成 [%s]", tid)
+                async for sse in _forward_stream_with_cancel(
+                    agent.session_manager.aresume_stream(req.payload, thread_id=tid),
+                    cancel_event,
+                    request,
+                    tid,
+                    enrich_done=False,
+                ):
+                    yield sse
             except Exception as e:
                 logger.error("恢复异常 [%s]: %s", tid, e)
                 yield _sse({"type": "error", "content": f"内部错误: {e}"})
+            finally:
+                # 流因停止信号取消结束时，清理该会话待处理的记忆沉淀（同 /api/chat）
+                if cancel_event.is_set():
+                    await _cancel_pending_memory(tid)
+                _cancel_events.pop(tid, None)
 
     return StreamingResponse(
         event_stream(),
@@ -722,8 +1059,8 @@ async def execute_command(req: CommandRequest):
     """执行 CLI 命令（如 /help, /info, /threads 等）。"""
     async with chat_lock:
         if req.thread_id:
-            agent.memory.thread_id = req.thread_id
-        tid = req.thread_id or agent.memory.thread_id
+            agent.set_current_session(req.thread_id)
+        tid = req.thread_id or agent.session.current_session_id
         
         # 去掉前导 / 符号（CLI 命令不需要 /）
         command = req.command.lstrip('/')
@@ -742,7 +1079,7 @@ async def execute_command(req: CommandRequest):
         # 对于菜单选择，优先返回当前项，否则返回第一项
         def fake_select_menu(
             title: str,
-            choices: List[str],
+            choices: list[str],
             current: str | None = None,
             action_keys: dict | None = None,
             hint: str | None = None,
@@ -766,7 +1103,7 @@ async def execute_command(req: CommandRequest):
             return None
         
         # 不支持的命令会 fallback 到聊天模式，提示用户用正常对话
-        def unsupported_runner(agent_obj, text: str) -> str:
+        async def unsupported_runner(agent_obj, text: str) -> str:
             capture_output("未知命令。请直接发送消息进行对话，或输入 /help 查看可用命令。")
             return ""
         
@@ -786,7 +1123,7 @@ async def execute_command(req: CommandRequest):
                 mcp_config_file=MCP_CONFIG_FILE,
             )
             
-            outcome = dispatch_command(context, command)
+            outcome = await dispatch_command(context, command)
             output = "\n".join(output_lines)
             
             # 如果是 help 命令，将输出转换成表格格式
@@ -834,18 +1171,16 @@ async def reset_metrics():
 # 上下文压缩
 # --------------------------------------------------------------------------- #
 @app.post("/api/compact")
-async def compact_context(thread_id: Optional[str] = None):
-    """手动触发当前会话的上下文压缩（增量摘要 + 工具输出 Prune）
+async def compact_context(thread_id: str | None = None):
+    """手动触发指定会话的上下文压缩（增量摘要 + 工具输出 Prune）
 
     与 before_model 中间件使用相同的压缩逻辑，适用于对话过长时主动释放 token。
     """
-    async with chat_lock:
-        if thread_id:
-            agent.memory.thread_id = thread_id
-        tid = agent.memory.thread_id
-        logger.info("手动压缩上下文 [%s]", tid)
+    tid = thread_id or agent.session.current_session_id
+    logger.info("手动压缩上下文 [%s]", tid)
+    async with _thread_lock(tid):
         try:
-            result = await agent.manually_compact()
+            result = await agent.session_manager.manually_compact(thread_id=tid)
         except Exception as e:
             logger.error("压缩失败 [%s]: %s", tid, e)
             raise HTTPException(status_code=500, detail=f"压缩失败: {e}")
@@ -863,19 +1198,19 @@ async def get_memory_summary():
     """获取记忆摘要统计（当前会话消息数、长期记忆条数、checkpoint 信息）"""
     if not agent:
         raise HTTPException(status_code=503, detail="Agent 未初始化")
-    return agent.get_memory_summary()
+    return await agent.session_manager.aget_memory_summary()
 
 
 @app.post("/api/compress")
 async def compress_long_term_memory():
     """压缩长期记忆（用 LLM 生成摘要并替换原始记忆条目）
 
-    compress_memory 内部调用同步 LLM，用 to_thread 避免阻塞事件循环。
+    acompress_memory 内部将同步 LLM 调用放入线程池，避免阻塞事件循环。
     """
     async with chat_lock:
         logger.info("压缩长期记忆")
         try:
-            result = await asyncio.to_thread(agent.compress_memory)
+            result = await agent.session_manager.acompress_memory()
         except Exception as e:
             logger.error("长期记忆压缩失败: %s", e)
             raise HTTPException(status_code=500, detail=f"压缩失败: {e}")
@@ -893,15 +1228,18 @@ async def clear_memory(scope: str = "long"):
     """
     async with chat_lock:
         if scope in ("long", "长期"):
-            agent.memory.clear_long_term()
-            logger.info("已清空长期记忆")
+            cleared = await agent.session_manager.aclear_long_term_memory()
+            logger.info("已清空长期记忆 (%d 条 facts)", cleared)
         elif scope in ("short", "短期"):
-            agent.memory.clear_short_term()
-            logger.info("已清空短期记忆")
+            # 短期记忆 = 当前会话 checkpoint；开启新会话替代删除
+            tid = agent.session.new_session()
+            agent.set_current_session(tid)
+            logger.info("已清空短期记忆（新会话: %s）", tid)
         elif scope in ("all", "全部"):
-            agent.memory.clear_long_term()
-            agent.memory.clear_short_term()
-            logger.info("已清空全部记忆")
+            cleared = await agent.session_manager.aclear_long_term_memory()
+            tid = agent.session.new_session()
+            agent.set_current_session(tid)
+            logger.info("已清空全部记忆 (长期 %d 条 facts + 短期，新会话: %s)", cleared, tid)
         else:
             raise HTTPException(status_code=400, detail="scope 必须为 long|short|all")
         return {"cleared": True, "scope": scope}
@@ -956,8 +1294,147 @@ async def export_thread(thread_id: str, fmt: str = "text"):
         raise HTTPException(status_code=503, detail="Agent 未初始化")
     if fmt not in ("text", "markdown"):
         raise HTTPException(status_code=400, detail="fmt 必须为 text|markdown")
-    content = agent.memory.export_thread(thread_id=thread_id, fmt=fmt)
+    msgs = await agent.session.aget_messages(session_id=thread_id)
+    blocks = []
+    for m in msgs:
+        if isinstance(m, HumanMessage):
+            role = "用户"
+        elif isinstance(m, AIMessage):
+            role = "助手"
+        elif isinstance(m, SystemMessage):
+            role = "系统"
+        else:
+            role = "工具"
+        text = stringify_content(m.content).strip()
+        if not text:
+            continue
+        if fmt == "markdown":
+            blocks.append(f"**{role}**:\n\n{text}")
+        else:
+            blocks.append(f"【{role}】\n{text}")
+    sep = "\n\n---\n\n" if fmt == "markdown" else "\n\n"
+    header = f"# 对话导出 - {thread_id}\n\n" if fmt == "markdown" else f"对话导出 - {thread_id}\n{'=' * 40}\n"
+    content = header + sep.join(blocks)
     return {"thread_id": thread_id, "format": fmt, "content": content}
+
+
+# --------------------------------------------------------------------------- #
+# 工作空间绑定（Workspace）
+# --------------------------------------------------------------------------- #
+@app.get("/api/threads/{thread_id}/workspace")
+async def get_workspace(thread_id: str):
+    """查看指定会话绑定的工作空间路径（对应 CLI ``workspace`` 命令）。
+
+    Returns:
+        thread_id 与 workspace（未绑定时为 None）
+    """
+    if not agent:
+        raise HTTPException(status_code=503, detail="Agent 未初始化")
+    ws = await agent.session.aget_workspace(session_id=thread_id)
+    logger.info("查询工作空间 [%s]: %s", thread_id, ws or "(未绑定)")
+    return {"thread_id": thread_id, "workspace": ws}
+
+
+@app.post("/api/threads/{thread_id}/workspace")
+async def set_workspace(thread_id: str, req: SetWorkspaceRequest):
+    """设置/修改指定会话的工作空间绑定（对应 CLI ``workspace <path>`` 命令）。
+
+    路径校验由 ``SessionRegistry.aset_workspace`` 完成：必须是已存在的目录、
+    非系统关键目录。校验失败（ValueError）返回 400。
+
+    Returns:
+        thread_id 与规范化后的绝对路径
+    """
+    if not agent:
+        raise HTTPException(status_code=503, detail="Agent 未初始化")
+    logger.info("绑定工作空间 [%s]: %s", thread_id, req.path)
+    try:
+        real = await agent.session.aset_workspace(req.path, session_id=thread_id)
+    except ValueError as e:
+        logger.warning("绑定失败 [%s]: %s", thread_id, e)
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"thread_id": thread_id, "workspace": real}
+
+
+@app.delete("/api/threads/{thread_id}/workspace")
+async def clear_workspace(thread_id: str):
+    """清除指定会话的工作空间绑定（对应 CLI ``workspace:clear`` 命令）。
+
+    Returns:
+        thread_id 与 cleared 状态（True=原绑定存在已清除，False=原本无绑定）
+    """
+    if not agent:
+        raise HTTPException(status_code=503, detail="Agent 未初始化")
+    existed = await agent.session.aclear_workspace(session_id=thread_id)
+    logger.info("清除工作空间 [%s]: existed=%s", thread_id, existed)
+    return {"thread_id": thread_id, "cleared": existed}
+
+
+@app.get("/api/workspace/browse")
+async def browse_workspace(path: str | None = None):
+    """浏览文件系统目录结构（仅返回子目录），供前端文件检索器选择工作空间。
+
+    与 ``/api/threads/{thread_id}/workspace`` 配合：本端点负责"检索"目录树，
+    用户选定目录后由前端调用 POST ``workspace`` 完成绑定并记录。
+
+    安全限制：
+      - 路径必须是已存在的目录，否则返回 400
+      - 仅返回子目录（不返回文件），避免泄露文件级信息
+      - 跳过隐藏目录（``.`` 开头）与无权限目录
+      - 无 ``path`` 时：Windows 返回可用盘符列表，其他平台从根目录 ``/`` 开始
+
+    Args:
+        path: 要浏览的目录绝对路径，为空时返回浏览起点
+
+    Returns:
+        path: 当前规范化路径（起点时为空串）
+        entries: 子目录列表 ``[{name, path, has_children}]``
+        is_root: 是否为浏览起点（盘符列表/根目录）
+    """
+    import string
+    import sys
+
+    def _has_subdir(full: str) -> bool:
+        """快速判断目录是否含子目录（命中即返回，最多扫 256 个条目）。"""
+        try:
+            for i, sub in enumerate(os.listdir(full)):
+                if i >= 256:
+                    break
+                if os.path.isdir(os.path.join(full, sub)):
+                    return True
+        except (PermissionError, OSError):
+            pass
+        return False
+
+    # 无 path：返回浏览起点
+    if not path:
+        if sys.platform == "win32":
+            drives = []
+            for letter in string.ascii_uppercase:
+                drive = f"{letter}:\\"
+                if os.path.exists(drive):
+                    drives.append({"name": f"{letter}:", "path": drive, "has_children": True})
+            return {"path": "", "entries": drives, "is_root": True}
+        path = "/"
+
+    real_path = os.path.realpath(os.path.abspath(path))
+    if not os.path.isdir(real_path):
+        raise HTTPException(status_code=400, detail=f"路径不存在或不是目录: {real_path}")
+
+    entries = []
+    try:
+        for name in sorted(os.listdir(real_path)):
+            full = os.path.join(real_path, name)
+            if not os.path.isdir(full):
+                continue
+            # 跳过隐藏目录
+            if name.startswith("."):
+                continue
+            entries.append({"name": name, "path": full, "has_children": _has_subdir(full)})
+    except PermissionError:
+        raise HTTPException(status_code=403, detail=f"无权限访问: {real_path}")
+
+    return {"path": real_path, "entries": entries, "is_root": False}
 
 
 # 生产环境：如果前端已构建（web/dist），则由本服务直接托管静态文件
@@ -968,10 +1445,10 @@ if os.path.isdir(WEB_DIST):
 def main():
     # 配置日志 - 必须在 uvicorn.run() 之前
     # 1. 生成日志文件名：按日期分目录，文件名为时间 + 哈希
-    from datetime import datetime
     import hashlib
-    
-    now = datetime.now()
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).astimezone()  # noqa: UP017 - 本环境 Python 构建缺少 datetime.UTC 属性
     date_str = now.strftime("%Y%m%d")
     time_str = now.strftime("%H%M%S")
     time_hash = hashlib.md5(str(now.timestamp()).encode()).hexdigest()[:8]
@@ -1002,15 +1479,9 @@ def main():
     parser.add_argument("--port", type=int, default=server_cfg["port"], help=f"绑定端口（默认读自 {SERVER_CONFIG_FILE}）")
     args = parser.parse_args()
 
-    global agent, llm
-    provider = args.provider or pick_default_provider()
-    logger.info("初始化提供商: %s", provider)
-    agent, llm = build_agent(provider)
-    # 非交互环境：危险命令确认改为通过 LangGraph interrupt 抛给前端，而不是终端 input()
-    safety_module.set_confirm_backend(safety_module.interrupt_confirm)
-    info = llm.get_info()
-    logger.info("模型: %s / %s", info["provider_name"], info["model"])
-    logger.info("工具: %s", ", ".join(agent.get_available_tools()))
+    global _startup_provider
+    _startup_provider = args.provider or pick_default_provider()
+    logger.info("初始化提供商: %s", _startup_provider)
     logger.info("服务启动: http://%s:%s", args.host, args.port)
 
     import uvicorn

@@ -7,7 +7,6 @@ import { ThemePicker } from './ThemePicker'
 export function Sidebar() {
   const threads = useStore((s) => s.threads)
   const currentThreadId = useStore((s) => s.currentThreadId)
-  const isStreaming = useStore((s) => s.isStreaming)
   const theme = useStore((s) => s.theme)
   const viewMode = useStore((s) => s.viewMode)
   const switchViewMode = useStore((s) => s.switchViewMode)
@@ -72,7 +71,8 @@ export function Sidebar() {
         </button>
       </div>
 
-      <button className="new-thread-btn" onClick={handleNew} disabled={isStreaming}>
+      {/* 并发多会话：当前线程流式时仍可新建/切换会话，其他会话可继续聊天 */}
+      <button className="new-thread-btn" onClick={handleNew}>
         <GitBranch size={16} />
         {viewMode === 'workflow' ? '新建工作流会话' : '新建会话'}
       </button>

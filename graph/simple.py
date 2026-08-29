@@ -3,96 +3,227 @@
 
 节点进度跟踪与通用运行器已提取至 graph/common.py，本文件仅保留
 工作流状态定义、节点函数与图构建逻辑。
+
+节点执行链路说明：
+    节点函数在自身渲染 prompt（get_template + render_template + 技能注入）后，
+    调 ``run_team_turn_with_interrupt(agent, prompt, config)``（见 graph/common.py）。
+    helper 内部经 ``TeamAgent.arun_structured`` 流式执行 LLM（token 增量经
+    config["callbacks"] 流出到外层事件流）；工具内 ``interrupt()`` 时透传给
+    外层 graph 的 checkpointer，由外层 resume 恢复（对照 plan team-checkpointer-interrupt）。
+    summarize_context 节点直接把 ``summarize_context`` 模板内容拼到 prompt 前部
+    作系统指令（原 asummarize_context 内部经 _astream_messages 的 system 消息语义）。
+
+workspace 隔离说明：
+    worker_exec 节点接收 LangGraph 注入的 config（含 configurable.workspace_path），
+    透传给 Worker 的工作流 → self.invoke，使 Worker 工具调用受
+    WorkspaceSecurityMW 约束（见 graph/common.arun_compiled_workflow）。
+
+会话化说明：
+    WorkflowState 含 ``messages``（add_messages reducer）与 ``summary`` 字段，
+    每个节点把自身产出追加为 AIMessage；build 时可选注入 compaction 中间件，
+    消息通道超阈值（默认 50）时节点级增量压缩（见 graph/common._compaction_wrapper），
+    为 workflow 提供与 AgentCore 会话链路同构的长期消息流。
 """
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import Annotated, Optional, TypedDict
 
+from langchain_core.messages import AIMessage, AnyMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
 
-from graph.common import NodeCallback, run_compiled_workflow
+from agent.compaction import CompactionConfig
+from graph.common import (
+    NodeCallback,
+    NodeSpec,
+    _build_compaction_middleware,
+    arun_compiled_workflow,
+    register_nodes,
+    run_team_turn_with_interrupt,
+)
 from graph.registry import register_workflow
+from skmng.injector import SkillInjector
+from team.base import TeamAgent
 
 
 # 1. 定义工作流状态
-class WorkflowState(TypedDict):
+class WorkflowState(TypedDict, total=False):
     """监督者工作流状态"""
+
     task: str             # 用户原始任务
     raw_context: str      # 原始记忆文本(当前会话+长期记忆,仅 summarize 节点消费)
     context_summary: str  # Manager 提炼后的上下文摘要(注入 plan/final 节点)
     plan: str             # Manager 拆解的执行计划
     worker_result: str    # Worker 执行结果
     final_answer: str     # Terminator 最终答案
+    # 会话化消息通道:各节点产出追加为 AIMessage,经 add_messages reducer 累积;
+    # 超阈值时由 compaction 中间件压缩(摘要进 summary,旧消息清空)
+    messages: Annotated[list[AnyMessage], add_messages]
+    summary: str          # 历史消息摘要(compaction 产物,随 checkpoint 持久化)
 
 
 # 2. 节点函数(提示词模板由各角色 TeamAgent 懒加载,节点需要时调用 get_template)
-def summarize_context(state: WorkflowState, manager) -> WorkflowState:
-    """Manager 提炼记忆上下文,生成分发给下游节点的上下文摘要"""
-    result = manager.summarize_context(state.get("raw_context", ""))
-    return {"context_summary": result}
+async def summarize_context(
+    state: WorkflowState,
+    agent: TeamAgent,
+    injector=None,
+    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 见 worker_exec_node 注释
+) -> WorkflowState:
+    """Manager 提炼记忆上下文,生成分发给下游节点的上下文摘要
+
+    raw_context 为空时短路返回空串,跳过 LLM 调用(对照原
+    ManagerAgent.asummarize_context 的短路语义)。非空时把
+    ``summarize_context`` 模板内容拼到 prompt 前部作为指令(原实现经
+    _astream_messages 的 system 消息语义,helper 单 prompt 通道下合并为用户消息),
+    调 ``run_team_turn_with_interrupt`` 流式执行。
+
+    config 透传(含 callbacks):使 summarize 的 LLM token 增量可流出到外层事件流。
+    """
+    raw = state.get("raw_context", "")
+    # 与原 asummarize_context 一致:raw 为空时短路返回空串(不调 helper)
+    if not raw:
+        return {"context_summary": "", "messages": [AIMessage(content="")]}
+    # summarize 节点不注入技能块(原 asummarize_context 也不调 injector)
+    prompt = f"{agent.get_template('summarize_context')}\n\n{raw}"
+    result = await run_team_turn_with_interrupt(agent, prompt, config)
+    return {"context_summary": result, "messages": [AIMessage(content=result)]}
 
 
-def manager_plan_node(state: WorkflowState, manager) -> WorkflowState:
-    """Manager 拆解任务,生成执行计划(结合记忆上下文摘要)"""
+async def manager_plan_node(
+    state: WorkflowState,
+    agent: TeamAgent,
+    injector=None,
+    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 见 worker_exec_node 注释
+) -> WorkflowState:
+    """Manager 拆解任务,生成执行计划(结合记忆上下文摘要)
+
+    节点内渲染 ``manager_plan`` 模板 + 注入技能块,然后调
+    ``run_team_turn_with_interrupt`` 流式执行;技能注入 match 文本为
+    ``task``(对照原 ManagerAgent.aplan_task)。
+    """
     task = state["task"]
     summary = state.get("context_summary", "")
-    template = manager.get_template("manager_plan")
-    prompt = manager.render_template(template, task=task, context_summary=summary)
-    result = manager.invoke(prompt)
-    return {"plan": result}
+    prompt = agent.render_template(
+        agent.get_template("manager_plan"), task=task, context_summary=summary
+    )
+    if injector is not None:
+        prompt = injector.inject_into_prompt(prompt, task)
+    result = await run_team_turn_with_interrupt(agent, prompt, config)
+    return {"plan": result, "messages": [AIMessage(content=result)]}
 
 
-def worker_exec_node(state: WorkflowState, worker) -> WorkflowState:
-    """Worker 执行计划中的子任务"""
+async def worker_exec_node(
+    state: WorkflowState,
+    agent: TeamAgent,
+    injector=None,
+    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 见下文:须用 Optional 写法,LangGraph 注解判定仅接受该字符串形态
+) -> WorkflowState:
+    """Worker 执行计划中的子任务。
+
+    节点内渲染 ``worker_exec`` 模板 + 注入技能块,然后调
+    ``run_team_turn_with_interrupt`` 流式执行;技能注入 match 文本为
+    ``plan``(对照原 WorkerAgent.aexecute_task,worker 的"任务文本"即计划)。
+
+    config 由 LangGraph 按节点签名以关键字注入（含 configurable.workspace_path）,
+    透传给 helper → arun_structured → astream,使工具调用受 workspace 隔离约束、
+    LLM token 增量经 callbacks 流出到外层事件流。
+
+    注:必须用 Optional[RunnableConfig] 而非 RunnableConfig | None——模块启用
+    ``from __future__ import annotations`` 后注解为字符串,仅
+    'Optional[RunnableConfig]'/'RunnableConfig' 在 LangGraph 判定中被接受,
+    'RunnableConfig | None' 字符串不匹配会导致 config 静默不注入。
+    """
     plan = state["plan"]
-    template = worker.get_template("worker_exec")
-    prompt = worker.render_template(template, plan=plan)
-    result = worker.invoke(prompt)
-    return {"worker_result": result}
+    prompt = agent.render_template(agent.get_template("worker_exec"), plan=plan)
+    if injector is not None:
+        prompt = injector.inject_into_prompt(prompt, plan)
+    result = await run_team_turn_with_interrupt(agent, prompt, config)
+    return {"worker_result": result, "messages": [AIMessage(content=result)]}
 
 
-def terminator_final_node(state: WorkflowState, terminator) -> WorkflowState:
-    """Terminator 汇总结果并返回最终答案(结合记忆上下文摘要)"""
+async def terminator_final_node(
+    state: WorkflowState,
+    agent: TeamAgent,
+    injector=None,
+    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 见 worker_exec_node 注释
+) -> WorkflowState:
+    """Terminator 汇总结果并返回最终答案(结合记忆上下文摘要)
+
+    节点内渲染 ``terminator_final`` 模板 + 注入技能块,然后调
+    ``run_team_turn_with_interrupt`` 流式执行;技能注入 match 文本为
+    ``task``(对照原 TerminatorAgent.afinalize)。
+    """
     task = state["task"]
     plan = state["plan"]
     worker_result = state["worker_result"]
     summary = state.get("context_summary", "")
-    template = terminator.get_template("terminator_final")
-
-    prompt = terminator.render_template(
-        template,
+    prompt = agent.render_template(
+        agent.get_template("terminator_final"),
         task=task,
         plan=plan,
         worker_result=worker_result,
         context_summary=summary,
     )
-    result = terminator.invoke(prompt)
-    return {"final_answer": result}
+    if injector is not None:
+        prompt = injector.inject_into_prompt(prompt, task)
+    result = await run_team_turn_with_interrupt(agent, prompt, config)
+    return {"final_answer": result, "messages": [AIMessage(content=result)]}
 
 
 # 3. 构建工作流图
-def build_simple_workflow(agents: dict) -> StateGraph:
+def build_simple_workflow(
+    agents: dict,
+    checkpointer=None,
+    skills_dir: str | None = None,
+    auto_match_skills: bool = True,
+    compaction_config: CompactionConfig | None = None,
+) -> StateGraph:
     """
     构建监督者模式工作流
 
     Args:
         agents: 角色字典,需包含 manager/worker/terminator 三个键,
             分别对应管理者/执行者/终结者 Agent 实例
+        checkpointer: LangGraph checkpointer 实例。传入时图编译带持久化，
+            工作流状态按 thread_id 保存/恢复；为 None 时无持久化（测试/临时运行）。
+        skills_dir: 技能目录路径,为 None 时使用默认目录(.agents/skills)
+        auto_match_skills: 是否在节点渲染 prompt 时按任务自动匹配注入技能
+        compaction_config: 消息通道压缩配置。为 None 时使用默认配置
+            （阈值 50）；agent 无 llm 时自动禁用压缩（如测试 Fake）。
 
     Returns:
         编译好的 LangGraph StateGraph
     """
     manager = agents["manager"]
-    worker = agents["worker"]
-    terminator = agents["terminator"]
+
+    # 技能注入器:节点渲染 prompt 时追加匹配的技能指引块
+    injector = SkillInjector(
+        skills_dir=skills_dir,
+        auto_match=auto_match_skills,
+    )
+
+    # compaction 中间件:消息通道超阈值时节点级增量压缩(agent 无 llm 时禁用)
+    compaction_mw = _build_compaction_middleware(manager, compaction_config)
 
     builder = StateGraph(WorkflowState)
 
-    # 添加节点(使用 lambda 绑定 agent 实例;提示词模板由节点内懒加载)
-    builder.add_node("summarize", lambda state: summarize_context(state, manager))
-    builder.add_node("manager_plan", lambda state: manager_plan_node(state, manager))
-    builder.add_node("worker_exec", lambda state: worker_exec_node(state, worker))
-    builder.add_node("terminator_final", lambda state: terminator_final_node(state, terminator))
+    # 添加节点(声明式 NodeSpec 表:partial 绑定 + compaction 包装 + add_node 三步合一)
+    # 注意:register_nodes 内部用 functools.partial 绑定 agent 实例;提示词模板由节点内懒加载
+    # partial 保留 async 函数的 coroutine 特征(LangGraph 据此判定节点为异步并 await),
+    # lambda 会返回未 await 的 coroutine 导致 InvalidUpdateError
+    register_nodes(
+        builder,
+        agents,
+        injector,
+        compaction_mw,
+        [
+            NodeSpec("summarize", summarize_context, role="manager"),
+            NodeSpec("manager_plan", manager_plan_node, role="manager"),
+            NodeSpec("worker_exec", worker_exec_node, role="worker"),
+            NodeSpec("terminator_final", terminator_final_node, role="terminator"),
+        ],
+    )
 
     # 添加边: START → summarize → manager_plan → worker_exec → terminator_final → END
     builder.add_edge(START, "summarize")
@@ -101,40 +232,60 @@ def build_simple_workflow(agents: dict) -> StateGraph:
     builder.add_edge("worker_exec", "terminator_final")
     builder.add_edge("terminator_final", END)
 
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer)
 
 
 # 4. 运行工作流
-def run_simple_workflow(
+async def arun_simple_workflow(
     graph: StateGraph,
     task: str,
     raw_context: str = "",
+    thread_id: str | None = None,
+    workspace_path: str | None = None,
     on_node_start: NodeCallback | None = None,
     on_node_end: NodeCallback | None = None,
     on_node_error: NodeCallback | None = None,
+    max_history_chars: int = 6000,
+    memory=None,
+    memory_thread_id: str | None = None,
+    is_run_mode: bool = False,
 ) -> dict:
     """
-    运行监督者工作流
+    运行监督者工作流（异步）
 
     Args:
         graph: 编译好的工作流图
         task: 用户任务
         raw_context: 原始记忆文本(当前会话+长期记忆),为空则不注入记忆
+        thread_id: 会话线程 ID。为 None 时自动生成；传入显式值时配合
+            checkpointer 编译的图可实现状态持久化。
+        workspace_path: 会话绑定的工作空间绝对路径。为 None 时工作流内
+            Worker 工具调用不做 workspace 隔离（兼容旧场景）。
         on_node_start: 节点开始回调,接收节点名(用于运行进度跟踪)
         on_node_end: 节点结束回调,接收节点名
         on_node_error: 节点异常回调,接收节点名
+        max_history_chars: 跨轮次记忆摘要最大字符数(超长截断)
+        memory: MemoryManager 实例（长期记忆召回与结果沉淀）；None 禁用
+        memory_thread_id: 长期记忆使用的会话线程 ID
+        is_run_mode: 是否运行模式（决定 DONE 事件是否标记为重要记忆）
 
     Returns:
         包含 final_answer 的结果字典
     """
-    return run_compiled_workflow(
+    return await arun_compiled_workflow(
         graph,
         task,
         state_fields={"plan": "", "worker_result": "", "final_answer": ""},
         raw_context=raw_context,
+        thread_id=thread_id,
+        workspace_path=workspace_path,
         on_node_start=on_node_start,
         on_node_end=on_node_end,
         on_node_error=on_node_error,
+        max_history_chars=max_history_chars,
+        memory=memory,
+        memory_thread_id=memory_thread_id,
+        is_run_mode=is_run_mode,
     )
 
 
@@ -143,7 +294,7 @@ def run_simple_workflow(
 register_workflow(
     "simple",
     builder=build_simple_workflow,
-    runner=run_simple_workflow,
+    runner=arun_simple_workflow,
     roles=["manager", "worker", "terminator"],
     description="监督者模式工作流(Manager 拆解→Worker 执行→Terminator 汇总)",
 )

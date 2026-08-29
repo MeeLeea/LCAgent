@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 调度引擎 - 基于 APScheduler
 
@@ -15,13 +14,13 @@
 """
 import logging
 import threading
-from concurrent.futures import ThreadPoolExecutor, Future
-from datetime import datetime
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import Any
 
-from apscheduler.schedulers.base import SchedulerNotRunningError
 from apscheduler.jobstores.base import JobLookupError
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.schedulers.base import SchedulerNotRunningError
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -34,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 # APScheduler 的 BaseScheduler 类型（两个子类的公共基类）
 try:
-    from apscheduler.schedulers.base import BaseScheduler  # noqa: F401
+    from apscheduler.schedulers.base import BaseScheduler
 except Exception:  # pragma: no cover
     BaseScheduler = None
 
@@ -70,7 +69,7 @@ class SchedulerEngine:
         agent_factory: Callable[[], Any],
         poll_interval: int = DEFAULT_POLL_INTERVAL,
         blocking: bool = False,
-        timezone: Optional[str] = None,
+        timezone: str | None = None,
         max_workers: int = DEFAULT_MAX_WORKERS,
     ):
         """
@@ -101,7 +100,7 @@ class SchedulerEngine:
         # 已注册的周期任务 job_id 集合（避免重复注册）
         self._registered_periodic: set[str] = set()
         # 任务执行线程池：多个到期任务并发执行，避免长任务阻塞后续任务
-        self._executor: Optional[ThreadPoolExecutor] = None
+        self._executor: ThreadPoolExecutor | None = None
         # 跟踪已提交的 future，stop 时可等待或取消
         self._pending_futures: set[Future] = set()
 
@@ -230,7 +229,7 @@ class SchedulerEngine:
 
     # ---- 执行逻辑 ----
 
-    def _submit_task(self, task: dict, is_periodic: bool = False) -> Optional[Future]:
+    def _submit_task(self, task: dict, is_periodic: bool = False) -> Future | None:
         """
         将任务提交到线程池并发执行。
 
@@ -257,8 +256,8 @@ class SchedulerEngine:
         """
         try:
             due_tasks = self.task_store.get_due_tasks()
-        except Exception as exc:
-            logger.error("轮询查询失败: %s", exc, exc_info=True)
+        except Exception:
+            logger.exception("轮询查询失败")
             return
 
         if not due_tasks:

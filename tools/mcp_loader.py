@@ -7,8 +7,8 @@ import json
 import logging
 import os
 import sys
-import functools
-from typing import List, Dict, Any, Optional, Type
+from typing import Any
+
 from langchain_core.tools import BaseTool, StructuredTool
 
 logger = logging.getLogger(__name__)
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONFIG_FILE = "config/mcp_servers.json"
 
 
-def load_mcp_config(config_file: str = DEFAULT_CONFIG_FILE) -> Dict[str, Any]:
+def load_mcp_config(config_file: str = DEFAULT_CONFIG_FILE) -> dict[str, Any]:
     """
     读取 MCP servers 配置文件
 
@@ -32,12 +32,12 @@ def load_mcp_config(config_file: str = DEFAULT_CONFIG_FILE) -> Dict[str, Any]:
     try:
         with open(config_file, 'r', encoding='utf-8') as f:
             return json.load(f)
-    except (json.JSONDecodeError, IOError) as e:
+    except (OSError, json.JSONDecodeError) as e:
         logger.error("MCP 配置文件读取失败: %s", e)
         return {"servers": {}}
 
 
-def save_mcp_config(config: Dict[str, Any], config_file: str = DEFAULT_CONFIG_FILE):
+def save_mcp_config(config: dict[str, Any], config_file: str = DEFAULT_CONFIG_FILE):
     """保存 MCP servers 配置"""
     with open(config_file, 'w', encoding='utf-8') as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
@@ -102,7 +102,7 @@ def make_sync_compatible(tool: BaseTool) -> BaseTool:
     return new_tool
 
 
-async def load_mcp_tools(config_file: str = DEFAULT_CONFIG_FILE) -> List[BaseTool]:
+async def load_mcp_tools(config_file: str = DEFAULT_CONFIG_FILE) -> list[BaseTool]:
     """
     从所有已启用的 MCP Server 异步加载 LangChain 工具
 
@@ -146,7 +146,7 @@ async def load_mcp_tools(config_file: str = DEFAULT_CONFIG_FILE) -> List[BaseToo
         return []
 
     # 逐个服务器加载，避免一个失败导致全部失败
-    all_tools: List[BaseTool] = []
+    all_tools: list[BaseTool] = []
     for name, server_cfg in enabled_servers.items():
         try:
             # 单服务器客户端
@@ -155,15 +155,116 @@ async def load_mcp_tools(config_file: str = DEFAULT_CONFIG_FILE) -> List[BaseToo
             if tools:
                 logger.info("MCP %s: 加载了 %d 个工具", name, len(tools))
                 all_tools.extend(tools)
-        except Exception as e:
-            logger.error("MCP %s: 加载失败 - %s", name, e, exc_info=True)
+        except Exception:
+            logger.exception("MCP %s: 加载失败", name)
 
     # 包装为同步兼容
     sync_tools = [make_sync_compatible(t) for t in all_tools]
     return sync_tools
 
 
-def list_configured_servers(config_file: str = DEFAULT_CONFIG_FILE) -> List[Dict[str, Any]]:
+async def aload_mcp_tools_by_name(
+    names: list[str],
+    config_file: str = DEFAULT_CONFIG_FILE,
+) -> list[BaseTool]:
+    """按工具名从已启用的 MCP server 中筛选并加载工具。
+
+    全量加载所有启用 server 的工具后按名字过滤,返回命中工具的列表。
+    命中数为 0 时返回空列表(不抛异常,调用方据此降级为纯文本模式)。
+    单个 server 加载失败由 load_mcp_tools 内部兜底(异常 + 继续),不影响其他 server。
+
+    Args:
+        names: 期望加载的工具名列表(如 ["write_file"])
+        config_file: MCP 配置文件路径
+
+    Returns:
+        命中的 BaseTool 列表;无命中或 MCP 未配置时为空
+    """
+    if not names:
+        return []
+    wanted = set(names)
+    all_tools = await load_mcp_tools(config_file)
+    return [t for t in all_tools if t.name in wanted]
+
+
+def load_mcp_tools_by_name_sync(
+    names: list[str],
+    config_file: str = DEFAULT_CONFIG_FILE,
+) -> list[BaseTool]:
+    """aload_mcp_tools_by_name 的同步包装。
+
+    复用 mcp_loader._run_async 在同步上下文(如 build_workflow 装配期)拉起异步
+    加载;当前线程已在事件循环中时,_run_async 会另起线程执行,避免嵌套循环报错。
+
+    Args:
+        names: 期望加载的工具名列表
+        config_file: MCP 配置文件路径
+
+    Returns:
+        命中的 BaseTool 列表;加载失败或无命中时为空(静默降级,记 WARNING)
+    """
+    if not names:
+        return []
+    try:
+        result = _run_async(aload_mcp_tools_by_name(names, config_file))
+        return list(result) if result else []
+    except Exception as e:
+        logger.warning(
+            "MCP 工具按名同步加载失败(names=%s),将降级为纯文本模式: %s", names, e
+        )
+        return []
+
+
+def load_all_mcp_tools_sync(
+    config_file: str = DEFAULT_CONFIG_FILE,
+) -> list[BaseTool]:
+    """同步加载所有已启用 MCP server 的全部工具(不过滤)。
+
+    供 register_agent(mcp_all=True) 在 build_workflow 装配期调用:
+    一次性连接所有 enabled MCP server、拉取全部工具、按名去重后返回。
+
+    失败语义与 load_mcp_tools_by_name_sync 一致(静默降级):
+      - 单个 server 加载失败由 load_mcp_tools 内部兜底(异常 + 继续),
+        不影响其他 server,返回部分成功列表
+      - 所有 server 全部失败或配置缺失时返回空列表
+      - _run_async 自身异常时 WARNING + 返回空列表,不向上抛
+        (调用方 _build 据此降级角色为纯文本模式)
+
+    命名冲突处理:多个 server 提供同名工具时,按 server 遍历顺序
+    (json 配置中的 enabled_servers 字典序)保留先到者,丢弃后到者并记 WARNING。
+    这与 aload_mcp_tools_by_name 的既有行为(直接 extend 不去重)略有差异——
+    全量加载场景冲突面更大,故在此收敛。
+
+    Args:
+        config_file: MCP 配置文件路径
+
+    Returns:
+        去重后的 BaseTool 列表;加载失败或无 enabled server 时为空
+    """
+    try:
+        result = _run_async(load_mcp_tools(config_file))
+        tools = list(result) if result else []
+    except Exception as e:
+        logger.warning(
+            "MCP 全量同步加载失败,将降级为纯文本模式: %s", e
+        )
+        return []
+
+    # 按 tool.name 去重,保留先到者(enabled_servers 字典遍历序可预测)
+    seen: set[str] = set()
+    deduped: list[BaseTool] = []
+    for tool in tools:
+        if tool.name in seen:
+            logger.warning(
+                "MCP 工具名冲突: '%s' 已存在,丢弃后到的同名工具", tool.name
+            )
+            continue
+        seen.add(tool.name)
+        deduped.append(tool)
+    return deduped
+
+
+def list_configured_servers(config_file: str = DEFAULT_CONFIG_FILE) -> list[dict[str, Any]]:
     """
     列出配置文件中所有 MCP 服务器
 
@@ -191,10 +292,10 @@ def list_configured_servers(config_file: str = DEFAULT_CONFIG_FILE) -> List[Dict
 def add_server(
     name: str,
     transport: str,
-    command: Optional[str] = None,
-    args: Optional[List[str]] = None,
-    url: Optional[str] = None,
-    env: Optional[Dict[str, str]] = None,
+    command: str | None = None,
+    args: list[str] | None = None,
+    url: str | None = None,
+    env: dict[str, str] | None = None,
     enabled: bool = True,
     config_file: str = DEFAULT_CONFIG_FILE
 ):

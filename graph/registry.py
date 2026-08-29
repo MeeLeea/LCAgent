@@ -11,17 +11,20 @@
 
 工作流规格字段:
   - builder:     构建函数 build_xxx(agents: dict) -> 编译好的 StateGraph
-  - runner:      自定义运行器,缺失时回退到 graph.simple.run_simple_workflow
+  - runner:      自定义异步运行器,缺失时回退到 graph.simple.arun_simple_workflow
   - roles:       该工作流依赖的角色列表,缺失时构建全部已注册角色
   - description: 工作流描述,用于 CLI 列表展示
 """
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Callable
 from typing import TypeVar
 
 from langchain_core.tools import BaseTool
+
+logger = logging.getLogger(__name__)
 
 # 项目根目录(基于本文件位置计算)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -47,6 +50,8 @@ def register_agent(
     name: str,
     config_file: str,
     tools: list[BaseTool] | None = None,
+    mcp_tools: list[str] | None = None,
+    mcp_all: bool = False,
 ) -> Callable[[type[T]], type[T]]:
     """
     将 Agent 类注册到全局 AGENT_REGISTRY,供 build_workflow 统一构建
@@ -54,7 +59,18 @@ def register_agent(
     Args:
         name: 角色名(如 "manager"/"spec_analyst")
         config_file: agent_config.json 路径(相对项目根)
-        tools: 该角色的工具列表(纯文本角色传 None)
+        tools: 该角色的本地工具列表(纯文本角色传 None)。这些工具在装饰器
+            执行时即确定(模块加载期),与 mcp_tools 互补
+        mcp_tools: 该角色依赖的 MCP 工具名列表(如 ["write_file"])。这些工具
+            在 build_workflow 装配期由 mcp_loader.load_mcp_tools_by_name_sync
+            同步拉取(遍历已启用 MCP server 按名筛选),失败时静默降级为空列表
+            (角色退化为纯文本模式)。声明工具名而非 server 名,解耦 server 配置
+        mcp_all: 是否加载所有已启用 MCP server 的全部工具。True 时在
+            build_workflow 装配期调用 mcp_loader.load_all_mcp_tools_sync 一次性
+            拉取全部 enabled server 的全部工具(按名去重)。与 mcp_tools 互斥:
+            同时给出时 mcp_all 优先,mcp_tools 被忽略并记 WARNING。
+            注意: 全量挂载会让 ReAct 工具描述段膨胀,稀释 LLM 工具选择质量,
+            建议优先用 mcp_tools 精确声明所需工具,mcp_all 仅在确需全部时使用
 
     Returns:
         装饰器函数,原样返回被装饰的类
@@ -65,6 +81,8 @@ def register_agent(
             "agent_class": cls,
             "config_file": config_file,
             "tools": tools,
+            "mcp_tools": mcp_tools,
+            "mcp_all": mcp_all,
         }
         return cls
 
@@ -86,8 +104,8 @@ def register_workflow(
     Args:
         name: 工作流名称
         builder: 工作流构建函数,签名 build_xxx(agents: dict) -> StateGraph
-        runner: 工作流运行函数,签名 run_xxx(graph, task, ...) -> dict
-            缺失时回退到 graph.simple.run_simple_workflow
+        runner: 工作流异步运行函数,签名 run_xxx(graph, task, ...) -> dict
+            缺失时回退到 graph.simple.arun_simple_workflow
         roles: 该工作流依赖的角色名列表,为 None 时构建全部已注册角色
         description: 工作流描述(用于 CLI 列表展示)
     """
@@ -119,7 +137,7 @@ def _get_workflow_spec(name: str) -> dict:
 
 
 def get_workflow_runner(name: str) -> Callable | None:
-    """获取工作流的运行器函数,缺失返回 None(由调用方回退到 run_simple_workflow)"""
+    """获取工作流的异步运行器函数,缺失返回 None(由调用方回退到 arun_simple_workflow)"""
     return _get_workflow_spec(name)["runner"]
 
 
@@ -140,7 +158,7 @@ def list_workflows() -> list[tuple[str, str]]:
 # ──────────────────────────────────────────────
 # 构建入口
 # ──────────────────────────────────────────────
-def build_workflow(name: str) -> tuple[object, dict[str, object]]:
+def build_workflow(name: str, checkpointer=None) -> tuple[object, dict[str, object]]:
     """
     构建指定名称的工作流(静默返回,不打印)
 
@@ -149,6 +167,8 @@ def build_workflow(name: str) -> tuple[object, dict[str, object]]:
 
     Args:
         name: 工作流名称(如 "simple"/"pipline")
+        checkpointer: LangGraph checkpointer 实例。传入时图编译带持久化，
+            工作流状态按 thread_id 保存/恢复；为 None 时无持久化。
 
     Returns:
         (graph, agents) 元组:
@@ -160,6 +180,7 @@ def build_workflow(name: str) -> tuple[object, dict[str, object]]:
     """
     if name not in WORKFLOWS:
         available = ", ".join(WORKFLOWS.keys())
+        logger.warning("未知工作流: %s（可用: %s）", name, available)
         raise KeyError(f"未知工作流: {name}。可用工作流: {available}")
 
     spec = _get_workflow_spec(name)
@@ -170,13 +191,57 @@ def build_workflow(name: str) -> tuple[object, dict[str, object]]:
     def _build(role: str) -> object:
         if role not in AGENT_REGISTRY:
             available = ", ".join(AGENT_REGISTRY.keys()) or "(空)"
+            logger.warning("未注册的角色: %s（已注册: %s）", role, available)
             raise KeyError(f"未注册的角色: {role}。已注册角色: {available}")
         role_spec = AGENT_REGISTRY[role]
+        # 同步拉取声明的 MCP 工具并合并到本地 tools
+        # 失败时 mcp_loader 静默返回空列表,角色降级为纯文本模式(若本地 tools 也为空)
+        tools = list(role_spec["tools"]) if role_spec["tools"] else []
+        mcp_names = role_spec.get("mcp_tools")
+        mcp_all = role_spec.get("mcp_all", False)
+        # 互斥: mcp_all 优先, mcp_tools 被忽略并 warning
+        if mcp_all and mcp_names:
+            logger.warning(
+                "角色 %s: mcp_all=True 与 mcp_tools=%s 同时声明, "
+                "mcp_all 优先,mcp_tools 被忽略",
+                role, mcp_names,
+            )
+        if mcp_all:
+            from tools.mcp_loader import load_all_mcp_tools_sync
+
+            mcp_loaded = load_all_mcp_tools_sync()
+            if mcp_loaded:
+                tools.extend(mcp_loaded)
+                logger.info(
+                    "角色 %s: 加载 %d 个 MCP 工具(全部): %s",
+                    role, len(mcp_loaded), [t.name for t in mcp_loaded],
+                )
+            else:
+                logger.warning(
+                    "角色 %s: mcp_all 加载失败或无 enabled MCP server,降级为纯文本模式",
+                    role,
+                )
+        elif mcp_names:
+            from tools.mcp_loader import load_mcp_tools_by_name_sync
+
+            mcp_loaded = load_mcp_tools_by_name_sync(mcp_names)
+            if mcp_loaded:
+                tools.extend(mcp_loaded)
+                logger.info(
+                    "角色 %s: 加载 %d 个 MCP 工具: %s",
+                    role, len(mcp_loaded), [t.name for t in mcp_loaded],
+                )
+            else:
+                logger.warning(
+                    "角色 %s: 声明的 MCP 工具 %s 加载失败或未配置,降级为纯文本模式",
+                    role, mcp_names,
+                )
         return build_team_agent(
             role_spec["agent_class"],
             role_spec["config_file"],
             BASE_DIR,
-            tools=role_spec["tools"],
+            tools=tools or None,
+            checkpointer=checkpointer,
         )
 
     # 按工作流声明的 roles 构建;未声明则构建全部已注册角色
@@ -186,15 +251,17 @@ def build_workflow(name: str) -> tuple[object, dict[str, object]]:
         missing = [r for r in required_roles if r not in AGENT_REGISTRY]
         if missing:
             available = ", ".join(AGENT_REGISTRY.keys()) or "(空)"
+            logger.warning("工作流 '%s' 缺少角色: %s（已注册: %s）", name, missing, available)
             raise KeyError(f"工作流 '{name}' 缺少角色: {missing}。已注册角色: {available}")
     else:
         roles_to_build = list(AGENT_REGISTRY.keys())
 
     agents = {role: _build(role) for role in roles_to_build}
 
-    # 调用工作流构建器(统一接收 agents 字典)
-    graph = spec["builder"](agents)
+    # 调用工作流构建器(统一接收 agents 字典 + checkpointer)
+    graph = spec["builder"](agents, checkpointer=checkpointer)
 
+    logger.info("工作流构建成功: %s（角色: %s）", name, ", ".join(sorted(roles_to_build)))
     return graph, agents
 
 
@@ -224,7 +291,7 @@ def _load_builtin_workflows() -> None:
     for _finder, _name, _is_pkg in pkgutil.iter_modules(_graph_pkg.__path__):
         if _is_pkg or _name in _NON_WORKFLOW_MODULES:
             continue
-        importlib.import_module(f"graph.{_name}")  # noqa: F401
+        importlib.import_module(f"graph.{_name}")
 
 
 _load_builtin_workflows()
@@ -233,23 +300,38 @@ _load_builtin_workflows()
 # ──────────────────────────────────────────────
 # 独立执行入口(供 scheduler 等非 CLI 场景使用)
 # ──────────────────────────────────────────────
-def run_workflow_by_name(
+async def arun_workflow_by_name(
     workflow_name: str,
     task: str,
+    checkpointer=None,
+    thread_id: str | None = None,
+    workspace_path: str | None = None,
     on_node_start: Callable | None = None,
     on_node_end: Callable | None = None,
+    memory=None,
+    memory_thread_id: str | None = None,
+    is_run_mode: bool = False,
 ) -> dict:
     """
-    按名称构建并运行工作流(不依赖 CLI 上下文)
+    按名称构建并异步运行工作流(不依赖 CLI 上下文)
 
     供 scheduler/executor 等非 CLI 场景调用:只需工作流名称和任务文本,
-    内部完成构建 → 运行 → 返回结果字典。
+    内部完成构建 → 异步运行 → 返回结果字典。
 
     Args:
         workflow_name: 工作流名称(如 "simple"/"systemc_cmodel")
         task: 用户任务文本
+        checkpointer: LangGraph checkpointer 实例。传入时图编译带持久化；
+            为 None 时无持久化（scheduler 场景默认无持久化）。
+        thread_id: 会话线程 ID。为 None 时自动生成；传入显式值时配合
+            checkpointer 可实现状态持久化。
+        workspace_path: 会话绑定的工作空间绝对路径。为 None 时工作流内
+            Worker 工具调用不做 workspace 隔离（scheduler 场景默认无绑定）。
         on_node_start: 节点开始回调(可选,接收节点名)
         on_node_end: 节点结束回调(可选,接收节点名)
+        memory: MemoryManager 实例（长期记忆召回与结果沉淀）；None 禁用
+        memory_thread_id: 长期记忆使用的会话线程 ID
+        is_run_mode: 是否运行模式（决定 DONE 事件是否标记为重要记忆）
 
     Returns:
         工作流结果字典(含 "final_answer" 键)
@@ -258,17 +340,22 @@ def run_workflow_by_name(
         KeyError: 工作流不存在或角色未注册
         Exception: 工作流执行中的异常
     """
-    graph, _agents = build_workflow(workflow_name)
+    graph, _agents = build_workflow(workflow_name, checkpointer=checkpointer)
 
-    # 获取工作流专用运行器,缺失时回退到 run_simple_workflow
+    # 获取工作流专用运行器,缺失时回退到 arun_simple_workflow
     runner = get_workflow_runner(workflow_name)
     if runner is None:
-        from graph.simple import run_simple_workflow as runner
+        from graph.simple import arun_simple_workflow as runner
 
-    return runner(
+    return await runner(
         graph,
         task,
         raw_context="",  # scheduler 场景无会话记忆
+        thread_id=thread_id,
+        workspace_path=workspace_path,
         on_node_start=on_node_start,
         on_node_end=on_node_end,
+        memory=memory,
+        memory_thread_id=memory_thread_id,
+        is_run_mode=is_run_mode,
     )

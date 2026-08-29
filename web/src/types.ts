@@ -28,7 +28,7 @@ export interface ThreadSummary {
 export interface WorkflowNode {
   id: string
   label: string
-  status: 'pending' | 'running' | 'done'
+  status: 'pending' | 'running' | 'done' | 'error'
 }
 
 export interface WorkflowEdge {
@@ -76,11 +76,26 @@ export interface ChatMessage {
   interrupted?: boolean
   /** 消息创建时间戳（ms） */
   timestamp?: number
+  /** 节点结果块标记：workflow 会话中某节点的产出消息（非空时按节点块渲染） */
+  nodeName?: string
+}
+
+export interface InterruptItemChoice {
+  id: string
+  label: string
+}
+
+export interface InterruptItem {
+  id: string
+  question: string
+  choices: InterruptItemChoice[]
 }
 
 export interface InterruptInfo {
   prompt: string
   choices: { id: string; label: string }[]
+  /** 分组单选项：存在且非空时进入分组模式（user_confirmation），否则走扁平单选 */
+  items?: InterruptItem[]
 }
 
 /** 运行时指标 */
@@ -178,15 +193,35 @@ export interface ExportResult {
   content: string
 }
 
+/** 工作空间绑定信息（GET/POST /api/threads/{id}/workspace） */
+export interface WorkspaceInfo {
+  thread_id: string
+  workspace: string | null
+}
+
+/** 文件检索器：单个目录条目 */
+export interface BrowseEntry {
+  name: string
+  path: string
+  has_children: boolean
+}
+
+/** 文件检索器：目录浏览结果（GET /api/workspace/browse） */
+export interface BrowseResult {
+  path: string
+  entries: BrowseEntry[]
+  is_root: boolean
+}
+
 /** SSE 事件联合类型 */
 export type StreamEvent =
   | { type: 'thread_created'; thread_id: string }
   | { type: 'token'; content: string }
   | { type: 'tool_call'; id: string; name: string; args: unknown }
   | { type: 'tool_result'; id: string; name: string; content: string }
-  | { type: 'interrupt'; prompt: string; choices: { id: string; label: string }[] }
+  | { type: 'interrupt'; prompt: string; choices: { id: string; label: string }[]; items?: InterruptItem[] }
   | { type: 'cancelled'; content: string }
   | { type: 'error'; content: string }
-  | { type: 'workflow_node'; node: string; status: 'running' | 'done' }
+  | { type: 'workflow_node'; node: string; status: 'running' | 'done' | 'error'; content?: string }
   | { type: 'workflow_status'; status: 'idle' | 'running' | 'done' }
-  | { type: 'done'; total_tokens?: number }
+  | { type: 'done'; content?: string; total_tokens?: number }

@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import json
 
-from .types import CommandContext, CommandOutcome, HANDLED
+from .types import HANDLED, CommandContext, CommandOutcome
 
 
-def json_mode(context: CommandContext, user_input: str) -> CommandOutcome:
+async def json_mode(context: CommandContext, user_input: str) -> CommandOutcome:
     task = user_input[5:].strip()
     if not task:
         context.print("\n用法: json:<任务描述>  (要求 Agent 以 JSON 对象返回结果)")
@@ -17,7 +17,7 @@ def json_mode(context: CommandContext, user_input: str) -> CommandOutcome:
         "不要包含 ``` 代码块标记或其它任何解释性文字,"
         "直接用 JSON 表达任务结果。"
     )
-    result = context.run_structured_until_completion(context.agent, full)
+    result = await context.run_structured_until_completion(context.agent, full)
     parsed = context.agent.llm.extract_json(result)
     if parsed is not None:
         context.print("\n解析成功,JSON 结构:")
@@ -28,21 +28,21 @@ def json_mode(context: CommandContext, user_input: str) -> CommandOutcome:
     return HANDLED
 
 
-def react_mode(context: CommandContext, user_input: str) -> CommandOutcome:
+async def react_mode(context: CommandContext, user_input: str) -> CommandOutcome:
     task = user_input[6:].strip()
-    result = context.run_structured_until_completion(context.agent, task)
+    result = await context.run_structured_until_completion(context.agent, task)
     context.print(f"\n助手: {result}")
     return HANDLED
 
 
-def cot_mode(context: CommandContext, user_input: str) -> CommandOutcome:
+async def cot_mode(context: CommandContext, user_input: str) -> CommandOutcome:
     task = user_input[4:].strip()
-    result = context.agent.cot(task)
+    result = await context.agent.acot(task)
     context.print(f"\n助手: {result}")
     return HANDLED
 
 
-def chat_mode(context: CommandContext, user_input: str) -> CommandOutcome:
-    result = context.chat_until_completion(context.agent, user_input)
+async def chat_mode(context: CommandContext, user_input: str) -> CommandOutcome:
+    result = await context.chat_until_completion(context.agent, user_input)
     context.print(f"\n助手: {result}")
     return HANDLED

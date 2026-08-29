@@ -5,10 +5,9 @@ import ast
 import math
 import operator
 from collections.abc import Callable
+from typing import Any
 
 from langchain_core.tools import tool
-from typing import Dict, Any
-
 
 MAX_EXPRESSION_LENGTH = 200
 MAX_AST_NODES = 64
@@ -32,7 +31,7 @@ class InvalidExpressionError(ValueError):
     """Raised when an expression exceeds the calculator's safe subset."""
 
 
-def _bounded(value: int | float) -> int | float:
+def _bounded(value: float) -> int | float:
     # 每一步运算都检查中间值，防止最终结果虽小但中途已产生超大数。
     if isinstance(value, bool) or not math.isfinite(value) or abs(value) > MAX_ABS_VALUE:
         raise InvalidExpressionError("数值超出允许范围")
@@ -61,7 +60,7 @@ def _evaluate(node: ast.AST, depth: int = 0) -> int | float:
 
 
 @tool
-def calculate(expression: str) -> Dict[str, Any]:
+def calculate(expression: str) -> dict[str, Any]:
     """
     数学计算工具。计算给定的数学表达式。
     支持加(+)、减(-)、乘(*)、除(/)、括号()。

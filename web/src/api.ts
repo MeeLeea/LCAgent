@@ -1,5 +1,5 @@
 // API 客户端：REST 请求 + SSE 流式解析
-import type { ProvidersInfo, ThreadSummary, RawMessage, StreamEvent, WorkflowInfo, MetricsSummary, CompactResult, MemorySummary, CompressResult, SafetyConfig, SkillInfo, ExportResult } from './types'
+import type { ProvidersInfo, ThreadSummary, RawMessage, StreamEvent, WorkflowInfo, MetricsSummary, CompactResult, MemorySummary, CompressResult, SafetyConfig, SkillInfo, ExportResult, WorkspaceInfo, BrowseResult } from './types'
 
 // Vite 构建期从 config/server_config.json 注入的后端地址（Tauri 模式使用）
 declare const __SERVER_HOST__: string
@@ -190,6 +190,18 @@ export const api = {
     onEvent: (ev: StreamEvent) => void,
   ): (() => void) => streamRequest(`${BASE}/chat/resume`, body, onEvent),
 
+  /**
+   * 请求停止指定会话的生成（幂等）。
+   * 后端收到后置位 per-thread 取消信号，立即中断 LLM 阻塞调用与重试，
+   * 并返回 cancelled 事件。前端点击停止按钮时应先调用本接口再 abort 连接。
+   */
+  stop: (thread_id?: string | null) =>
+    jsonFetch<{ stopped: boolean; thread_id: string }>(`${BASE}/stop`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ thread_id: thread_id ?? null }),
+    }),
+
   executeCommand: (command: string, thread_id?: string | null) =>
     jsonFetch<{ success: boolean; outcome: string; output: string; thread_id: string }>(
       `${BASE}/command`,
@@ -237,5 +249,26 @@ export const api = {
   exportThread: (thread_id: string, fmt: 'text' | 'markdown' = 'text') =>
     jsonFetch<ExportResult>(
       `${BASE}/threads/${encodeURIComponent(thread_id)}/export?fmt=${fmt}`,
+    ),
+
+  // ── 工作空间绑定 ──
+  getWorkspace: (thread_id: string) =>
+    jsonFetch<WorkspaceInfo>(`${BASE}/threads/${encodeURIComponent(thread_id)}/workspace`),
+  setWorkspace: (thread_id: string, path: string) =>
+    jsonFetch<WorkspaceInfo>(`${BASE}/threads/${encodeURIComponent(thread_id)}/workspace`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    }),
+  clearWorkspace: (thread_id: string) =>
+    jsonFetch<{ thread_id: string; cleared: boolean }>(
+      `${BASE}/threads/${encodeURIComponent(thread_id)}/workspace`,
+      { method: 'DELETE' },
+    ),
+
+  // ── 文件检索器：目录浏览 ──
+  browseFolders: (path?: string) =>
+    jsonFetch<BrowseResult>(
+      `${BASE}/workspace/browse${path ? `?path=${encodeURIComponent(path)}` : ''}`,
     ),
 }
