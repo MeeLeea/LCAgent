@@ -7,6 +7,7 @@
     "verbose": true,
     "mcp_config_file": "config/mcp_servers.json",
     "agent_prompt_file": "team/architect/AGENT.md",
+
     "max_execution_history": 100,
     "max_context_messages": 0,
     "context_trim_keep": 12,
@@ -14,6 +15,7 @@
     "temperature": 0.7,
     "max_tokens": 4096,
     "latest_msg_cnt": 10,
+    
     "provider": "yunwu",
     "model": "qwen3.7-max"
 }
