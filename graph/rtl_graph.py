@@ -509,7 +509,7 @@ async def sim_exec_check_node(
             "messages": [AIMessage(content="sim_exec_check: 未找到 scripts/start.tcl")],
         }
     # Vivado 可执行文件:环境变量 VIVADO_BIN 指定绝对路径,缺省回退 vivado(依赖 PATH)
-    vivado_bin = os.environ.get("VIVADO_BIN") or "vivado"
+    vivado_bin = os.environ.get("VIVADO_BIN") or "D:\\AMDTools\\2025.2\\Vivado\\bin\\vivado.bat"
     log_dir = os.path.join(workspace, "logs")
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, "sim_exec.log")

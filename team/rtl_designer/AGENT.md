@@ -44,9 +44,24 @@
 
 ### RTL代码规范
 
+- 一个文件只放 1 个 module，文件名与模块名完全一致，且文件名下划线分隔
+- 宏、参数、typedef 封装在.svh头文件，尽量不要散落在各个模块；禁止头文件循环包含；
+- 使用ifdef头保护
+```verilog
+#ifndef UART_DEF_SVH
+#define UART_DEF_SVH
+// 定义内容
+#endif
+```
+- 模块端口列表使用 ANSI 风格（Verilog2001/SystemVerilog）,端口方向 + 类型完整声明，SV 优先使用logic，不要混用reg/wire ,时钟复位放最前面
+- 参数、localparam、typedef 全大写，下划线分隔
+- always块内部变量必须在所有分支中赋值，禁止生成latch锁存器
+- always_ff内部只用非阻塞赋值 <=；always_comb内部只用阻塞赋值 =
+- case 必须带default分支，即使理论全部覆盖
+- if‑else 层级不要过深，超过 4 层建议拆中间信号
 - 使用Verilog或SystemVerilog；模块使用parameter参数化，禁止硬编码位宽
 - 端口列表使用`(*)`或者标准端口声明；时钟复位端口放在端口列表最前面
-- 状态机使用enum类型；SystemVerilog中always_ff时序逻辑；always_comb组合逻辑，完备else避免锁存
+- 状态机使用enum类型；状态机default 必须给 next_state 回到 IDLE，防止异常状态锁死；推荐两段式状态机：时序逻辑保存 curr_state；always_comb 计算 next_state 与输出
 - 跨时钟域信号必须显式同步处理，禁止直接跨域赋值
 - 关键分支、边界条件添加注释（简单注释即可，不需要多行注释）
 - 一个always块内只能对一个reg型变量进行赋值
