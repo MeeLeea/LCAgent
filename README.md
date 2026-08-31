@@ -1061,7 +1061,7 @@ HTTP API（[api/server.py](api/server.py)）同样暴露三个 RESTful 端点，
 | `thread`                                  | 方向键菜单切换会话（显示首条用户消息预览 + 消息数；Enter 切换、Ctrl+D 删除、Esc 取消） |
 | `thread:new`                              | 开启新会话（原会话保留，可随时切回）                                                   |
 | `thread:delete <id>`                      | 删除指定会话（二次确认，不可恢复；删当前会话自动切换到其他会话）                       |
-| `export` 或 `export:<thread_id> [路径]` | 导出对话为 Markdown（默认存`exports/`）                                              |
+| `export[:<thread_id>] [text\|markdown] [路径]` | 导出对话为可读文本（默认 text 格式，存`exports/`；markdown 用 .md 后缀）                                              |
 | `workspace <路径>` / `workspace:clear`  | 绑定/清除当前会话工作空间                                                              |
 
 > **存储位置**：会话历史在 `data/checkpoints_async.sqlite` 的 `checkpoints` / `writes` 表（按 `thread_id` 隔离）；工作空间映射在 `session_workspaces` 表；执行历史与挂起中断写入 LangGraph Store（瞬态，随会话删除清理）。详见[记忆系统 → 文件位置](#文件位置)。
@@ -2066,7 +2066,7 @@ output = chat_until_completion(agent, "需要人工选择时请先问我")
 | `workspace <路径>`                        | 为当前会话绑定/修改工作空间（文件与执行类工具将被限制在该目录内）            |
 | `workspace:clear`                         | 清除当前会话的工作空间绑定                                                   |
 | `workspace:help`                          | 显示 workspace 命令帮助                                                      |
-| `export` 或 `export:<thread_id> [路径]` | 导出对话为 Markdown(默认存`exports/`)                                      |
+| `export[:<thread_id>] [text\|markdown] [路径]` | 导出对话为可读文本(默认 text 格式,存`exports/`;markdown 用 .md 后缀)                                      |
 | `json:<任务>`                             | 让 Agent 以 JSON 对象返回结果并解析展示                                      |
 | `quit` / `exit`                         | 退出                                                                         |
 | 其他输入                                    | 普通对话模式（也支持工具调用，但不打印步骤）                                 |
@@ -2504,13 +2504,16 @@ Agent 调用 `ask_human` 暂停图执行，等待人工选择后继续：
 
 ```
 你: export
-已导出当前会话到 exports/thread-a4d099d2.md
+已导出对话到: exports/thread-a4d099d2.txt (1234 字符, 格式: text)
 
-你: export:thread-b1dc3b2a 我的导出/backup.md
-已导出会话 thread-b1dc3b2a 到 我的导出/backup.md
+你: export:thread-b1dc3b2a markdown
+已导出对话到: exports/thread-b1dc3b2a.md (5678 字符, 格式: markdown)
+
+你: export markdown 我的导出/backup.md
+已导出对话到: 我的导出/backup.md (5678 字符, 格式: markdown)
 ```
 
-由 [session/registry.py](session/registry.py) 的 `SessionRegistry.aexport_session()` 实现，将 checkpoint 中的对话渲染为可读 Markdown。
+由 [session/registry.py](session/registry.py) 的 `SessionRegistry.aexport_session()` 实现，将 checkpoint 中的对话渲染为可读文本（支持 text 与 markdown 两种格式；content 提取与 [api/server.py](api/server.py) 的导出端点保持一致）。
 
 ### 7. JSON 模式
 

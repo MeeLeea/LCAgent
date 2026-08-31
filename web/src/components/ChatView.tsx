@@ -13,8 +13,9 @@ import {
   Wrench,
 } from 'lucide-react'
 import { useStore, stripWorkflowPrefix, selectIsStreaming } from '../store'
+import { api } from '../api'
+import { ExportResult, ChatMessage } from '../types'
 import { Message } from './Message'
-import type { ChatMessage } from '../types'
 
 const SUGGESTIONS = [
   { icon: Search, text: '帮我搜索一下 LangGraph 的最新特性' },
@@ -112,53 +113,6 @@ function InterruptCard() {
   )
 }
 
-/** 把当前会话消息导出为 Markdown 文件并下载 */
-function exportMarkdown(messages: ChatMessage[], preview: string) {
-  const lines: string[] = []
-  lines.push(`# ${preview || '对话记录'}`)
-  lines.push('')
-  lines.push(`> 导出时间：${new Date().toLocaleString('zh-CN')}`)
-  lines.push('')
-  for (const m of messages) {
-    if (m.role === 'user') {
-      lines.push(`## 🧑 用户`)
-      lines.push('')
-      lines.push(stripWorkflowPrefix(m.content))
-      lines.push('')
-    } else {
-      if (m.toolCalls && m.toolCalls.length) {
-        for (const tc of m.toolCalls) {
-          lines.push(`### 🔧 工具调用：${tc.name}`)
-          lines.push('```json')
-          try {
-            lines.push(JSON.stringify(tc.args, null, 2))
-          } catch {
-            lines.push(String(tc.args))
-          }
-          lines.push('```')
-          lines.push('')
-        }
-      }
-      if (m.content) {
-        lines.push(`## 🤖 助手`)
-        lines.push('')
-        lines.push(m.content)
-        lines.push('')
-      }
-    }
-  }
-  const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  const safeName = (preview || '对话').replace(/[\\/:*?"<>|]/g, '_').slice(0, 40)
-  a.download = `${safeName}.md`
-  document.body.appendChild(a)
-  a.click()
-  document.body.removeChild(a)
-  URL.revokeObjectURL(url)
-}
-
 export function ChatView() {
   const messages = useStore((s) => s.messages)
   const isStreaming = useStore(selectIsStreaming)
@@ -169,6 +123,31 @@ export function ChatView() {
   const threads = useStore((s) => s.threads)
   const currentThreadId = useStore((s) => s.currentThreadId)
   const scrollRef = useRef<HTMLDivElement>(null)
+
+  /** 导出当前会话：调用后端 API (/api/threads/{id}/export) 并下载结果。 */
+  const doExportThread = useCallback(async (format: 'text' | 'markdown' = 'markdown') => {
+    if (!currentThreadId) return
+    try {
+      const content: ExportResult = await api.exportThread(currentThreadId, format)
+
+      // 下载文件
+      const blob = new Blob([content.content], {
+        type: `text/${format === 'markdown' ? 'markdown' : 'plain'};charset=utf-8`,
+      })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      const safeName = `thread_${currentThreadId}_export.${format}`
+      a.download = safeName
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      console.error('导出失败:', err)
+      alert('导出失败，请查看控制台')
+    }
+  }, [currentThreadId])
 
   // 滚动控制：用户上滑时暂停自动滚动，显示"回到底部"按钮
   const [showScrollBtn, setShowScrollBtn] = useState(false)
@@ -275,14 +254,14 @@ export function ChatView() {
                 )}
               </div>
               <div className="chat-toolbar-actions">
-                <button
-                  className="msg-action-btn"
-                  onClick={() => exportMarkdown(messages, currentThread?.preview ?? '')}
-                  title="导出当前会话为 Markdown"
-                >
-                  <Download size={12} />
-                  导出
-                </button>
+<button
+  className="msg-action-btn"
+  onClick={() => doExportThread('markdown')}
+  title="导出当前会话为 Markdown"
+>
+  <Download size={12} />
+  导出
+</button>
                 <button
                   className="msg-action-btn danger"
                   onClick={clearMessages}

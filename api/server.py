@@ -1284,7 +1284,7 @@ async def get_skills():
 # --------------------------------------------------------------------------- #
 @app.get("/api/threads/{thread_id}/export")
 async def export_thread(thread_id: str, fmt: str = "text"):
-    """导出指定会话的对话为可读文本
+    """导出指定会话的对话为可读文本（经 aexport_session，content 提取与 registry/CLI 一致）。
 
     Args:
         thread_id: 会话 ID
@@ -1294,27 +1294,7 @@ async def export_thread(thread_id: str, fmt: str = "text"):
         raise HTTPException(status_code=503, detail="Agent 未初始化")
     if fmt not in ("text", "markdown"):
         raise HTTPException(status_code=400, detail="fmt 必须为 text|markdown")
-    msgs = await agent.session.aget_messages(session_id=thread_id)
-    blocks = []
-    for m in msgs:
-        if isinstance(m, HumanMessage):
-            role = "用户"
-        elif isinstance(m, AIMessage):
-            role = "助手"
-        elif isinstance(m, SystemMessage):
-            role = "系统"
-        else:
-            role = "工具"
-        text = stringify_content(m.content).strip()
-        if not text:
-            continue
-        if fmt == "markdown":
-            blocks.append(f"**{role}**:\n\n{text}")
-        else:
-            blocks.append(f"【{role}】\n{text}")
-    sep = "\n\n---\n\n" if fmt == "markdown" else "\n\n"
-    header = f"# 对话导出 - {thread_id}\n\n" if fmt == "markdown" else f"对话导出 - {thread_id}\n{'=' * 40}\n"
-    content = header + sep.join(blocks)
+    content = await agent.session.aexport_session(thread_id, fmt=fmt)
     return {"thread_id": thread_id, "format": fmt, "content": content}
 
 

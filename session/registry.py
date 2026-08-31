@@ -26,6 +26,8 @@ from langchain_core.messages import (
 )
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
+from llm.message_utils import stringify_content  # 多模态 content 归一化（与 api/server.py 一致）
+
 from .context import SessionContext
 from .store import SessionStore
 from .workspace_store import WorkspaceStore
@@ -504,9 +506,25 @@ class SessionRegistry:
                 role = "系统"
             else:
                 role = "工具"
-            text = _message_text(m).strip()
-            if not text:
+            # 提取 content 文本
+            text = stringify_content(m.content).strip()
+            # 尝试从 additional_kwargs 获取工具原始参数/结果（LangGraph/ToolMessage 常见结构）
+            extra = ""
+            if hasattr(m, "additional_kwargs") and m.additional_kwargs:
+                ekw = m.additional_kwargs
+                if "tool_input" in ekw:
+                    extra += f"\n[工具输入]: {ekw['tool_input']}"
+                if "output" in ekw:
+                    extra += f"\n[工具输出]: {ekw['output']}"
+            # 如果 content 为空且无 additional_kwargs 信息，则跳过此消息（保留原 skip-empty 行为）
+            if not text and not extra:
                 continue
+            # 如 content 为空但有 extra(工具输入/输出)，用 extra 补齐
+            if not text and extra:
+                text = extra
+            # 有 content 时，额外补上工具输入/输出
+            elif extra:
+                text = f"{text}{extra}"
             if fmt == "markdown":
                 blocks.append(f"**{role}**:\n\n{text}")
             else:

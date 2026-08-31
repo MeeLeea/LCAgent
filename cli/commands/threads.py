@@ -66,23 +66,64 @@ async def delete_thread_command(context: CommandContext, user_input: str) -> Com
     return HANDLED
 
 
+_EXPORT_FMT_KEYWORDS = {"text", "markdown", "md"}
+
+
 async def export_thread(context: CommandContext, user_input: str) -> CommandOutcome:
+    """导出指定会话的对话为可读文本。
+
+    用法:
+        export                       导出当前会话(text 格式,默认路径)
+        export <id>                  导出指定会话
+        export <id> markdown         指定会话 + markdown 格式
+        export <id> markdown <path>  指定会话 + 格式 + 输出路径
+        export markdown              当前会话 + markdown
+        export markdown <path>       当前会话 + 格式 + 路径
+
+    content 提取与格式化与 api/server.py 的 export 端点保持一致
+    (经 aexport_session 内部用 stringify_content 归一化多模态内容)。
+    格式关键字 text|markdown|md 不作为会话 ID 或路径解析;含路径分隔符的
+    token 视为输出路径。
+    """
     low = user_input.lower()
     rest = user_input[7:].strip() if low.startswith("export:") else user_input[6:].strip()
-    parts = rest.split(None, 1)
-    thread_id = parts[0] if parts else None
-    text = await context.agent.session.aexport_session(thread_id)
+
+    # 识别格式关键字,剩余 token 按位置归入 thread_id / path
+    fmt = "text"
+    positionals: list[str] = []
+    for token in rest.split():
+        if token.lower() in _EXPORT_FMT_KEYWORDS:
+            fmt = "markdown" if token.lower() != "text" else "text"
+        else:
+            positionals.append(token)
+
+    thread_id: str | None = None
+    path: str | None = None
+    for token in positionals:
+        if "/" in token or "\\" in token:
+            # 含路径分隔符:优先作为输出路径
+            if path is None:
+                path = token
+            elif thread_id is None:
+                thread_id = token
+        elif thread_id is None:
+            thread_id = token
+        else:
+            path = token
+
+    text = await context.agent.session.aexport_session(thread_id, fmt=fmt)
     if not text.strip():
         context.print("\n该会话没有可导出的消息")
         return HANDLED
-    if not path:
+    if path is None:
         exports_dir = os.path.join(context.base_dir, "exports")
         os.makedirs(exports_dir, exist_ok=True)
         safe_thread_id = thread_id or context.agent.session.current_session_id
-        path = os.path.join(exports_dir, f"{safe_thread_id}.md")
+        suffix = ".md" if fmt == "markdown" else ".txt"
+        path = os.path.join(exports_dir, f"{safe_thread_id}{suffix}")
     try:
         await asyncio.to_thread(_write_export_file, path, text)
-        context.print(f"\n已导出对话到: {path} ({len(text)} 字符)")
+        context.print(f"\n已导出对话到: {path} ({len(text)} 字符, 格式: {fmt})")
     except OSError as error:
         context.print(f"\n导出失败: {error}")
         context.print("\n--- 对话内容预览 ---")
