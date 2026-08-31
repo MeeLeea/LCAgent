@@ -254,6 +254,7 @@ LangChainAgent/
 │   ├── interrupts.py        # Interrupts Mixin：中断检查/恢复命令/拒绝处理
 │   ├── turn_runners.py      # TurnRunners Mixin：结构化执行入口（arun/achat/aresume_structured）
 │   ├── turn_types.py        # AgentTurnResult（结构化执行结果类型）
+│   ├── terminal_retry_cap_mw.py  # TerminalRetryCapMW：终端命令超时重试上限中间件（达3次超时则拦截）
 │   ├── tool_error_mw.py     # ToolExecutionErrorMW：工具错误反思纠错中间件
 │   ├── workspace_mw.py      # WorkspaceSecurityMW：工作空间安全中间件
 │   ├── compaction.py        # LangGraph 上下文压缩中间件（增量摘要 + 工具输出 Prune + 保留近期消息）
@@ -305,7 +306,7 @@ LangChainAgent/
 │   ├── search.py            # 联网搜索工具(Tavily API)
 │   ├── file_tool.py         # 文件读写工具
 │   ├── calculator.py        # 数学计算工具
-│   ├── terminal_tools.py    # 终端命令工具（shell/python/bat/ps1,含安全护栏）
+│   ├── terminal_tools.py    # 终端命令工具（shell/python/bat/ps1,含安全护栏+ctrl+c超时分类）
 │   ├── get_local_time.py    # 获取本地时间工具
 │   ├── open_file.py         # 文件打开工具（系统默认程序/DB Browser）
 │   ├── skills.py            # re-export skmng.manager（向后兼容，待删）
@@ -1679,6 +1680,16 @@ with TraceContext(trace_id="req-123", thread_id="thread-abc"):
 
 默认覆盖：`ask_human` 600s、`schedule_task` 120s、`search` 90s。
 
+### 终端命令超时重试与分类（Terminal Timeout Retry）
+
+[`tools/terminal_tools.py`](tools/terminal_tools.py) 对 `run_shell` / `run_python` / `run_cmd` 三个终端工具叠加 ctrl+c 软中断 + 超时分类 + 重试上限机制，防止命令卡死导致 Agent 无限等待或无限重试：
+
+- **ctrl+c 软中断**：超时后先发 ctrl+c（Windows `CTRL_BREAK_EVENT` / Unix `SIGINT`），等 5 秒 grace period 收集 partial 输出，再强杀进程树（Windows `taskkill /T` / Unix `killpg`）。相比直接 kill，子进程有机会刷出缓冲输出供 LLM 判断超时原因。
+- **超时原因分类**（`_classify_timeout`）：启发式识别交互式命令 / 网络阻塞 / IO 阻塞 / 命令错误 / 死循环，写入返回结果的 `timeout_reason` 字段，供主模型判断如何修改命令重试。
+- **富结果返回**：超时返回 `{error_type: "timeout", timeout_reason, partial_stdout, partial_stderr, ...}`，主模型读到后自行反思修改命令重试（方案 B，每次重试是模型新发的 tool_call，事件干净）。
+- **重试上限中间件**（[`agent/terminal_retry_cap_mw.py`](agent/terminal_retry_cap_mw.py) `TerminalRetryCapMW`）：无状态中间件，读 `request.state["messages"]` 统计当前会话内 exec 工具（`run_shell`/`run_python`/`run_cmd`）的超时累计次数，达 `MAX_TIMEOUT_RETRIES`（3 次）则拦截返回失败 `ToolMessage(status="error")`，阻止主模型无限重试。注册在 `create_agent` middleware 链最外层（最先拦截）。
+- **前端超时展示**：工具卡片（`web/src/components/ToolCallCard.tsx`）识别 `error_type:"timeout"` / `"error":"tool_timeout"` / "执行超时" 等标记，显示橙色边框 + Clock 图标 + "超时"文字，区别于红色"异常"和绿色"已完成"。
+
 ### 统一异常层次
 
 [`utils/exceptions.py`](utils/exceptions.py) 定义分层异常，便于上层精准 `catch`：
@@ -2903,7 +2914,8 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 | `tests/tools/test_search.py`           | `search` 工具：无 Key 降级、Tavily 返回结构(mock)                                      |
 | `tests/cli/test_cli_commands.py`       | CLI 命令分发：路由优先级、状态变更和各领域处理器                                        |
 | `tests/agent/test_human_input.py`      | LangGraph HITL：interrupt、恢复、并行选择和线程隔离                                     |
-| `tests/tools/test_terminal.py`         | 终端工具：输出截断、护栏拒绝、安全执行(mock subprocess)                                 |
+| `tests/tools/test_terminal.py`         | 终端工具：输出截断、护栏拒绝、安全执行、超时分类、ctrl+c 软中断(mock Popen)             |
+| `tests/agent/test_terminal_retry_cap_mw.py` | TerminalRetryCapMW：超时计数 cap、达上限拦截、非 exec 工具放行、state 容错           |
 | `tests/tools/test_calculator.py`       | 计算器工具：表达式求值、错误处理                                                        |
 | `tests/memory/test_memory.py`          | memory/ 包`AgentMemory`：checkpointer + Store 基础设施的初始化、SQLite/acreate/aclose |
 | `tests/agent/test_agent_core_regressions.py` | Agent 核心回归：HITL 恢复、会话隔离、技能匹配、长上下文裁剪等                      |

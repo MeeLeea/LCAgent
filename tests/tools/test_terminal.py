@@ -10,6 +10,7 @@ if ROOT not in sys.path:
 
 from tools.terminal_tools import (
     UserRejectedCommandError,
+    _classify_timeout,
     _guard_command,
     _redact_command,
     _truncate,
@@ -97,25 +98,95 @@ def test_guard_confirmation_shows_redacted_command_and_matching_reason(monkeypat
     assert "sk-secret" not in prompts[0]
 
 
-class _FakeResult:
-    returncode = 0
-    stdout = "ok"
-    stderr = None
+class _FakePopen:
+    """模拟 subprocess.Popen，配合 _run_with_timeout 测试。
+
+    timeout_once=True 时第一次 communicate 抛 TimeoutExpired（模拟超时），
+    _run_with_timeout 会发 ctrl+c 后再次 communicate，第二次返回正常输出。
+    """
+
+    def __init__(self, returncode=0, stdout="ok", stderr="", timeout_once=False):
+        self.returncode = returncode
+        self._stdout = stdout
+        self._stderr = stderr
+        self._timeout_once = timeout_once
+        self._call_count = 0
+        self.pid = 12345
+
+    def communicate(self, timeout=None):
+        self._call_count += 1
+        if self._timeout_once and self._call_count == 1:
+            raise subprocess.TimeoutExpired(cmd="test", timeout=timeout or 0)
+        return self._stdout, self._stderr
+
+    def send_signal(self, sig):
+        pass
+
+    def kill(self):
+        pass
 
 
 def test_run_shell_safe(monkeypatch):
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _FakeResult())
+    monkeypatch.setattr(
+        subprocess, "Popen", lambda *a, **k: _FakePopen(returncode=0, stdout="ok")
+    )
     r = run_shell.invoke({"command": "echo hi"})
     assert r["success"] is True
     assert r["stdout"] == "ok"
 
 
 def test_run_shell_deny(monkeypatch):
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _FakeResult())
+    monkeypatch.setattr(
+        subprocess, "Popen", lambda *a, **k: _FakePopen(returncode=0, stdout="ok")
+    )
     # rm -rf tools 目录是询问级路径，会请求确认
     # 模拟用户拒绝确认
     monkeypatch.setattr("tools.terminal_tools.confirm", lambda prompt: False)
-    
+
     # 用户拒绝时应该抛出异常
     with pytest.raises(UserRejectedCommandError):
         run_shell.invoke({"command": "rm -rf tools"})
+
+
+def test_run_shell_timeout(monkeypatch):
+    """超时返回 error_type=timeout + timeout_reason + partial_stdout。"""
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *a, **k: _FakePopen(timeout_once=True, stdout="partial output"),
+    )
+    r = run_shell.invoke({"command": "ping localhost", "timeout": 1})
+    assert r["success"] is False
+    assert r["error_type"] == "timeout"
+    assert "timeout_reason" in r
+    assert r["partial_stdout"] == "partial output"
+
+
+def test_classify_timeout_interactive():
+    """交互式命令（python 未加 -c 等非交互标志）。"""
+    assert _classify_timeout("python", "", None) == "interactive"
+
+
+def test_classify_timeout_network():
+    """网络命令未带超时标志。"""
+    assert _classify_timeout("curl http://example.com", "", None) == "network"
+
+
+def test_classify_timeout_network_with_timeout_flag():
+    """网络命令自带 --max-time 不算网络阻塞。"""
+    assert _classify_timeout("curl --max-time 10 http://example.com", "", None) != "network"
+
+
+def test_classify_timeout_io_block():
+    """tail -f 等 IO 持续监听。"""
+    assert _classify_timeout("tail -f log.txt", "", None) == "io_block"
+
+
+def test_classify_timeout_command_error():
+    """有输出且 returncode 异常。"""
+    assert _classify_timeout("ls", "error output", 1) == "command_error"
+
+
+def test_classify_timeout_dead_loop():
+    """无明显特征，兜底为死循环。"""
+    assert _classify_timeout("while true; do :; done", "", None) == "dead_loop"

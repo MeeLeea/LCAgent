@@ -307,6 +307,7 @@ class TeamAgent:
 
         # 延迟导入避免循环依赖(agent.workspace_mw 顶层仅依赖 langchain,
         # 且 agent_core 早已在顶层导入该模块,此处只是保险)
+        from agent.terminal_retry_cap_mw import TerminalRetryCapMW
         from agent.tool_error_mw import ToolExecutionErrorMW
         from agent.workspace_mw import WorkspaceSecurityMW
         from tools.tool_wrapper import wrap_tools_with_timeout
@@ -320,14 +321,14 @@ class TeamAgent:
             self.tools, getattr(self, "tool_timeout", None)
         )
 
-        # 中间件链:工具错误纠错(异常 → ToolMessage(status="error") + 反思指令)
-        # + 工作空间安全(路径解析 + 逃逸校验),使工作流内工具调用同样受
-        # workspace 隔离约束
+        # 中间件链:终端超时重试上限(达3次超时则拦截) + 工具错误纠错
+        # (异常 → ToolMessage(status="error") + 反思指令) + 工作空间安全
+        # (路径解析 + 逃逸校验),使工作流内工具调用同样受 workspace 隔离约束
         self.agent_executor = create_agent(
             model=chat_model,
             tools=wrapped_tools,
             system_prompt=self.system_prompt,
-            middleware=[ToolExecutionErrorMW(), WorkspaceSecurityMW()],
+            middleware=[TerminalRetryCapMW(), ToolExecutionErrorMW(), WorkspaceSecurityMW()],
             checkpointer=getattr(self, "_checkpointer", None),
         )
     
@@ -609,6 +610,8 @@ class TeamAgent:
         - on_chat_model_end → 记录 LLM 调用(token 用量,msg id 去重)
         - on_tool_end / on_tool_error → 记录工具执行(失败/超时)
         """
+        from agent.terminal_retry_cap_mw import is_timeout_content
+
         if self.verbose:
             logger.info("[%s] 执行任务(工具模式·异步): %s", self.name, task[:100])
         
@@ -644,7 +647,7 @@ class TeamAgent:
                     # 记录工具指标:超时(wrap 层转 JSON 错误串)/失败(status="error")
                     output = data_dict.get("output")
                     content_str = str(getattr(output, "content", ""))
-                    timed_out = '"error": "tool_timeout"' in content_str
+                    timed_out = is_timeout_content(content_str)
                     success = not timed_out and getattr(output, "status", "success") != "error"
                     self.metrics.record_tool_call(
                         name=ev.get("name") or "",

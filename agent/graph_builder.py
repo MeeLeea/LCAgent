@@ -20,6 +20,7 @@ from skmng.middleware import SkillInjectionMW
 from tools.tool_wrapper import wrap_tools_with_timeout
 
 from .compaction import LCAgentCompactionMiddleware, LCAgentState
+from .terminal_retry_cap_mw import TerminalRetryCapMW
 from .tool_error_mw import ToolExecutionErrorMW
 from .workspace_mw import WorkspaceSecurityMW
 
@@ -67,9 +68,14 @@ class GraphBuilder:
         # 工作空间安全中间件：拦截文件/执行类工具，注入 workspace 路径 + 逃逸校验
         workspace_middleware = WorkspaceSecurityMW()
 
+        # 终端命令超时重试上限中间件：读 state 统计 exec 工具历史超时次数，
+        # 达上限(3次)则拦截返回失败 ToolMessage，阻止主模型无限重试超时命令
+        # （方案 B：主模型自行反思改命令重试，本中间件只做硬性 cap）
+        # 放在 middleware 列表最前 = 最外层，最先拦截，包住 tool_error_mw
+        terminal_retry_middleware = TerminalRetryCapMW()
+
         # 工具错误纠错中间件：捕获工具执行异常 → 转 ToolMessage(status="error")，
         # 附加异常类型 + workspace 提示 + 反思指令，使 LLM 能读到报错并修正重试
-        # （放在 middleware 列表最前 = 最外层，包住 workspace 中间件，捕获所有工具异常）
         tool_error_middleware = ToolExecutionErrorMW()
 
         # create_agent 直接返回可调用的agent
@@ -82,6 +88,7 @@ class GraphBuilder:
             store=self._store,
             state_schema=LCAgentState,
             middleware=[
+                terminal_retry_middleware,
                 tool_error_middleware,
                 compaction_middleware,
                 skill_middleware,
