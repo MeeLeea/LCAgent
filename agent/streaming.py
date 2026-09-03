@@ -28,6 +28,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# 工具执行心跳间隔（秒）：长耗时工具执行期间定期发 tool_running 事件，
+# 重置前端 watchdog（WATCHDOG_MS=90s），防止 60s+ 工具超时误触发响应超时。
+# 15s 间隔留 6 倍余量，即使丢 1-2 个心跳也不误触发。
+HEARTBEAT_INTERVAL = 15
+
 
 class Streaming:
     """事件流引擎 Mixin（供 AgentCore 多继承使用，自身不初始化状态）"""
@@ -64,17 +69,54 @@ class Streaming:
         # 需借助 on_chat_model_end 拿到的 AIMessage.tool_calls id 桥接，保证前端
         # tool_call / tool_result 事件 id 一致，避免工具卡片永远停留在"执行中"。
         active_tool_call_ids: dict[str, str] = {}
+        # tool_call_id → tool_name：心跳事件携带工具名供前端显示
+        active_tool_names: dict[str, str] = {}
         # 工具名 → 本轮 tool_call id 队列：on_chat_model_end 填充，on_tool_start 按事件 name 取用
         pending_tool_call_ids: dict[str, list[str]] = {}
 
         for attempt in range(RETRY_ATTEMPTS):
             emitted = False
             try:
-                async for ev in graph.astream_events(
-                    input_or_command,
-                    config=config,
-                    version="v2",
-                ):
+                # 用独立 task 消费 graph 事件到 queue，主循环从 queue 取。
+                # 超时发心跳，不 cancel graph 的 async generator
+                # （wait_for cancel __anext__ 会导致 generator 终止，后续事件丢失）。
+                _event_queue: asyncio.Queue = asyncio.Queue()
+                _consume_exc: BaseException | None = None
+
+                async def _consume_graph(_q: asyncio.Queue) -> None:
+                    nonlocal _consume_exc
+                    try:
+                        async for _ev in graph.astream_events(
+                            input_or_command,
+                            config=config,
+                            version="v2",
+                        ):
+                            await _q.put(_ev)
+                    except BaseException as _exc:
+                        _consume_exc = _exc
+                    finally:
+                        await _q.put(None)
+
+                _consumer_task = asyncio.create_task(_consume_graph(_event_queue))
+                while True:
+                    try:
+                        _item = await asyncio.wait_for(
+                            _event_queue.get(),
+                            timeout=HEARTBEAT_INTERVAL,
+                        )
+                    except TimeoutError:
+                        # 工具执行期间长时间无事件：发心跳重置前端 watchdog
+                        for _tc_id in active_tool_call_ids.values():
+                            yield AgentEvent.tool_running(
+                                tool_call_id=_tc_id,
+                                name=active_tool_names.get(_tc_id, ""),
+                                thread_id=thread_id,
+                                trace_id=trace_id,
+                            )
+                        continue
+                    if _item is None:
+                        break
+                    ev = _item
                     event_name = ev.get("event", "") if isinstance(ev, dict) else ""
                     metadata = ev.get("metadata") if isinstance(ev, dict) else None
                     data = ev.get("data") if isinstance(ev, dict) else None
@@ -111,6 +153,8 @@ class Streaming:
                         if tc_id and tc_id in emitted_tool_call_ids:
                             continue
                         name = ev.get("name") or data_dict.get("name")
+                        if tc_id:
+                            active_tool_names[tc_id] = name or ""
                         tool_input = data_dict.get("input")
                         emitted = True
                         yield AgentEvent.tool_call(
@@ -144,6 +188,8 @@ class Streaming:
                                 or getattr(output, "tool_call_id", None)
                                 or ev.get("name", "")
                             )
+                        if tc_id:
+                            active_tool_names.pop(tc_id, None)
                         emitted = True
                         yield AgentEvent.tool_result(
                             tool_call_id=tc_id,
@@ -175,6 +221,8 @@ class Streaming:
                                 tc_id = bucket.pop(0)
                         if not tc_id:
                             tc_id = ev.get("name", "")
+                        if tc_id:
+                            active_tool_names.pop(tc_id, None)
                         name = ev.get("name") or data_dict.get("name", "") or ""
                         emitted = True
                         yield AgentEvent.tool_result(
@@ -217,6 +265,10 @@ class Streaming:
                                         thread_id=thread_id,
                                         trace_id=trace_id,
                                     )
+                if not _consumer_task.done():
+                    _consumer_task.cancel()
+                if _consume_exc is not None:
+                    raise _consume_exc
                 return
             except UserRejectedCommandError:
                 await self._arepair_rejected_tool_calls(config)
