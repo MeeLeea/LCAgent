@@ -263,8 +263,11 @@ def run_shell(command: str, cwd: str | None = None, timeout: float = DEFAULT_TIM
     Windows PowerShell 5.1 约束（重要，违反会触发 ParserError: InvalidEndOfLine）：
     - 禁止裸 && / ||：PS 5.1 不支持，用 `cmd1; if ($?) { cmd2 }` 代替
     - 禁止 2>nul / cd /d：这些是 cmd 语法，PS 不识别
-    - 需完整 cmd 语法时用 cmd /c "..." 包裹整条命令
-    - 路径含空格的 exe 用 & "path" args 调用
+    - 路径含空格的 exe 用 & "path" args 调用（如 & "D:/path/xvlog.bat" --incr）
+    - 优先用 cwd 参数指定工作目录，不要在命令里 cd
+    - 禁止用 cmd /c "..." 包裹命令：会命中安全护栏的 cmd /c 规则触发 GraphInterrupt，
+      需要前端人工确认。链式命令用 `cmd1; if ($?) { cmd2 }`，递归删除用
+      Remove-Item -Recurse -Force，工作目录用 cwd 参数。
 
     Args:
         command: shell 命令字符串，如 "dir" / "ls -la" / "Get-ChildItem"
