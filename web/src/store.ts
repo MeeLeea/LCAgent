@@ -372,6 +372,10 @@ function handleStreamEvent(
       }
       commitThreadMessages(get, set, threadId, arr)
       break
+    case 'tool_running':
+      // 工具执行心跳：仅重置 watchdog（外层 armWatchdog 自动调用）
+      // 无 UI 变化、无 message 写入
+      return threadId
     case 'tool_result':
       if (!streamLast || streamLast.role !== 'assistant') return threadId
       // ask_human 的结果不渲染为 ToolCallCard（避免孤儿 toolResult）
