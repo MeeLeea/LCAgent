@@ -43,6 +43,9 @@ class EventType(str, Enum):
     TOOL_RESULT = "tool_result"
     """工具执行结果"""
 
+    TOOL_RUNNING = "tool_running"
+    """工具执行中心跳（长耗时工具执行期间定期发出，重置前端 watchdog）"""
+
     INTERRUPT = "interrupt"
     """被 ask_human / 危险命令确认中断"""
 
@@ -184,6 +187,29 @@ class AgentEvent:
         return cls(
             event_type=EventType.TOOL_RESULT,
             content=content,
+            tool_call_id=tool_call_id,
+            tool_name=name,
+            thread_id=thread_id,
+            trace_id=trace_id,
+        )
+
+    @classmethod
+    def tool_running(
+        cls,
+        *,
+        tool_call_id: str = "",
+        name: str = "",
+        thread_id: str = "",
+        trace_id: str = "",
+    ) -> AgentEvent:
+        """创建工具执行心跳事件。
+
+        工具执行期间定期发出，携带 tool_call_id + tool_name，
+        供前端重置 watchdog 防止误触发响应超时。
+        不携带实质内容，不渲染 UI、不沉淀记忆。
+        """
+        return cls(
+            event_type=EventType.TOOL_RUNNING,
             tool_call_id=tool_call_id,
             tool_name=name,
             thread_id=thread_id,
@@ -387,6 +413,12 @@ class AgentEvent:
                 "id": self.tool_call_id,
                 "name": self.tool_name,
                 "content": self.content,
+            }
+        elif self.event_type == EventType.TOOL_RUNNING:
+            return {
+                "type": "tool_running",
+                "id": self.tool_call_id,
+                "name": self.tool_name,
             }
         elif self.event_type == EventType.INTERRUPT:
             return make_interrupt_dict(
