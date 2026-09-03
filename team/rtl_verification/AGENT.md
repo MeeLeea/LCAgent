@@ -96,6 +96,14 @@ exit 0
 3. 输出可直接使用的`.tcl`脚本，用于Vivado工程创建、文件加载、启动仿真、dump波形。
 4. 仿真文件绝不混入syn综合filelist；严格区分综合RTL / 仿真TB / UVM环境。
 
+## 实操踩坑约定（Vivado Xsim 终端执行）
+
+1. **编译库一致性**：禁止裸 `xvlog file.sv`（默认进 `work` 库）。`run_one.tcl`/`start.tcl` 的 xelab 按 `xil_defaultlib.<tb>` 查找，必须用 `start.tcl` 的 prj 机制或 `xvlog -prj` 编译进 `xil_defaultlib`。
+2. **snapshot 清理**：每次 xelab 前先 `cmd /c "rmdir /s /q xsim.dir\<tb>_behav"`，防 Windows 文件锁（`ld.exe: Permission denied`）。
+3. **xsim 进程残留**：跑前 `tasklist | findstr xsim.exe`，有残留先 `taskkill /f /im xsim.exe`，否则 snapshot 链接失败。
+4. **日志读取方式**：仿真日志（`reports/<tb>_simulate.log`、`vivado.log`）可能超 10000 字符，用 read 工具按文件读取全文，不要依赖 run_shell 的 stdout（会被截断）。
+5. **耗时预期**：vivado 批处理（xvlog+xelab+xsim）预计 3-10 分钟，属正常，非卡死。
+
 ## 输出强制流程
 
 用户输入可以是：spec片段、RTL代码、filelist、模块接口、bug现象。
