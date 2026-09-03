@@ -263,6 +263,12 @@ def run_shell(command: str, cwd: str | None = None, timeout: int = DEFAULT_TIMEO
     在 Windows 上使用 PowerShell，在 Linux/Mac 上使用 bash/sh。
     适合执行单条命令、管道、重定向等通用 shell 操作。
 
+    Windows PowerShell 5.1 约束（重要，违反会触发 ParserError: InvalidEndOfLine）：
+    - 禁止裸 && / ||：PS 5.1 不支持，用 `cmd1; if ($?) { cmd2 }` 代替
+    - 禁止 2>nul / cd /d：这些是 cmd 语法，PS 不识别
+    - 需完整 cmd 语法时用 cmd /c "..." 包裹整条命令
+    - 路径含空格的 exe 用 & "path" args 调用
+
     Args:
         command: shell 命令字符串，如 "dir" / "ls -la" / "Get-ChildItem"
         cwd: 工作目录（绝对路径），默认为当前目录
