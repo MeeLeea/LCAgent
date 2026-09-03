@@ -23,7 +23,7 @@ TOOL_TIMEOUTS: dict[str, float] = {
     "ask_human": 600.0,       # 人工交互，给 10 分钟
     "schedule_task": 120.0,   # 调度器可能需要更长
     "search": 90.0,           # 搜索可能需要多次请求
-    "run_shell": 600.0,       # shell 命令（vivado/xsim 批处理耗时 3-10 分钟）
+    "run_shell": 600.0,       # shell 命令
 }
 
 # 完全排除超时的工具（无限等待）

@@ -82,8 +82,8 @@ class ThreadMemoryWriteMiddleware:
 
         # 防抖 buffer: thread_id → [(role, content, important), ...]
         self._buffer: dict[str, list[tuple[str, str, bool]]] = {}
-        # 定时器: thread_id → asyncio.Task
-        self._timers: dict[str, asyncio.Task] = {}
+        # 定时器: thread_id → asyncio.Task[None]（_a_delayed_flush 无返回值）
+        self._timers: dict[str, asyncio.Task[None]] = {}
         # 保护 buffer 和 timers 的并发访问
         self._buffer_lock = asyncio.Lock()
 
@@ -257,7 +257,7 @@ class ThreadMemoryWriteMiddleware:
         if agent_items:
             await self._store.save_agent_facts_batch(agent_items)
             logger.info(
-                "agent %s: 写入 %d 条长期记忆",
+                "[长期记忆-agent级] thread=%s 写入 %d 条 (跨会话共享, namespace=global_facts)",
                 thread_id,
                 len(agent_items),
             )
@@ -266,7 +266,7 @@ class ThreadMemoryWriteMiddleware:
         if thread_items:
             await self._store.save_facts_batch(thread_id, thread_items)
             logger.info(
-                "thread %s: 写入 %d 条长期记忆",
+                "[长期记忆-session级] thread=%s 写入 %d 条 (会话隔离, namespace=thread_facts)",
                 thread_id,
                 len(thread_items),
             )
@@ -600,20 +600,20 @@ class ThreadMemoryReadMiddleware(AgentMiddleware):
         request: ModelRequest[ContextT], fact_text: str
     ) -> ModelRequest[ContextT]:
         """将 facts 文本追加到 SystemMessage，返回新的 ModelRequest。"""
+        # 收集 SystemMessage 内容块（ContentBlock 可能是 dict 子类如 TextContentBlock，
+        # 也可能不是如 AudioContentBlock；非 dict 元素统一包成 text 格式 dict）
+        new_content: list[str | dict[Any, Any]] = []
         if request.system_message is not None:
-            new_content = [
-                *request.system_message.content_blocks,
-                {"type": "text", "text": f"\n{fact_text}"},
-            ]
+            for c in request.system_message.content_blocks:
+                if isinstance(c, dict):
+                    new_content.append(dict(c))
+                else:
+                    new_content.append({"type": "text", "text": str(c)})
+            new_content.append({"type": "text", "text": f"\n{fact_text}"})
         else:
-            new_content = [{"type": "text", "text": fact_text}]
+            new_content.append({"type": "text", "text": fact_text})
 
-        new_sys_msg = SystemMessage(
-            content=[
-                c if isinstance(c, dict) else {"type": "text", "text": str(c)}
-                for c in new_content
-            ]
-        )
+        new_sys_msg = SystemMessage(content=new_content)
         return request.override(system_message=new_sys_msg)
 
 
