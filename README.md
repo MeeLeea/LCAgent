@@ -250,7 +250,7 @@ LangChainAgent/
 │   ├── session_mgmt.py      # SessionMgmt Mixin：会话/Store/中断状态管理
 │   ├── mcp_tools.py         # McpTools Mixin：MCP 工具加载
 │   ├── graph_builder.py     # GraphBuilder Mixin：executor 构建/重建 + LLM 切换
-│   ├── streaming.py         # Streaming Mixin：事件流引擎（arun/aresume_events）
+│   ├── streaming.py         # Streaming Mixin：事件流引擎（arun/aresume_events）+ 工具执行心跳（HEARTBEAT_INTERVAL）
 │   ├── interrupts.py        # Interrupts Mixin：中断检查/恢复命令/拒绝处理
 │   ├── turn_runners.py      # TurnRunners Mixin：结构化执行入口（arun/achat/aresume_structured）
 │   ├── turn_types.py        # AgentTurnResult（结构化执行结果类型）
@@ -1392,6 +1392,16 @@ LLM 决定是否调用工具
 - **并行工具异常**：第一个工具崩后 Pregel 立即 `raise`，其余已 `on_tool_start` 但未 `on_tool_end`/`on_tool_error` 的 tool_call（孤儿）在 `except` 块中补发失败 `TOOL_RESULT`，避免前端工具卡片永远卡在"执行中"
 
 设计决策：工具失败发 `TOOL_RESULT`（携带错误信息）而非 `ERROR`——`ERROR` 是终止事件会中断整个流，而工具失败应让 LLM 看到错误并调整策略（ReAct 模式标准行为）。异常最终仍会逃逸到 `except Exception` 发 `ERROR` 终止流（因 Pregel 的 `_panic_or_proceed` 在第一个工具崩后立即 raise，无法继续执行后续节点）。
+
+**工具执行心跳（防 watchdog 误触发）**
+
+长耗时工具执行（如 60s 超时命令）期间，`graph.astream_events` 阻塞无事件，前端 watchdog（90s 无事件 → 标记响应超时）会误触发把助手消息标红。`_arun_graph_events` 的主循环改为 queue 模式：
+
+- 独立 `_consume_graph` task 消费 graph 事件到 `asyncio.Queue`，主循环从 queue 取
+- 主循环 `asyncio.wait_for(queue.get(), timeout=HEARTBEAT_INTERVAL=15s)` 超时时，若 `active_tool_call_ids` 非空（有工具在执行），发 `TOOL_RUNNING` 事件
+- 前端收到 `tool_running` 事件后重置 watchdog（不渲染 UI、不写 message）
+- `on_tool_end`/`on_tool_error` 清空 `active_tool_call_ids`，心跳停止
+- 用 queue 模式而非 `wait_for(__anext__)`：后者超时 cancel 会终止 async generator，导致后续事件丢失
 
 ### 6. System Prompt 强化
 
@@ -2916,6 +2926,7 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 | `tests/agent/test_human_input.py`      | LangGraph HITL：interrupt、恢复、并行选择和线程隔离                                     |
 | `tests/tools/test_terminal.py`         | 终端工具：输出截断、护栏拒绝、安全执行、超时分类、ctrl+c 软中断(mock Popen)             |
 | `tests/agent/test_terminal_retry_cap_mw.py` | TerminalRetryCapMW：超时计数 cap、达上限拦截、非 exec 工具放行、state 容错           |
+| `tests/agent/test_streaming_heartbeat.py` | streaming 心跳：工具执行期间发 tool_running、on_tool_end 后停止、非工具期不发          |
 | `tests/tools/test_calculator.py`       | 计算器工具：表达式求值、错误处理                                                        |
 | `tests/memory/test_memory.py`          | memory/ 包`AgentMemory`：checkpointer + Store 基础设施的初始化、SQLite/acreate/aclose |
 | `tests/agent/test_agent_core_regressions.py` | Agent 核心回归：HITL 恢复、会话隔离、技能匹配、长上下文裁剪等                      |
