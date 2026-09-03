@@ -14,11 +14,8 @@ from typing import Any
 from langchain_core.tools import tool
 from langgraph.errors import GraphInterrupt
 
+from .config import DEFAULT_TIMEOUT, MAX_OUTPUT_CHARS
 from .safety import check_command, check_exec, confirm
-
-# Windows 默认超时（秒），防止命令卡死
-DEFAULT_TIMEOUT = 60
-MAX_OUTPUT_CHARS = 10000  # 超长输出截断，避免回传给 LLM 时占用过多 token
 
 # 超时后 ctrl+c 软中断的 grace period（秒）：给子进程时间刷出缓冲输出并清理
 _GRACE_PERIOD = 5
@@ -257,7 +254,7 @@ def _guard_exec(file_path: str) -> dict[str, Any] | None:
 
 
 @tool
-def run_shell(command: str, cwd: str | None = None, timeout: int = DEFAULT_TIMEOUT) -> dict[str, Any]:
+def run_shell(command: str, cwd: str | None = None, timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
     """
     运行 Shell 命令（跨平台）。
     在 Windows 上使用 PowerShell，在 Linux/Mac 上使用 bash/sh。
@@ -343,7 +340,7 @@ def run_shell(command: str, cwd: str | None = None, timeout: int = DEFAULT_TIMEO
 
 
 @tool
-def run_python(file_path: str, script_args: str = "", cwd: str | None = None, timeout: int = DEFAULT_TIMEOUT) -> dict[str, Any]:
+def run_python(file_path: str, script_args: str = "", cwd: str | None = None, timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
     """
     运行 Python 脚本文件（.py）。
     使用当前 Python 解释器执行，可传递命令行参数。
@@ -428,7 +425,7 @@ def run_python(file_path: str, script_args: str = "", cwd: str | None = None, ti
 
 
 @tool
-def run_cmd(file_path: str, script_args: str = "", cwd: str | None = None, timeout: int = DEFAULT_TIMEOUT) -> dict[str, Any]:
+def run_cmd(file_path: str, script_args: str = "", cwd: str | None = None, timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
     """
     运行 CMD/PowerShell 脚本文件（.bat / .cmd / .ps1）。
     自动根据扩展名选择解释器：

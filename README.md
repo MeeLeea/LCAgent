@@ -1682,7 +1682,7 @@ with TraceContext(trace_id="req-123", thread_id="thread-abc"):
 
 ### 工具超时保护（Tool Timeout）
 
-[`tools/tool_wrapper.py`](tools/tool_wrapper.py) 为本地工具和 MCP 工具叠加统一超时保护，防止 Agent 因工具卡死而永久阻塞：
+[`tools/tool_wrapper.py`](tools/tool_wrapper.py) 为本地工具和 MCP 工具叠加统一超时保护，防止 Agent 因工具卡死而永久阻塞（超时与输出截断常量集中定义于 [`tools/config.py`](tools/config.py)）：
 
 - 在工具 `_arun` 上叠加 `asyncio.wait_for`（同步工具先 `to_thread` 再加超时）
 - **超时后返回 JSON 错误消息**（`{"error": "tool_timeout", ...}`）而非抛异常，让 Agent 能继续推理

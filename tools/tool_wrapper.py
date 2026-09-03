@@ -22,20 +22,7 @@ from typing import Any
 from langchain_core.runnables.config import RunnableConfig
 from langchain_core.tools import BaseTool
 
-# 全局默认超时（秒）
-DEFAULT_TIMEOUT: float = 60.0
-
-# 按工具名覆盖超时（优先于全局默认）
-TOOL_TIMEOUTS: dict[str, float] = {
-    "ask_human": 600.0,       # 人工交互，给 10 分钟
-    "schedule_task": 120.0,   # 调度器可能需要更长
-    "search": 90.0,           # 搜索可能需要多次请求
-    "run_shell": 600.0,       # shell 命令（vivado/xsim 批处理耗时 3-10 分钟）
-}
-
-# 完全排除超时的工具（无限等待）
-# 目前为空，ask_human 通过 TOOL_TIMEOUTS 给了 600 秒上限
-NO_TIMEOUT_TOOLS: set[str] = set()
+from .config import DEFAULT_TIMEOUT, NO_TIMEOUT_TOOLS, TOOL_TIMEOUTS
 
 
 def _get_tool_timeout(tool: BaseTool, default_timeout: float | None = None) -> float | None:
