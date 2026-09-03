@@ -1688,7 +1688,7 @@ with TraceContext(trace_id="req-123", thread_id="thread-abc"):
 - **超时后返回 JSON 错误消息**（`{"error": "tool_timeout", ...}`）而非抛异常，让 Agent 能继续推理
 - 优先级：`NO_TIMEOUT_TOOLS` > `TOOL_TIMEOUTS`（按工具名覆盖）> 全局 `DEFAULT_TIMEOUT`（60 秒）
 
-默认覆盖：`ask_human` 600s、`schedule_task` 120s、`search` 90s。
+默认覆盖：`ask_human` 600s、`schedule_task` 120s、`search` 90s、`run_shell` 600s（vivado/xsim 批处理耗时 3-10 分钟）。
 
 ### 终端命令超时重试与分类（Terminal Timeout Retry）
 
