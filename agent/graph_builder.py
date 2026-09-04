@@ -21,6 +21,7 @@ from tools.tool_wrapper import wrap_tools_with_timeout
 
 from .compaction import LCAgentCompactionMiddleware, LCAgentState
 from .terminal_retry_cap_mw import TerminalRetryCapMW
+from .tool_arg_validator_mw import ToolArgValidatorMW
 from .tool_error_mw import ToolExecutionErrorMW
 from .workspace_mw import WorkspaceSecurityMW
 
@@ -68,6 +69,11 @@ class GraphBuilder:
         # 工作空间安全中间件：拦截文件/执行类工具，注入 workspace 路径 + 逃逸校验
         workspace_middleware = WorkspaceSecurityMW()
 
+        # 工具参数校验中间件：拦截违反语义约束的参数组合（如 head/tail 互斥），
+        # 冲突时返回 error ToolMessage，LLM 下一轮 ReAct 反思修正。
+        # 放在 workspace 之前（更外层）：参数校验不依赖 workspace，纯参数检查
+        tool_arg_validator_middleware = ToolArgValidatorMW()
+
         # 终端命令超时重试上限中间件：读 state 统计 exec 工具历史超时次数，
         # 达上限(3次)则拦截返回失败 ToolMessage，阻止主模型无限重试超时命令
         # （方案 B：主模型自行反思改命令重试，本中间件只做硬性 cap）
@@ -92,6 +98,7 @@ class GraphBuilder:
                 tool_error_middleware,
                 compaction_middleware,
                 skill_middleware,
+                tool_arg_validator_middleware,
                 workspace_middleware,
                 *self._extra_middleware,
             ],
