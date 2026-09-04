@@ -203,11 +203,26 @@ class Streaming:
                         # LangGraph 不发射 on_tool_end，而是发射 on_tool_error。
                         # 发 tool_result 携带错误信息（而非 error 终止事件），
                         # 让前端工具卡片显示失败 + LLM 能看到错误并调整策略。
+                        #
+                        # 防御性兜底：ToolExecutionErrorMW 理论上应兜住所有异常并转为
+                        # ToolMessage，但某些 MCP 异常（如 MCPError）可能绕过
+                        # handle_tool_error 逃逸到 on_tool_error 事件。此处增强错误信息，
+                        # 加入异常类型名 + 修正提示，让 LLM 即使在异常逃逸时也能自愈。
                         error_obj = data_dict.get("error")
-                        error_msg = (
-                            str(error_obj) if error_obj is not None
-                            else "工具执行异常（未知错误）"
-                        )
+                        if error_obj is not None:
+                            exc_type = type(error_obj).__name__
+                            exc_msg = str(error_obj).strip() or "无详细信息"
+                            error_msg = (
+                                f"{exc_type}: {exc_msg}"
+                                "。请反思失败原因（参数是否正确、"
+                                "参数组合是否合法、路径是否有效），"
+                                "修正后重试"
+                            )
+                        else:
+                            error_msg = (
+                                "工具执行异常（未知错误），"
+                                "请反思失败原因后修正重试"
+                            )
                         # on_tool_error 的 data 直接含 tool_call_id（复现验证），
                         # 但仍走 ID 桥接兜底，与 on_tool_end 保持一致
                         run_id = ev.get("run_id", "")
