@@ -255,6 +255,7 @@ LangChainAgent/
 │   ├── turn_runners.py      # TurnRunners Mixin：结构化执行入口（arun/achat/aresume_structured）
 │   ├── turn_types.py        # AgentTurnResult（结构化执行结果类型）
 │   ├── terminal_retry_cap_mw.py  # TerminalRetryCapMW：终端命令超时重试上限中间件（达3次超时则拦截）
+│   ├── tool_arg_validator_mw.py  # ToolArgValidatorMW：工具参数语义校验中间件（互斥参数拦截）
 │   ├── tool_error_mw.py     # ToolExecutionErrorMW：工具错误反思纠错中间件
 │   ├── workspace_mw.py      # WorkspaceSecurityMW：工作空间安全中间件
 │   ├── compaction.py        # LangGraph 上下文压缩中间件（增量摘要 + 工具输出 Prune + 保留近期消息）
@@ -363,7 +364,7 @@ LangChainAgent/
 | [utils/metrics.py](utils/metrics.py)                     | `MetricsCollector`：线程安全的运行时指标收集（LLM 调用 / 工具执行 / 压缩统计）                                                                                                                                                           |
 | [utils/logging_config.py](utils/logging_config.py)       | 结构化日志：`contextvars` 实现 trace_id / thread_id 异步安全注入                                                                                                                                                                         |
 | [utils/exceptions.py](utils/exceptions.py)               | 统一异常层次：`LCAgentError` 基类及 MCP/超时/压缩/中断/状态等子类                                                                                                                                                                        |
-| [agent/](agent/)                                         | Agent 核心按职责拆分：`agent_core.py`（主类，构造/生命周期/共享工具方法）+ 6 个 Mixin（`session_mgmt`/`mcp_tools`/`graph_builder`/`streaming`/`interrupts`/`turn_runners`）+ `turn_types.py`（`AgentTurnResult`）+ 2 个中间件（`tool_error_mw`/`workspace_mw`）+ `role_sw.py`（团队角色切换唯一实现）；技能相关 Mixin/中间件已迁入 `skmng/` 包 |
+| [agent/](agent/)                                         | Agent 核心按职责拆分：`agent_core.py`（主类，构造/生命周期/共享工具方法）+ 6 个 Mixin（`session_mgmt`/`mcp_tools`/`graph_builder`/`streaming`/`interrupts`/`turn_runners`）+ `turn_types.py`（`AgentTurnResult`）+ 3 个中间件（`tool_arg_validator_mw`/`tool_error_mw`/`workspace_mw`）+ `role_sw.py`（团队角色切换唯一实现）；技能相关 Mixin/中间件已迁入 `skmng/` 包 |
 | [session/](session/)                                     | 三层架构 Session 层：`SessionContext`（单会话运行时上下文）/ `SessionStore`（per-session 瞬态状态）/ `SessionRegistry`（生命周期管理）/ `WorkspaceStore`（工作空间映射）/ `SessionManager`（对外门面 & 会话调度）                |
 | [team/](team/)                                           | 多 Agent 团队协作：ManagerAgent（拆解）/ WorkerAgent（执行）/ TerminatorAgent（汇总）+ 工厂函数                                                                                                                                            |
 | [skmng/](skmng/)                                         | 技能管理统一包：`SkillManager`（扫描/匹配/渲染）+ `SkillInjector`（工作流节点注入器）+ `SkillInjectionMW`（agent 层中间件）+ `SkillOps`（Mixin）+ `core.py`（三来源合并核心）+ `protocols.py`（PromptInjector 协议）+ `read_skill` 工具 |
@@ -1374,6 +1375,16 @@ LLM 决定是否调用工具
 
 工具内部抛异常时（MCP 崩溃、路径解析 bug、权限错误等），分两层处理：
 
+**Layer 3：`ToolArgValidatorMW`（执行前参数语义校验）**
+
+位于 `agent/tool_arg_validator_mw.py`，在工具执行**前**拦截违反语义约束的参数组合。背景：MCP server 的工具 schema 声明了参数类型，但不声明语义约束（如 `read_file` 的 `head` 和 `tail` 互斥），pydantic `args_schema` 只校验类型不查互斥，导致 LLM 同时填入 `head` 和 `tail` 调用到 MCP server 才报错。
+
+- **规则声明式注册**：`ArgRule` 抽象基类 + `MutexRule` 子类，规则用 Python 代码声明在模块级 `_RULES` 列表，加规则不改中间件逻辑（开闭原则）
+- **冲突返回 error ToolMessage**：不调 handler（不执行工具），返回 `ToolMessage(status="error")`，与 `TerminalRetryCapMW` 范式一致
+- **错误信息含修正提示**：如"参数冲突：read_file 的 head 和 tail 互斥，不能同时指定。请移除其中一个后重试"，利于 LLM 下一轮 ReAct 自愈
+- **与 MCP 描述增强互补**：`mcp_loader.py` 加载 MCP 工具时给 `read_file`/`read_text_file` 的 description 追加 head/tail 互斥说明（事前提示），本中间件做事中拦截（双保险）
+- 扩展新约束类型 = 加 `ArgRule` 子类 + 注册规则，中间件调度逻辑不变
+
 **Layer 4：`ToolExecutionErrorMW`（工具执行层，LLM 反思纠错）**
 
 基于 langchain 内置 `ToolErrorMiddleware`，挂载在 `create_agent` 中间件链最外层（`agent/tool_error_mw.py`）。在 `wrap_tool_call`/`awrap_tool_call` 拦截层捕获工具执行异常，转换为 `ToolMessage(status="error")` **进入图状态**——这是 LLM 下一轮 ReAct 循环真正读到的内容：
@@ -1388,7 +1399,7 @@ LLM 决定是否调用工具
 
 `AgentCore._arun_graph_events` 的事件循环处理 `on_tool_error` 事件（LangGraph 在工具异常时不发射 `on_tool_end`，改发射 `on_tool_error`）：
 
-- **单工具异常**：`on_tool_error` → 映射为 `TOOL_RESULT` 事件（content 以 `[工具执行失败]` 前缀标记），前端工具卡片显示失败状态；异常逃逸到 `except Exception` → 发 `ERROR` 事件终止流
+- **单工具异常**：`on_tool_error` → 映射为 `TOOL_RESULT` 事件（content 以 `[工具执行失败]` 前缀标记，含异常类型名 + 修正提示），前端工具卡片显示失败状态；异常逃逸到 `except Exception` → 发 `ERROR` 事件终止流
 - **并行工具异常**：第一个工具崩后 Pregel 立即 `raise`，其余已 `on_tool_start` 但未 `on_tool_end`/`on_tool_error` 的 tool_call（孤儿）在 `except` 块中补发失败 `TOOL_RESULT`，避免前端工具卡片永远卡在"执行中"
 
 设计决策：工具失败发 `TOOL_RESULT`（携带错误信息）而非 `ERROR`——`ERROR` 是终止事件会中断整个流，而工具失败应让 LLM 看到错误并调整策略（ReAct 模式标准行为）。异常最终仍会逃逸到 `except Exception` 发 `ERROR` 终止流（因 Pregel 的 `_panic_or_proceed` 在第一个工具崩后立即 raise，无法继续执行后续节点）。
