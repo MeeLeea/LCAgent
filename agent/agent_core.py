@@ -11,9 +11,7 @@ Agent核心调度模块 - 基于LangChain 1.x + LangGraph
 - streaming.py       Streaming：事件流引擎（arun/aresume_events）
 - interrupts.py      Interrupts：中断检查/恢复命令/拒绝处理
 - turn_runners.py    TurnRunners：结构化执行入口 + 工具步骤记账
-- skill_ops.py       SkillOps：技能加载/清理 + 手动压缩
 - turn_types.py      AgentTurnResult（避免 mixin 反向导入 agent_core）
-- skill_mw.py        技能注入中间件 SkillInjectionMW
 - tool_error_mw.py   工具错误纠错中间件 ToolExecutionErrorMW
 - workspace_mw.py    工作空间安全中间件 WorkspaceSecurityMW
 - role_sw.py         团队角色切换
@@ -43,10 +41,7 @@ from .interrupts import Interrupts
 from .mcp_tools import McpTools
 from .session_mgmt import SessionMgmt
 from .streaming import Streaming
-from .tool_error_mw import ToolExecutionErrorMW
 from .turn_runners import TurnRunners
-from .turn_types import AgentTurnResult
-from .workspace_mw import WorkspaceSecurityMW
 
 logger = logging.getLogger(__name__)
 

@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 
@@ -22,9 +22,6 @@ from llm.message_utils import extract_llm_error, stringify_content
 from tools.terminal_tools import UserRejectedCommandError
 from utils.events import AgentEvent
 from utils.logging_config import TraceContext, generate_trace_id
-
-if TYPE_CHECKING:
-    from .agent_core import AgentCore
 
 logger = logging.getLogger(__name__)
 
