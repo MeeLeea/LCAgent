@@ -11,9 +11,24 @@ function formatArgs(args: unknown): string {
   }
 }
 
-/** 启发式判断工具结果是否为异常（后端将错误信息写入 content） */
+/**
+ * 判断工具结果是否为异常。
+ *
+ * 匹配后端中间件写入的结构化错误前缀（可靠标记，不会误伤合法文件内容）：
+ * - `[工具执行失败]`     ToolExecutionErrorMW（agent/tool_error_mw.py）
+ * - `[超时重试已达上限]`  TerminalRetryCapMW（agent/terminal_retry_cap_mw.py）
+ * - `参数冲突：`          ToolArgValidatorMW（agent/tool_arg_validator_mw.py）
+ *
+ * 不再对正文做启发式正则扫描：工具结果可能包含任意用户文件内容 / 命令输出，
+ * 其中合法出现的 "Error:" / "失败" / "Exception" 等词会被误判为异常
+ * （如 SystemVerilog 的 `TRAIN_ERROR:` case 标签曾命中 /Error[:：]/i）。
+ */
 function isErrorContent(content: string): boolean {
-  return /Traceback|Error[:：]|错误|失败|Exception|❌|执行出错/i.test(content)
+  return (
+    content.startsWith('[工具执行失败]') ||
+    content.startsWith('[超时重试已达上限]') ||
+    content.startsWith('参数冲突：')
+  )
 }
 
 /** 启发式判断工具结果是否为超时
