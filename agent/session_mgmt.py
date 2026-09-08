@@ -12,12 +12,9 @@ _memory_manager / _session_registry。
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from session import SessionManager, SessionRegistry, SessionStore
-
-if TYPE_CHECKING:
-    from .agent_core import AgentCore
 
 logger = None  # 占位，实际 logger 由 agent_core 模块提供
 

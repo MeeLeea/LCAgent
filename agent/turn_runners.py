@@ -11,17 +11,15 @@ _session_store / metrics / verbose / llm。
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from tools.terminal_tools import UserRejectedCommandError
 from utils.logging_config import TraceContext, generate_trace_id
 
+from .terminal_retry_cap_mw import is_timeout_content
 from .turn_types import AgentTurnResult
-
-if TYPE_CHECKING:
-    from .agent_core import AgentCore
 
 logger = logging.getLogger(__name__)
 
@@ -190,7 +188,7 @@ class TurnRunners:
                 # 记录工具调用指标（检测超时和失败）
                 if entry is not None:
                     content_str = str(msg.content)
-                    timed_out = '"error": "tool_timeout"' in content_str
+                    timed_out = is_timeout_content(content_str)
                     success = not timed_out and getattr(msg, "status", "success") != "error"
                     self.metrics.record_tool_call(
                         name=entry.get("tool", "unknown"),

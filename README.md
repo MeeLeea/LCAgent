@@ -250,10 +250,12 @@ LangChainAgent/
 │   ├── session_mgmt.py      # SessionMgmt Mixin：会话/Store/中断状态管理
 │   ├── mcp_tools.py         # McpTools Mixin：MCP 工具加载
 │   ├── graph_builder.py     # GraphBuilder Mixin：executor 构建/重建 + LLM 切换
-│   ├── streaming.py         # Streaming Mixin：事件流引擎（arun/aresume_events）
+│   ├── streaming.py         # Streaming Mixin：事件流引擎（arun/aresume_events）+ 工具执行心跳（HEARTBEAT_INTERVAL）
 │   ├── interrupts.py        # Interrupts Mixin：中断检查/恢复命令/拒绝处理
 │   ├── turn_runners.py      # TurnRunners Mixin：结构化执行入口（arun/achat/aresume_structured）
 │   ├── turn_types.py        # AgentTurnResult（结构化执行结果类型）
+│   ├── terminal_retry_cap_mw.py  # TerminalRetryCapMW：终端命令超时重试上限中间件（达3次超时则拦截）
+│   ├── tool_arg_validator_mw.py  # ToolArgValidatorMW：工具参数语义校验中间件（互斥参数拦截）
 │   ├── tool_error_mw.py     # ToolExecutionErrorMW：工具错误反思纠错中间件
 │   ├── workspace_mw.py      # WorkspaceSecurityMW：工作空间安全中间件
 │   ├── compaction.py        # LangGraph 上下文压缩中间件（增量摘要 + 工具输出 Prune + 保留近期消息）
@@ -305,7 +307,7 @@ LangChainAgent/
 │   ├── search.py            # 联网搜索工具(Tavily API)
 │   ├── file_tool.py         # 文件读写工具
 │   ├── calculator.py        # 数学计算工具
-│   ├── terminal_tools.py    # 终端命令工具（shell/python/bat/ps1,含安全护栏）
+│   ├── terminal_tools.py    # 终端命令工具（shell/python/bat/ps1,含安全护栏+ctrl+c超时分类）
 │   ├── get_local_time.py    # 获取本地时间工具
 │   ├── open_file.py         # 文件打开工具（系统默认程序/DB Browser）
 │   ├── skills.py            # re-export skmng.manager（向后兼容，待删）
@@ -362,7 +364,7 @@ LangChainAgent/
 | [utils/metrics.py](utils/metrics.py)                     | `MetricsCollector`：线程安全的运行时指标收集（LLM 调用 / 工具执行 / 压缩统计）                                                                                                                                                           |
 | [utils/logging_config.py](utils/logging_config.py)       | 结构化日志：`contextvars` 实现 trace_id / thread_id 异步安全注入                                                                                                                                                                         |
 | [utils/exceptions.py](utils/exceptions.py)               | 统一异常层次：`LCAgentError` 基类及 MCP/超时/压缩/中断/状态等子类                                                                                                                                                                        |
-| [agent/](agent/)                                         | Agent 核心按职责拆分：`agent_core.py`（主类，构造/生命周期/共享工具方法）+ 6 个 Mixin（`session_mgmt`/`mcp_tools`/`graph_builder`/`streaming`/`interrupts`/`turn_runners`）+ `turn_types.py`（`AgentTurnResult`）+ 2 个中间件（`tool_error_mw`/`workspace_mw`）+ `role_sw.py`（团队角色切换唯一实现）；技能相关 Mixin/中间件已迁入 `skmng/` 包 |
+| [agent/](agent/)                                         | Agent 核心按职责拆分：`agent_core.py`（主类，构造/生命周期/共享工具方法）+ 6 个 Mixin（`session_mgmt`/`mcp_tools`/`graph_builder`/`streaming`/`interrupts`/`turn_runners`）+ `turn_types.py`（`AgentTurnResult`）+ 3 个中间件（`tool_arg_validator_mw`/`tool_error_mw`/`workspace_mw`）+ `role_sw.py`（团队角色切换唯一实现）；技能相关 Mixin/中间件已迁入 `skmng/` 包 |
 | [session/](session/)                                     | 三层架构 Session 层：`SessionContext`（单会话运行时上下文）/ `SessionStore`（per-session 瞬态状态）/ `SessionRegistry`（生命周期管理）/ `WorkspaceStore`（工作空间映射）/ `SessionManager`（对外门面 & 会话调度）                |
 | [team/](team/)                                           | 多 Agent 团队协作：ManagerAgent（拆解）/ WorkerAgent（执行）/ TerminatorAgent（汇总）+ 工厂函数                                                                                                                                            |
 | [skmng/](skmng/)                                         | 技能管理统一包：`SkillManager`（扫描/匹配/渲染）+ `SkillInjector`（工作流节点注入器）+ `SkillInjectionMW`（agent 层中间件）+ `SkillOps`（Mixin）+ `core.py`（三来源合并核心）+ `protocols.py`（PromptInjector 协议）+ `read_skill` 工具 |
@@ -1373,6 +1375,16 @@ LLM 决定是否调用工具
 
 工具内部抛异常时（MCP 崩溃、路径解析 bug、权限错误等），分两层处理：
 
+**Layer 3：`ToolArgValidatorMW`（执行前参数语义校验）**
+
+位于 `agent/tool_arg_validator_mw.py`，在工具执行**前**拦截违反语义约束的参数组合。背景：MCP server 的工具 schema 声明了参数类型，但不声明语义约束（如 `read_file` 的 `head` 和 `tail` 互斥），pydantic `args_schema` 只校验类型不查互斥，导致 LLM 同时填入 `head` 和 `tail` 调用到 MCP server 才报错。
+
+- **规则声明式注册**：`ArgRule` 抽象基类 + `MutexRule` 子类，规则用 Python 代码声明在模块级 `_RULES` 列表，加规则不改中间件逻辑（开闭原则）
+- **冲突返回 error ToolMessage**：不调 handler（不执行工具），返回 `ToolMessage(status="error")`，与 `TerminalRetryCapMW` 范式一致
+- **错误信息含修正提示**：如"参数冲突：read_file 的 head 和 tail 互斥，不能同时指定。请移除其中一个后重试"，利于 LLM 下一轮 ReAct 自愈
+- **与 MCP 描述增强互补**：`mcp_loader.py` 加载 MCP 工具时给 `read_file`/`read_text_file` 的 description 追加 head/tail 互斥说明（事前提示），本中间件做事中拦截（双保险）
+- 扩展新约束类型 = 加 `ArgRule` 子类 + 注册规则，中间件调度逻辑不变
+
 **Layer 4：`ToolExecutionErrorMW`（工具执行层，LLM 反思纠错）**
 
 基于 langchain 内置 `ToolErrorMiddleware`，挂载在 `create_agent` 中间件链最外层（`agent/tool_error_mw.py`）。在 `wrap_tool_call`/`awrap_tool_call` 拦截层捕获工具执行异常，转换为 `ToolMessage(status="error")` **进入图状态**——这是 LLM 下一轮 ReAct 循环真正读到的内容：
@@ -1387,10 +1399,20 @@ LLM 决定是否调用工具
 
 `AgentCore._arun_graph_events` 的事件循环处理 `on_tool_error` 事件（LangGraph 在工具异常时不发射 `on_tool_end`，改发射 `on_tool_error`）：
 
-- **单工具异常**：`on_tool_error` → 映射为 `TOOL_RESULT` 事件（content 以 `[工具执行失败]` 前缀标记），前端工具卡片显示失败状态；异常逃逸到 `except Exception` → 发 `ERROR` 事件终止流
+- **单工具异常**：`on_tool_error` → 映射为 `TOOL_RESULT` 事件（content 以 `[工具执行失败]` 前缀标记，含异常类型名 + 修正提示），前端工具卡片显示失败状态；异常逃逸到 `except Exception` → 发 `ERROR` 事件终止流
 - **并行工具异常**：第一个工具崩后 Pregel 立即 `raise`，其余已 `on_tool_start` 但未 `on_tool_end`/`on_tool_error` 的 tool_call（孤儿）在 `except` 块中补发失败 `TOOL_RESULT`，避免前端工具卡片永远卡在"执行中"
 
 设计决策：工具失败发 `TOOL_RESULT`（携带错误信息）而非 `ERROR`——`ERROR` 是终止事件会中断整个流，而工具失败应让 LLM 看到错误并调整策略（ReAct 模式标准行为）。异常最终仍会逃逸到 `except Exception` 发 `ERROR` 终止流（因 Pregel 的 `_panic_or_proceed` 在第一个工具崩后立即 raise，无法继续执行后续节点）。
+
+**工具执行心跳（防 watchdog 误触发）**
+
+长耗时工具执行（如 60s 超时命令）期间，`graph.astream_events` 阻塞无事件，前端 watchdog（90s 无事件 → 标记响应超时）会误触发把助手消息标红。`_arun_graph_events` 的主循环改为 queue 模式：
+
+- 独立 `_consume_graph` task 消费 graph 事件到 `asyncio.Queue`，主循环从 queue 取
+- 主循环 `asyncio.wait_for(queue.get(), timeout=HEARTBEAT_INTERVAL=15s)` 超时时，若 `active_tool_call_ids` 非空（有工具在执行），发 `TOOL_RUNNING` 事件
+- 前端收到 `tool_running` 事件后重置 watchdog（不渲染 UI、不写 message）
+- `on_tool_end`/`on_tool_error` 清空 `active_tool_call_ids`，心跳停止
+- 用 queue 模式而非 `wait_for(__anext__)`：后者超时 cancel 会终止 async generator，导致后续事件丢失
 
 ### 6. System Prompt 强化
 
@@ -1671,13 +1693,23 @@ with TraceContext(trace_id="req-123", thread_id="thread-abc"):
 
 ### 工具超时保护（Tool Timeout）
 
-[`tools/tool_wrapper.py`](tools/tool_wrapper.py) 为本地工具和 MCP 工具叠加统一超时保护，防止 Agent 因工具卡死而永久阻塞：
+[`tools/tool_wrapper.py`](tools/tool_wrapper.py) 为本地工具和 MCP 工具叠加统一超时保护，防止 Agent 因工具卡死而永久阻塞（超时与输出截断常量集中定义于 [`tools/config.py`](tools/config.py)）：
 
 - 在工具 `_arun` 上叠加 `asyncio.wait_for`（同步工具先 `to_thread` 再加超时）
 - **超时后返回 JSON 错误消息**（`{"error": "tool_timeout", ...}`）而非抛异常，让 Agent 能继续推理
 - 优先级：`NO_TIMEOUT_TOOLS` > `TOOL_TIMEOUTS`（按工具名覆盖）> 全局 `DEFAULT_TIMEOUT`（60 秒）
 
-默认覆盖：`ask_human` 600s、`schedule_task` 120s、`search` 90s。
+默认覆盖：`ask_human` 600s、`schedule_task` 120s、`search` 90s、`run_shell` 600s（vivado/xsim 批处理耗时 3-10 分钟）。
+
+### 终端命令超时重试与分类（Terminal Timeout Retry）
+
+[`tools/terminal_tools.py`](tools/terminal_tools.py) 对 `run_shell` / `run_python` / `run_cmd` 三个终端工具叠加 ctrl+c 软中断 + 超时分类 + 重试上限机制，防止命令卡死导致 Agent 无限等待或无限重试：
+
+- **ctrl+c 软中断**：超时后先发 ctrl+c（Windows `CTRL_BREAK_EVENT` / Unix `SIGINT`），等 5 秒 grace period 收集 partial 输出，再强杀进程树（Windows `taskkill /T` / Unix `killpg`）。相比直接 kill，子进程有机会刷出缓冲输出供 LLM 判断超时原因。
+- **超时原因分类**（`_classify_timeout`）：启发式识别交互式命令 / 网络阻塞 / IO 阻塞 / 命令错误 / 死循环，写入返回结果的 `timeout_reason` 字段，供主模型判断如何修改命令重试。
+- **富结果返回**：超时返回 `{error_type: "timeout", timeout_reason, partial_stdout, partial_stderr, ...}`，主模型读到后自行反思修改命令重试（方案 B，每次重试是模型新发的 tool_call，事件干净）。
+- **重试上限中间件**（[`agent/terminal_retry_cap_mw.py`](agent/terminal_retry_cap_mw.py) `TerminalRetryCapMW`）：无状态中间件，读 `request.state["messages"]` 统计当前会话内 exec 工具（`run_shell`/`run_python`/`run_cmd`）的超时累计次数，达 `MAX_TIMEOUT_RETRIES`（3 次）则拦截返回失败 `ToolMessage(status="error")`，阻止主模型无限重试。注册在 `create_agent` middleware 链最外层（最先拦截）。
+- **前端超时展示**：工具卡片（`web/src/components/ToolCallCard.tsx`）识别 `error_type:"timeout"` / `"error":"tool_timeout"` / "执行超时" 等标记，显示橙色边框 + Clock 图标 + "超时"文字，区别于红色"异常"和绿色"已完成"。
 
 ### 统一异常层次
 
@@ -2903,7 +2935,9 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 | `tests/tools/test_search.py`           | `search` 工具：无 Key 降级、Tavily 返回结构(mock)                                      |
 | `tests/cli/test_cli_commands.py`       | CLI 命令分发：路由优先级、状态变更和各领域处理器                                        |
 | `tests/agent/test_human_input.py`      | LangGraph HITL：interrupt、恢复、并行选择和线程隔离                                     |
-| `tests/tools/test_terminal.py`         | 终端工具：输出截断、护栏拒绝、安全执行(mock subprocess)                                 |
+| `tests/tools/test_terminal.py`         | 终端工具：输出截断、护栏拒绝、安全执行、超时分类、ctrl+c 软中断(mock Popen)             |
+| `tests/agent/test_terminal_retry_cap_mw.py` | TerminalRetryCapMW：超时计数 cap、达上限拦截、非 exec 工具放行、state 容错           |
+| `tests/agent/test_streaming_heartbeat.py` | streaming 心跳：工具执行期间发 tool_running、on_tool_end 后停止、非工具期不发          |
 | `tests/tools/test_calculator.py`       | 计算器工具：表达式求值、错误处理                                                        |
 | `tests/memory/test_memory.py`          | memory/ 包`AgentMemory`：checkpointer + Store 基础设施的初始化、SQLite/acreate/aclose |
 | `tests/agent/test_agent_core_regressions.py` | Agent 核心回归：HITL 恢复、会话隔离、技能匹配、长上下文裁剪等                      |

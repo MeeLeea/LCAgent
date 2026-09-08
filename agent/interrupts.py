@@ -13,7 +13,7 @@ _session_store / max_iterations / verbose。
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.types import Command
@@ -22,9 +22,6 @@ from llm.message_utils import build_interrupt_event
 from utils.events import AgentEvent
 
 from .turn_types import AgentTurnResult
-
-if TYPE_CHECKING:
-    from .agent_core import AgentCore
 
 logger = logging.getLogger(__name__)
 

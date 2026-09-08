@@ -819,6 +819,15 @@ tool-group,
   border-color: #ef4444;
 }
 
+/* 超时工具卡片：橙色边框高亮，区别于红色异常 */
+.tool-card-timeout {
+  border-color: #f59e0b;
+}
+
+.tool-card-timeout .tool-card-status {
+  color: #f59e0b;
+}
+
 .tool-card-head {
   padding: 8px 12px;
   display: flex;

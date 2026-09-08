@@ -54,7 +54,7 @@ def test_ask_human_invokes_interrupt_with_structured_choice_payload(monkeypatch)
 
 def test_agent_turn_result_distinguishes_completed_and_interrupted():
     # Given: one completed turn and one interrupted turn.
-    from agent.agent_core import AgentTurnResult
+    from agent.turn_types import AgentTurnResult
 
     interrupt = Interrupt(
         value={"kind": "human_choice", "prompt": "Pick one", "choices": []},

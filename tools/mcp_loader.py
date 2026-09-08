@@ -16,6 +16,19 @@ logger = logging.getLogger(__name__)
 # 默认配置文件路径
 DEFAULT_CONFIG_FILE = "config/mcp_servers.json"
 
+# MCP 工具描述增强提示：加载时追加到工具 description，帮助 LLM 避免违规参数组合。
+# 与 tool_arg_validator_mw.py 的 _RULES 互补——这里是"事前提示"，那边是"事中拦截"。
+_TOOL_DESCRIPTION_HINTS: dict[str, str] = {
+    "read_file": (
+        "\n\n注意：head 和 tail 参数互斥，不能同时指定。"
+        "head 读取文件开头 N 行，tail 读取末尾 N 行，请只使用其中一个。"
+    ),
+    "read_text_file": (
+        "\n\n注意：head 和 tail 参数互斥，不能同时指定。"
+        "head 读取文件开头 N 行，tail 读取末尾 N 行，请只使用其中一个。"
+    ),
+}
+
 
 def load_mcp_config(config_file: str = DEFAULT_CONFIG_FILE) -> dict[str, Any]:
     """
@@ -92,9 +105,15 @@ def make_sync_compatible(tool: BaseTool) -> BaseTool:
         return _run_async(original_coroutine(**kwargs))
 
     # 重建工具，同时提供 sync func 和 async coroutine
+    # 加载时追加描述提示（如 head/tail 互斥说明），帮助 LLM 避免违规参数组合
+    description = tool.description or ""
+    hint = _TOOL_DESCRIPTION_HINTS.get(tool.name)
+    if hint:
+        description = description + hint
+
     new_tool = StructuredTool(
         name=tool.name,
-        description=tool.description,
+        description=description,
         args_schema=tool.args_schema,
         func=_sync_runner,
         coroutine=_async_runner,
