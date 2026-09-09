@@ -4,7 +4,7 @@ Architect Agent - 芯片架构工程师,负责架构方案设计、权衡分析�
 from collections.abc import Sequence
 from typing import ClassVar
 
-from graph.registry import register_agent
+from graph.common import register_agent
 from team.base import PromptInjector, TeamAgent
 from tools.human_confirmation import request_user_confirmation
 

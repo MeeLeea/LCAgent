@@ -165,7 +165,7 @@ async def workflow_command(context: CommandContext, user_input: str) -> CommandO
         workflow:<name> <task> - 运行指定工作流
     """
     # 导入放在函数内避免循环依赖
-    from graph.registry import list_workflows
+    from graph.common import list_workflows
     
     if user_input.strip() == "workflow":
         # 列出可用工作流(含描述)
@@ -199,7 +199,7 @@ async def workflow_command(context: CommandContext, user_input: str) -> CommandO
         task = parts[1]
         
         # 检查工作流是否存在
-        from graph.registry import WORKFLOWS
+        from graph.common import WORKFLOWS
         if workflow_name not in WORKFLOWS:
             available = ", ".join(name for name, _ in list_workflows())
             context.print(f"\n错误: 未知工作流 '{workflow_name}'")

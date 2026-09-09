@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from unittest.mock import patch
 
-from graph.registry import AGENT_REGISTRY, build_workflow, register_agent
+from graph.common import AGENT_REGISTRY, build_workflow, register_agent
 from team.base import TeamAgent
 
 
@@ -246,7 +246,7 @@ def test_build_workflow_mcp_all_injection_distinct_classes():
 
     try:
         import team as team_mod
-        from graph import registry as reg_mod
+        from graph.common import registry as reg_mod
 
         original_build = _patch_build_team_agent(team_mod, captured)
         original_get_spec = _patch_workflow_spec(
@@ -300,7 +300,7 @@ def test_build_workflow_mcp_all_and_mcp_tools_mutex_warning(caplog):
 
     try:
         import team as team_mod
-        from graph import registry as reg_mod
+        from graph.common import registry as reg_mod
 
         original_build = _patch_build_team_agent(team_mod, captured)
         original_get_spec = _patch_workflow_spec(
@@ -349,7 +349,7 @@ def test_build_workflow_mcp_all_degrade_on_empty(caplog):
 
     try:
         import team as team_mod
-        from graph import registry as reg_mod
+        from graph.common import registry as reg_mod
 
         original_build = _patch_build_team_agent(team_mod, captured)
         original_get_spec = _patch_workflow_spec(
@@ -398,7 +398,7 @@ def test_mcp_all_false_preserves_existing_behavior():
 
     try:
         import team as team_mod
-        from graph import registry as reg_mod
+        from graph.common import registry as reg_mod
 
         original_build = _patch_build_team_agent(team_mod, captured)
         original_get_spec = _patch_workflow_spec(

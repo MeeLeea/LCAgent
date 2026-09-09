@@ -4,7 +4,7 @@ Verification Agent - 数字芯片 RTL 验证工程师,负责验证需求梳理�
 from collections.abc import Sequence
 from typing import ClassVar
 
-from graph.registry import register_agent
+from graph.common import register_agent
 from team.base import PromptInjector, TeamAgent
 from tools.human_confirmation import request_user_confirmation
 

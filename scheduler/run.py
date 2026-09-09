@@ -197,7 +197,7 @@ def main():
     #     使 executor 中的 workflow: 任务能正确构建所需 Agent
     try:
         import team  # noqa: F401  触发各 agent 模块的 @register_agent
-        from graph.registry import AGENT_REGISTRY, list_workflows
+        from graph.common import AGENT_REGISTRY, list_workflows
         wf_list = list_workflows()
         logger.info("已注册 Agent: %s", ", ".join(sorted(AGENT_REGISTRY.keys())))
         logger.info("可用工作流: %s", ", ".join(name for name, _ in wf_list))

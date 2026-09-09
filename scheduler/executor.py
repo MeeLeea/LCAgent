@@ -75,7 +75,7 @@ async def _arun_workflow_task(task_id: Any, task_text: str) -> tuple[bool, str]:
     logger.info("  任务内容: %s", task[:80])
 
     try:
-        from graph.registry import arun_workflow_by_name, list_workflows
+        from graph.common import arun_workflow_by_name, list_workflows
     except ImportError as exc:
         return False, f"无法导入工作流模块: {exc}"
 

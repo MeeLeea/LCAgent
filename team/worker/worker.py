@@ -4,7 +4,7 @@ Worker Agent - 负责执行具体子任务
 from collections.abc import Sequence
 from typing import ClassVar
 
-from graph.registry import register_agent
+from graph.common import register_agent
 from team.base import PromptInjector, TeamAgent
 from tools import all_tools
 

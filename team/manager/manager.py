@@ -4,7 +4,7 @@ Manager Agent - 负责拆解任务并生成执行计划
 from collections.abc import Sequence
 from typing import ClassVar
 
-from graph.registry import register_agent
+from graph.common import register_agent
 from team.base import PromptInjector, TeamAgent
 
 

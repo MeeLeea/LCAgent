@@ -269,7 +269,7 @@ def test_arun_events_node_flow(monkeypatch):
     """事件流顺序 NODE_START → NODE_END → DONE，DONE 携带 final_answer。"""
     fake_graph = FakeGraph()
     monkeypatch.setattr(
-        "graph.registry.build_workflow",
+        "graph.common.build_workflow",
         lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
     )
     adapter = _make_adapter()
@@ -299,7 +299,7 @@ def test_arun_events_emits_token_stream(monkeypatch):
     """
     fake_graph = FakeGraphToken()
     monkeypatch.setattr(
-        "graph.registry.build_workflow",
+        "graph.common.build_workflow",
         lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
     )
     adapter = _make_adapter()
@@ -335,7 +335,7 @@ def test_arun_events_recall_injected(monkeypatch):
     """执行前 recall 的长期记忆注入 initial_state.raw_context。"""
     fake_graph = FakeGraph()
     monkeypatch.setattr(
-        "graph.registry.build_workflow",
+        "graph.common.build_workflow",
         lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
     )
     memory = FakeMemory()
@@ -351,7 +351,7 @@ def test_arun_events_history_injected(monkeypatch):
     """checkpoint 历史 AIMessage 注入 raw_context（含【历史执行记录】标记）。"""
     fake_graph = FakeGraph()
     monkeypatch.setattr(
-        "graph.registry.build_workflow",
+        "graph.common.build_workflow",
         lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
     )
     reg = _make_registry()
@@ -376,7 +376,7 @@ def test_arun_events_done_is_important_false_by_default(monkeypatch):
     """is_run_mode=False（对话模式）时 DONE 事件 is_important=False。"""
     fake_graph = FakeGraph()
     monkeypatch.setattr(
-        "graph.registry.build_workflow",
+        "graph.common.build_workflow",
         lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
     )
     adapter = _make_adapter()
@@ -391,7 +391,7 @@ def test_arun_events_injects_workspace_path(monkeypatch):
     """会话绑定 workspace 时,workspace_path 写入 config.configurable(Worker 工具隔离)。"""
     fake_graph = FakeGraph()
     monkeypatch.setattr(
-        "graph.registry.build_workflow",
+        "graph.common.build_workflow",
         lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
     )
     reg = _make_registry()
@@ -414,7 +414,7 @@ def test_arun_events_no_workspace_path_by_default(monkeypatch):
     """会话未绑定 workspace 时不注入 workspace_path(兼容旧会话)。"""
     fake_graph = FakeGraph()
     monkeypatch.setattr(
-        "graph.registry.build_workflow",
+        "graph.common.build_workflow",
         lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
     )
     adapter = _make_adapter()
@@ -437,7 +437,7 @@ def test_arun_events_emits_interrupt_event(monkeypatch):
     }
     fake_graph = FakeGraphInterrupt(interrupt_value)
     monkeypatch.setattr(
-        "graph.registry.build_workflow",
+        "graph.common.build_workflow",
         lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
     )
     adapter = _make_adapter()
@@ -460,7 +460,7 @@ def test_arun_events_interrupt_with_no_kind_uses_stringified_value(monkeypatch):
     """interrupt.value 不是 dict 时,build_interrupt_event 用 stringify 兜底。"""
     fake_graph = FakeGraphInterrupt("裸字符串中断值")
     monkeypatch.setattr(
-        "graph.registry.build_workflow",
+        "graph.common.build_workflow",
         lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
     )
     adapter = _make_adapter()
@@ -499,7 +499,7 @@ def test_arun_events_user_confirmation_populates_interrupt_items(monkeypatch):
     }
     fake_graph = FakeGraphInterrupt(interrupt_value)
     monkeypatch.setattr(
-        "graph.registry.build_workflow",
+        "graph.common.build_workflow",
         lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
     )
     adapter = _make_adapter()
@@ -540,7 +540,7 @@ def test_aresume_events_uses_command_resume(monkeypatch):
     """
     fake_graph = FakeGraphResume(result={"final_answer": "恢复后完成"})
     monkeypatch.setattr(
-        "graph.registry.build_workflow",
+        "graph.common.build_workflow",
         lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
     )
     adapter = _make_adapter()
@@ -576,7 +576,7 @@ def test_aresume_events_emits_interrupt_event(monkeypatch):
     fake_graph = FakeGraphInterrupt(interrupt_value)
     fake_graph.last_config = None  # 由 ainvoke 填充
     monkeypatch.setattr(
-        "graph.registry.build_workflow",
+        "graph.common.build_workflow",
         lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
     )
     adapter = _make_adapter()
@@ -665,7 +665,7 @@ def test_manually_compact_applies_update(monkeypatch):
 
     fake_mw = _FakeMW()
     monkeypatch.setattr(
-        "graph.registry.build_workflow",
+        "graph.common.build_workflow",
         lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
     )
     monkeypatch.setattr(

@@ -4,7 +4,7 @@ Terminator Agent - 负责汇总 Worker 执行结果并返回最终答案
 from collections.abc import Sequence
 from typing import ClassVar
 
-from graph.registry import register_agent
+from graph.common import register_agent
 from team.base import PromptInjector, TeamAgent
 
 

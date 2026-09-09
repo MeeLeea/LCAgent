@@ -356,7 +356,7 @@ def test_run_simple_workflow():
 
 def test_workflow_registry():
     """测试 WORKFLOWS 注册表"""
-    from graph.registry import WORKFLOWS
+    from graph.common import WORKFLOWS
 
     assert "simple" in WORKFLOWS
     spec = WORKFLOWS["simple"]
@@ -368,7 +368,7 @@ def test_workflow_registry():
 
 def test_build_workflow_unknown_name():
     """测试未知工作流名称抛出 KeyError"""
-    from graph.registry import build_workflow
+    from graph.common import build_workflow
     
     with pytest.raises(KeyError) as exc_info:
         build_workflow("unknown_workflow")
@@ -382,7 +382,7 @@ def test_build_workflow_unknown_name():
 
 def test_register_agent_decorator():
     """测试 register_agent 装饰器:注册条目 + 原样返回类"""
-    from graph.registry import AGENT_REGISTRY, register_agent
+    from graph.common import AGENT_REGISTRY, register_agent
     from team.base import TeamAgent
     
     @register_agent("fake_role", "team/fake/agent_config.json", tools=None)
@@ -404,7 +404,7 @@ def test_register_agent_decorator():
 
 def test_register_agent_tools_passthrough():
     """测试装饰器的 tools 参数原样透传到注册表"""
-    from graph.registry import AGENT_REGISTRY, register_agent
+    from graph.common import AGENT_REGISTRY, register_agent
     from team.base import TeamAgent
     
     fake_tools = ["tool_a", "tool_b"]
@@ -421,7 +421,7 @@ def test_register_agent_tools_passthrough():
 
 def test_register_agent_mcp_tools_passthrough():
     """测试装饰器的 mcp_tools 参数原样透传到注册表(默认 None,显式声明时存列表)"""
-    from graph.registry import AGENT_REGISTRY, register_agent
+    from graph.common import AGENT_REGISTRY, register_agent
     from team.base import TeamAgent
 
     # 显式声明 mcp_tools
@@ -455,7 +455,7 @@ def test_register_agent_mcp_tools_passthrough():
 def test_builtin_agents_registered():
     """测试内置角色(manager/worker/terminator/architect)已通过装饰器注册"""
     import team  # noqa: F401 - 触发各 agent 模块加载,完成注册
-    from graph.registry import AGENT_REGISTRY
+    from graph.common import AGENT_REGISTRY
     from team.base import TeamAgent
     
     for role in ("manager", "worker", "terminator", "architect"):
@@ -500,7 +500,7 @@ def test_build_workflow_mcp_tools_injection():
     - 未声明 mcp_tools 的角色,tools 保持原样(本地 tools 或 None)
     - MCP 加载失败(返回空)时,角色降级为纯文本模式(tools=None)
     """
-    from graph.registry import AGENT_REGISTRY, register_agent, build_workflow
+    from graph.common import AGENT_REGISTRY, register_agent, build_workflow
     from team.base import TeamAgent
     from dataclasses import dataclass
 
@@ -551,7 +551,7 @@ def test_build_workflow_mcp_tools_injection():
         team_mod.build_team_agent = _spy_build
 
         # 还需 patch 工作流 builder,避免真实图编译
-        from graph import registry as reg_mod
+        from graph.common import registry as reg_mod
 
         original_get_spec = reg_mod._get_workflow_spec
 

@@ -284,26 +284,27 @@ def test_run_workflow_requires_workflow_sm():
 
 
 # --------------------------------------------------------------------------- #
-# compaction wrapper 透传 config（回归: _compaction_wrapper 签名须用
+# register_nodes 透传 config（回归: 节点签名须用
 # Optional[RunnableConfig] 而非 RunnableConfig | None,否则 LangGraph
 # 注解判定不匹配,config 不注入,节点收到 None → 下游 aget_state 抛
 # KeyError('configurable') → 前端报"任务执行失败: 'configurable'"）
 # --------------------------------------------------------------------------- #
-def test_compaction_wrapper_passes_config_to_node():
-    """compaction wrapper 启用时,LangGraph 注入的 config 透传到被包装的节点。
+def test_register_nodes_passes_config_to_node():
+    """register_nodes 注册的节点,LangGraph 注入的 config 透传到节点函数。
 
-    回归保护:_compaction_wrapper 的 config 参数注解必须用 Optional[RunnableConfig]
+    回归保护:节点函数的 config 参数注解必须用 Optional[RunnableConfig]
     (非 RunnableConfig | None),否则在 ``from __future__ import annotations`` 下
     字符串注解不匹配 LangGraph 的 KWARGS_CONFIG_KEYS,config 静默不注入。
     """
-    from functools import partial
     from typing import Optional, TypedDict
 
     from langchain_core.runnables import RunnableConfig
+    from langchain_core.messages import AIMessage
     from langgraph.checkpoint.memory import MemorySaver
     from langgraph.graph import END, START, StateGraph
 
-    from graph.common import _compaction_wrapper
+    from graph.common import NodeSpec, register_nodes
+
     class WfState(TypedDict):
         out: str
         messages: list
@@ -317,18 +318,18 @@ def test_compaction_wrapper_passes_config_to_node():
         config: Optional[RunnableConfig] = None,  # noqa: UP045
     ) -> dict:
         received["config"] = config
-        return {"out": "done", "messages": []}
+        return {"out": "done", "messages": [AIMessage(content="done")]}
 
-    # 模拟 register_nodes 的包装链:partial 绑定 agent/injector → _compaction_wrapper
-    bound = partial(inner_node, agent=None, injector=None)
-    mw = object()  # 非 None,触发 _compaction_wrapper 包装路径
-    wrapped = partial(_compaction_wrapper, bound, mw)
-
-    graph = StateGraph(WfState)
-    graph.add_node("n", wrapped)
-    graph.add_edge(START, "n")
-    graph.add_edge("n", END)
-    compiled = graph.compile(checkpointer=MemorySaver())
+    graph_builder = StateGraph(WfState)
+    register_nodes(
+        graph_builder,
+        agents={"r": None},
+        injector=None,
+        specs=[NodeSpec("n", inner_node, role="r")],
+    )
+    graph_builder.add_edge(START, "n")
+    graph_builder.add_edge("n", END)
+    compiled = graph_builder.compile(checkpointer=MemorySaver())
 
     asyncio.run(
         compiled.ainvoke(
@@ -337,6 +338,6 @@ def test_compaction_wrapper_passes_config_to_node():
         )
     )
 
-    assert received["config"] is not None, "LangGraph 未注入 config(_compaction_wrapper 签名注解可能不匹配)"
+    assert received["config"] is not None, "LangGraph 未注入 config(节点签名注解可能不匹配)"
     assert received["config"]["configurable"]["thread_id"] == "t1"
     assert received["config"]["configurable"]["workspace_path"] == "C:/ws"

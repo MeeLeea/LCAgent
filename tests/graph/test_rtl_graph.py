@@ -29,7 +29,6 @@ from graph.rtl_graph import (
     arun_rtl_graph_workflow,
     build_rtl_graph_workflow,
     designer_file_check_node,
-    designer_output_node,
     designer_spec_node,
     designer_verilog_node,
     route_after_file_check,
@@ -262,17 +261,6 @@ def test_verification_check_node_requires_verdict_marker():
     prompt = verifier.calls[0][1]
     assert "module uart;" in prompt
     assert "验证结论: PASS" in prompt  # 强制结论行要求出现在提示词中
-
-
-def test_designer_output_node_produces_final_answer():
-    """Designer 交付节点输出最终交付物"""
-    designer = FakeRTLAgent(name="rtl_designer", response="最终交付: filelist + rtl")
-    state = initial_state(design_spec="规格D", rtl_code="module uart;", verification_report="验证结论: PASS")
-    result = asyncio.run(designer_output_node(state, designer))
-    assert result["final_answer"] == "最终交付: filelist + rtl"
-    prompt = designer.calls[0][1]
-    assert "module uart;" in prompt
-    assert "验证结论: PASS" in prompt
 
 
 # ==================== 验证结论解析与条件路由 ====================
@@ -548,7 +536,7 @@ def test_run_rtl_graph_with_context_memory(tmp_path, monkeypatch):
 
 def test_rtl_graph_registered():
     """rtl_graph 工作流已注册且 roles 正确"""
-    from graph.registry import WORKFLOWS
+    from graph.common import WORKFLOWS
 
     assert "rtl_graph" in WORKFLOWS
     spec = WORKFLOWS["rtl_graph"]
@@ -559,7 +547,7 @@ def test_rtl_graph_registered():
 
 def test_rtl_agents_registered():
     """rtl_designer / rtl_verification 角色已注册(由 rtl_graph 顶部导入触发)"""
-    from graph.registry import AGENT_REGISTRY
+    from graph.common import AGENT_REGISTRY
     from team.base import TeamAgent
 
     for role in ("rtl_designer", "rtl_verification"):
@@ -569,7 +557,7 @@ def test_rtl_agents_registered():
 
 def test_build_workflow_rtl_graph_via_registry():
     """通过 registry.build_workflow 构建 rtl_graph(验证角色构建链路)"""
-    from graph.registry import build_workflow
+    from graph.common import build_workflow
 
     graph, agents = build_workflow("rtl_graph", checkpointer=None)
     assert graph is not None

@@ -4,7 +4,7 @@ Designer Agent - 数字芯片 RTL 设计工程师,负责规格梳理、模块拆
 from collections.abc import Sequence
 from typing import ClassVar
 
-from graph.registry import register_agent
+from graph.common import register_agent
 from team.base import PromptInjector, TeamAgent
 from tools.human_confirmation import request_user_confirmation
 

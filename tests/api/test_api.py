@@ -531,7 +531,7 @@ def clear_workflow_cache():
 
 def test_get_workflow(client, mock_agent):
     """测试获取工作流结构与节点状态"""
-    with patch("graph.registry.build_workflow", return_value=(FakeCompiledGraph(), {})):
+    with patch("graph.common.build_workflow", return_value=(FakeCompiledGraph(), {})):
         response = client.get("/api/workflow")
 
     assert response.status_code == 200
@@ -563,7 +563,7 @@ def test_get_workflow_cached(client, mock_agent):
         calls.append(name)
         return FakeCompiledGraph(), {}
 
-    with patch("graph.registry.build_workflow", side_effect=fake_build):
+    with patch("graph.common.build_workflow", side_effect=fake_build):
         r1 = client.get("/api/workflow")
         r2 = client.get("/api/workflow")
 
@@ -579,7 +579,7 @@ def test_get_workflow_unknown_name(client, mock_agent):
     def fake_build(name: str, checkpointer=None):
         raise KeyError(f"未知工作流: {name}")
 
-    with patch("graph.registry.build_workflow", side_effect=fake_build):
+    with patch("graph.common.build_workflow", side_effect=fake_build):
         response = client.get("/api/workflow?name=unknown_workflow")
 
     assert response.status_code == 404
@@ -591,7 +591,7 @@ def test_get_workflow_build_error(client, mock_agent):
     def fake_build(name: str, checkpointer=None):
         raise RuntimeError("构建失败")
 
-    with patch("graph.registry.build_workflow", side_effect=fake_build):
+    with patch("graph.common.build_workflow", side_effect=fake_build):
         response = client.get("/api/workflow")
 
     assert response.status_code == 500
@@ -659,7 +659,7 @@ def test_create_workflow_thread_default_name(client, mock_agent):
 
 def test_list_workflows(client):
     """测试列出可用工作流名称"""
-    with patch("graph.registry.WORKFLOWS", {"simple": None, "pipline": None}):
+    with patch("graph.common.WORKFLOWS", {"simple": None, "pipline": None}):
         response = client.get("/api/workflows")
 
     assert response.status_code == 200

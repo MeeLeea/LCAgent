@@ -524,7 +524,7 @@ def _workflow_snapshot(name: str) -> dict:
     Raises:
         KeyError: 工作流名称不存在
     """
-    from graph.registry import build_workflow
+    from graph.common import build_workflow
 
     # 从全局 agent 获取 checkpointer（API 层持久化注入）
     checkpointer = None
@@ -568,7 +568,7 @@ async def get_workflow(name: str = "simple"):
 @app.get("/api/workflows")
 async def list_workflows():
     """列出全部可用工作流名称（供前端切换选择）。"""
-    from graph.registry import WORKFLOWS
+    from graph.common import WORKFLOWS
 
     return {"workflows": list(WORKFLOWS.keys())}
 

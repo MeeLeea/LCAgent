@@ -250,7 +250,7 @@ class WorkflowAdapter:
             logger.debug("读取 workflow 摘要失败: %s", error)
 
         # 惰性构造压缩中间件（从任一角色 agent 的 llm）
-        from graph.registry import build_workflow
+        from graph.common import build_workflow
 
         _graph, agents = build_workflow(workflow_name, checkpointer=self._checkpointer)
         mw = _build_compaction_middleware(
@@ -326,7 +326,7 @@ class WorkflowAdapter:
         if not workflow_name:
             raise ValueError(f"会话 {tid} 不是 workflow 会话,无法执行工作流")
 
-        from graph.registry import build_workflow
+        from graph.common import build_workflow
 
         graph, _agents = build_workflow(workflow_name, checkpointer=self._checkpointer)
 
