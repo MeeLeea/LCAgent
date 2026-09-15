@@ -28,28 +28,17 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ContextT, ModelRequest
 from langchain_core.messages import SystemMessage
 
+from .config import MEMORY_BUFFER_DELAY_SECONDS, MEMORY_MAX_BUFFER_MESSAGES
 from .lock_pool import ThreadMemoryLockPool
 from .models import (
     MemoryCategory,
     MemoryInputEvent,
     ThreadFactItem,
-    _naive_now,
     judge_long_term_memory,
 )
 from .store import ThreadMemoryStore
 
 logger = logging.getLogger(__name__)
-
-# ============ 运行时配置常量 ============
-
-MEMORY_BUFFER_DELAY_SECONDS = 20
-"""防抖缓冲窗口（秒）：同一 thread 的新事件重置计时"""
-
-MAX_FACT_PER_THREAD = 50
-"""单 thread 最大 fact 条数"""
-
-MAX_BUFFER_MESSAGE_COUNT = 30
-"""单 thread 缓冲区上限（防溢出）"""
 
 
 class ThreadMemoryWriteMiddleware:
@@ -63,7 +52,7 @@ class ThreadMemoryWriteMiddleware:
         lock_pool: ThreadMemoryLockPool 实例（per-thread 并发锁）
         llm_getter: 返回当前 LLMClient 的 callable（支持 LLM 热切换）
         buffer_delay_seconds: 防抖缓冲窗口（秒），默认 MEMORY_BUFFER_DELAY_SECONDS
-        max_buffer_messages: 单 thread 缓冲区上限，默认 MAX_BUFFER_MESSAGE_COUNT
+        max_buffer_messages: 单 thread 缓冲区上限，默认 MEMORY_MAX_BUFFER_MESSAGES
     """
 
     def __init__(
@@ -78,7 +67,7 @@ class ThreadMemoryWriteMiddleware:
         self._lock_pool = lock_pool
         self._llm_getter = llm_getter
         self._buffer_delay_seconds = buffer_delay_seconds if buffer_delay_seconds is not None else MEMORY_BUFFER_DELAY_SECONDS
-        self._max_buffer_messages = max_buffer_messages if max_buffer_messages is not None else MAX_BUFFER_MESSAGE_COUNT
+        self._max_buffer_messages = max_buffer_messages if max_buffer_messages is not None else MEMORY_MAX_BUFFER_MESSAGES
 
         # 防抖 buffer: thread_id → [(role, content, important), ...]
         self._buffer: dict[str, list[tuple[str, str, bool]]] = {}
@@ -167,13 +156,8 @@ class ThreadMemoryWriteMiddleware:
         async with lock:
             try:
                 await self._a_run_pipeline(thread_id, messages)
-            except Exception as error:
-                logger.error(
-                    "Fact 抽取流水线失败 [thread=%s]: %s",
-                    thread_id,
-                    error,
-                    exc_info=True,
-                )
+            except Exception:
+                logger.exception("Fact 抽取流水线失败 [thread=%s]", thread_id)
 
     # 路由到 agent 级作用域的 category 集合（user_fact / lesson 跨会话共享）
     _AGENT_CATEGORIES: frozenset[str] = frozenset({
@@ -193,24 +177,23 @@ class ThreadMemoryWriteMiddleware:
         - ``conv`` / ``business`` / 兜底 → thread 级（会话隔离，保持原行为）
         """
 
-        # ① 构造 MemoryInputEvent 并分类
-        events: list[tuple[MemoryInputEvent, MemoryCategory]] = []
+        # ① 预过滤：只保留通过 judge_long_term_memory 初筛的消息
+        filtered_messages: list[tuple[str, str, bool]] = []
         for role, content, important in messages:
             event = MemoryInputEvent(
                 event_type="message",
                 content=content,
                 is_user_explicit_remember=important,
-                is_reusable=not important,  # 非显式标记的默认可复用
+                is_reusable=not important,
             )
-            category = judge_long_term_memory(event)
-            if category != MemoryCategory.SKIP:
-                events.append((event, category))
+            if judge_long_term_memory(event) != MemoryCategory.SKIP:
+                filtered_messages.append((role, content, important))
 
-        if not events:
+        if not filtered_messages:
             return
 
-        # ② LLM fact 抽取（从原始消息中提取结构化事实）
-        facts_raw = await self._a_extract_facts(thread_id, messages)
+        # ② LLM fact 抽取：仅对预过滤后的消息抽取
+        facts_raw = await self._a_extract_facts(thread_id, filtered_messages)
         if not facts_raw:
             return
 
@@ -571,8 +554,8 @@ class ThreadMemoryReadMiddleware(AgentMiddleware):
                 tid = configurable.get("thread_id")
                 if isinstance(tid, str):
                     return tid
-        except Exception:
-            pass
+        except Exception as error:
+            logger.debug("提取 thread_id 失败: %s", error)
         return None
 
     def _format_facts(self, facts: list[ThreadFactItem]) -> str:
@@ -619,9 +602,6 @@ class ThreadMemoryReadMiddleware(AgentMiddleware):
 
 
 __all__ = [
-    "MAX_BUFFER_MESSAGE_COUNT",
-    "MAX_FACT_PER_THREAD",
-    "MEMORY_BUFFER_DELAY_SECONDS",
     "ThreadMemoryReadMiddleware",
     "ThreadMemoryWriteMiddleware",
 ]

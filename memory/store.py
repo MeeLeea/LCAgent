@@ -31,8 +31,8 @@ logger = logging.getLogger(__name__)
 _NS_FACTS = "thread_facts"
 _NS_AGENT = "global_facts"
 
-# asearch 默认上限（LangGraph Store asearch 默认 limit=10，此处提高以确保取全）
-_SEARCH_LIMIT = 200
+# asearch 默认上限（LangGraph Store asearch 默认 limit=10，此处按容量上限动态取值，
+# 确保 agent 级配置 max_agent_facts > 200 时不会被静默截断，避免漏读/漏淘汰）
 
 
 class ThreadMemoryStore:
@@ -104,7 +104,10 @@ class ThreadMemoryStore:
         self, ns: tuple[str, ...]
     ) -> list[ThreadFactItem]:
         """读取指定 namespace 全部 facts，按 ``create_time`` 升序排列。"""
-        items = await self._store.asearch(ns, limit=_SEARCH_LIMIT)
+        # 查询上限取 thread 级与 agent 级容量上限的较大值，确保 asearch 不会
+        # 在 max_agent_facts 配到 >200 时静默截断（原硬编码 200 与默认值撞车）
+        limit = max(self._max_facts, self._max_agent_facts, 1)
+        items = await self._store.asearch(ns, limit=limit)
         facts = [ThreadFactItem.from_dict(item.value) for item in items]
         facts.sort(key=lambda f: f.create_time)
         return facts
@@ -165,6 +168,9 @@ class ThreadMemoryStore:
 
         使用 ``fact_id`` 作为 Store key，namespace + key 唯一定位。
         同一 ``fact_id`` 重复写入会覆盖（幂等）。
+
+        注意：生产写入链路统一走 :meth:`save_facts_batch`，本方法仅保留供测试
+        与少量单条写入场景使用，勿在生产循环中逐条调用。
 
         Args:
             thread_id: 会话线程 ID
@@ -324,6 +330,9 @@ class ThreadMemoryStore:
         ``item.thread_id`` 会被强制设为 ``self._agent_key``，便于溯源
         （与 thread 级 :meth:`save_fact` 强制 thread_id 的做法对称）。
         同一 ``fact_id`` 重复写入会覆盖（幂等）。
+
+        注意：生产写入链路统一走 :meth:`save_agent_facts_batch`，本方法仅保留
+        供测试与少量单条写入场景使用，勿在生产循环中逐条调用。
 
         Args:
             item: 记忆条目

@@ -13,7 +13,6 @@ import logging
 import os
 import sqlite3
 import uuid
-from typing import Any
 
 import aiosqlite
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -39,7 +38,6 @@ class AgentMemory:
         self,
         checkpoint_file: str | None = None,
         thread_id: str | None = None,
-        short_term_size: int = 10,  # 仅兼容旧 API
         use_sqlite: bool = True,
         process_type: str | None = None
     ):
@@ -49,14 +47,12 @@ class AgentMemory:
         Args:
             checkpoint_file: SQLite 持久化文件路径(为 None 时用内存)
             thread_id: 会话线程 ID(为 None 时自动生成)
-            short_term_size: 仅兼容旧 API(checkpoint 不限容量)
             use_sqlite: True=SQLite持久化, False=内存(调试用)
             process_type: 进程类型标识(server/scheduler/feishu)，用于多进程隔离
         """
         self.checkpoint_file = checkpoint_file
         self.process_type = process_type
         self.thread_id = thread_id or self._generate_thread_id()
-        self.short_term_size = short_term_size
         self.use_sqlite = use_sqlite and checkpoint_file is not None
         self._async_mode = False
         self._async_conn: aiosqlite.Connection | None = None
@@ -73,7 +69,6 @@ class AgentMemory:
         cls,
         checkpoint_file: str | None = None,
         thread_id: str | None = None,
-        short_term_size: int = 10,
         use_sqlite: bool = True,
         process_type: str | None = None,
     ) -> AgentMemory:
@@ -82,7 +77,6 @@ class AgentMemory:
         choice.checkpoint_file = checkpoint_file
         choice.process_type = process_type
         choice.thread_id = thread_id or choice._generate_thread_id()
-        choice.short_term_size = short_term_size
         choice.use_sqlite = use_sqlite and checkpoint_file is not None
         choice._async_mode = True
         choice._async_conn = None

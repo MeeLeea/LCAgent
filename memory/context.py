@@ -138,7 +138,6 @@ class MemoryContext:
         cls,
         checkpoint_file: str | None = None,
         thread_id: str | None = None,
-        short_term_size: int = 10,
         use_sqlite: bool = True,
         process_type: str | None = None,
         llm_getter: Any = None,
@@ -155,7 +154,6 @@ class MemoryContext:
         Args:
             checkpoint_file: SQLite checkpoint 文件路径
             thread_id: 会话线程 ID
-            short_term_size: 兼容旧 API
             use_sqlite: True=SQLite持久化, False=内存
             process_type: 进程类型标识
             llm_getter: 返回当前 LLMClient 的 callable（支持热切换）
@@ -169,7 +167,6 @@ class MemoryContext:
         agent_memory = await AgentMemory.acreate(
             checkpoint_file=checkpoint_file,
             thread_id=thread_id,
-            short_term_size=short_term_size,
             use_sqlite=use_sqlite,
             process_type=process_type,
         )
@@ -192,7 +189,8 @@ class MemoryContext:
             memory_store, recall_limit=recall_limit
         )
 
-        # 5. 创建 MemoryManager（内部自建写中间件）
+        # 5. 创建 MemoryManager（内部自建写中间件；读中间件复用上面创建的实例，
+        #    避免 manager 内部再自建一套造成双实例导致配置分叉）
         memory_manager = MemoryManager(
             memory_store=memory_store,
             lock_pool=lock_pool,
@@ -200,6 +198,7 @@ class MemoryContext:
             recall_limit=recall_limit,
             buffer_delay_seconds=buffer_delay_seconds,
             max_buffer_messages=max_buffer_messages,
+            read_middleware=read_middleware,
         )
 
         return cls(

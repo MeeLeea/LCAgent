@@ -64,6 +64,9 @@ class MemoryManager:
         recall_limit: 召回长期记忆时的默认条数上限
         buffer_delay_seconds: 防抖缓冲窗口（秒），透传给写中间件
         max_buffer_messages: 单 thread 缓冲区上限，透传给写中间件
+        read_middleware: 读中间件实例。由 MemoryContext 创建后注入以复用同一实例
+            （避免 manager 内部再自建造成双实例）；为 None 时内部自建，
+            供测试等无外部注入场景使用
     """
 
     def __init__(
@@ -74,6 +77,7 @@ class MemoryManager:
         recall_limit: int = _DEFAULT_RECALL_LIMIT,
         buffer_delay_seconds: int | None = None,
         max_buffer_messages: int | None = None,
+        read_middleware: ThreadMemoryReadMiddleware | None = None,
     ) -> None:
         self._store = memory_store
         self._lock_pool = lock_pool
@@ -90,9 +94,12 @@ class MemoryManager:
         )
 
         # 读中间件：awrap_model_call 时注入 thread facts 到 SystemMessage
-        # （recall_limit 约束每次注入的 fact 条数，与显式召回 recall() 一致）
-        self._read_middleware = ThreadMemoryReadMiddleware(
-            memory_store, recall_limit=recall_limit
+        # （recall_limit 约束每次注入的 fact 条数，与显式召回 recall() 一致）。
+        # 复用 MemoryContext 注入的实例，避免双实例导致配置分叉；未注入时自建。
+        self._read_middleware = (
+            read_middleware
+            if read_middleware is not None
+            else ThreadMemoryReadMiddleware(memory_store, recall_limit=recall_limit)
         )
 
     # ============ 属性暴露 ============
@@ -189,9 +196,10 @@ class MemoryManager:
 
         读取 ``user_fact`` / ``lesson`` 类的 agent 级记忆，按 ``create_time``
         升序返回，截取最近 ``limit`` 条。与 thread 级 :meth:`recall` 不同，
-        agent 级记忆跨会话共享且无 thread 上下文，因此 **不进行 touch 更新**
-        （store 未提供 agent 级 touch 方法），LRU 淘汰依赖
-        :meth:`ThreadMemoryStore.prune_agent_facts`。
+        agent 级记忆跨会话共享且无 thread 上下文，此处不主动 touch 更新
+        ``last_used_at``——agent 级 LRU 依赖读中间件注入时的
+        :meth:`ThreadMemoryStore.touch_agent_fact` 与写流水线末尾的
+        :meth:`ThreadMemoryStore.prune_agent_facts` 共同维护。
 
         Args:
             limit: 返回条数上限（为 None 时使用构造时设定的 recall_limit）
