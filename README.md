@@ -529,7 +529,7 @@ awrap_model_call
 - 抽取结果中 `category ∈ {conv, business}` 或非法回退为 `conv` → 组装 `scope="thread"` 的 `ThreadFactItem`，写入 thread namespace，触发 `prune_facts(thread_id)`；
 - 去重基准同时读取两级 existing，按 `content` 精确比对，agent 级优先（避免同一条 fact 跨作用域重复）。
 
-> **写入路径不变**：事件筛选（`is_memory_worthy`：DONE / TOOL_RESULT 且 content 非空）→ 防抖 20s → `judge_long_term_memory` 规则分类 → LLM 抽取 → 按分类路由到 agent / thread 作用域 → 去重 → 写入 → LRU 淘汰。本次分层只改变了"写到哪一级 namespace"和"读时如何聚合"，未改变前置流水线。
+> **写入路径**：事件筛选（`is_memory_worthy`：DONE / TOOL_RESULT 且 content 非空）→ 防抖 → `judge_long_term_memory` 确定性预判定（SKIP 丢弃 / 失败≥2 记 lesson / 其余交 LLM）→ LLM 抽取 → 按 `category` 路由到 agent / thread 作用域 → 去重 → 写入 → LRU 淘汰。本次分层只改变了"写到哪一级 namespace"和"读时如何聚合"。
 
 ### 上下文注入机制（重要）
 
@@ -624,7 +624,7 @@ self.agent_executor = self._create_agent_executor(
 | `cot:任务`   | `acot()`                        | ❌ 不写         | ❌ 不写                               | CoT 绕过 Agent，纯 LLM 推理，无事件流      |
 | 普通输入       | `achat_stream()`                | ✅ 自动         | ✅ 事件驱动（不标记 important）       | 对话同样参与记忆抽取，只是不强调重要       |
 
-> **关键区别**：Checkpoint 由 LangGraph 自动管理，无需手动干预；长期记忆由**事件驱动流水线**自动沉淀（分类判定 + LLM 抽取 + 两级去重 + 按 `category` 路由到 agent / thread 作用域），`important` 标记只是提高"值得评估"的优先级，不再决定是否写入。
+> **关键区别**：Checkpoint 由 LangGraph 自动管理，无需手动干预；长期记忆由**事件驱动流水线**自动沉淀（确定性预判定 + LLM 抽取 + 两级去重 + 按 `category` 路由到 agent / thread 作用域），`important` 标记提高"值得评估"的优先级（在 LLM 抽取时加「用户明确要求记住」标注），不再决定是否写入。
 
 ### Checkpoint 持久化原理
 
@@ -673,16 +673,18 @@ memory_ctx.bind_llm(lambda: agent.llm)  # 记忆组件直接读取 agent 当前 
 长期记忆不再是"手动标记 important"的简单追加，而是**事件驱动 + LLM 抽取**的完整流水线。写入在 [memory/middleware.py](memory/middleware.py) 的 `ThreadMemoryWriteMiddleware` 中实现：
 
 ```
-submit_event(thread_id, role, content, important)   # SessionManager 非阻塞调用
-   ↓ 投递到防抖 buffer（同 thread 新事件重置 20s 计时）
-   ↓ 限流：单 thread buffer 上限 30 条
+submit_event(thread_id, role, content, important, event_type, tool_name)   # SessionManager 非阻塞调用
+   ↓ 投递到防抖 buffer（同 thread 新事件重置计时）
+   ↓ 限流：单 thread buffer 上限 memory_max_buffer_messages 条
    ↓
 _a_run_pipeline()  （buffer 超时后批量处理）
    ↓
-① 分类判定  judge_long_term_memory(MemoryInputEvent)
-   ↓ 非 SKIP 的事件进入下一步
+① 确定性预判定  judge_long_term_memory(MemoryInputEvent)
+   ↓ 返回 SKIP → 确定性丢弃；LESSON（同类失败≥2）→ 直接构造（绕过 LLM）；
+   ↓ IMPORTANT_CONVERSATION / None → 进入 LLM 抽取
 ② LLM Fact 抽取  _a_extract_facts()
    ↓ 从原始消息提取 {"content", "category", "confidence"} JSON 列表
+   ↓ important 消息带「用户明确要求记住」标注提高优先级
 ③ 无效内容过滤（空 content 丢弃）
 ④ 两级 existing 去重（同时读 query_agent_facts + query_facts(thread_id)，
    按 content 精确比对，agent 级优先，避免跨作用域重复）
@@ -713,17 +715,18 @@ if self._memory is not None:
 - `DONE` / `TOOL_RESULT` 事件（`AgentEvent.is_memory_worthy`）→ 提交给记忆流水线评估
 - `TOKEN` / `TOOL_CALL` / `INTERRUPT` 事件不单独提交
 
-**分类判定**（[memory/models.py](memory/models.py) 的 `judge_long_term_memory`）：
+**确定性预判定**（[memory/models.py](memory/models.py) 的 `judge_long_term_memory`）：
 
-| 分类                       | 取值          | 作用域           | 判定条件                                                  |
-| -------------------------- | ------------- | ---------------- | --------------------------------------------------------- |
-| `USER_FACT`              | `user_fact` | **agent 级**（跨会话共享） | 用户告知的个人信息、习惯、偏好                            |
-| `LESSON_EXPERIENCE`      | `lesson`    | **agent 级**（跨会话共享） | 工具踩坑、稳定推理结论、不可行方案（同类失败 ≥2 次）     |
-| `BUSINESS_ENTITY`        | `business`  | **thread 级**（会话隔离） | 项目配置、关键路径、接口、长期目标                        |
-| `IMPORTANT_CONVERSATION` | `conv`      | **thread 级**（会话隔离） | 用户显式说"记住"、重要技术决策                            |
-| `SKIP`                   | `skip`      | 不写入            | 临时资源 / 未确认猜想 / 一次性子任务 / 单次失败 → 不写入 |
+`judge_long_term_memory` 只做**可确定性判定**的信号（失败次数 / 用户显式记住），语义字段（是否猜想、是否临时、是否技术决策等）不再以规则硬编码，统一交由 LLM 抽取阶段依据对话内容自行分类。返回值语义：
 
-> **LLM 抽取是第二道闸门**：分类判定只决定"值得评估"，最终是否入库由 LLM 从原始对话中抽取结构化事实决定，并附带 `category` 与 `confidence`（置信度），无效分类回退为 `conv`（走 thread 级）。
+| 返回值                   | 取值      | 作用域/行为                                                        |
+| ------------------------ | --------- | ------------------------------------------------------------------ |
+| `LESSON_EXPERIENCE`    | `lesson` | **agent 级**（跨会话共享）——同类工具失败 ≥2 次，确定性绕过 LLM 直接记 |
+| `IMPORTANT_CONVERSATION` | `conv`  | 用户显式说"记住"，进入 LLM 抽取并带「用户明确要求记住」标注提高优先级 |
+| `SKIP`                 | `skip`  | 单次失败的工具结果（且非显式记住）→ 确定性丢弃，不进 LLM 也不落库    |
+| `None`                 | —       | 值得评估，分类交由 LLM 抽取（`user_fact` / `lesson` / `business` / `conv`）决定 |
+
+> **LLM 抽取是主闸门**：除「同类失败 ≥2 次」这一确定性信号外，最终分类（`user_fact` / `lesson` / `business` / `conv`）由 LLM 从原始对话中抽取结构化事实决定，并附带 `category` 与 `confidence`（置信度），无效分类回退为 `conv`（走 thread 级）。
 
 ### 为什么 cot 不写入 checkpoint
 
