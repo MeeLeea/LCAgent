@@ -43,6 +43,14 @@ class FakeSessionManager:
         self.calls.append(("aclear_long_term_memory", session_id))
         return 2
 
+    async def aclear_agent_memory(self) -> int:
+        self.calls.append(("aclear_agent_memory", None))
+        return 3
+
+    async def arecall_agent_memory(self, limit: int | None = None) -> str:
+        self.calls.append(("arecall_agent_memory", limit))
+        return "【长期记忆】\n- [用户事实] 喜欢深色主题\n"
+
 
 @dataclass
 class FakeSession:
@@ -284,8 +292,9 @@ def test_dispatch_thread_new_and_clear_mutate_memory(harness: Harness) -> None:
     assert clear_result.handled is True
     # thread:new → session.new_session()
     assert ("new_session", None) in harness.agent.session.calls
-    # clear all → session_manager.aclear_long_term_memory() + session.new_session()
+    # clear all → session_manager.aclear_long_term_memory() + aclear_agent_memory() + session.new_session()
     assert ("aclear_long_term_memory", None) in harness.agent.session_manager.calls
+    assert ("aclear_agent_memory", None) in harness.agent.session_manager.calls
     assert ("new_session", None) in harness.agent.session.calls
 
 
@@ -356,3 +365,24 @@ def test_dispatch_log_with_invalid_level_shows_error(harness: Harness) -> None:
     # Then: the command is handled and an error message is shown.
     assert result.handled is True
     assert any("失败" in msg or "未知" in msg for msg in harness.printed)
+
+
+def test_dispatch_clear_agent_clears_agent_level_memory(harness: Harness) -> None:
+    # Given: agent-level memory is exposed through the session manager.
+    # When: clear agent is dispatched.
+    result = dispatch(harness, "clear agent")
+    # Then: it calls aclear_agent_memory, not thread-level clear.
+    assert result.handled is True
+    assert ("aclear_agent_memory", None) in harness.agent.session_manager.calls
+    assert ("aclear_long_term_memory", None) not in harness.agent.session_manager.calls
+
+
+def test_dispatch_agent_memory_recalls_agent_level_memory(harness: Harness) -> None:
+    # Given: agent-level memory recall returns formatted text.
+    # When: agent memory is dispatched.
+    result = dispatch(harness, "agent memory")
+    # Then: the recall text is printed and no LLM run is started.
+    assert result.handled is True
+    assert ("arecall_agent_memory", None) in harness.agent.session_manager.calls
+    assert any("喜欢深色主题" in msg for msg in harness.printed)
+    assert harness.runners.calls == []
