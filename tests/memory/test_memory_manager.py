@@ -18,7 +18,7 @@ from unittest.mock import MagicMock
 
 from memory.lock_pool import ThreadMemoryLockPool
 from memory.manager import MemoryManager
-from memory.models import MemoryCategory, ThreadFactItem
+from memory.models import ThreadFactItem
 from memory.store import ThreadMemoryStore
 
 
@@ -157,7 +157,7 @@ class TestSubmitAndConsume:
     def test_consume_event_skips_non_memory_worthy(self):
         """TOKEN 事件不提交记忆。"""
         async def run():
-            from utils.events import AgentEvent, EventType
+            from utils.events import AgentEvent
 
             mgr, _ = _make_manager()
             event = AgentEvent.token("hello", thread_id="t1")
@@ -276,7 +276,7 @@ class TestCompressAndClear:
         """clear 应丢弃未 flush 的缓冲事件，防止清完被回写“复活”。"""
         async def run():
             # 大延迟确保防抖定时器在测试期间不会触发 flush
-            mgr, store = _make_manager(buffer_delay_seconds=1000)
+            mgr, _ = _make_manager(buffer_delay_seconds=1000)
             await mgr.write_middleware.submit_event("t1", "user", "待沉淀事件", False)
             assert "t1" in mgr.write_middleware._buffer
 

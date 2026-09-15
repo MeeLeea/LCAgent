@@ -15,12 +15,10 @@ from unittest.mock import MagicMock
 
 from memory.lock_pool import ThreadMemoryLockPool
 from memory.middleware import (
-    MEMORY_BUFFER_DELAY_SECONDS,
-    MAX_BUFFER_MESSAGE_COUNT,
     ThreadMemoryReadMiddleware,
     ThreadMemoryWriteMiddleware,
 )
-from memory.models import MemoryCategory, ThreadFactItem
+from memory.models import ThreadFactItem
 from memory.store import ThreadMemoryStore
 
 
@@ -513,11 +511,24 @@ class TestLockPool:
 
 
 class TestConfigConstants:
-    def test_default_buffer_delay(self):
-        assert MEMORY_BUFFER_DELAY_SECONDS == 20
+    """中间件默认值来自 memory/config.py（单一来源，避免分叉常量）。"""
 
-    def test_default_max_buffer_messages(self):
-        assert MAX_BUFFER_MESSAGE_COUNT == 30
+    def test_default_values_come_from_config(self):
+        from memory.config import (
+            MEMORY_BUFFER_DELAY_SECONDS,
+            MEMORY_MAX_BUFFER_MESSAGES,
+        )
+
+        store = ThreadMemoryStore()
+        lock_pool = ThreadMemoryLockPool()
+        mw = ThreadMemoryWriteMiddleware(
+            memory_store=store,
+            lock_pool=lock_pool,
+            llm_getter=lambda: None,
+        )
+        # 未显式传参时，中间件默认值应取自 config.py 的唯一来源
+        assert mw._buffer_delay_seconds == MEMORY_BUFFER_DELAY_SECONDS
+        assert mw._max_buffer_messages == MEMORY_MAX_BUFFER_MESSAGES
 
 
 # ════════════════════════════════════════════════════════════════════════
