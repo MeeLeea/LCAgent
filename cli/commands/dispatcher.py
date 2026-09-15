@@ -52,6 +52,8 @@ async def dispatch_command(context: CommandContext, user_input: str) -> CommandO
         return await _invoke(core.show_tools, context)
     if low.startswith("clear"):
         return await _invoke(memory.clear_memory, context, user_input)
+    if low in ("agent memory", "agent:memory", "agentmem"):
+        return await _invoke(memory.show_agent_memory, context)
     if low in ("compress", "压缩"):
         return await _invoke(memory.compress_memory, context)
     if low in ("compact", "压缩上下文"):

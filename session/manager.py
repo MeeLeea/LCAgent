@@ -363,6 +363,18 @@ class SessionManager:
         sid = self._resolve_thread_id(session_id)
         return await self._memory.clear(sid)
 
+    async def aclear_agent_memory(self) -> int:
+        """清空 agent 级（跨会话共享）长期记忆（user_fact / lesson）。"""
+        if self._memory is None:
+            return 0
+        return await self._memory.clear_agent_facts()
+
+    async def arecall_agent_memory(self, limit: int | None = None) -> str:
+        """召回 agent 级长期记忆并格式化为文本片段。"""
+        if self._memory is None:
+            return ""
+        return await self._memory.recall_agent_text(limit)
+
     # ============ 执行历史 ============
 
     async def aget_execution_history(

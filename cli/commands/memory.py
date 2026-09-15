@@ -16,13 +16,20 @@ async def clear_memory(context: CommandContext, user_input: str) -> CommandOutco
         tid = context.agent.session.new_session()
         context.agent.set_current_session(tid)
         context.print(f"\n已清空短期记忆（新会话: {tid}）")
+    elif target in ("agent", "全局"):
+        cleared = await context.agent.session_manager.aclear_agent_memory()
+        context.print(f"\n已清空 agent 级长期记忆 ({cleared} 条 facts)")
     elif target in ("all", "全部"):
         cleared = await context.agent.session_manager.aclear_long_term_memory()
+        agent_cleared = await context.agent.session_manager.aclear_agent_memory()
         tid = context.agent.session.new_session()
         context.agent.set_current_session(tid)
-        context.print(f"\n已清空全部记忆 (长期 {cleared} 条 facts + 短期，新会话: {tid})")
+        context.print(
+            f"\n已清空全部记忆 "
+            f"(长期 {cleared} 条 + agent 级 {agent_cleared} 条 + 短期，新会话: {tid})"
+        )
     else:
-        context.print("\n用法: clear [long|short|all]  (默认 long)")
+        context.print("\n用法: clear [long|short|agent|all]  (默认 long)")
     return HANDLED
 
 
@@ -45,6 +52,16 @@ async def compress_memory(context: CommandContext) -> CommandOutcome:
         context.print("--- 已保存到长期记忆 Store ---")
     else:
         context.print(f"\n压缩失败: {result.get('error', '未知错误')}")
+    return HANDLED
+
+
+async def show_agent_memory(context: CommandContext) -> CommandOutcome:
+    """召回并展示 agent 级（跨会话共享）长期记忆。"""
+    text = await context.agent.session_manager.arecall_agent_memory()
+    if not text:
+        context.print("\n暂无 agent 级长期记忆")
+    else:
+        context.print("\n" + text.rstrip("\n"))
     return HANDLED
 
 
