@@ -24,7 +24,9 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import Any
+
+from utils.events import AgentEvent, EventType
 
 from .lock_pool import ThreadMemoryLockPool
 from .middleware import (
@@ -33,9 +35,6 @@ from .middleware import (
 )
 from .models import MemoryCategory, ThreadFactItem
 from .store import ThreadMemoryStore
-
-if TYPE_CHECKING:
-    from utils.events import AgentEvent
 
 logger = logging.getLogger(__name__)
 
@@ -298,12 +297,18 @@ class MemoryManager:
             return
 
         role = event.role or "assistant"
+        # 提取真实事件类型：TOOL_RESULT 走 tool_result（供失败计数/lesson 判定），
+        # DONE 走 message（模型最终输出）
+        evt_type = "tool_result" if event.event_type == EventType.TOOL_RESULT else "message"
+        tool_name = event.tool_name if event.event_type == EventType.TOOL_RESULT else ""
         try:
             await self._write_middleware.submit_event(
                 event.thread_id,
                 role,
                 event.content,
                 event.is_important,
+                event_type=evt_type,
+                tool_name=tool_name,
             )
         except Exception as error:
             logger.debug("事件记忆消费失败: %s", error)

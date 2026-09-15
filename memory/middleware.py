@@ -41,6 +41,23 @@ from .store import ThreadMemoryStore
 logger = logging.getLogger(__name__)
 
 
+def _is_tool_failure(content: str) -> bool:
+    """检测 TOOL_RESULT 内容是否表示工具执行失败/超时。
+
+    与 ``agent.terminal_retry_cap_mw.is_timeout_content`` 逻辑一致，
+    额外补充工具执行失败标记。memory 层独立实现以避免跨层引用。
+    """
+    if not content:
+        return False
+    return (
+        '"error_type": "timeout"' in content
+        or '"error": "tool_timeout"' in content
+        or "[工具执行失败]" in content
+        or "执行超时" in content
+        or "命令超时" in content
+    )
+
+
 class ThreadMemoryWriteMiddleware:
     """长期记忆写入服务：事件接收 + 防抖 + Fact 抽取流水线。
 
@@ -75,6 +92,9 @@ class ThreadMemoryWriteMiddleware:
         self._timers: dict[str, asyncio.Task[None]] = {}
         # 保护 buffer 和 timers 的并发访问
         self._buffer_lock = asyncio.Lock()
+        # 失败计数：(thread_id, tool_name) → 同类工具失败累计次数，
+        # 供 judge_long_term_memory 确定性判定经验教训（失败 ≥2 次）
+        self._failure_counts: dict[tuple[str, str], int] = {}
 
     def bind_llm(self, llm_getter: Callable[[], Any]) -> None:
         """运行时替换 LLM 获取器（支持 provider 热切换后即时生效）。
@@ -95,6 +115,8 @@ class ThreadMemoryWriteMiddleware:
         role: str,
         content: str,
         important: bool = False,
+        event_type: str = "message",
+        tool_name: str = "",
     ) -> None:
         """非阻塞投递事件到 buffer。
 
@@ -106,13 +128,17 @@ class ThreadMemoryWriteMiddleware:
             role: 消息角色 (user / assistant / system)
             content: 消息文本内容
             important: 是否用户显式标记为重要
+            event_type: 事件类型（``"message"`` 或 ``"tool_result"``），
+                供 :func:`judge_long_term_memory` 确定性判定
+            tool_name: 工具名（仅 ``event_type="tool_result"`` 时有效），
+                用于同类失败计数
         """
         if not thread_id or not content.strip():
             return
 
         async with self._buffer_lock:
             buf = self._buffer.setdefault(thread_id, [])
-            buf.append((role, content, important))
+            buf.append((role, content, important, event_type, tool_name))
 
             # 限制单 thread 缓存条数
             if len(buf) > self._max_buffer_messages:
@@ -168,49 +194,71 @@ class ThreadMemoryWriteMiddleware:
     async def _a_run_pipeline(
         self,
         thread_id: str,
-        messages: list[tuple[str, str, bool]],
+        messages: list[tuple[str, str, bool, str, str]],
     ) -> None:
         """执行完整 Fact 处理流水线。
 
-        步骤 ④⑤⑥ 按 category 分流：
-        - ``user_fact`` / ``lesson`` → agent 级（跨会话共享）
-        - ``conv`` / ``business`` / 兜底 → thread 级（会话隔离，保持原行为）
+        ① 确定性预判定（judge_long_term_memory）：
+           SKIP → 确定性丢弃；LESSON（失败≥2）→ 直接构造（绕过 LLM）；
+           IMPORTANT_CONVERSATION / None → 进入 LLM 抽取
+        ② LLM fact 抽取：仅对需抽取的消息调用 _a_extract_facts
+        ③④⑤⑥ 不变：无效过滤 → 两级去重 → 按 category 分流 → 写入 → LRU 淘汰
         """
 
-        # ① 预过滤：只保留通过 judge_long_term_memory 初筛的消息
-        filtered_messages: list[tuple[str, str, bool]] = []
-        for role, content, important in messages:
+        # ① 确定性预判定 + 失败计数
+        direct_agent_items: list[ThreadFactItem] = []
+        extract_messages: list[tuple[str, str, bool]] = []
+
+        for role, content, important, evt_type, tool_nm in messages:
+            failure_count = 0
+            if evt_type == "tool_result" and _is_tool_failure(content):
+                key = (thread_id, tool_nm)
+                self._failure_counts[key] = self._failure_counts.get(key, 0) + 1
+                failure_count = self._failure_counts[key]
+
             event = MemoryInputEvent(
-                event_type="message",
+                event_type=evt_type,
                 content=content,
                 is_user_explicit_remember=important,
-                is_reusable=not important,
+                failure_repeat_count=failure_count,
             )
-            if judge_long_term_memory(event) != MemoryCategory.SKIP:
-                filtered_messages.append((role, content, important))
+            result = judge_long_term_memory(event)
 
-        if not filtered_messages:
-            return
+            if result is MemoryCategory.SKIP:
+                continue  # 确定性丢弃（如单次失败、非显式 tool_result）
+            if result is MemoryCategory.LESSON_EXPERIENCE:
+                # 确定性 lesson：同类失败 ≥2 次，绕过 LLM 直接构造
+                direct_agent_items.append(
+                    self._build_fact_item(
+                        content,
+                        MemoryCategory.LESSON_EXPERIENCE.value,
+                        {"confidence": 0.9},
+                        scope="agent",
+                    )
+                )
+                continue
 
-        # ② LLM fact 抽取：仅对预过滤后的消息抽取
-        facts_raw = await self._a_extract_facts(thread_id, filtered_messages)
-        if not facts_raw:
-            return
+            # IMPORTANT_CONVERSATION 或 None → 进入 LLM 抽取
+            # （important 字段供 _a_extract_facts 加标注提高优先级）
+            extract_messages.append((role, content, important))
+
+        # ② LLM fact 抽取：仅对需抽取的消息（失败≥2 的已确定性处理）
+        facts_raw: list[dict[str, Any]] = []
+        if extract_messages:
+            facts_raw = await self._a_extract_facts(thread_id, extract_messages)
 
         # ③ 无效内容过滤
         facts_raw = [f for f in facts_raw if f.get("content", "").strip()]
-        if not facts_raw:
-            return
 
         # ④ 读取两级 existing 作为去重基准（agent 级别优先，避免跨作用域重复）
         existing_thread = await self._store.query_facts(thread_id)
         existing_agent = await self._store.query_agent_facts()
 
-        # ⑤ 按 category 分流组装 ThreadFactItem
+        # ⑤ 按 category 分流组装 ThreadFactItem（确定性 lesson 优先加入）
         agent_seen: set[str] = {f.content for f in existing_agent}
         thread_seen: set[str] = {f.content for f in existing_thread}
 
-        agent_items: list[ThreadFactItem] = []
+        agent_items: list[ThreadFactItem] = list(direct_agent_items)
         thread_items: list[ThreadFactItem] = []
 
         for fact_data in facts_raw:
@@ -295,10 +343,11 @@ class ThreadMemoryWriteMiddleware:
         Returns:
             fact 字典列表，可能为空
         """
-        # 构建对话文本
+        # 构建对话文本（important 消息加标注，提高 LLM 抽取优先级）
         lines = []
-        for role, content, _ in messages:
-            lines.append(f"[{role}] {content}")
+        for role, content, important in messages:
+            marker = " [用户明确要求记住]" if important else ""
+            lines.append(f"[{role}]{marker} {content}")
         conversation_text = "\n".join(lines)
 
         system_prompt = (
@@ -385,13 +434,18 @@ class ThreadMemoryWriteMiddleware:
     # ============ 生命周期管理 ============
 
     async def cleanup_thread(self, thread_id: str) -> None:
-        """thread 销毁时清理 buffer 和定时器。"""
+        """thread 销毁时清理 buffer、定时器与失败计数。"""
         async with self._buffer_lock:
             self._buffer.pop(thread_id, None)
             timer = self._timers.pop(thread_id, None)
 
         if timer is not None and not timer.done():
             timer.cancel()
+
+        # 清理该 thread 相关的失败计数，避免跨会话串号
+        keys = [k for k in self._failure_counts if k[0] == thread_id]
+        for k in keys:
+            del self._failure_counts[k]
 
     async def flush_all(self) -> None:
         """立即处理所有 buffer 中的待处理事件（用于 Agent 关闭前）。"""

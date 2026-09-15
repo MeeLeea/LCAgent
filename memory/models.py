@@ -77,96 +77,57 @@ class ThreadFactItem:
 
 @dataclass
 class MemoryInputEvent:
-    """待评估是否写入长期记忆的事件（原 AgentEvent，重命名以释放 AgentEvent 给执行事件模型）。
+    """待评估是否写入长期记忆的事件。
 
-    由中间件在每轮 Agent 执行结束后构建，传入
-    :func:`judge_long_term_memory` 判定分类。
+    由写中间件的 Fact 处理流水线构建，传入
+    :func:`judge_long_term_memory` 做确定性预判定。
+    语义字段（是否猜想/是否一次性任务等）不再以确定性规则判断，
+    统一交由 LLM 抽取阶段依据对话内容自行分类。
 
     Attributes:
-        event_type: 事件类型 (message / tool_result / reasoning / user_command)
+        event_type: 事件类型（``"message"`` 或 ``"tool_result"``）
         content: 原始文本片段
         is_user_explicit_remember: 用户明确说"记住这个"
-        is_one_shot_task: 是否为本轮临时一次性子任务
-        is_hypothesis: 是否未确认的猜想、试探方案
-        failure_repeat_count: 同类失败历史出现次数
-        is_reusable: 是否跨会话可复用
-        is_project_long_term_goal: 是否项目长期目标
-        is_temp_resource: 临时路径、临时变量、本轮才有效
-        is_technical_decision: 技术选型、方案取舍、架构约定
+        failure_repeat_count: 同类工具失败历史出现次数（由写中间件维护）
     """
 
     event_type: str = "message"
     content: str = ""
     is_user_explicit_remember: bool = False
-    is_one_shot_task: bool = False
-    is_hypothesis: bool = False
     failure_repeat_count: int = 0
-    is_reusable: bool = False
-    is_project_long_term_goal: bool = False
-    is_temp_resource: bool = False
-    is_technical_decision: bool = False
 
 
-def judge_long_term_memory(event: MemoryInputEvent) -> MemoryCategory:
-    """判断一条 Agent 事件是否下沉长期记忆。
+def judge_long_term_memory(event: MemoryInputEvent) -> MemoryCategory | None:
+    """确定性预判定一条事件是否值得沉淀长期记忆。
 
-    返回分类；返回 :attr:`MemoryCategory.SKIP` 表示只保存在 checkpoint 短期会话记忆。
+    只处理可确定性判定的信号（失败次数 / 用户显式记住），语义字段
+    （是否猜想、是否临时、是否技术决策等）不再以规则判断，统一交由
+    LLM 抽取阶段依据对话内容自行分类。
 
-    判定逻辑参照 ``docs/长期事件触发.md``：
-    1. 前置过滤：临时资源、未确认猜想、单纯一次性子任务、单次未标记失败 → SKIP
-    2. 经验教训：同类报错重复 >= 2 次、稳定可复用推理结论 → LESSON_EXPERIENCE
-    3. 业务实体：项目长期目标、可复用且非一次性非临时的实体信息 → BUSINESS_ENTITY
-    4. 用户显式标记 / 技术决策 → IMPORTANT_CONVERSATION
-    5. 其余 → SKIP
+    返回值语义：
+    - :attr:`MemoryCategory.SKIP`：确定性丢弃，不进入 LLM 抽取
+    - :attr:`MemoryCategory.LESSON_EXPERIENCE`：同类失败 ≥2 次，确定性记为经验教训
+    - :attr:`MemoryCategory.IMPORTANT_CONVERSATION`：用户显式标记，提高 LLM 抽取优先级
+    - ``None``：值得评估，分类交由 LLM 抽取决定
     """
-    # --------------------------
-    # 前置过滤：直接跳过的条件
-    # --------------------------
-    if any([
-        event.is_temp_resource,
-        event.is_hypothesis,
-        event.is_one_shot_task and not event.is_technical_decision,
-        (
-            event.event_type == "tool_result"
-            and event.failure_repeat_count <= 1
-            and not event.is_user_explicit_remember
-        ),
-    ]):
+    # 1. 单次失败的工具结果且非显式记住 → 确定性丢弃（不值得沉淀）
+    if (
+        event.event_type == "tool_result"
+        and event.failure_repeat_count <= 1
+        and not event.is_user_explicit_remember
+    ):
         return MemoryCategory.SKIP
 
-    # --------------------------
-    # 条件 1：经验 & 教训
-    # --------------------------
-    is_lesson_case = any([
-        event.event_type == "tool_result" and event.failure_repeat_count >= 2,
-        event.event_type == "reasoning" and event.is_reusable and not event.is_hypothesis,
-    ])
-    if is_lesson_case:
+    # 2. 同类失败 ≥2 次 → 确定性记为经验教训（绕过 LLM 分类）
+    if event.event_type == "tool_result" and event.failure_repeat_count >= 2:
         return MemoryCategory.LESSON_EXPERIENCE
 
-    # --------------------------
-    # 条件 2：业务实体信息
-    # --------------------------
-    is_business_entity_case = any([
-        event.is_project_long_term_goal,
-        event.is_reusable and not event.is_one_shot_task and not event.is_temp_resource,
-    ])
-    if is_business_entity_case:
-        return MemoryCategory.BUSINESS_ENTITY
-
-    # --------------------------
-    # 条件 3：用户显式标记 / 重要技术决策
-    # --------------------------
-    if any([
-        event.is_user_explicit_remember,
-        event.is_technical_decision,
-    ]):
+    # 3. 用户显式标记 → 提高优先级（LLM 抽取时标注）
+    if event.is_user_explicit_remember:
         return MemoryCategory.IMPORTANT_CONVERSATION
 
-    # --------------------------
-    # 其余全部跳过
-    # --------------------------
-    return MemoryCategory.SKIP
+    # 4. 其余 → 交 LLM 抽取
+    return None
 
 
 __all__ = [
