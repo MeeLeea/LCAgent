@@ -59,7 +59,6 @@ async def build_agent(provider: str, process_type: str | None = None) -> tuple[A
     # 三层架构：先创建 MemoryContext（记忆基础设施），再创建 AgentCore（纯执行内核）
     memory_ctx = await MemoryContext.acreate(
         checkpoint_file=CHECKPOINT_FILE,
-        short_term_size=config["latest_msg_cnt"],
         use_sqlite=True,
         process_type=process_type,
         llm_getter=lambda: llm,

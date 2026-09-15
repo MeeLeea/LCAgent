@@ -190,7 +190,6 @@ async def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
     # 三层架构：先创建 MemoryContext（记忆基础设施），再创建 AgentCore（纯执行内核）
     memory_ctx = await MemoryContext.acreate(
         checkpoint_file=CHECKPOINT_FILE,
-        short_term_size=cfg["latest_msg_cnt"],
         use_sqlite=True,
         process_type="server",
         llm_getter=lambda: new_llm,

@@ -104,7 +104,6 @@ def make_agent_factory(provider: str):
         # 三层架构：先创建 MemoryContext（记忆基础设施），再创建 AgentCore（纯执行内核）
         memory_ctx = await MemoryContext.acreate(
             checkpoint_file=CHECKPOINT_FILE,
-            short_term_size=agent_config["latest_msg_cnt"],
             use_sqlite=True,
             process_type="scheduler",
             llm_getter=lambda: llm,
