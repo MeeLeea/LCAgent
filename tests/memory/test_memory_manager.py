@@ -196,6 +196,32 @@ class TestSubmitAndConsume:
 
         asyncio.run(run())
 
+    def test_consume_event_tool_result_failure_becomes_lesson(self):
+        """TOOL_RESULT 失败事件经 consume_event 提取 event_type/tool_name，
+        同类失败 ≥2 次确定性沉淀为 lesson（agent 级）。"""
+        async def run():
+            from utils.events import AgentEvent, EventType
+
+            mgr, store = _make_manager()
+            for _ in range(2):
+                event = AgentEvent(
+                    event_type=EventType.TOOL_RESULT,
+                    content="命令超时",
+                    thread_id="t1",
+                    tool_name="run_shell",
+                    role="assistant",
+                )
+                assert event.is_memory_worthy
+                await mgr.consume_event(event)
+            await mgr.flush_all()
+
+            agent_facts = await store.query_agent_facts()
+            assert len(agent_facts) == 1
+            assert agent_facts[0].category == "lesson"
+            assert agent_facts[0].scope == "agent"
+
+        asyncio.run(run())
+
 
 
 # ════════════════════════════════════════════════════════════════════════

@@ -113,7 +113,7 @@ class TestBufferTruncation:
 
             assert len(mw._buffer["t1"]) == 3
             # 保留最后 3 条
-            contents = [c for _, c, _ in mw._buffer["t1"]]
+            contents = [c for _, c, _, _, _ in mw._buffer["t1"]]
             assert contents == ["msg-2", "msg-3", "msg-4"]
 
         asyncio.run(run())
@@ -742,5 +742,87 @@ class TestAgentScopeRouting:
             thread_facts = await store.query_facts("t1")
             assert agent_facts[0].last_used_at != "2026-01-01T00:00:00"
             assert thread_facts[0].last_used_at != "2026-01-01T00:00:00"
+
+        asyncio.run(run())
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  确定性预判定（judge_long_term_memory 精简后的行为）
+# ════════════════════════════════════════════════════════════════════════
+
+
+class _RecordingLLM:
+    """记录 chat 调用消息的 mock，用于验证 important 标注透传。"""
+
+    def __init__(self, response: str = "[]"):
+        self._response = response
+        self.calls: list[list[dict[str, str]]] = []
+
+    def chat(self, messages: list[dict[str, str]]) -> str:
+        self.calls.append(messages)
+        return self._response
+
+
+class TestDeterministicJudgment:
+    """失败次数驱动的确定性判定：SKIP 生效 + 失败≥2 绕过 LLM 直接记 lesson。"""
+
+    def test_single_failed_tool_result_skipped(self):
+        """单次失败的工具结果应被确定性丢弃，不触发 LLM 抽取也不落库。"""
+        async def run():
+            llm = _RecordingLLM(response=json.dumps([]))
+            mw, store = _make_write_middleware(llm_getter=lambda: llm)
+            await mw.submit_event(
+                "t1",
+                "assistant",
+                "[工具执行失败] run_shell 抛出了 TimeoutError",
+                event_type="tool_result",
+                tool_name="run_shell",
+            )
+            await mw._aflush_thread("t1")
+
+            # 单次失败 → SKIP：既不调 LLM，也不落库
+            assert llm.calls == []
+            assert await store.query_facts("t1") == []
+            assert await store.query_agent_facts() == []
+
+        asyncio.run(run())
+
+    def test_two_failed_tool_results_become_lesson(self):
+        """同类失败 ≥2 次应确定性记为 lesson（agent 级），绕过 LLM。"""
+        async def run():
+            llm = _RecordingLLM(response=json.dumps([]))
+            mw, store = _make_write_middleware(llm_getter=lambda: llm)
+            for _ in range(2):
+                await mw.submit_event(
+                    "t1",
+                    "assistant",
+                    "命令超时 run_shell",
+                    event_type="tool_result",
+                    tool_name="run_shell",
+                )
+            await mw._aflush_thread("t1")
+
+            # 两次失败 → 确定性 lesson，直接写入 agent 级，无需 LLM
+            assert llm.calls == []
+            agent_facts = await store.query_agent_facts()
+            assert len(agent_facts) == 1
+            assert agent_facts[0].category == "lesson"
+            assert agent_facts[0].scope == "agent"
+
+        asyncio.run(run())
+
+    def test_important_message_marked_in_llm_prompt(self):
+        """important=True 的消息应带 [用户明确要求记住] 标注传入 LLM。"""
+        async def run():
+            llm = _RecordingLLM(response=json.dumps([]))
+            mw, _ = _make_write_middleware(llm_getter=lambda: llm)
+            await mw.submit_event("t1", "user", "记住我喜欢蓝色", important=True)
+            await mw._aflush_thread("t1")
+
+            # important 消息进入 LLM 抽取，且对话文本带标注
+            assert llm.calls
+            conversation = llm.calls[0][-1]["content"]
+            assert "用户明确要求记住" in conversation
+            assert "我喜欢蓝色" in conversation
 
         asyncio.run(run())
