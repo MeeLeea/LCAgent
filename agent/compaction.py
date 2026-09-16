@@ -19,7 +19,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Annotated, Any
+from typing import Annotated, Any, NotRequired
 
 from langchain.agents.middleware import AgentMiddleware, AgentState
 from langchain.agents.middleware.types import OmitFromInput
@@ -31,7 +31,6 @@ from langchain_core.messages import (
 from langchain_core.messages.utils import get_buffer_string
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.runtime import Runtime
-from typing_extensions import NotRequired
 
 logger = logging.getLogger(__name__)
 
@@ -100,10 +99,12 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
 
     def __init__(
         self,
-        model: Any,
+        model: Any | None = None,
         config: CompactionConfig | None = None,
         on_compaction: Callable[[str, int, int, int, float], None] | None = None,
-    ):
+        *,
+        model_resolver: Callable[[Any], Any] | None = None,
+    ) -> None:
         """初始化压缩中间件
 
         Args:
@@ -112,7 +113,10 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
             on_compaction: 压缩完成回调，签名 (trigger, messages_before, messages_after, summary_length, duration_ms)
                            用于将自动触发的压缩记录到 MetricsCollector
         """
+        if model is None and model_resolver is None:
+            raise ValueError("model 和 model_resolver 至少提供一个")
         self.model = model
+        self._model_resolver = model_resolver
         self.config = config or CompactionConfig()
         self._on_compaction = on_compaction
 
@@ -125,7 +129,7 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
         messages = state["messages"]
         if len(messages) <= self.config.max_messages:
             return None
-        return self._do_compact_sync(state)
+        return self._do_compact_sync(state, runtime)
 
     async def abefore_model(
         self, state: AgentState, runtime: Runtime
@@ -134,7 +138,7 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
         messages = state["messages"]
         if len(messages) <= self.config.max_messages:
             return None
-        return await self._do_compact_async(state)
+        return await self._do_compact_async(state, runtime)
 
     # ============ 手动触发（供 AgentCore 调用） ============
 
@@ -143,6 +147,7 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
         messages: list[AnyMessage],
         existing_summary: str = "",
         force: bool = False,
+        model: Any | None = None,
     ) -> dict[str, Any] | None:
         """手动执行一次压缩，返回状态更新字典（或 None 表示无需压缩）。
 
@@ -168,7 +173,7 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
         to_summarize = messages[:cutoff]
         to_keep = messages[cutoff:]
 
-        new_summary = await self._aincremental_summary(existing_summary, to_summarize)
+        new_summary = await self._aincremental_summary(existing_summary, to_summarize, model=model)
         if not new_summary:
             return None
 
@@ -177,7 +182,7 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
 
     # ============ 核心压缩逻辑 ============
 
-    def _do_compact_sync(self, state: dict[str, Any]) -> dict[str, Any] | None:
+    def _do_compact_sync(self, state: dict[str, Any], runtime: Any = None) -> dict[str, Any] | None:
         """同步执行压缩"""
         _start = time.time()
         messages = list(state.get("messages", []))
@@ -189,7 +194,9 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
         to_keep = messages[cutoff:]
 
         existing_summary = state.get("summary", "") or ""
-        new_summary = self._create_summary_sync(existing_summary, to_summarize)
+        new_summary = self._create_summary_sync(
+            existing_summary, to_summarize, model=self._resolve_model(runtime)
+        )
         if not new_summary:
             return None
 
@@ -197,7 +204,7 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
         self._notify_compaction_metric(len(messages), messages_after, len(new_summary), _start)
         return result
 
-    async def _do_compact_async(self, state: dict[str, Any]) -> dict[str, Any] | None:
+    async def _do_compact_async(self, state: dict[str, Any], runtime: Any = None) -> dict[str, Any] | None:
         """异步执行压缩"""
         _start = time.time()
         messages = list(state.get("messages", []))
@@ -209,7 +216,9 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
         to_keep = messages[cutoff:]
 
         existing_summary = state.get("summary", "") or ""
-        new_summary = await self._aincremental_summary(existing_summary, to_summarize)
+        new_summary = await self._aincremental_summary(
+            existing_summary, to_summarize, model=self._resolve_model(runtime)
+        )
         if not new_summary:
             return None
 
@@ -262,21 +271,34 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
 
     # ============ 增量摘要 ============
 
+    def _resolve_model(self, runtime: Any) -> Any | None:
+        """解析当前 runtime 的模型，失败时回退构建期模型。"""
+        if self._model_resolver is None:
+            return self.model
+        try:
+            return self._model_resolver(runtime)
+        except (ValueError, TypeError, OSError, RuntimeError) as error:
+            logger.warning("压缩模型解析失败，沿用默认模型: %s", error)
+            return self.model
+
     def _create_summary_sync(
-        self, existing: str, messages: list[AnyMessage]
+        self, existing: str, messages: list[AnyMessage], model: Any | None = None
     ) -> str:
         """同步生成增量摘要"""
         formatted = get_buffer_string(messages, format="xml")
         prompt = self._build_summary_prompt(existing, formatted)
+        selected_model = self.model if model is None else model
+        if selected_model is None:
+            return ""
         try:
-            response = self.model.invoke(prompt)
+            response = selected_model.invoke(prompt)
             return response.text.strip()
         except Exception as error:
             logger.warning("增量摘要生成失败，跳过压缩: %s", error, exc_info=True)
             return ""
 
     async def _aincremental_summary(
-        self, existing: str, messages: list[AnyMessage]
+        self, existing: str, messages: list[AnyMessage], model: Any | None = None
     ) -> str:
         """异步生成增量摘要：已有摘要 + 新消息 -> 更新后的摘要
 
@@ -287,8 +309,11 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
         """
         formatted = get_buffer_string(messages, format="xml")
         prompt = self._build_summary_prompt(existing, formatted)
+        selected_model = self.model if model is None else model
+        if selected_model is None:
+            return ""
         try:
-            response = await self.model.ainvoke(prompt)
+            response = await selected_model.ainvoke(prompt)
             return response.text.strip()
         except Exception as error:
             logger.warning("增量摘要生成失败，跳过压缩: %s", error, exc_info=True)

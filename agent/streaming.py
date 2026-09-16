@@ -363,7 +363,7 @@ class Streaming:
 
         with TraceContext(trace_id=trace_id, thread_id=tid):
             logger.info("arun_events: %s", message[:100])
-            config = self._invoke_config(thread_id)
+            config = await self._ainvoke_config(thread_id)
             input_msg = HumanMessage(content=message)
             collected_output: list[str] = []
 
@@ -425,7 +425,7 @@ class Streaming:
 
         with TraceContext(trace_id=trace_id, thread_id=tid):
             logger.info("aresume_events: thread=%s", tid)
-            config = self._invoke_config(thread_id)
+            config = await self._ainvoke_config(thread_id)
 
             # 从 SessionStore 读取 per-session 中断模式
             mode = await self._get_store().aget_interrupt_mode(tid)

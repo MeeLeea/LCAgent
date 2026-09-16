@@ -115,6 +115,62 @@ def test_first_time_summary_has_no_existing():
     assert "【已有摘要】" not in model.invoke_calls[0]
 
 
+def test_dynamic_summary_model_follows_runtime_resolver():
+    """自动压缩使用 runtime 解析出的摘要模型。"""
+    static_model = FakeModel(response="静态摘要")
+    session_model = FakeModel(response="会话摘要")
+    runtime = SimpleNamespace(context={"configurable": {}})
+    mw = LCAgentCompactionMiddleware(
+        static_model,
+        CompactionConfig(max_messages=5, keep_recent=2),
+        model_resolver=lambda _: session_model,
+    )
+
+    result = mw.before_model({"messages": _build_messages(8), "summary": ""}, runtime)
+
+    assert result is not None
+    assert result["summary"] == "会话摘要"
+    assert len(session_model.invoke_calls) == 1
+    assert not static_model.invoke_calls
+
+
+def test_dynamic_async_summary_model_follows_runtime_resolver():
+    """异步自动压缩使用 runtime 解析出的摘要模型。"""
+    static_model = FakeModel(response="静态摘要")
+    session_model = FakeModel(response="会话摘要")
+    mw = LCAgentCompactionMiddleware(
+        static_model,
+        CompactionConfig(max_messages=5, keep_recent=2),
+        model_resolver=lambda _: session_model,
+    )
+
+    async def run():
+        return await mw.abefore_model({"messages": _build_messages(8), "summary": ""}, None)
+
+    result = asyncio.run(run())
+
+    assert result is not None
+    assert result["summary"] == "会话摘要"
+    assert len(session_model.ainvoke_calls) == 1
+    assert not static_model.ainvoke_calls
+
+
+def test_dynamic_summary_model_failure_falls_back_to_static_model():
+    """runtime 模型解析失败时继续使用构建期模型。"""
+    static_model = FakeModel(response="静态摘要")
+    mw = LCAgentCompactionMiddleware(
+        static_model,
+        CompactionConfig(max_messages=5, keep_recent=2),
+        model_resolver=lambda _: (_ for _ in ()).throw(ValueError("bad")),
+    )
+
+    result = mw.before_model({"messages": _build_messages(8), "summary": ""}, None)
+
+    assert result is not None
+    assert result["summary"] == "静态摘要"
+    assert len(static_model.invoke_calls) == 1
+
+
 def test_compaction_summary_failure_returns_none():
     """LLM 调用失败时不压缩，保留原消息"""
     model = FakeModel(fail=True)

@@ -42,7 +42,7 @@ class TurnRunners:
         tid = self._current_sid(thread_id)
         with TraceContext(trace_id=generate_trace_id(), thread_id=tid):
             logger.info("arun_structured: %s", task[:100])
-            config = self._invoke_config(thread_id)
+            config = await self._ainvoke_config(thread_id)
             input_msg = HumanMessage(content=task)
 
             try:
@@ -71,7 +71,7 @@ class TurnRunners:
         tid = self._current_sid(thread_id)
         with TraceContext(trace_id=generate_trace_id(), thread_id=tid):
             logger.info("achat_structured: %s", message[:100])
-            config = self._invoke_config(thread_id)
+            config = await self._ainvoke_config(thread_id)
 
             with self._temp_verbose(False):
                 try:
@@ -99,7 +99,7 @@ class TurnRunners:
             payload: 恢复数据
             thread_id: 目标会话线程 ID（为 None 时使用当前会话）
         """
-        config = self._invoke_config(thread_id)
+        config = await self._ainvoke_config(thread_id)
         tid = thread_id or self._thread_id_from_config(config)
 
         # 从 SessionStore 读取 per-session 中断模式

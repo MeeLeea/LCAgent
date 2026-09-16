@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 from session import SessionManager, SessionRegistry, SessionStore
+from session.config import SessionConfig
 
 logger = None  # 占位，实际 logger 由 agent_core 模块提供
 
@@ -29,13 +30,25 @@ class SessionMgmt:
         消息读取 + 瞬态状态隔离。
         checkpointer / store / async_conn 由入口程序 / MemoryContext 注入。
         """
+        provider = getattr(getattr(self, "llm", None), "provider", None)
+        model = getattr(getattr(self, "llm", None), "model", None)
+        max_iterations = getattr(self, "max_iterations", None)
+        default_session_config = None
+        if isinstance(provider, str) and provider and isinstance(max_iterations, int):
+            default_session_config = SessionConfig(
+                provider=provider,
+                model=model if isinstance(model, str) else None,
+                max_iterations=max_iterations,
+            )
+
         self._session_registry = SessionRegistry(
             checkpointer=self._checkpointer,
             store=self._session_store or SessionStore(),
             process_type=self._process_type,
-            recursion_limit=self.max_iterations,
+            recursion_limit=max_iterations if isinstance(max_iterations, int) else 25,
             async_conn=self._async_conn,
             short_term_size=self._short_term_size,
+            default_session_config=default_session_config,
         )
         # 同步当前会话指针
         self._session_registry.current_session_id = self._initial_thread_id or self._session_registry.current_session_id

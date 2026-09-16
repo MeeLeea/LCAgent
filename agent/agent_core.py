@@ -332,6 +332,21 @@ class AgentCore(
             "recursion_limit": getattr(self, "max_iterations", 25),
         }
 
+    async def _ainvoke_config(self, thread_id: str | None = None) -> dict[str, Any]:
+        """构建带会话配置快照的 LangGraph 调用 config。
+
+        每轮只从 SessionRegistry 读取一次 immutable 配置；没有会话配置时严格
+        回退到同步兼容路径，避免影响 object.__new__ 测试实例和旧调用方。
+        """
+        reg = getattr(self, "_session_registry", None)
+        sid = self._current_sid(thread_id)
+        if reg is None:
+            return self._invoke_config(sid)
+        context = await reg.aget_context(sid)
+        if context.session_config is None:
+            return self._invoke_config(sid)
+        return context.config
+
     def _thread_id_from_config(self, config: dict[str, Any]) -> str | None:
         configurable = config.get("configurable")
         if isinstance(configurable, dict):
