@@ -2,7 +2,7 @@
 
 基于 **LangChain 1.x + LangGraph** 框架的智能 Agent 项目，支持：
 
-- 配置驱动的多 LLM 提供商（见 `config/llm_config.json`），运行时可切换提供商/模型
+- 配置驱动的多 LLM 提供商（见 `config/llm_config.json`），每个会话独立保存 provider/model/角色，切换会话自动恢复；并行会话互不干扰
 - 本地工具调用（搜索、文件读写、计算、终端命令、文件打开、技能读取）
 - **MCP Server 工具动态加载**（可扩展任意 MCP 服务）
 - **LangGraph Checkpoint 持久化**（服务器异步运行时使用 `data/checkpoints_async.sqlite`，程序重启可恢复对话）
@@ -11,7 +11,7 @@
 - **长上下文压缩中间件**（增量摘要 + 工具输出 Prune，摘要随 checkpoint 持久化、per-thread 隔离；`before_model` 自动触发或 `compact` 命令手动触发）
 - **MCP 连接池**（per-server 隔离、健康探测、单 server 自动重连，替代全量重载）
 - 多会话隔离（thread_id 机制，方向键菜单切换/删除/导出）
-- **并发多会话**（per-thread 锁 + 独立编译图 + 按线程中断状态，Web 多标签页/多客户端可同时对话互不阻塞，详见「异步 Public API → 并发多会话」）
+- **并发多会话**（共享编译图 + per-thread 锁 + 按线程配置和中断状态，Web 多标签页/多客户端可同时对话互不阻塞，详见「异步 Public API → 并发多会话」）
 - 命令模式下的会话切换会优先保持当前会话，不会因为菜单参数不兼容而失败
 - 安全护栏（危险终端命令拦截/确认、路径保护）
 - **全套异步 Public API**（`arun` / `achat` / `aresume` / `arun_structured` / `achat_structured` 等）
@@ -59,6 +59,8 @@
       - [特点与注意事项](#特点与注意事项)
     - [记忆相关 API](#记忆相关-api)
   - [会话管理（Session）](#会话管理session)
+    - [会话基础配置（provider / model / 角色）](#会话基础配置provider--model--角色)
+    - [会话基础配置的 HTTP API](#会话基础配置的-http-api)
   - [工具系统（Tools）](#工具系统tools)
     - [1. 本地工具（Local Tools）](#1-本地工具local-tools)
     - [2. MCP 工具（MCP Server Tools）](#2-mcp-工具mcp-server-tools)
@@ -247,6 +249,7 @@ LangChainAgent/
 │   ├── config.py            # 运行时配置加载(agent/agent_config.json)
 │   ├── message_utils.py     # LLM 异常信息提取（中文化错误提示）
 │   ├── agent_core.py        # Agent 核心调度主类：构造/生命周期/共享工具方法（多继承聚合入口）
+│   ├── session_config_middleware.py # SessionConfigMW：按会话覆盖模型与 system prompt
 │   ├── session_mgmt.py      # SessionMgmt Mixin：会话/Store/中断状态管理
 │   ├── mcp_tools.py         # McpTools Mixin：MCP 工具加载
 │   ├── graph_builder.py     # GraphBuilder Mixin：executor 构建/重建 + LLM 切换
@@ -275,6 +278,7 @@ LangChainAgent/
 │   ├── logging_config.py    # 结构化日志（trace_id/thread_id 上下文注入）
 │   └── metrics.py           # 运行时指标收集（LLM/工具/压缩统计，线程安全）
 ├── session/                 # 会话管理模块（三层架构 Session 层）
+│   ├── config.py            # SessionConfig / SessionConfigPatch：会话基础配置模型
 │   ├── context.py           # SessionContext：单会话运行时上下文（session_id + config + checkpointer）
 │   ├── store.py             # SessionStore：基于 LangGraph Store 的 per-session 瞬态状态
 │   ├── registry.py          # SessionRegistry：会话生命周期管理（生成/查询/删除/消息读取）
@@ -365,7 +369,8 @@ LangChainAgent/
 | [utils/logging_config.py](utils/logging_config.py)       | 结构化日志：`contextvars` 实现 trace_id / thread_id 异步安全注入                                                                                                                                                                         |
 | [utils/exceptions.py](utils/exceptions.py)               | 统一异常层次：`LCAgentError` 基类及 MCP/超时/压缩/中断/状态等子类                                                                                                                                                                        |
 | [agent/](agent/)                                         | Agent 核心按职责拆分：`agent_core.py`（主类，构造/生命周期/共享工具方法）+ 6 个 Mixin（`session_mgmt`/`mcp_tools`/`graph_builder`/`streaming`/`interrupts`/`turn_runners`）+ `turn_types.py`（`AgentTurnResult`）+ 3 个中间件（`tool_arg_validator_mw`/`tool_error_mw`/`workspace_mw`）+ `role_sw.py`（团队角色切换唯一实现）；技能相关 Mixin/中间件已迁入 `skmng/` 包 |
-| [session/](session/)                                     | 三层架构 Session 层：`SessionContext`（单会话运行时上下文）/ `SessionStore`（per-session 瞬态状态）/ `SessionRegistry`（生命周期管理）/ `WorkspaceStore`（工作空间映射）/ `SessionManager`（对外门面 & 会话调度）                |
+| [agent/session_config_middleware.py](agent/session_config_middleware.py) | `SessionConfigMW` 按请求覆盖会话模型与角色 system prompt，`SessionModelFactory` 对模型配置做有界 LRU 缓存 |
+| [session/](session/)                                     | 三层架构 Session 层：`SessionConfig`（会话基础配置）/ `SessionContext`（单会话运行时上下文）/ `SessionStore`（per-session 瞬态状态）/ `SessionRegistry`（生命周期管理）/ `WorkspaceStore`（工作空间映射）/ `SessionManager`（对外门面 & 会话调度） |
 | [team/](team/)                                           | 多 Agent 团队协作：ManagerAgent（拆解）/ WorkerAgent（执行）/ TerminatorAgent（汇总）+ 工厂函数                                                                                                                                            |
 | [skmng/](skmng/)                                         | 技能管理统一包：`SkillManager`（扫描/匹配/渲染）+ `SkillInjector`（工作流节点注入器）+ `SkillInjectionMW`（agent 层中间件）+ `SkillOps`（Mixin）+ `core.py`（三来源合并核心）+ `protocols.py`（PromptInjector 协议）+ `read_skill` 工具 |
 | [graph/common.py](graph/common.py)                       | 工作流通用能力：`NodeTrackingHandler` 节点级进度回调(含 TOKEN 级流式)、`arun_compiled_workflow` 跨轮次记忆压缩 + `workspace_path` 注入 `config.configurable`（SkillInjector 已迁往 `skmng/injector.py`）                                                                        |
@@ -965,12 +970,13 @@ ThreadMemoryStore.replace_with_summary(thread_id, summary)
 
 ## 会话管理（Session）
 
-会话（Session / Thread）是对话隔离的基本单元，每个会话对应一个 `thread_id`（即 session_id），历史消息、工具调用链、执行历史、挂起中断等状态按会话隔离并持久化。早期会话管理内嵌在 `AgentMemory` 中，现已抽离为独立的 `session/` 模块（三层架构）：`SessionRegistry` 负责生命周期、`SessionStore` 负责瞬态状态、`SessionManager` 作为对外门面。
+会话（Session / Thread）是对话隔离的基本单元，每个会话对应一个 `thread_id`（即 session_id），历史消息、工具调用链、执行历史、挂起中断和基础模型配置等状态按会话隔离并持久化。早期会话管理内嵌在 `AgentMemory` 中，现已抽离为独立的 `session/` 模块（三层架构）：`SessionRegistry` 负责生命周期、`SessionStore` 负责瞬态状态、`SessionManager` 作为对外门面。
 
 ### 架构总览
 
 ```
 session/
+├── config.py            # SessionConfig / SessionConfigPatch：会话基础配置模型
 ├── context.py          # SessionContext：单会话运行时上下文（session_id + config + checkpointer）
 ├── store.py            # SessionStore：基于 LangGraph Store 的 per-session 瞬态状态
 ├── registry.py         # SessionRegistry：会话生命周期管理（生成/查询/删除/消息读取）
@@ -981,12 +987,35 @@ session/
 | 组件                | 职责                                                                                                                |
 | ------------------- | ------------------------------------------------------------------------------------------------------------------- |
 | `SessionContext`  | 单个会话的运行时上下文（session_id + LangGraph config + checkpointer）                                              |
-| `SessionStore`    | 基于 LangGraph Store 的 per-session 瞬态状态：`execution_history`（执行历史）/ `pending_interrupts`（挂起中断） |
+| `SessionStore`    | 基于 LangGraph Store 的 per-session 状态：`execution_history`（执行历史）/ `pending_interrupts`（挂起中断）/ `session_config`（会话配置） |
 | `SessionRegistry` | 会话生命周期管理（生成/查询/删除/消息读取），桥接 checkpointer 与 Store                                             |
 | `WorkspaceStore`  | `session_id ↔ workspace_path` 映射（多会话工作目录隔离）                                                         |
-| `SessionManager`  | 对外门面 & 会话调度（封装 Agent + Memory），承接所有流式/并发/记忆调度                                              |
+| `SessionManager`  | 对外门面 & 会话调度（封装 Agent + Memory），承接所有流式/并发/记忆调度，并提供会话配置读写与批量读取 |
 
-> **设计要点**：`AgentCore` 实例只持有不可变配置 + 共享的编译图 / Store / checkpointer，可安全在多会话间复用；所有会话级可变状态通过 `session_id` 显式隔离（`active_skills` 等放入 `LCAgentState` 随 checkpoint per-thread 持久化）。
+> **设计要点**：`AgentCore` 实例只持有不可变配置 + 一个共享编译图 / Store / checkpointer，可安全在多会话间复用；所有会话级可变状态通过 `session_id` 显式隔离。会话基础配置的唯一事实源是 LangGraph Store，不是 checkpoint；checkpoint 只保留用于诊断的只读配置快照。
+
+### 会话基础配置（provider / model / 角色）
+
+每个 `thread_id` 拥有一份 `SessionConfig`，包括 provider、model、role、采样参数、推理步数上限以及已经解析的 system prompt：
+
+| 字段 | 说明 |
+| ---- | ---- |
+| `provider` | LLM 提供商标识 |
+| `model` | 模型名；为 `null` 时使用该提供商的默认模型 |
+| `role` | 当前团队角色名 |
+| `temperature` | LLM 采样温度 |
+| `max_tokens` | 最大生成 token 数 |
+| `max_iterations` | 单轮最大推理步数，同时决定 LangGraph `recursion_limit` |
+| `version` | 配置版本号 |
+| `system_prompt` | 写入时解析得到的 system prompt 快照 |
+
+配置保存在同一 SQLite 文件中的 LangGraph `Store` namespace `("lcagent", "sessions", <session_id>, "session_config")`，键为 `"current"`。`Store` 是唯一事实源，checkpoint 中的配置只作为诊断用只读快照，不参与配置读取。旧会话首次读取时，会将当时的进程级默认配置懒迁移并持久化，之后不再重新读取默认值，因此默认值改变不会使旧会话漂移。进程级默认配置保存在 `SessionRegistry.default_session_config`，由启动时 Agent 的 `llm.provider`、`llm.model` 和 `max_iterations` 推导，也可通过 `set_default_session_config()` 更新。
+
+会话配置的读写使用现有的 `SessionManager._thread_locks[thread_id]` 串行化，同一会话的配置更新与执行互斥，不同会话无需全局锁即可并行。模型由 `SessionModelFactory` 通过既有 `LLMClient` 构造，并按 `(provider, model, temperature, max_tokens)` 使用有界 LRU 缓存，默认上限为 16 个不同模型配置，而不是为每个会话复制模型对象。
+
+配置优先级为：显式请求字段 > 角色目录 `team/<role>/agent_config.json` 中的字段 > 保持原值。设置角色时，会在写入时读取该角色的 `agent_config.json` 和 `AGENT.md`，将解析后的 system prompt 保存到 `system_prompt`；之后即使 `AGENT.md` 被修改，已有会话仍使用原快照。每轮开始时捕获一份不可变配置快照，轮中修改只影响下一轮。
+
+`SessionManager` 推荐使用 `aget_session_config()`、`aupdate_session_config()` 和 `aget_session_configs()` 读取、更新及批量读取会话配置。
 
 ### Session ID 生成
 
@@ -1043,6 +1072,27 @@ HTTP API（[api/server.py](api/server.py)）同样暴露三个 RESTful 端点，
 | `POST`   | `/api/threads/{thread_id}/workspace` | `workspace <路径>` | 设置/修改绑定，body`{"path": "..."}`；路径非法返回 400 |
 | `DELETE` | `/api/threads/{thread_id}/workspace` | `workspace:clear`  | 清除绑定，返回`{"cleared": true/false}`                |
 
+### 会话基础配置的 HTTP API
+
+会话基础配置（provider / model / 角色）也可通过 RESTful 端点读写，供 Web 前端在切换会话时恢复该会话的配置：
+
+| 方法       | 路径                                   | 对应 CLI                            | 说明                                                                                                                                       |
+| ---------- | -------------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `PATCH`  | `/api/sessions/{thread_id}/config`   | `switch:` / `model:` / `role:`  | 更新该会话的配置，body 为 `{provider?, model?, role?, temperature?, max_tokens?, max_iterations?, system_prompt?}`（省略或 `null` 表示不修改）；返回 `{"thread_id", "session_config"}`；provider/role/model 非法或 temperature 越界返回 **400** |
+| `GET`    | `/api/providers?thread_id=<id>`      | `switch` / `model`                | 返回 `providers` / `available` / `current_provider` / `current_provider_name` / `current_model` / `session_config` / `defaults`。`current_*` 为**该会话**生效值；无会话配置时回退共享 LLM  |
+| `GET`    | `/api/threads`                       | `thread`                          | 每个会话条目附带 `session_config`，由一次批量 `aget_session_configs()` 读取（非逐会话查询）                                              |
+| `GET`    | `/api/roles?thread_id=<id>`          | `role` / `roles`                  | 返回可用角色列表与 `current`（该会话的角色）                                                                                              |
+
+兼容端点（保留原路径与请求体，新增可选 `thread_id`）：
+
+| 方法       | 路径                          | 说明                                                                                                                                                     |
+| ---------- | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST`   | `/api/providers/switch`     | 带 `thread_id` → `{"scope": "session", ...}`，只改该会话；不带 → `{"scope": "default", "deprecated": true, ...}`，只改进程默认值（仅影响新会话） |
+| `POST`   | `/api/models/switch`        | 同上                                                                                                                                                     |
+| `POST`   | `/api/roles/switch`         | 同上；`task` 字段仍接受以兼容旧客户端，但不再在此端点触发任务执行                                                                                        |
+
+> ⚠️ 这些端点**不再**调用 `agent.aswitch_llm()` 或 `arebuild_agent_from_team_dir()`，也**不会**把一个会话的改动广播到其他会话。新代码请使用 `PATCH /api/sessions/{thread_id}/config`。
+
 ### SessionManager 门面
 
 `AgentCore.session_manager`（懒初始化）是上层流量的统一入口，封装 Agent + Memory：
@@ -1051,6 +1101,7 @@ HTTP API（[api/server.py](api/server.py)）同样暴露三个 RESTful 端点，
   - **`tool_call` / `tool_result` id 一致性**：LangChain 的 `on_tool_start` / `on_tool_end` 事件 data 不含 `tool_call_id`，`agent_core._arun_graph_events` 借助 `on_chat_model_end` 的 `AIMessage.tool_calls` 与事件 `run_id` 建立桥接，保证两个事件的 `id` 一致（兜底回退到事件 `name`），前端按 `id` 关联工具卡片与其结果
 - **非流式接口**：`achat` / `aresume` / `arun`，收集全部 token 为最终文本
 - **会话管理委托**：`new_session` / `new_workflow_session` / `set_current_session` / `current_session_id` / `alist_sessions` / `aswitch_session` / `adelete_session` / `aget_messages` / `aexport_session` / `asummarize`
+- **会话基础配置**：`aget_session_config(thread_id)` / `aupdate_session_config(patch, thread_id)`（均在 per-thread 锁内执行，转发 `SessionRegistry`；后者在会话尚无配置时先懒迁移再更新）
 - **记忆管理委托**：`aget_memory_summary` / `acompress_memory` / `aclear_long_term_memory` / `aclear_agent_memory` / `arecall_agent_memory`
 - **执行历史**：`aget_execution_history` / `aclear_history`
 - **上下文压缩**：`manually_compact(force, thread_id)`
@@ -1630,6 +1681,7 @@ create_tool(
 关键设计：
 
 - 摘要存入 LangGraph `state.summary` 字段，随 **checkpoint 自动持久化**，天然实现 **per-thread 隔离**（每个 thread 拥有独立 summary），彻底消除跨会话污染。
+- **摘要模型按会话动态解析**：中间件除静态 `model=` 外还接受 `model_resolver`，每次压缩从 runtime context 解析当前会话的模型（解析失败回退静态模型）。这修复了「主模型已按会话切换、摘要却仍用启动时 provider」的静默缺陷。手动路径 `arun_compaction()` 亦可显式传入 `model`。
 - **安全切割**：不会拆开 `AIMessage(tool_calls)` + `ToolMessage` 配对（切割点落在 `ToolMessage` 上时向前回退到对应的 `AIMessage`）。
 - 压缩后用 `RemoveMessage(REMOVE_ALL_MESSAGES)` 先清空 checkpoint 旧消息，再写入 `SystemMessage(摘要) + Pruned 近期消息`，旧消息彻底移除不再占用存储。
 
@@ -1743,8 +1795,8 @@ LCAgentError                    ← 所有 LCAgent 异常的基类（含 detail 
 | `await achat(message)`                                                                              | 普通对话模式，返回最终文本                                                                                                                                                     |
 | `await aresume(payload)`                                                                            | 恢复被`ask_human` 中断的会话（`Command(resume=...)`）                                                                                                                      |
 | `await arun_structured(task, thread_id=None)` / `await achat_structured(message, thread_id=None)` | 返回`AgentTurnResult`（含 HITL 结构化中断信息）；`thread_id` 显式指定目标会话                                                                                              |
-| `await aswitch_llm(llm_client)`                                                                     | 运行时切换 LLM 提供商/模型                                                                                                                                                     |
-| `await role_sw.arebuild_agent_from_team_dir(agent, agent_name, *, task="")` | 按`team/<角色>/` 文件夹名切换主对话 Agent 的角色（读取该目录的 `agent_config.json` + `AGENT.md`，仅提示词变化时不重建 Graph，provider/model 变化时重建 LLM 与 executor） |
+| `await aswitch_llm(llm_client)`                                                                     | **仅 legacy 全局切换**：替换共享 LLM 并重建图，同时刷新进程级默认会话配置；只影响**新会话**，不再用于会话级切换（会话级请用 `PATCH /api/sessions/{thread_id}/config`） |
+| `await role_sw.arebuild_agent_from_team_dir(agent, agent_name, *, task="")` | **仅 legacy 全局路径**：按`team/<角色>/` 文件夹名切换主对话 Agent 的角色（读取该目录的 `agent_config.json` + `AGENT.md`）；会话级角色切换已改为写入会话配置，见「会话管理 → 会话基础配置」 |
 | `await areload_mcp_tools()`                                                                         | 通过 MCP 连接池重载工具并按需重建 Graph                                                                                                                                        |
 | `await manually_compact(force=False, thread_id=None)`                                               | 手动触发上下文压缩，返回状态更新字典或`None`；`thread_id` 指定目标会话                                                                                                     |
 | `await aclose()`                                                                                    | 释放资源（MCP 连接、checkpoint 等）的生命周期收尾                                                                                                                              |
@@ -1756,15 +1808,17 @@ LCAgentError                    ← 所有 LCAgent 异常的基类（含 detail 
 | 层                 | 隔离机制                                                                                                                                                        |
 | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 锁                 | 普通对话 / 恢复 / 压缩走**per-thread 锁**（`api/server.py::_thread_lock`），不同会话互不阻塞、同会话严格排队；管理型命令/会话切换仍走全局 `chat_lock` |
-| 编译图（executor） | `_executor_for(thread_id)` 为每个线程缓存独立 compiled graph + `SystemMessage`（LRU 上限 `_MAX_THREAD_EXECUTORS=50`），技能提示词互不覆盖                 |
+| 编译图（executor） | **全进程共享同一个已编译图**；会话差异不靠克隆图实现，而是在每次 model 调用时由 `SessionConfigMW` 覆盖 model 与 system prompt                     |
+| 会话配置           | 每个 `thread_id` 的 provider/model/角色独立存于 Store（见「会话管理 → 会话基础配置」），读取/写入由该会话的 `_thread_lock` 串行化                |
 | 中断状态           | `_pending_interrupts` 按 thread_id 记录 HITL 挂起中断，恢复/清理只作用于目标线程，杜绝跨会话串线                                                              |
-| config             | `_config_for(thread_id)` 构建含 `configurable.thread_id` 的 LangGraph config，`thread_id=None` 时兼容无参旧调用                                           |
+| config             | `_ainvoke_config(thread_id)` 构建含 `configurable.thread_id`、`configurable.workspace_path` 与 `configurable.session_config` 的 LangGraph config              |
 
 行为要点：
 
 - **同会话串行**：同一 `thread_id` 的请求持有同一把锁，仍严格按到达顺序执行，保证 checkpoint 读写一致。
 - **跨会话并发**：不同 `thread_id` 各自持有独立锁，可同时流式对话，互不阻塞。
-- **缓存淘汰**：超过 `_MAX_THREAD_EXECUTORS` 时淘汰最久未使用的线程图；运行中的流持有旧 executor 对象引用，不受淘汰影响。
+- **配置隔离**：两个会话可同时使用不同 provider/model/角色，互不污染——模型对象、系统提示词、`recursion_limit` 均不经过任何共享属性传递。
+- **轮内快照**：一轮开始处捕获不可变的 `SessionConfig` 快照，轮中修改会话配置只对下一轮生效。
 
 ---
 
@@ -2068,9 +2122,9 @@ output = chat_until_completion(agent, "需要人工选择时请先问我")
 | ------------------------------------------- | ---------------------------------------------------------------------------- |
 | `react:任务`                              | Agent 模式，自动调用工具，打印步骤，存长期记忆                               |
 | `cot:任务`                                | 链式思考模式，纯推理不调用工具                                               |
-| `switch:提供商名`                         | 运行时切换 LLM 提供商（如`switch:deepseek`）                               |
-| `model`                                   | 方向键选择切换当前提供商的模型                                               |
-| `model:<name>`                            | 直接切换模型（如`model:glm-4-flash`）                                      |
+| `switch:提供商名`                         | 切换**当前会话**的 LLM 提供商（如`switch:deepseek`），不改动其他会话        |
+| `model`                                   | 方向键选择切换**当前会话**的模型                                             |
+| `model:<name>`                            | 直接切换**当前会话**的模型（如`model:glm-4-flash`）                        |
 | `help`                                    | 查看完整命令说明                                                             |
 | `info`                                    | 查看当前模型和记忆状态(含 thread_id、会话数)                                 |
 | `tools`                                   | 查看可用工具列表（含 MCP 工具）                                              |
@@ -2094,9 +2148,9 @@ output = chat_until_completion(agent, "需要人工选择时请先问我")
 | `skill:<name>`                            | 将某技能加载进当前会话(注入 system prompt)                                   |
 | `skill:<name> <任务>`                     | 加载技能并立即以 Agent 模式执行该任务(如`skill:git-commit 提交README`)     |
 | `skill:clear`                             | 清空手动加载的技能                                                           |
-| `role` 或 `roles`                       | 方向键选择切换团队角色(扫描`team/` 下的可用角色)                           |
-| `role:<name>`                             | 直接切换到指定团队角色(如`role:manager`)                                   |
-| `role:<name> <任务>`                      | 切换角色并立即以 Agent 模式执行该任务                                        |
+| `role` 或 `roles`                       | 方向键选择切换**当前会话**的团队角色(扫描`team/` 下的可用角色)             |
+| `role:<name>`                             | 直接切换**当前会话**的团队角色(如`role:manager`)                           |
+| `role:<name> <任务>`                      | 切换当前会话角色并立即以 Agent 模式执行该任务                                |
 | `safety`                                  | 查看当前安全策略                                                             |
 | `safety:mode <blacklist\|whitelist>`       | 切换安全模式                                                                 |
 | `safety:confirm <on\|off>`                 | 开关危险命令确认                                                             |
@@ -2684,6 +2738,16 @@ async def main() -> None:
     print(await agent.session.alist_sessions())            # 列出所有会话
     print(await agent.session.aexport_session(fmt="markdown"))  # 导出当前会话为 Markdown 文本
 
+    # 会话基础配置（provider / model / 角色，按会话隔离；旧会话首次读取会自动懒迁移并持久化）
+    from session import SessionConfigPatch
+    tid = agent.session.current_session_id
+    cfg = await agent.session_manager.aget_session_config(tid)     # 读取当前会话配置
+    await agent.session_manager.aupdate_session_config(
+        SessionConfigPatch(provider="yunwu", model="qwen3.7-max", role="architect"),
+        thread_id=tid,
+    )                                                              # 只改这个会话，不影响其他会话
+    configs = await agent.session.aget_session_configs([tid])       # 批量读取（列表页用，避免 N+1）
+
     # 记忆管理（经 SessionManager 委托 MemoryManager）
     await agent.session_manager.aclear_long_term_memory()   # 清空当前线程长期记忆
     print(await agent.session.asummarize())    # 查看会话统计(含 session_id、消息数)
@@ -2711,6 +2775,8 @@ asyncio.run(main())
 ## 运行时配置
 
 项目所有外置配置均位于 `config/` 目录下，每个配置文件有对应的 `.example` 模板（不含真实密钥），适合纳入版本控制。
+
+> **会话级覆盖**：`agent/agent_config.json` 中的 `provider` / `model` 及 `agent_config.json` 的采样参数，现在只是**新会话的进程级默认值**。已有会话保留各自在 Store 中的 `session_config`（见「会话管理 → 会话基础配置」），不会被默认值改动影响。
 
 ### 1. `agent_config.json` — Agent 运行时参数
 
@@ -2935,6 +3001,10 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 
 | 测试文件                                 | 覆盖内容                                                                                |
 | ---------------------------------------- | --------------------------------------------------------------------------------------- |
+| `tests/session/test_session_config.py` | 会话基础配置：SessionConfig 序列化/patch、Store 读写、双会话隔离、旧会话懒迁移并持久化、批量读取含缺失、删除连带清理 |
+| `tests/agent/test_session_config_middleware.py` | 中间件与模型工厂：按会话切换模型、无配置时透传（legacy）、角色提示词覆盖、不污染共享 Agent、缓存命中与有界淘汰、解析失败回退 |
+| `tests/agent/test_session_config_wiring.py` | 接线回归：SessionConfigMW 位于中间件首位、compaction 同时持有 resolver 与静态模型、进程默认配置推导、异步 config 注入会话配置、双会话产出不同配置、legacy 全局切换只刷新默认值 |
+| `tests/api/test_session_config_api.py` | 会话配置 API：PATCH 契约与 400 校验、会话隔离、角色提示词持久化、新会话自动播种、`GET /api/providers` 会话级返回值、threads 批量读取、legacy 端点的 scope/deprecated 语义且不触碰共享 LLM |
 | `tests/config/test_config.py`          | 运行时配置：默认值合并、路径解析                                                        |
 | `tests/config/test_config_templates.py` | 配置模板验证：.example 文件完整性检查                                                    |
 | `tests/tools/test_safety.py`           | 安全护栏：黑名单拒绝、白名单放行、危险命令确认、路径保护                                |
