@@ -127,10 +127,6 @@ async def arebuild_agent_from_team_dir(
     # 3. 判断是否需要切换 LLM(provider/model 变化)
     #    目标 provider：角色显式配置优先，否则沿用当前 LLM 的 provider。
     target_provider = (config.get("provider") or agent.llm.provider).lower()
-    #    目标 model：角色显式配置优先；未配置时回退到「目标 provider」在
-    #    llm_config.json 中声明的默认 model，而非沿用当前 LLM 的 model。
-    #    否则从 yunwu(qwen3.7-max) 切到 zhipu(model=null) 时，会把旧 provider 的
-    #    model 误带到新 provider，触发网关 400「modelCode：不存在」。
     configured_model = config.get("model")
     if configured_model:
         target_model = configured_model

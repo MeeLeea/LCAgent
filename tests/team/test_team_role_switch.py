@@ -192,12 +192,12 @@ def test_rebuild_uses_target_provider_default_model_when_role_model_null(monkeyp
     """角色 model 为 null 且 provider 与当前不同时，回退到目标 provider 的默认 model。
 
     回归测试：修复前 target_model = config.get("model") or agent.llm.model，
-    会从 yunwu(qwen3.7-max) 切到 zhipu(model=null) 时把旧 provider 的 model 误带过去，
+    会从 yunlan(qwen3.8-max) 切到 zhipu(model=null) 时把旧 provider 的 model 误带过去，
     触发网关 400「modelCode：不存在」。
 
-    Given: 当前 LLM 为 yunwu / qwen3.7-max，切到 worker(zhipu, model=null)
+    Given: 当前 LLM 为 yunlan / qwen3.8-max，切到 worker(zhipu, model=null)
     Then: 重建的 LLMClient 的 model 应为 zhipu 在 llm_config.json 的默认模型(glm-4.7-flash)，
-          而非沿用当前的 qwen3.7-max。
+          而非沿用当前的 qwen3.8-max。
     """
     from llm.llm_client import load_providers
 
@@ -205,8 +205,8 @@ def test_rebuild_uses_target_provider_default_model_when_role_model_null(monkeyp
     zhipu_default = load_providers("config/llm_config.json")["zhipu"]["model"]
     assert zhipu_default, "llm_config.json 中 zhipu 应声明默认 model"
 
-    # Given: 当前处于 yunwu / qwen3.7-max
-    core = _make_minimal_core(FakeLLM(provider="yunwu", model="qwen3.7-max"))
+    # Given: 当前处于 yunlan / qwen3.8-max
+    core = _make_minimal_core(FakeLLM(provider="yunlan", model="qwen3.8-max"))
     constructed = {}
 
     async def noop_rebuild(task=""):

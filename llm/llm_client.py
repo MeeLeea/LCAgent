@@ -138,7 +138,7 @@ def _make_retryer() -> Retrying:
         reraise=True,
     )
 
-
+#PATCH:yunwu网关的缺陷规避: 还原 max_tokens 参数(见 CloudmistChatOpenAI 类文档)
 class CloudmistChatOpenAI(ChatOpenAI):
     """云雾网关专用 ChatOpenAI 子类，规避其 max_completion_tokens 缺陷。
 
@@ -271,7 +271,7 @@ class LLMClient:
         base_url = self.provider_config.get("base_url")
         if base_url:  # base_url 可选:仅当配置中提供时才传入
             kwargs["base_url"] = base_url
-        if self.provider == "yunwu":
+        if self.provider == "yunlan" or self.provider == "yunlan-gpt":
             # 云雾网关缺陷规避: 还原 max_tokens 参数(见 CloudmistChatOpenAI 类文档)
             kwargs.pop("model_provider")
             return CloudmistChatOpenAI(**kwargs)

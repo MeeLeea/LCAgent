@@ -16,6 +16,6 @@
     "max_tokens": 4096,
     "latest_msg_cnt": 10,
     
-    "provider": "yunwu",
-    "model": "qwen3.7-max"
+    "provider": "yunlan",
+    "model": "deepseek-v4.1-flash"
 }
