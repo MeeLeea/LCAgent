@@ -5,6 +5,7 @@ import type {
   ChatMessage,
   InterruptInfo,
   Provider,
+  SessionConfig,
   RawMessage,
   StreamEvent,
   ThreadSummary,
@@ -79,6 +80,7 @@ interface AppState {
   currentThreadId: string | null
   messages: ChatMessage[]
   providers: Provider[]
+  sessionConfigs: Record<string, SessionConfig>
   currentProvider: string | null
   currentModel: string | null
   tools: string[]
@@ -118,7 +120,7 @@ interface AppState {
   // 初始化与元数据
   init: () => Promise<void>
   fetchThreads: () => Promise<void>
-  refreshProviders: () => Promise<void>
+  refreshProviders: (threadId?: string | null) => Promise<void>
 
   // 会话操作
   selectThread: (id: string) => Promise<void>
@@ -162,6 +164,14 @@ type StoreGet = () => AppState
 /** 统一线程 key：null（尚无会话，等待后端 thread_created）归一化为 '' */
 function normKey(threadId: string | null): string {
   return threadId ?? ''
+}
+
+function sessionSelectorPatch(config: SessionConfig | null): Pick<AppState, 'currentProvider' | 'currentModel' | 'currentRole'> {
+  return {
+    currentProvider: config?.provider ?? null,
+    currentModel: config?.model ?? null,
+    currentRole: config?.role ?? null,
+  }
 }
 
 // per-thread 流式基础设施：abort / 终止标记 / 看门狗 均按线程隔离
@@ -571,6 +581,7 @@ export const useStore = create<AppState>((set, get) => ({
   currentThreadId: null,
   messages: [],
   providers: [],
+  sessionConfigs: {},
   currentProvider: null,
   currentModel: null,
   tools: [],
@@ -652,13 +663,26 @@ export const useStore = create<AppState>((set, get) => ({
     void get().fetchRoles()
   },
 
-  refreshProviders: async () => {
+  refreshProviders: async (threadId) => {
     try {
-      const info = await api.getProviders()
-      set({
-        providers: info.providers,
-        currentProvider: info.current_provider,
-        currentModel: info.current_model,
+      const targetId = threadId ?? get().currentThreadId
+      const info = await api.getProviders(targetId)
+      set((s) => {
+        const currentThreadId = s.currentThreadId
+        const sessionConfigs = { ...s.sessionConfigs }
+        if (targetId && info.session_config) sessionConfigs[targetId] = info.session_config
+        const config = currentThreadId ? sessionConfigs[currentThreadId] : undefined
+        return {
+          providers: info.providers,
+          sessionConfigs,
+          ...(currentThreadId
+            ? sessionSelectorPatch(config ?? null)
+            : {
+                currentProvider: info.current_provider,
+                currentModel: info.current_model,
+                currentRole: null,
+              }),
+        }
       })
     } catch {
       /* ignore */
@@ -668,7 +692,24 @@ export const useStore = create<AppState>((set, get) => ({
   fetchThreads: async () => {
     try {
       const r = await api.listThreads()
-      set({ threads: r.threads })
+      set((s) => ({
+        threads: r.threads,
+        sessionConfigs: r.threads.reduce<Record<string, SessionConfig>>(
+          (configs, thread) => {
+            if (thread.session_config) configs[thread.thread_id] = thread.session_config
+            else delete configs[thread.thread_id]
+            return configs
+          },
+          { ...s.sessionConfigs },
+        ),
+        ...(s.currentThreadId
+          ? sessionSelectorPatch(
+              r.threads.find((thread) => thread.thread_id === s.currentThreadId)?.session_config
+                ?? s.sessionConfigs[s.currentThreadId]
+                ?? null,
+            )
+          : {}),
+      }))
       // 没有选中会话时，自动选当前模式的第一个会话（无匹配则退回首个）
       if (!get().currentThreadId && r.threads.length) {
         const wantWorkflow = get().viewMode === 'workflow'
@@ -699,6 +740,25 @@ export const useStore = create<AppState>((set, get) => ({
       return
     }
     set({ messages: [] })
+    const cachedConfig = get().sessionConfigs[id]
+    if (cachedConfig) {
+      set(sessionSelectorPatch(cachedConfig))
+    } else {
+      try {
+        const info = await api.getProviders(id)
+        if (get().currentThreadId === id) {
+          set((s) => ({
+            providers: info.providers,
+            sessionConfigs: info.session_config
+              ? { ...s.sessionConfigs, [id]: info.session_config }
+              : s.sessionConfigs,
+            ...sessionSelectorPatch(info.session_config),
+          }))
+        }
+      } catch {
+        if (get().currentThreadId === id) set(sessionSelectorPatch(null))
+      }
+    }
     try {
       const r = await api.getMessages(id)
       if (get().currentThreadId === id) {
@@ -722,6 +782,7 @@ export const useStore = create<AppState>((set, get) => ({
         workspace: null,
         messagesByThread: { ...s.messagesByThread, [r.thread_id]: [] },
       }))
+      await get().refreshProviders(r.thread_id)
       await get().fetchThreads()
     } catch (e) {
       console.error(e)
@@ -738,6 +799,7 @@ export const useStore = create<AppState>((set, get) => ({
         workspace: null,
         messagesByThread: { ...s.messagesByThread, [r.thread_id]: [] },
       }))
+      await get().refreshProviders(r.thread_id)
       await get().fetchThreads()
     } catch (e) {
       console.error(e)
@@ -760,10 +822,13 @@ export const useStore = create<AppState>((set, get) => ({
         delete streamingThreads[id]
         const pendingInterrupts = { ...s.pendingInterrupts }
         delete pendingInterrupts[id]
+        const sessionConfigs = { ...s.sessionConfigs }
+        delete sessionConfigs[id]
         const patch: Partial<AppState> = {
           messagesByThread,
           streamingThreads,
           pendingInterrupts,
+          sessionConfigs,
         }
         if (s.currentThreadId === id) {
           patch.currentThreadId = null
@@ -985,9 +1050,15 @@ export const useStore = create<AppState>((set, get) => ({
 
   switchProvider: async (key) => {
     console.log('[前端] 切换提供商:', key)
+    const threadId = get().currentThreadId
+    if (!threadId) return
     try {
-      await api.switchProvider(key)
-      await get().refreshProviders()
+      const r = await api.updateSessionConfig(threadId, { provider: key })
+      // 后端负责在切换提供商后选择默认模型，不能用 null 清空模型，因为 null 表示不变更。
+      set((s) => ({
+        sessionConfigs: { ...s.sessionConfigs, [threadId]: r.session_config },
+        ...sessionSelectorPatch(r.session_config),
+      }))
       console.log('[前端] 提供商切换完成')
     } catch (e) {
       console.error('[前端] 切换提供商失败:', e)
@@ -996,9 +1067,14 @@ export const useStore = create<AppState>((set, get) => ({
 
   switchModel: async (model) => {
     console.log('[前端] 切换模型:', model)
+    const threadId = get().currentThreadId
+    if (!threadId) return
     try {
-      await api.switchModel(model)
-      await get().refreshProviders()
+      const r = await api.updateSessionConfig(threadId, { model })
+      set((s) => ({
+        sessionConfigs: { ...s.sessionConfigs, [threadId]: r.session_config },
+        ...sessionSelectorPatch(r.session_config),
+      }))
       console.log('[前端] 模型切换完成')
     } catch (e) {
       console.error('[前端] 切换模型失败:', e)
@@ -1008,7 +1084,10 @@ export const useStore = create<AppState>((set, get) => ({
   fetchRoles: async () => {
     try {
       const r = await api.getRoles()
-      set({ roles: r.roles, currentRole: r.current })
+      const config = get().currentThreadId
+        ? get().sessionConfigs[get().currentThreadId ?? '']
+        : undefined
+      set({ roles: r.roles, currentRole: config ? config.role : r.current })
     } catch {
       /* ignore */
     }
@@ -1016,9 +1095,14 @@ export const useStore = create<AppState>((set, get) => ({
 
   switchRole: async (role) => {
     console.log('[前端] 切换角色:', role)
+    const threadId = get().currentThreadId
+    if (!threadId) return
     try {
-      await api.switchRole(role)
-      await get().fetchRoles()
+      const r = await api.updateSessionConfig(threadId, { role })
+      set((s) => ({
+        sessionConfigs: { ...s.sessionConfigs, [threadId]: r.session_config },
+        ...sessionSelectorPatch(r.session_config),
+      }))
       console.log('[前端] 角色切换完成')
     } catch (e) {
       console.error('[前端] 切换角色失败:', e)

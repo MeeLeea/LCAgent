@@ -8,11 +8,34 @@ export interface Provider {
   has_key: boolean
 }
 
+export interface SessionConfig {
+  provider: string
+  model: string | null
+  role: string | null
+  temperature: number | null
+  max_tokens: number | null
+  max_iterations: number
+  version: number
+}
+
+export interface SessionConfigPatch {
+  provider?: string | null
+  model?: string | null
+  role?: string | null
+  temperature?: number | null
+  max_tokens?: number | null
+  max_iterations?: number | null
+  system_prompt?: string | null
+}
+
 export interface ProvidersInfo {
   providers: Provider[]
+  available: Provider[]
   current_provider: string | null
   current_provider_name: string | null
   current_model: string | null
+  session_config: SessionConfig | null
+  defaults: SessionConfig | null
 }
 
 export interface ThreadSummary {
@@ -23,6 +46,12 @@ export interface ThreadSummary {
   type?: 'chat' | 'workflow'
   /** 工作流会话绑定的工作流名称（仅 type=workflow 时存在） */
   workflow_name?: string
+  session_config: SessionConfig | null
+}
+
+export interface SessionConfigResponse {
+  thread_id: string
+  session_config: SessionConfig
 }
 
 export interface WorkflowNode {

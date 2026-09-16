@@ -1,5 +1,5 @@
 // API 客户端：REST 请求 + SSE 流式解析
-import type { ProvidersInfo, ThreadSummary, RawMessage, StreamEvent, WorkflowInfo, MetricsSummary, CompactResult, MemorySummary, CompressResult, SafetyConfig, SkillInfo, ExportResult, WorkspaceInfo, BrowseResult } from './types'
+import type { ProvidersInfo, ThreadSummary, RawMessage, StreamEvent, WorkflowInfo, MetricsSummary, CompactResult, MemorySummary, CompressResult, SafetyConfig, SkillInfo, ExportResult, WorkspaceInfo, BrowseResult, SessionConfigPatch, SessionConfigResponse } from './types'
 
 // Vite 构建期从 config/server_config.json 注入的后端地址（Tauri 模式使用）
 declare const __SERVER_HOST__: string
@@ -132,29 +132,38 @@ function streamRequest(
 export const api = {
   health: () => jsonFetch<{ status: string }>(`${BASE}/health`),
 
-  getProviders: () => jsonFetch<ProvidersInfo>(`${BASE}/providers`),
-  switchProvider: (provider: string) =>
+  getProviders: (threadId?: string | null) =>
+    jsonFetch<ProvidersInfo>(`${BASE}/providers${threadId ? `?thread_id=${encodeURIComponent(threadId)}` : ''}`),
+  updateSessionConfig: (threadId: string, patch: SessionConfigPatch) =>
+    jsonFetch<SessionConfigResponse>(`${BASE}/sessions/${encodeURIComponent(threadId)}/config`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(
+        Object.fromEntries(Object.entries(patch).filter(([, value]) => value !== undefined)),
+      ),
+    }),
+  switchProvider: (provider: string, threadId?: string | null) =>
     jsonFetch(`${BASE}/providers/switch`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ provider }),
+      body: JSON.stringify({ provider, ...(threadId ? { thread_id: threadId } : {}) }),
     }),
-  switchModel: (model: string) =>
+  switchModel: (model: string, threadId?: string | null) =>
     jsonFetch(`${BASE}/models/switch`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model }),
+      body: JSON.stringify({ model, ...(threadId ? { thread_id: threadId } : {}) }),
     }),
 
   getTools: () => jsonFetch<{ tools: string[] }>(`${BASE}/tools`),
 
   // ── 团队角色 ──
   getRoles: () => jsonFetch<{ roles: string[]; current: string | null }>(`${BASE}/roles`),
-  switchRole: (role: string, task?: string) =>
+  switchRole: (role: string, task?: string, threadId?: string | null) =>
     jsonFetch<{ role: string; current: string | null }>(`${BASE}/roles/switch`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ role, task }),
+      body: JSON.stringify({ role, task, ...(threadId ? { thread_id: threadId } : {}) }),
     }),
 
   getWorkflows: () => jsonFetch<{ workflows: string[] }>(`${BASE}/workflows`),
