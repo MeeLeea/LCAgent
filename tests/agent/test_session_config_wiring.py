@@ -151,3 +151,31 @@ def test_aswitch_llm_updates_only_process_default():
     assert asyncio.run(core.session.aget_session_config("existing")) == SessionConfig(
         provider="openai", model="gpt-session", max_iterations=9
     )
+
+
+def test_session_store_uses_injected_durable_backend():
+    """Given 注入的 Store，When 构造 AgentCore，Then SessionStore 复用它（而非内存后端）。
+
+    若这里退化成 InMemoryStore，会话配置重启即丢、跨进程不共享，
+    整个「保存会话配置」的需求会静默失效。
+    """
+    from langgraph.store.memory import InMemoryStore
+
+    from llm.llm_client import LLMClient
+
+    store = InMemoryStore()
+
+    async def run() -> AgentCore:
+        return await AgentCore.acreate(
+            llm_client=LLMClient(provider="zhipu", config_file="config/llm_config.json"),
+            enable_mcp=False,
+            store=store,
+            max_iterations=15,
+        )
+
+    core = asyncio.run(run())
+    assert core._session_store is not None
+    assert core._session_store.backend is store
+    assert core._store is store
+    asyncio.run(core.aclose())
+

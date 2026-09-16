@@ -147,7 +147,7 @@ class AgentCore(
         self._session_manager = None
         self._memory_manager: Any = None
         self._session_store: SessionStore | None = SessionStore(
-            max_history=max_execution_history
+            backend=store, max_history=max_execution_history
         )
 
         # LangGraph 原语（由入口程序 / MemoryContext 注入）

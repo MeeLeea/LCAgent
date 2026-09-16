@@ -124,3 +124,44 @@ def test_session_context_without_config_keeps_legacy_shape():
     assert context.config["recursion_limit"] == 7
     assert "session_config" not in context.config["configurable"]
     assert context.session_config is None
+
+
+def test_session_config_survives_real_sqlite_reopen(tmp_path):
+    """会话配置必须落在持久化后端：重开连接后仍能读到（重启不丢）。
+
+    这条用例锁定「注入真实 Store 后端」这一前提——若 SessionStore 退化为
+    InMemoryStore，重启后配置会静默丢失。
+    """
+    import aiosqlite
+    from langgraph.store.sqlite.aio import AsyncSqliteStore
+
+    db_path = str(tmp_path / "checkpoints.sqlite")
+
+    async def open_store() -> tuple[AsyncSqliteStore, object]:
+        conn = await aiosqlite.connect(db_path)
+        await conn.execute("PRAGMA journal_mode=WAL")
+        await conn.execute("PRAGMA busy_timeout=10000")
+        store = AsyncSqliteStore(conn)
+        await store.setup()
+        await conn.commit()
+        return store, conn
+
+    async def run() -> tuple[SessionConfig, SessionConfig | None]:
+        expected = _config()
+        store1, conn1 = await open_store()
+        try:
+            await SessionStore(backend=store1).aset_session_config("thread-x", expected)
+        finally:
+            await conn1.close()
+
+        # 模拟进程重启：全新连接 + 全新 SessionStore
+        store2, conn2 = await open_store()
+        try:
+            actual = await SessionStore(backend=store2).aget_session_config("thread-x")
+        finally:
+            await conn2.close()
+        return expected, actual
+
+    expected, actual = asyncio.run(run())
+    assert actual == expected
+
