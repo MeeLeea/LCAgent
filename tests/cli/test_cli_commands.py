@@ -10,6 +10,7 @@ import pytest
 
 from cli.commands.dispatcher import dispatch_command
 from cli.commands.types import CommandContext
+from session.config import SessionConfig, SessionConfigPatch
 
 
 @dataclass
@@ -17,6 +18,9 @@ class FakeSessionManager:
     """模拟 SessionManager 的记忆管理接口"""
     calls: list[tuple[str, Any]] = field(default_factory=list)
     _thread_id: str = "thread-1"
+    session_config: SessionConfig = field(
+        default_factory=lambda: SessionConfig(provider="zhipu", model="glm-4")
+    )
 
     async def aget_memory_summary(self) -> dict[str, Any]:
         self.calls.append(("aget_memory_summary", None))
@@ -50,6 +54,17 @@ class FakeSessionManager:
     async def arecall_agent_memory(self, limit: int | None = None) -> str:
         self.calls.append(("arecall_agent_memory", limit))
         return "【长期记忆】\n- [用户事实] 喜欢深色主题\n"
+
+    async def aget_session_config(self, thread_id: str | None = None) -> SessionConfig:
+        self.calls.append(("aget_session_config", thread_id))
+        return self.session_config
+
+    async def aupdate_session_config(
+        self, patch: SessionConfigPatch, thread_id: str | None = None
+    ) -> SessionConfig:
+        self.calls.append(("aupdate_session_config", patch))
+        self.session_config = self.session_config.apply(patch)
+        return self.session_config
 
 
 @dataclass
@@ -213,7 +228,10 @@ def harness(tmp_path: Path) -> Harness:
         input_fn=lambda prompt="": "y",
         select_menu=lambda *args, **kwargs: "deepseek",
         create_llm=create_llm,
-        list_providers=lambda: {"zhipu": {"name": "Zhipu"}, "deepseek": {"name": "DeepSeek"}},
+        list_providers=lambda: {
+            "zhipu": {"name": "Zhipu", "model": "glm-4"},
+            "deepseek": {"name": "DeepSeek", "model": "deepseek-model"},
+        },
         run_structured_until_completion=runners.structured,
         chat_until_completion=runners.chat,
         safety_backend=safety,
@@ -232,7 +250,10 @@ def dispatch(harness: Harness, command: str) -> Any:
         input_fn=lambda prompt="": "y",
         select_menu=lambda *args, **kwargs: "deepseek",
         create_llm=lambda provider: FakeLlm(provider=provider, model=f"{provider}-model"),
-        list_providers=lambda: {"zhipu": {"name": "Zhipu"}, "deepseek": {"name": "DeepSeek"}},
+        list_providers=lambda: {
+            "zhipu": {"name": "Zhipu", "model": "glm-4"},
+            "deepseek": {"name": "DeepSeek", "model": "deepseek-model"},
+        },
         run_structured_until_completion=harness.runners.structured,
         chat_until_completion=harness.runners.chat,
         safety_backend=harness.safety,
@@ -261,25 +282,39 @@ def test_dispatch_handles_info_without_running_agent(harness: Harness) -> None:
 
 
 def test_dispatch_switch_replaces_provider_llm(harness: Harness) -> None:
-    # Given: the context can construct a replacement provider client.
+    # Given: the current session has a persisted configuration.
+    original_llm = harness.agent.llm
     # When: a direct provider switch is dispatched.
     result = dispatch(harness, "switch:deepseek")
-    # Then: the agent receives a new LLM object for that provider.
+    # Then: only the session configuration changes.
     assert result.handled is True
-    switched_llm = harness.agent.calls[-1][1]
-    assert harness.agent.calls[-1][0] == "switch_llm"
-    assert switched_llm.provider == "deepseek"
-    assert switched_llm is not harness.llm
+    assert harness.agent.session_manager.session_config.provider == "deepseek"
+    assert harness.agent.session_manager.session_config.model == "deepseek-model"
+    assert harness.agent.llm is original_llm
+    assert not any(call[0] == "switch_llm" for call in harness.agent.calls)
 
 
 def test_dispatch_model_switch_reuses_same_llm_object(harness: Harness) -> None:
-    # Given: model switching stays within the current provider client.
+    # Given: model switching is scoped to the current session.
+    original_llm = harness.agent.llm
     # When: a direct model switch is dispatched.
     result = dispatch(harness, "model:glm-4-flash")
-    # Then: the existing LLM is mutated and passed back to the agent.
+    # Then: the session model changes and the shared LLM is untouched.
     assert result.handled is True
-    assert ("switch_model", "glm-4-flash") in harness.llm.calls
-    assert harness.agent.calls[-1] == ("switch_llm", harness.llm)
+    assert harness.agent.session_manager.session_config.model == "glm-4-flash"
+    assert harness.agent.llm is original_llm
+    assert harness.llm.model == "glm-4"
+    assert not any(call[0] == "switch_llm" for call in harness.agent.calls)
+
+
+def test_dispatch_invalid_provider_does_not_write_session_config(harness: Harness) -> None:
+    # Given: the requested provider is not in the available provider catalog.
+    # When: an invalid provider switch is dispatched.
+    result = dispatch(harness, "switch:invalid")
+    # Then: the command is handled without changing session configuration.
+    assert result.handled is True
+    assert harness.agent.session_manager.session_config.provider == "zhipu"
+    assert not any(call[0] == "aupdate_session_config" for call in harness.agent.session_manager.calls)
 
 
 def test_dispatch_thread_new_and_clear_mutate_memory(harness: Harness) -> None:

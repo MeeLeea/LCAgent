@@ -51,6 +51,12 @@ from llm.config import load_agent_config, resolve_path
 from llm.llm_client import LLMClient, load_providers
 from llm.message_utils import stringify_content  # 消息内容序列化
 from memory import MemoryContext
+from session.config import (
+    SessionConfig,
+    SessionConfigError,
+    SessionConfigPatch,
+    validate_session_config,
+)
 from tools import safety as safety_module
 
 # --------------------------------------------------------------------------- #
@@ -223,6 +229,9 @@ async def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
     # 动态绑定：记忆组件直接读取 agent 当前 LLM，切换 provider 后自动同步
     # （修复 /api/providers/switch 后记忆抽取仍用启动时旧 LLMClient 的问题）
     memory_ctx.bind_llm(lambda: new_agent.llm)
+    new_agent.session.set_default_session_config(
+        SessionConfig(provider=new_llm.provider, model=new_llm.model, max_iterations=cfg["max_iterations"])
+    )
     return new_agent, new_llm
 
 
@@ -296,7 +305,7 @@ def serialize_messages(messages: list[Any]) -> list[dict[str, Any]]:
     return out
 
 
-async def thread_summary(thread_id: str) -> dict[str, Any]:
+async def thread_summary(thread_id: str, session_config: SessionConfig | None = None) -> dict[str, Any]:
     """单个会话的摘要信息（消息数 + 预览 + 会话类型）。"""
     msgs = await agent.session.aget_messages(session_id=thread_id) if agent else []
     preview = ""
@@ -311,6 +320,7 @@ async def thread_summary(thread_id: str) -> dict[str, Any]:
         "message_count": len(msgs),
         "preview": preview,
         "type": "chat",
+        "session_config": session_config.to_dict() if session_config else None,
     }
     # 专属工作流会话：标注类型并带上绑定的工作流名，前端据此区分展示
     if agent and agent.session.is_workflow_session(thread_id):
@@ -340,10 +350,12 @@ class ResumeRequest(BaseModel):
 
 class SwitchProviderRequest(BaseModel):
     provider: str
+    thread_id: str | None = None
 
 
 class SwitchModelRequest(BaseModel):
     model: str
+    thread_id: str | None = None
 
 
 class CommandRequest(BaseModel):
@@ -358,6 +370,17 @@ class StopRequest(BaseModel):
 class SwitchRoleRequest(BaseModel):
     role: str
     task: str | None = None
+    thread_id: str | None = None
+
+
+class SessionConfigPatchRequest(BaseModel):
+    provider: str | None = None
+    model: str | None = None
+    role: str | None = None
+    system_prompt: str | None = None
+    temperature: float | None = None
+    max_tokens: int | None = None
+    max_iterations: int | None = None
 
 
 class SafetyUpdateRequest(BaseModel):
@@ -394,10 +417,26 @@ async def health():
 
 
 @app.get("/api/providers")
-async def get_providers():
-    """列出全部提供商与模型（脱敏，不含 api_key）。"""
+async def get_providers(thread_id: str | None = None):
+    """列出全部提供商；旧字段现在反映目标会话的有效配置。"""
+    return await _provider_payload(thread_id)
+
+
+async def _provider_payload(thread_id: str | None) -> dict[str, Any]:
     providers = load_providers(LLM_FILE)
-    current = llm.get_info() if llm else {}
+    config = None
+    if agent:
+        getter = getattr(agent.session, "aget_session_config", None)
+        if getter is not None:
+            value = getter(thread_id or agent.session.current_session_id)
+            candidate = await value if hasattr(value, "__await__") else value
+            config = candidate if isinstance(candidate, SessionConfig) else None
+    fallback = llm.get_info() if llm else {}
+    provider_key = config.provider if config else fallback.get("provider")
+    provider_conf = providers.get(provider_key or "", {})
+    current_model = config.model if config and config.model else provider_conf.get("model")
+    if current_model is None:
+        current_model = fallback.get("model")
     items = []
     for key, conf in providers.items():
         items.append({
@@ -409,43 +448,128 @@ async def get_providers():
         })
     return {
         "providers": items,
-        "current_provider": current.get("provider"),
-        "current_provider_name": current.get("provider_name"),
-        "current_model": current.get("model"),
+        "available": items,
+        "current_provider": provider_key,
+        "current_provider_name": provider_conf.get("name", fallback.get("provider_name")),
+        "current_model": current_model,
+        "session_config": config.to_dict() if config else None,
+        "defaults": agent.session.default_session_config.to_dict()
+        if agent and agent.session.default_session_config
+        else None,
     }
+
+
+def _patch_from_request(req: SessionConfigPatchRequest) -> SessionConfigPatch:
+    return SessionConfigPatch(**req.model_dump())
+
+
+async def _resolve_role_patch(
+    patch: SessionConfigPatch,
+    current: SessionConfig,
+) -> SessionConfigPatch:
+    if patch.role is None:
+        return patch
+    from agent.role_sw import _locate_team_agent_dir
+    from llm.config import load_agent_config
+    from team.base import TeamAgent
+
+    try:
+        role_dir = _locate_team_agent_dir(patch.role)
+    except KeyError as error:
+        raise HTTPException(status_code=400, detail=f"角色不存在: {patch.role}") from error
+    config = load_agent_config(os.path.join(role_dir, "agent_config.json"))
+    prompt_path = os.path.join(role_dir, "AGENT.md")
+    content = TeamAgent._read_prompt_file(prompt_path)
+    if content is None:
+        raise HTTPException(status_code=400, detail=f"角色提示词为空或无法读取: {patch.role}")
+    role_prompt, _ = TeamAgent.parse_prompt_sections(content)
+    values: dict[str, Any] = {"role": patch.role, "system_prompt": patch.system_prompt or role_prompt}
+    for field in ("provider", "model", "temperature", "max_tokens", "max_iterations"):
+        explicit = getattr(patch, field)
+        if explicit is not None:
+            values[field] = explicit
+        elif field in config and config[field] is not None:
+            values[field] = config[field]
+    return SessionConfigPatch(**values)
+
+
+async def _ensure_session_config(thread_id: str) -> SessionConfig:
+    value = agent.session.aget_session_config(thread_id)
+    current = await value if hasattr(value, "__await__") else value
+    if isinstance(current, SessionConfig):
+        return current
+    default = agent.session.default_session_config
+    if default is None:
+        fallback = llm.get_info()
+        default = SessionConfig(provider=fallback["provider"], model=fallback.get("model"))
+    await agent.session.aset_session_config(thread_id, default)
+    return default
+
+
+async def _update_session_config(thread_id: str, patch: SessionConfigPatch) -> SessionConfig:
+    """应用一次会话配置更新；非法配置统一转为 HTTP 400。"""
+    current = await _ensure_session_config(thread_id)
+    patch = await _resolve_role_patch(patch, current)
+    providers = load_providers(LLM_FILE)
+    provider = patch.provider or current.provider
+    models = providers.get(provider, {}).get("models", [])
+    # 延迟导入避免与 agent 包形成循环依赖（与本文件其他 role_sw 用法一致）
+    from agent.role_sw import get_available_team_roles
+
+    try:
+        # SessionConfig.apply() 内部会做一次结构校验（如 temperature 越界），
+        # 必须与显式校验同处 try 内，否则会逃逸成 500 而非 400。
+        result = current.apply(patch)
+        validate_session_config(
+            result,
+            providers=providers.keys(),
+            roles=get_available_team_roles(),
+            models=models,
+        )
+    except SessionConfigError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    await agent.session.aset_session_config(thread_id, result)
+    return result
+
+
+@app.patch("/api/sessions/{thread_id}/config")
+async def patch_session_config(thread_id: str, req: SessionConfigPatchRequest):
+    async with _thread_lock(thread_id):
+        config = await _update_session_config(thread_id, _patch_from_request(req))
+    return {"thread_id": thread_id, "session_config": config.to_dict()}
 
 
 @app.post("/api/providers/switch")
 async def switch_provider(req: SwitchProviderRequest):
-    logger.info("切换提供商: %s", req.provider)
-    async with chat_lock:
-        global llm
-        try:
-            # 采样参数由 LLMClient 内部从全局 agent_config.json 读取，无需外部传参
-            new_llm = LLMClient(provider=req.provider, config_file=LLM_FILE)
-        except Exception as e:
-            logger.error("切换失败: %s", e)
-            raise HTTPException(status_code=400, detail=str(e))
-        await agent.aswitch_llm(new_llm)
-        llm = new_llm
-    info = llm.get_info()
-    logger.info("已切换 → %s / %s", info["provider_name"], info["model"])
-    return info
+    providers = load_providers(LLM_FILE)
+    if req.provider not in providers:
+        raise HTTPException(status_code=400, detail=f"未知 provider: {req.provider!r}")
+    if req.thread_id:
+        async with _thread_lock(req.thread_id):
+            conf = await _update_session_config(
+                req.thread_id,
+                SessionConfigPatch(provider=req.provider, model=providers[req.provider].get("model")),
+            )
+        return {"scope": "session", "thread_id": req.thread_id, "session_config": conf.to_dict(), "provider": conf.provider, "model": conf.model}
+    current = agent.session.default_session_config or SessionConfig(provider=req.provider)
+    conf = current.apply(SessionConfigPatch(provider=req.provider, model=providers[req.provider].get("model")))
+    agent.session.set_default_session_config(conf)
+    return {"scope": "default", "thread_id": None, "session_config": conf.to_dict(), "provider": conf.provider, "model": conf.model, "deprecated": True, "message": "未指定 thread_id，已更新进程默认配置（仅影响新会话）；请改用 PATCH /api/sessions/{thread_id}/config"}
 
 
 @app.post("/api/models/switch")
 async def switch_model(req: SwitchModelRequest):
-    logger.info("切换模型: %s", req.model)
-    async with chat_lock:
-        try:
-            llm.switch_model(req.model)
-            await agent.aswitch_llm(llm)
-        except Exception as e:
-            logger.error("切换失败: %s", e)
-            raise HTTPException(status_code=400, detail=str(e))
-    info = llm.get_info()
-    logger.info("已切换 → %s / %s", info["provider_name"], info["model"])
-    return info
+    if req.thread_id:
+        async with _thread_lock(req.thread_id):
+            conf = await _update_session_config(req.thread_id, SessionConfigPatch(model=req.model))
+        return {"scope": "session", "thread_id": req.thread_id, "session_config": conf.to_dict(), "provider": conf.provider, "model": conf.model}
+    current = agent.session.default_session_config or SessionConfig(provider=llm.provider)
+    providers = load_providers(LLM_FILE)
+    if req.model not in providers.get(current.provider, {}).get("models", []):
+        raise HTTPException(status_code=400, detail=f"未知模型: {req.model!r}")
+    conf = current.apply(SessionConfigPatch(model=req.model))
+    agent.session.set_default_session_config(conf)
+    return {"scope": "default", "thread_id": None, "session_config": conf.to_dict(), "provider": conf.provider, "model": conf.model, "deprecated": True, "message": "未指定 thread_id，已更新进程默认配置（仅影响新会话）；请改用 PATCH /api/sessions/{thread_id}/config"}
 
 
 @app.get("/api/tools")
@@ -454,46 +578,35 @@ async def get_tools():
 
 
 @app.get("/api/roles")
-async def get_roles():
+async def get_roles(thread_id: str | None = None):
     """列出 team/ 下的可用团队角色与当前角色名（对应 CLI 的 role 命令）。"""
     from agent.role_sw import get_available_team_roles
 
+    config = None
+    if agent:
+        getter = getattr(agent.session, "aget_session_config", None)
+        if getter is not None:
+            value = getter(thread_id or agent.session.current_session_id)
+            config = await value if hasattr(value, "__await__") else value
     return {
         "roles": get_available_team_roles(),
-        "current": agent.name if agent else None,
+        "current": config.role if config else (agent.name if agent else None),
     }
 
 
 @app.post("/api/roles/switch")
 async def switch_role(req: SwitchRoleRequest):
-    """切换主对话 Agent 的团队角色。
-
-    就地把 AgentCore 重建为 team/<role>/ 定义的角色（提示词/LLM）。
-    可选 task：切换后由角色自动匹配注入相应技能。
-
-    错误映射：未知角色 → 404；角色提示词文件为空 → 400；其他异常 → 500。
-    """
+    """更新会话角色；task 仅为兼容保留，不在此端点执行。"""
     logger.info("切换团队角色: %s", req.role)
-    async with chat_lock:
-        try:
-            # 直接调用 role_sw 模块入口,就地把 AgentCore 切换为目标角色
-            from agent.role_sw import arebuild_agent_from_team_dir
-
-            await arebuild_agent_from_team_dir(agent, req.role, task=req.task or "")
-        except KeyError as e:
-            from agent.role_sw import get_available_team_roles
-
-            available = ", ".join(get_available_team_roles()) or "(无)"
-            logger.warning("角色不存在 [%s]，可用: %s", req.role, available)
-            raise HTTPException(status_code=404, detail=f"{e}")
-        except FileNotFoundError as e:
-            logger.error("角色提示词读取失败 [%s]: %s", req.role, e)
-            raise HTTPException(status_code=400, detail=f"{e}")
-        except (RuntimeError, ValueError) as e:
-            logger.error("切换角色失败 [%s]: %s", req.role, e)
-            raise HTTPException(status_code=500, detail=f"{e}")
-    logger.info("已切换到团队角色: %s", req.role)
-    return {"role": req.role, "current": agent.name if agent else None}
+    if req.thread_id:
+        async with _thread_lock(req.thread_id):
+            config = await _update_session_config(req.thread_id, SessionConfigPatch(role=req.role))
+        return {"scope": "session", "thread_id": req.thread_id, "role": config.role, "current": config.role, "session_config": config.to_dict()}
+    current = agent.session.default_session_config or SessionConfig(provider=llm.provider)
+    config = await _resolve_role_patch(SessionConfigPatch(role=req.role), current)
+    updated = current.apply(config)
+    agent.session.set_default_session_config(updated)
+    return {"scope": "default", "thread_id": None, "role": updated.role, "current": updated.role, "session_config": updated.to_dict(), "deprecated": True, "message": "未指定 thread_id，已更新进程默认配置（仅影响新会话）；请改用 PATCH /api/sessions/{thread_id}/config"}
 
 
 # LangGraph 内部哨兵节点与前端友好标签的映射
@@ -576,7 +689,13 @@ async def list_workflows():
 async def list_threads():
     """列出所有会话（按消息数倒序，便于最近活跃的靠前）。"""
     ids = await agent.session.alist_sessions() if agent else []
-    summaries = [await thread_summary(tid) for tid in ids]
+    configs = {}
+    if agent:
+        getter = getattr(agent.session, "aget_session_configs", None)
+        if getter is not None:
+            value = getter(ids)
+            configs = await value if hasattr(value, "__await__") else value
+    summaries = [await thread_summary(tid, configs.get(tid)) for tid in ids]
     summaries.sort(key=lambda x: x["message_count"], reverse=True)
     return {"threads": summaries, "current": agent.session.current_session_id if agent else None}
 

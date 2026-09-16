@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+from session.config import SessionConfigPatch
+
 from .types import HANDLED, CommandContext, CommandOutcome
 
 
@@ -40,10 +42,11 @@ async def _choose_role(context: CommandContext) -> CommandOutcome:
         context.print("\n当前没有可用团队角色(目录 team/ 为空或缺少 agent_config.json/AGENT.md)")
         return HANDLED
 
+    current_config = await context.agent.session_manager.aget_session_config()
     selected = context.select_menu(
         "选择团队角色",
         [(name, name) for name in roles],
-        current=getattr(context.agent, "name", None),
+        current=current_config.role if current_config else getattr(context.agent, "name", None),
     )
     if selected is None:
         return HANDLED
@@ -51,12 +54,23 @@ async def _choose_role(context: CommandContext) -> CommandOutcome:
 
 
 async def _switch_role(context: CommandContext, role_name: str, task_text: str) -> CommandOutcome:
-    """按角色名重建主 Agent,可选地在切换后立即执行任务。"""
+    """更新当前会话角色，可选地在切换后立即执行任务。"""
     try:
-        # role_sw.arebuild_agent_from_team_dir 为异步入口,就地把 AgentCore 切换为目标角色
-        from agent.role_sw import arebuild_agent_from_team_dir
+        from agent.role_sw import _locate_team_agent_dir
+        from llm.config import load_agent_config
+        from team.base import TeamAgent
 
-        await arebuild_agent_from_team_dir(context.agent, role_name, task=task_text)
+        role_dir = _locate_team_agent_dir(role_name)
+        config = load_agent_config(f"{role_dir}/agent_config.json")
+        content = TeamAgent._read_prompt_file(f"{role_dir}/AGENT.md")
+        if content is None:
+            raise FileNotFoundError(f"角色提示词为空: {role_name}")
+        prompt, _ = TeamAgent.parse_prompt_sections(content)
+        patch_values = {"role": role_name, "system_prompt": prompt}
+        for field in ("provider", "model", "temperature", "max_tokens", "max_iterations"):
+            if field in config:
+                patch_values[field] = config[field]
+        await context.agent.session_manager.aupdate_session_config(SessionConfigPatch(**patch_values))
     except KeyError as error:
         # 角色不存在:补充展示可用角色,便于用户重试
         from agent.role_sw import get_available_team_roles

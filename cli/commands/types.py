@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Protocol, TypeAlias
+from typing import Any, Protocol
 
-JsonScalar: TypeAlias = str | int | float | bool | None
-JsonValue: TypeAlias = JsonScalar | list[JsonScalar]
+from session.config import SessionConfig, SessionConfigPatch
+
+type JsonScalar = str | int | float | bool | None
+type JsonValue = JsonScalar | list[JsonScalar]
 
 
 class LlmLike(Protocol):
@@ -44,6 +46,10 @@ class SessionManagerLike(Protocol):
     async def acompress_memory(self) -> dict[str, JsonValue]: ...
     async def aclear_long_term_memory(self, session_id: str | None = None) -> int: ...
     async def aclose(self) -> None: ...
+    async def aget_session_config(self, thread_id: str | None = None) -> SessionConfig | None: ...
+    async def aupdate_session_config(
+        self, patch: SessionConfigPatch, thread_id: str | None = None
+    ) -> SessionConfig: ...
 
 
 class SessionLike(Protocol):
@@ -124,14 +130,14 @@ class McpBackend(Protocol):
     def toggle_server(self, name: str, enabled: bool, config_file: str) -> bool: ...
 
 
-PrintFn: TypeAlias = Callable[[str], None]
-InputFn: TypeAlias = Callable[[str], str]
-SelectMenuFn: TypeAlias = Callable[..., str | tuple[str, str] | None]
-CreateLlmFn: TypeAlias = Callable[[str], LlmLike]
-ListProvidersFn: TypeAlias = Callable[[], dict[str, dict[str, JsonValue]]]
-RunnerFn: TypeAlias = Callable[[AgentLike, str], Awaitable[str]]
+type PrintFn = Callable[[str], None]
+type InputFn = Callable[[str], str]
+type SelectMenuFn = Callable[..., str | tuple[str, str] | None]
+type CreateLlmFn = Callable[[str], LlmLike]
+type ListProvidersFn = Callable[[], dict[str, dict[str, JsonValue]]]
+type RunnerFn = Callable[[AgentLike, str], Awaitable[str]]
 # 工作流运行跟踪事件回调:接收结构化事件字典(如 {"type": "workflow_node", "node": ..., "status": ...})
-WorkflowEventFn: TypeAlias = Callable[[dict[str, str]], None]
+type WorkflowEventFn = Callable[[dict[str, str]], None]
 
 
 @dataclass(slots=True)

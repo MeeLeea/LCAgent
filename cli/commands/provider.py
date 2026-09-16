@@ -6,6 +6,8 @@ import json
 import os
 import sys
 
+from session.config import SessionConfigPatch
+
 from .types import HANDLED, CommandContext, CommandOutcome, LlmLike
 
 
@@ -42,17 +44,22 @@ async def switch_provider(context: CommandContext, user_input: str) -> CommandOu
     if user_input.lower() == "switch":
         providers = context.list_providers()
         options = [(f"{provider}  ({providers[provider]['name']})", provider) for provider in providers]
-        selected = context.select_menu("选择提供商", options, current=context.agent.llm.provider)
+        current = await context.agent.session_manager.aget_session_config()
+        selected = context.select_menu("选择提供商", options, current=current.provider if current else context.agent.llm.provider)
         if selected is None:
             return HANDLED
         new_provider = str(selected)
     else:
         new_provider = user_input[7:].strip().lower()
     try:
-        new_llm = context.create_llm(new_provider)
-        await context.replace_llm(new_llm)
-        info = context.agent.llm.get_info()
-        context.print(f"\n已切换到: {info['provider_name']} ({info['model']})")
+        providers = context.list_providers()
+        if new_provider not in providers:
+            raise ValueError(f"未知 provider: {new_provider}")
+        default_model = providers[new_provider].get("model")
+        config = await context.agent.session_manager.aupdate_session_config(
+            SessionConfigPatch(provider=new_provider, model=str(default_model) if default_model else None)
+        )
+        context.print(f"\n已切换到: {new_provider} ({config.model})（仅当前会话）")
     except SystemExit:
         return HANDLED
     except (AttributeError, KeyError, RuntimeError, ValueError) as error:
@@ -61,18 +68,22 @@ async def switch_provider(context: CommandContext, user_input: str) -> CommandOu
 
 
 async def choose_model(context: CommandContext) -> CommandOutcome:
-    info = context.agent.llm.get_info()
-    models = context.agent.llm.list_models()
+    config = await context.agent.session_manager.aget_session_config()
+    provider = config.provider if config else context.agent.llm.provider
+    providers = context.list_providers()
+    models = [str(model) for model in providers.get(provider, {}).get("models", [])]
+    provider_name = str(providers.get(provider, {}).get("name", provider))
+    current_model = config.model if config and config.model else str(providers.get(provider, {}).get("model", ""))
     selected = context.select_menu(
-        f"选择模型 [{info['provider_name']}]",
+        f"选择模型 [{provider_name}]",
         [(model, model) for model in models],
-        current=context.agent.llm.model,
+        current=current_model,
     )
     if selected is None:
         return HANDLED
     # 选择当前模型时不重建 Agent，避免无意义地刷新执行器。
-    if selected == context.agent.llm.model:
-        context.print(f"\n模型未变: {context.agent.llm.model}")
+    if selected == current_model:
+        context.print(f"\n模型未变: {current_model}")
         return HANDLED
     return await _switch_model(context, str(selected))
 
@@ -93,10 +104,12 @@ async def switch_model(context: CommandContext, user_input: str) -> CommandOutco
 
 async def _switch_model(context: CommandContext, model: str) -> CommandOutcome:
     try:
-        context.agent.llm.switch_model(model)
-        await context.replace_llm(context.agent.llm)
-        info = context.agent.llm.get_info()
-        context.print(f"\n已切换模型: {info['model']} (提供商: {info['provider_name']})")
+        config = await context.agent.session_manager.aupdate_session_config(
+            SessionConfigPatch(model=model)
+        )
+        providers = context.list_providers()
+        provider_name = str(providers.get(config.provider, {}).get("name", config.provider))
+        context.print(f"\n已切换模型: {config.model} (提供商: {provider_name})（仅当前会话）")
     except (AttributeError, KeyError, RuntimeError, ValueError) as error:
         context.print(f"\n切换失败: {error}")
     return HANDLED
