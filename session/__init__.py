@@ -13,6 +13,12 @@
 - 所有会话级可变状态通过 session_id 显式隔离，消除实例级隐式状态
 - SessionManager 是唯一对外入口，接管所有流式/并发/记忆调度
 """
+from .config import (
+    SessionConfig,
+    SessionConfigError,
+    SessionConfigPatch,
+    validate_session_config,
+)
 from .context import SessionContext
 from .manager import SessionManager
 from .registry import SessionRegistry
@@ -20,9 +26,13 @@ from .store import SessionStore
 from .workspace_store import WorkspaceStore
 
 __all__ = [
+    "SessionConfig",
+    "SessionConfigError",
+    "SessionConfigPatch",
     "SessionContext",
     "SessionManager",
     "SessionRegistry",
     "SessionStore",
     "WorkspaceStore",
+    "validate_session_config",
 ]

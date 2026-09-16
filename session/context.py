@@ -11,6 +11,8 @@ from typing import Any
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
+from .config import SessionConfig, session_config_to_configurable
+
 
 @dataclass(slots=True)
 class SessionContext:
@@ -26,6 +28,7 @@ class SessionContext:
     session_id: str
     config: dict[str, Any]
     checkpointer: BaseCheckpointSaver
+    session_config: SessionConfig | None = None
 
     @classmethod
     def create(
@@ -34,6 +37,7 @@ class SessionContext:
         checkpointer: BaseCheckpointSaver,
         recursion_limit: int = 25,
         workspace_path: str | None = None,
+        session_config: SessionConfig | None = None,
     ) -> SessionContext:
         """构建会话上下文。
 
@@ -54,11 +58,20 @@ class SessionContext:
         configurable: dict[str, Any] = {"thread_id": session_id}
         if workspace_path is not None:
             configurable["workspace_path"] = workspace_path
+        effective_recursion_limit = recursion_limit
+        if session_config is not None:
+            configurable.update(session_config_to_configurable(session_config))
+            effective_recursion_limit = session_config.max_iterations
         config: dict[str, Any] = {
             "configurable": configurable,
-            "recursion_limit": recursion_limit,
+            "recursion_limit": effective_recursion_limit,
         }
-        return cls(session_id=session_id, config=config, checkpointer=checkpointer)
+        return cls(
+            session_id=session_id,
+            config=config,
+            checkpointer=checkpointer,
+            session_config=session_config,
+        )
 
 
 __all__ = ["SessionContext"]

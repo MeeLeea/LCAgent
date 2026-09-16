@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import uuid
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 
@@ -28,6 +29,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from llm.message_utils import stringify_content  # 多模态 content 归一化（与 api/server.py 一致）
 
+from .config import SessionConfig, SessionConfigError, SessionConfigPatch, validate_session_config
 from .context import SessionContext
 from .store import SessionStore
 from .workspace_store import WorkspaceStore
@@ -79,6 +81,8 @@ class SessionRegistry:
         recursion_limit: int = 25,
         async_conn: Any | None = None,
         short_term_size: int = 10,
+        *,
+        default_session_config: SessionConfig | None = None,
     ) -> None:
         self._checkpointer = checkpointer
         self._store = store
@@ -86,6 +90,7 @@ class SessionRegistry:
         self._recursion_limit = recursion_limit
         self._async_conn = async_conn
         self._short_term_size = short_term_size
+        self._default_session_config = default_session_config
         # 工作空间持久存储（复用 async_conn，内存模式降级为纯缓存）
         self._workspace_store = WorkspaceStore(async_conn)
         # CLI 单会话当前指针（并发场景必须传显式 session_id，不依赖此值）
@@ -97,6 +102,15 @@ class SessionRegistry:
     def checkpointer(self) -> BaseCheckpointSaver:
         """共享 checkpointer 实例（供工作流构建器注入持久化）。"""
         return self._checkpointer
+
+    @property
+    def default_session_config(self) -> SessionConfig | None:
+        """返回进程级默认会话配置。"""
+        return self._default_session_config
+
+    def set_default_session_config(self, config: SessionConfig) -> None:
+        """更新进程级默认会话配置。"""
+        self._default_session_config = config
 
     # ============ Session ID 生成 ============
 
@@ -270,6 +284,56 @@ class SessionRegistry:
             recursion_limit=self._recursion_limit,
             workspace_path=workspace_path,
         )
+
+    async def aget_context(self, session_id: str | None = None) -> SessionContext:
+        """异步获取包含会话配置快照的上下文。"""
+        sid = session_id or self.current_session_id
+        workspace_path = await self._workspace_store.aget(sid)
+        config = await self.aget_session_config(sid)
+        return SessionContext.create(
+            session_id=sid,
+            checkpointer=self._checkpointer,
+            recursion_limit=self._recursion_limit,
+            workspace_path=workspace_path,
+            session_config=config,
+        )
+
+    async def aget_session_config(self, session_id: str) -> SessionConfig | None:
+        """读取会话配置，并在需要时执行一次持久化迁移。"""
+        config = await self._store.aget_session_config(session_id)
+        if config is not None or self._default_session_config is None:
+            return config
+        migrated = SessionConfig(
+            provider=self._default_session_config.provider,
+            model=self._default_session_config.model,
+            role=self._default_session_config.role,
+            system_prompt=self._default_session_config.system_prompt,
+            temperature=self._default_session_config.temperature,
+            max_tokens=self._default_session_config.max_tokens,
+            max_iterations=self._default_session_config.max_iterations,
+            version=1,
+        )
+        await self._store.aset_session_config(session_id, migrated)
+        return migrated
+
+    async def aget_session_configs(
+        self, session_ids: Sequence[str]
+    ) -> dict[str, SessionConfig]:
+        """批量读取会话配置。"""
+        return await self._store.aget_session_configs(session_ids)
+
+    async def aset_session_config(self, session_id: str, config: SessionConfig) -> None:
+        """校验并写入会话配置。"""
+        validate_session_config(config)
+        await self._store.aset_session_config(session_id, config)
+
+    async def aupdate_session_config(
+        self, session_id: str, patch: SessionConfigPatch
+    ) -> SessionConfig:
+        """更新会话配置；无配置且无默认值时抛出 SessionConfigError。"""
+        if await self.aget_session_config(session_id) is None:
+            raise SessionConfigError(f"会话 {session_id!r} 尚未有配置")
+        return await self._store.aupdate_session_config(session_id, patch)
 
     async def awarm_workspace(self, session_id: str) -> str | None:
         """从 DB 加载指定 session 的 workspace 到缓存。

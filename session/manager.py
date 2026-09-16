@@ -29,6 +29,7 @@ from typing import Any
 
 from memory.manager import MemoryManager
 
+from .config import SessionConfig, SessionConfigPatch
 from .registry import SessionRegistry
 
 logger = logging.getLogger(__name__)
@@ -299,6 +300,24 @@ class SessionManager:
     async def aswitch_session(self, session_id: str) -> bool:
         """切换到指定会话。"""
         return await self.session.aswitch_session(session_id)
+
+    async def aget_session_config(
+        self, thread_id: str | None = None
+    ) -> SessionConfig | None:
+        """在目标会话锁内读取会话配置。"""
+        tid = self._resolve_thread_id(thread_id)
+        lock = await self._get_thread_lock(tid)
+        async with lock:
+            return await self.session.aget_session_config(tid)
+
+    async def aupdate_session_config(
+        self, patch: SessionConfigPatch, thread_id: str | None = None
+    ) -> SessionConfig:
+        """在目标会话锁内更新会话配置。"""
+        tid = self._resolve_thread_id(thread_id)
+        lock = await self._get_thread_lock(tid)
+        async with lock:
+            return await self.session.aupdate_session_config(tid, patch)
 
     async def adelete_session(self, session_id: str) -> bool:
         """删除会话。

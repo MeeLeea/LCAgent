@@ -1,8 +1,12 @@
 """会话状态存储 - 基于 LangGraph Store 的 per-session 隔离封装。
 
-按 session_id（= thread_id）隔离两类瞬态会话状态：
+按 session_id（= thread_id）隔离三类会话状态：
 - execution_history: 工具调用执行历史（有界队列，仅 CLI 展示用）
 - pending_interrupts: 挂起的中断模式（run/chat，记录是哪种执行被中断）
+- session_config: 每个会话的 provider/model/role 配置
+
+``session_config`` 是 per-session provider/model/role 的唯一事实源；checkpoint
+状态只保存只读快照，不在此处之外持久化配置。
 
 注意：
 - ``active_skills`` 不在此处，而是放入 ``LCAgentState``（随 checkpoint per-thread
@@ -13,11 +17,15 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import Sequence
 from typing import Any
 
 from langgraph.store.base import BaseStore
 from langgraph.store.memory import InMemoryStore
+
+from .config import STORE_KIND, SessionConfig, SessionConfigError, SessionConfigPatch
 
 logger = logging.getLogger(__name__)
 
@@ -144,12 +152,56 @@ class SessionStore:
         """清除挂起中断状态。"""
         await self._safe_delete(_ns(session_id, "interrupts"), "pending")
 
+    # ============ session_config ============
+
+    async def aget_session_config(self, session_id: str) -> SessionConfig | None:
+        """读取会话配置；不存在时返回 None。"""
+        item = await self._store.aget(_ns(session_id, STORE_KIND), key="current")
+        if item is None:
+            return None
+        return SessionConfig.from_dict(item.value)
+
+    async def aset_session_config(self, session_id: str, config: SessionConfig) -> None:
+        """写入会话配置。"""
+        await self._store.aput(
+            _ns(session_id, STORE_KIND), key="current", value=config.to_dict()
+        )
+
+    async def aupdate_session_config(
+        self, session_id: str, patch: SessionConfigPatch
+    ) -> SessionConfig:
+        """应用部分配置更新并持久化。"""
+        existing = await self.aget_session_config(session_id)
+        if existing is None:
+            raise SessionConfigError(f"会话 {session_id!r} 尚未有配置")
+        updated = existing.apply(patch)
+        await self.aset_session_config(session_id, updated)
+        return updated
+
+    async def aget_session_configs(
+        self, session_ids: Sequence[str]
+    ) -> dict[str, SessionConfig]:
+        """批量读取配置，省略不存在的会话。"""
+        configs = await asyncio.gather(
+            *(self.aget_session_config(session_id) for session_id in session_ids)
+        )
+        return {
+            session_id: config
+            for session_id, config in zip(session_ids, configs, strict=True)
+            if config is not None
+        }
+
+    async def adelete_session_config(self, session_id: str) -> None:
+        """幂等删除会话配置。"""
+        await self._safe_delete(_ns(session_id, STORE_KIND), "current")
+
     # ============ 会话级清理 ============
 
     async def adelete_session(self, session_id: str) -> None:
-        """删除指定会话在 Store 中的全部状态（history + interrupts）。"""
+        """删除指定会话在 Store 中的全部状态。"""
         await self.aclear_history(session_id)
         await self.aclear_interrupt(session_id)
+        await self.adelete_session_config(session_id)
 
     # ============ 内部辅助 ============
 
@@ -157,7 +209,7 @@ class SessionStore:
         """幂等删除：key 不存在时不报错。"""
         try:
             await self._store.adelete(namespace, key=key)
-        except Exception as error:  # noqa: BLE001 - Store backend 差异需兜底
+        except Exception as error:
             logger.debug("Store 删除失败 [%s/%s]: %s", namespace, key, error)
 
 
