@@ -11,6 +11,19 @@ from langchain.tools import tool
 # 默认工具存放目录：create_tools.py 的同级目录
 DEFAULT_TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# 默认工具测试存放目录：项目根目录下的 tests/tools
+DEFAULT_TEST_DIR = os.path.join(os.path.dirname(DEFAULT_TOOL_DIR), "tests", "tools")
+
+# args_spec 声明的参数类型 → 生成单元测试时的示例入参源码（未命中的类型回退字符串 "test"）
+_SAMPLE_VALUES: Final[dict[str, str]] = {
+    "str": '"test"',
+    "int": "1",
+    "float": "1.0",
+    "bool": "True",
+    "list": "[1, 2, 3]",
+    "dict": '{"key": "value"}',
+}
+
 # Python 3.12+ (PEP 701) 引入了 f-string 专用 token 类型；
 # Python 3.10/3.11 中 f-string 被当作普通 STRING 处理，getattr 安全回退。
 _STRING_TOKEN_TYPES: Final[frozenset[int]] = frozenset(
@@ -56,11 +69,21 @@ def _validate_tool_name(tool_name: str) -> str | None:
     return None
 
 
-def _is_within_tool_dir(path: str) -> bool:
-    tool_root = os.path.realpath(DEFAULT_TOOL_DIR)
+def _build_test_error_result(tool_name: str, error: str) -> dict[str, str | bool | None]:
+    return {
+        "success": False,
+        "error": f"工具测试生成失败：{error}",
+        "test_source_code": None,
+        "tool_name": tool_name,
+        "test_file_path": None,
+    }
+
+
+def _is_within_dir(path: str, root: str) -> bool:
+    real_root = os.path.realpath(root)
     target = os.path.realpath(path)
     try:
-        return os.path.commonpath([tool_root, target]) == tool_root
+        return os.path.commonpath([real_root, target]) == real_root
     except ValueError:
         return False
 
@@ -71,6 +94,31 @@ def _resolve_tool_path(tool_name: str, tool_path: str | None) -> str:
     if os.path.isdir(tool_path):
         return os.path.join(tool_path, f"{tool_name}.py")
     return tool_path
+
+
+def _resolve_test_path(tool_name: str, test_path: str | None) -> str:
+    if not test_path:
+        return os.path.join(DEFAULT_TEST_DIR, f"test_{tool_name}.py")
+    if os.path.isdir(test_path):
+        return os.path.join(test_path, f"test_{tool_name}.py")
+    return test_path
+
+
+def _parse_args_spec(args_spec: str) -> list[tuple[str, str, str]]:
+    """
+    解析 args_spec 为 (参数名, 参数类型, 参数说明) 列表。
+
+    每项格式为 `参数名:参数类型=参数说明`，项之间以分号分隔；格式非法时抛 ValueError，
+    由调用方统一转成错误结果返回。
+    """
+    specs: list[tuple[str, str, str]] = []
+    for item in (x.strip() for x in args_spec.split(";")):
+        if not item:
+            continue
+        name_type, desc = item.split("=", maxsplit=1)
+        param_name, param_type = name_type.split(":")
+        specs.append((param_name.strip(), param_type.strip(), desc.strip()))
+    return specs
 
 
 def _find_disallowed_import(source_code: str) -> str | None:
@@ -196,11 +244,13 @@ def create_tool(
     tool_logic: str,
     tool_path: str | None = None,
     force: bool = False,
+    with_test: bool = True,
 ) -> dict[str, str | bool | None]:
     """
     动态生成Langchain标准@tool装饰器工具源码。
     使用统一规范模板输出可直接运行的Python工具代码，遵循项目统一返回结构。
     生成后的代码可以直接写入py文件，导入到Agent工具集中使用。
+    默认顺带生成对应的pytest单元测试，保存到 tests/tools/test_<tool_name>.py。
 
     Args:
         tool_name: 工具函数名，仅小写字母、下划线，例如 "read_markdown_file"
@@ -211,6 +261,7 @@ def create_tool(
         tool_path: 工具存放的路径，可传目录或.py文件路径；
                    为空时默认保存到 create_tools.py 同级目录（tools/）下 tool_name.py
         force: 是否覆盖已存在文件，默认禁止覆盖
+        with_test: 是否顺带生成单元测试（默认生成到 tests/tools/ 下）
 
     Returns:
         字典包含生成的完整源码、状态，成功可直接写入文件运行
@@ -248,16 +299,9 @@ def @TOOL_NAME@(@PARAMS@) -> Dict[str, Any]:
 '''
 
         # 解析参数
-        param_lines = []
-        doc_args = []
-        arg_items = [x.strip() for x in args_spec.split(";") if x.strip()]
-        for item in arg_items:
-            name_type, desc = item.split("=", maxsplit=1)
-            param_name, param_type = name_type.split(":")
-            param_lines.append(f"{param_name}: {param_type}")
-            doc_args.append(f"{param_name}: {desc}")
-
-        param_str = ", ".join(param_lines)
+        param_specs = _parse_args_spec(args_spec)
+        param_str = ", ".join(f"{name}: {param_type}" for name, param_type, _ in param_specs)
+        doc_args = [f"{name}: {desc}" for name, _, desc in param_specs]
         args_doc = "\n    Args:\n        " + "\n        ".join(doc_args) if doc_args else ""
 
         # 工具逻辑整体缩进到 try 块内部（保留相对缩进，且不破坏多行字符串内容行）
@@ -284,7 +328,7 @@ def @TOOL_NAME@(@PARAMS@) -> Dict[str, Any]:
         tool_path = _resolve_tool_path(tool_name, tool_path)
 
         abs_path = os.path.abspath(tool_path)
-        if not _is_within_tool_dir(abs_path):
+        if not _is_within_dir(abs_path, DEFAULT_TOOL_DIR):
             return _build_error_result(tool_name, "路径逃逸被禁止")
 
         if os.path.exists(abs_path) and not force:
@@ -308,14 +352,204 @@ def @TOOL_NAME@(@PARAMS@) -> Dict[str, Any]:
             except (IndexError, OSError, ValueError) as err:
                 message += f"，但注册到 tools/__init__.py 失败：{err!s}"
 
+        # 顺带生成该工具的单元测试（失败不影响工具本身的生成结果）
+        test_file_path: str | None = None
+        if with_test:
+            test_result = creat_tool_tests(
+                tool_name=tool_name,
+                tool_description=tool_description,
+                args_spec=args_spec,
+                tool_path=abs_path,
+                force=force,
+            )
+            if test_result["success"]:
+                test_file_path = test_result["test_file_path"]
+                message += f"，并已生成单元测试 {test_file_path}"
+            else:
+                message += f"，但生成单元测试失败：{test_result['error']}"
+
         return {
             "success": True,
             "tool_name": tool_name,
             "source_code": source_code,
             "file_path": abs_path,
             "registered": registered,
+            "test_file_path": test_file_path,
             "message": message
         }
 
     except (IndexError, KeyError, OSError, SyntaxError, TypeError, ValueError) as err:
         return _build_error_result(tool_name, str(err))
+
+
+# 测试模板：同样使用占位符 + str.replace 拼接，模板内的花括号无需转义。
+# 生成的是“结构冒烟测试”：断言工具对象、参数签名与统一返回结构，
+# 不假设业务逻辑的具体输出（示例入参无法通过类型校验时自动跳过冒烟用例）。
+TEST_TEMPLATE: Final[str] = '''"""@TOOL_NAME@ 工具单元测试（由 tools/create_tools.py 自动生成，可自由补充用例）。"""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+
+import pytest
+from langchain_core.tools import BaseTool
+from pydantic import ValidationError
+
+TOOL_FILE = Path(@TOOL_FILE@)
+TOOL_NAME = "@TOOL_NAME@"
+TOOL_DESCRIPTION = @TOOL_DESCRIPTION@
+EXPECTED_PARAMS = @EXPECTED_PARAMS@
+SAMPLE_ARGS = @SAMPLE_ARGS@
+
+
+@pytest.fixture(scope="module")
+def generated_tool() -> BaseTool:
+    """从生成的工具文件加载 @TOOL_NAME@ 工具对象。"""
+    assert TOOL_FILE.is_file(), f"工具文件不存在：{TOOL_FILE}"
+    spec = importlib.util.spec_from_file_location("generated_@TOOL_NAME@", TOOL_FILE)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return getattr(module, TOOL_NAME)
+
+
+def test_@TOOL_NAME@_is_langchain_tool(generated_tool: BaseTool) -> None:
+    """工具是 LangChain 工具对象，且名称与生成时一致。"""
+    assert isinstance(generated_tool, BaseTool)
+    assert generated_tool.name == TOOL_NAME
+
+
+def test_@TOOL_NAME@_exposes_declared_params(generated_tool: BaseTool) -> None:
+    """工具入参与 args_spec 声明一致。"""
+    assert set(generated_tool.args) == set(EXPECTED_PARAMS)
+
+
+def test_@TOOL_NAME@_source_follows_project_template() -> None:
+    """生成源码遵循项目统一模板：@tool 装饰器 + 统一返回结构 + 异常兜底。"""
+    source = TOOL_FILE.read_text(encoding="utf-8")
+    assert "@tool" in source
+    assert '"success": True' in source
+    assert '"success": False' in source
+    assert '"error": str(e)' in source
+
+
+def test_@TOOL_NAME@_returns_structured_result(generated_tool, monkeypatch, tmp_path) -> None:
+    """调用工具返回统一结构且不向调用方抛异常（在临时目录内执行，避免污染工作区）。"""
+    monkeypatch.chdir(tmp_path)
+    try:
+        out = generated_tool.invoke(dict(SAMPLE_ARGS))
+    except ValidationError as err:
+        pytest.skip(f"示例入参不满足参数类型约束，请补充真实用例：{err!s}")
+    assert isinstance(out, dict)
+    assert "success" in out
+    if out["success"]:
+        assert "result" in out
+    else:
+        assert out["error"]
+'''
+
+
+def _sample_literal(param_type: str) -> str:
+    """
+    按 args_spec 声明的类型生成示例入参源码。
+
+    未识别的类型回退字符串 "test"；回退值若与真实类型约束不符，
+    生成的冒烟用例会捕获 ValidationError 并跳过，不会误报失败。
+    """
+    normalized = param_type.strip().lower()
+    exact = _SAMPLE_VALUES.get(normalized)
+    if exact is not None:
+        return exact
+    if normalized.startswith(("list", "sequence", "set", "tuple")):
+        inner = normalized.partition("[")[2].rstrip("]").strip() or "int"
+        element = _SAMPLE_VALUES.get(inner, '"test"')
+        return f"[{element}]"
+    return '"test"'
+
+
+def _build_sample_args_source(param_specs: list[tuple[str, str, str]]) -> str:
+    if not param_specs:
+        return "{}"
+    items = ",\n    ".join(
+        f"{name!r}: {_sample_literal(param_type)}" for name, param_type, _ in param_specs
+    )
+    return "{\n    " + items + ",\n}"
+
+
+def creat_tool_tests(
+    tool_name: str,
+    tool_description: str,
+    args_spec: str,
+    tool_path: str | None = None,
+    test_path: str | None = None,
+    force: bool = False,
+) -> dict[str, str | bool | None]:
+    """
+    为已生成的工具生成 pytest 单元测试，默认保存到 tests/tools/test_<tool_name>.py。
+
+    生成内容为结构冒烟测试：工具对象类型与名称、args_spec 声明的入参、
+    源码是否遵循统一模板、调用后是否返回统一结构（success/result 或 error）。
+    业务断言需人工在生成的文件中补充。create_tool 会默认调用本函数。
+
+    Args:
+        tool_name: 工具函数名，需与 create_tool 生成的函数名一致
+        tool_description: 工具描述，写入测试文件头部说明
+        args_spec: 参数定义说明，格式同 create_tool，用于生成入参断言与示例入参
+        tool_path: 工具文件路径，可传目录或.py文件路径；
+                   为空时默认取 create_tools.py 同级目录（tools/）下 tool_name.py
+        test_path: 测试文件存放路径，可传目录或.py文件路径；
+                   为空时默认保存到 tests/tools/ 下 test_<tool_name>.py
+        force: 是否覆盖已存在的测试文件，默认禁止覆盖
+
+    Returns:
+        字典包含生成的测试源码、保存路径与状态
+    """
+    try:
+        invalid_tool_name = _validate_tool_name(tool_name)
+        if invalid_tool_name is not None:
+            return _build_test_error_result(tool_name, invalid_tool_name)
+
+        param_specs = _parse_args_spec(args_spec)
+        tool_file = os.path.abspath(_resolve_tool_path(tool_name, tool_path))
+
+        # 解析测试保存路径并限制在 tests/tools 目录内
+        abs_test_path = os.path.abspath(_resolve_test_path(tool_name, test_path))
+        if not _is_within_dir(abs_test_path, DEFAULT_TEST_DIR):
+            return _build_test_error_result(tool_name, "测试路径逃逸被禁止")
+
+        if os.path.exists(abs_test_path) and not force:
+            return _build_test_error_result(tool_name, f"目标测试文件已存在：{abs_test_path}")
+
+        source_code = TEST_TEMPLATE
+        for placeholder, value in {
+            "@TOOL_NAME@": tool_name,
+            "@TOOL_DESCRIPTION@": repr(tool_description.strip()),
+            "@TOOL_FILE@": repr(tool_file),
+            "@EXPECTED_PARAMS@": repr([name for name, _, _ in param_specs]),
+            "@SAMPLE_ARGS@": _build_sample_args_source(param_specs),
+        }.items():
+            source_code = source_code.replace(placeholder, value)
+
+        # 校验生成的测试源码语法，不合法则不写入文件
+        ast.parse(source_code)
+
+        parent = os.path.dirname(abs_test_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        with open(abs_test_path, "w", encoding="utf-8") as f:
+            f.write(source_code)
+
+        return {
+            "success": True,
+            "tool_name": tool_name,
+            "test_source_code": source_code,
+            "test_file_path": abs_test_path,
+            "message": f"工具测试已保存到 {abs_test_path}",
+        }
+
+    except (IndexError, KeyError, OSError, SyntaxError, TypeError, ValueError) as err:
+        return _build_test_error_result(tool_name, str(err))
