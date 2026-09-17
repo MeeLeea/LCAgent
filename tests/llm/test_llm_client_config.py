@@ -15,6 +15,9 @@ class _FakeChatModel:
 
     def __init__(self, **kwargs) -> None:
         self.kwargs = kwargs
+        # 同时暴露为属性，便于断言参数已真正落到构造出的模型上
+        for key, value in kwargs.items():
+            setattr(self, key, value)
 
 
 def _monkeypatch_model_factory(monkeypatch, capture: list) -> None:
@@ -100,3 +103,61 @@ def test_real_global_config_has_sampling_params():
     cfg = load_agent_config(DEFAULT_AGENT_CONFIG_FILE)
     assert isinstance(cfg["temperature"], float)
     assert isinstance(cfg["max_tokens"], int)
+
+
+def test_stream_chunk_timeout_defaults_to_300(monkeypatch, tmp_path):
+    """未配置 stream_chunk_timeout 时回退 DEFAULTS(300.0)，并透传到模型"""
+    captured: list[dict] = []
+    _monkeypatch_model_factory(monkeypatch, captured)
+
+    cfg_file = tmp_path / "agent_config.json"
+    cfg_file.write_text('{"name": "x"}', encoding="utf-8")
+    monkeypatch.setattr("llm.config.DEFAULT_AGENT_CONFIG_FILE", str(cfg_file))
+
+    client = LLMClient(provider="zhipu", config_file="config/llm_config.json")
+    assert client.stream_chunk_timeout == 300.0
+    # 已真正落到构造出的 chat model 上
+    assert client.client.stream_chunk_timeout == 300.0
+    assert captured[0]["stream_chunk_timeout"] == 300.0
+
+
+def test_stream_chunk_timeout_reads_global_config(monkeypatch, tmp_path):
+    """全局 agent_config.json 中的 stream_chunk_timeout 优先于 DEFAULTS"""
+    captured: list[dict] = []
+    _monkeypatch_model_factory(monkeypatch, captured)
+
+    cfg_file = tmp_path / "agent_config.json"
+    cfg_file.write_text('{"stream_chunk_timeout": 222.0}', encoding="utf-8")
+    monkeypatch.setattr("llm.config.DEFAULT_AGENT_CONFIG_FILE", str(cfg_file))
+
+    client = LLMClient(provider="zhipu", config_file="config/llm_config.json")
+    assert client.stream_chunk_timeout == 222.0
+    assert client.client.stream_chunk_timeout == 222.0
+    assert captured[0]["stream_chunk_timeout"] == 222.0
+
+
+def test_explicit_stream_chunk_timeout_beats_global_config(monkeypatch, tmp_path):
+    """显式传入的 stream_chunk_timeout 优先于全局配置"""
+    captured: list[dict] = []
+    _monkeypatch_model_factory(monkeypatch, captured)
+
+    cfg_file = tmp_path / "agent_config.json"
+    cfg_file.write_text('{"stream_chunk_timeout": 222.0}', encoding="utf-8")
+    monkeypatch.setattr("llm.config.DEFAULT_AGENT_CONFIG_FILE", str(cfg_file))
+
+    client = LLMClient(
+        provider="zhipu",
+        config_file="config/llm_config.json",
+        stream_chunk_timeout=45.0,
+    )
+    assert client.stream_chunk_timeout == 45.0
+    assert client.client.stream_chunk_timeout == 45.0
+    assert captured[0]["stream_chunk_timeout"] == 45.0
+
+
+def test_real_global_config_has_stream_chunk_timeout():
+    """真实 agent/agent_config.json 显式包含 stream_chunk_timeout=300.0"""
+    from llm.config import load_agent_config
+
+    cfg = load_agent_config(DEFAULT_AGENT_CONFIG_FILE)
+    assert cfg["stream_chunk_timeout"] == 300.0

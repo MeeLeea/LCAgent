@@ -2,22 +2,30 @@
 统一大模型封装 - 基于LangChain，支持多提供商(智谱/千问/DeepSeek/Kimi)
 所有提供商均兼容 OpenAI API 格式，使用 langchain.chat_models.init_chat_model 统一调用
 """
+import asyncio
 import json
+import logging
 import os
 import re
+import time
+from collections.abc import AsyncIterator
 from typing import Any
 
 from langchain.chat_models import init_chat_model
+from langchain_core.callbacks import AsyncCallbackManagerForLLMRun
 from langchain_core.language_models import LanguageModelInput
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
+from langchain_core.outputs import ChatGenerationChunk
+from langchain_openai import ChatOpenAI, StreamChunkTimeoutError
 from tenacity import (
     Retrying,
     retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
+
+logger = logging.getLogger(__name__)
 
 # 提供商配置(单一来源: 见 config/llm_config.json 的 providers 字段)
 DEFAULT_CONFIG_FILE = os.path.join(
@@ -33,6 +41,13 @@ RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 RETRY_ATTEMPTS = 3  # 含首次在内最多尝试次数
 RETRY_BASE_DELAY = 1.0  # 指数退避基数(秒)
 RETRY_MAX_DELAY = 8.0  # 单次最长等待(秒)
+
+# ============ 流式中断(HTTP 流层)自动重启 ============
+
+# 单个流式 HTTP 请求的最大重启次数(总尝试次数 = 本值 + 1)
+STREAM_RETRY_ATTEMPTS: int = 2
+# 单次模型调用(含其全部重试)的总墙钟预算(秒)，防止重试线性放大延迟
+STREAM_CALL_DEADLINE: float = 900.0
 
 # 网关/模型服务过载时常见的纯文本关键字
 _RETRYABLE_KEYWORDS = (
@@ -56,12 +71,22 @@ def should_retry(e: Exception) -> bool:
       - 连接/超时类异常(ConnectionError / TimeoutError 等)
       - 网关纯文本提示(如 "Service temporarily unavailable")
 
+    例外(不重试):
+      - `StreamChunkTimeoutError`(流式 chunk 超时)由 `StreamStallRetryMixin`
+        在 HTTP 流层单独重启；本函数返回 False，避免图级重试与流层重试叠加，
+        导致已输出文本重复与延迟线性放大。
+
     Args:
         e: 待判断的异常对象
 
     Returns:
         是否应自动重试
     """
+    # 流式 chunk 超时由 StreamStallRetryMixin 在 HTTP 流层单独处理，
+    # 图级重试不得再接手（否则 3×N 层嵌套、延迟线性放大）。
+    if isinstance(e, StreamChunkTimeoutError):
+        return False
+
     # 连接/超时类异常
     if isinstance(e, (ConnectionError, TimeoutError, OSError)):
         return True
@@ -138,8 +163,87 @@ def _make_retryer() -> Retrying:
         reraise=True,
     )
 
+
+class StreamStallRetryMixin:
+    """流式 chunk 超时自动重启混入：仅在 HTTP 流层重试，杜绝已输出文本重复。
+
+    为什么必须在这一层:
+      - `langchain_openai` 的 `on_llm_new_token` 在 `_astream` 内部每解析出一个
+        chunk 就立即触发，与上层任何中间件的返回值无关。因此一旦把重试放在
+        model 的 `_astream` 之上(图级重试 / ModelRetryMiddleware)，已经流给用户
+        的文本会被完整重放一遍，且可能重复执行工具副作用。
+      - 本混入直接覆写 `_astream`，在"尚未产生任何用户可见内容"这一前提下重启
+        HTTP 请求，对上层完全透明。
+
+    内容判定:
+      - 以 `chunk.text` 是否非空作为"用户可见"的唯一标准。思考型模型会先产出
+        若干 `text` 为空、仅含 reasoning 的 chunk，这些不应阻断重启。
+      - 不使用 `exc.chunks_received` 作为门控——它统计的是全部 chunk(含空的
+        reasoning chunk)，会把可安全重启的流误判为"已输出"。
+
+    重试边界:
+      - 最多重启 `STREAM_RETRY_ATTEMPTS` 次(总尝试 `STREAM_RETRY_ATTEMPTS + 1`)。
+      - 单次模型调用的总墙钟预算为 `STREAM_CALL_DEADLINE` 秒(自首次尝试起算)，
+        预算耗尽后不再重启，避免重试线性放大延迟。
+      - 一旦产生过用户可见内容，或重试次数 / 预算耗尽，异常原样上抛，绝不吞异常。
+    """
+
+    async def _astream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,
+        *,
+        stream_usage: bool | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        """覆写 `Chat[OpenAI]._astream`，在零可见内容前提下重启停滞的流式请求。
+
+        Args:
+            messages: 输入消息列表
+            stop: 停止序列
+            run_manager: 异步回调管理器(向上游逐 chunk 转发 token)
+            stream_usage: 是否在流中返回 usage
+            **kwargs: 额外请求参数
+
+        Yields:
+            底层模型产出的 `ChatGenerationChunk`(重试时不重复产出已消费 chunk)
+
+        Raises:
+            StreamChunkTimeoutError: 已有可见内容 / 重试次数耗尽 / 超出总预算时原样上抛
+        """
+        call_started = time.monotonic()
+        for attempt in range(STREAM_RETRY_ATTEMPTS + 1):
+            content_emitted = False
+            try:
+                async for chunk in super()._astream(
+                    messages,
+                    stop,
+                    run_manager,
+                    stream_usage=stream_usage,
+                    **kwargs,
+                ):
+                    if chunk.text:  # 非空 content 才算用户可见
+                        content_emitted = True
+                    yield chunk
+                return  # 正常结束
+            except StreamChunkTimeoutError as exc:
+                if (
+                    content_emitted
+                    or attempt >= STREAM_RETRY_ATTEMPTS
+                    or (time.monotonic() - call_started) >= STREAM_CALL_DEADLINE
+                ):
+                    raise  # 原样上抛，绝不吞异常
+                logger.warning(
+                    "流式响应停滞，第 %d 次重启(已接收 %d 个 chunk)",
+                    attempt + 1,
+                    exc.chunks_received,
+                )
+                await asyncio.sleep(min(RETRY_MAX_DELAY, 2**attempt))
+
+
 #PATCH:yunwu网关的缺陷规避: 还原 max_tokens 参数(见 CloudmistChatOpenAI 类文档)
-class CloudmistChatOpenAI(ChatOpenAI):
+class CloudmistChatOpenAI(StreamStallRetryMixin, ChatOpenAI):
     """云雾网关专用 ChatOpenAI 子类，规避其 max_completion_tokens 缺陷。
 
     背景: langchain-openai >= 1.0 在 _get_request_payload 中无条件把 max_tokens
@@ -188,7 +292,8 @@ class LLMClient:
         model: str | None = None,
         config_file: str | None = None,
         temperature: float | None = None,
-        max_tokens: int | None = None
+        max_tokens: int | None = None,
+        stream_chunk_timeout: float | None = None,
     ):
         """
         初始化LLM客户端
@@ -202,6 +307,10 @@ class LLMClient:
                 DEFAULTS 兜底为 0.7）
             max_tokens: 最大生成token数（None 时从 agent/agent_config.json 全局配置读取，
                 DEFAULTS 兜底为 8192）
+            stream_chunk_timeout: LLM 流式响应 chunk 间隔超时(秒)（None 时从
+                agent/agent_config.json 全局配置读取，DEFAULTS 兜底为 300.0）。
+                显式设置可避免 langchain-openai 默认 120s 在思考型模型网关长时间
+                零字节时误触发 stream_chunk_timeout 告警。
 
         采样参数来源（高→低）:
             1. 本构造函数的显式参数
@@ -223,16 +332,20 @@ class LLMClient:
         self.provider_config = providers[provider]
 
         # 采样参数：显式参数 > 全局 agent_config.json（DEFAULTS 兜底）。
-        # load_agent_config 的 DEFAULTS 已含 temperature/max_tokens，故此处必然有值。
-        if temperature is None or max_tokens is None:
+        # load_agent_config 的 DEFAULTS 已含 temperature/max_tokens/stream_chunk_timeout，
+        # 故此处必然有值。
+        if temperature is None or max_tokens is None or stream_chunk_timeout is None:
             from llm.config import DEFAULT_AGENT_CONFIG_FILE, load_agent_config
             agent_config = load_agent_config(DEFAULT_AGENT_CONFIG_FILE)
             if temperature is None:
                 temperature = agent_config["temperature"]
             if max_tokens is None:
                 max_tokens = agent_config["max_tokens"]
+            if stream_chunk_timeout is None:
+                stream_chunk_timeout = agent_config["stream_chunk_timeout"]
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.stream_chunk_timeout = stream_chunk_timeout
 
         # 获取API密钥: 优先参数传入 > 配置文件 > 环境变量
         self.api_key = (
@@ -258,8 +371,11 @@ class LLMClient:
     def _create_chat_model(self) -> BaseChatModel:
         """创建统一聊天模型(init_chat_model, OpenAI 兼容接口)
 
-        云雾网关(yunwu)使用 CloudmistChatOpenAI 子类，规避其
+        云雾网关(yunlan)使用 CloudmistChatOpenAI 子类，规避其
         max_completion_tokens 把思考 token 计入预算导致空输出的缺陷。
+
+        采样参数(temperature/max_tokens/stream_chunk_timeout)经 kwargs 透传给
+        两条构造路径，保证流式 chunk 间隔超时显式可控。
         """
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -267,6 +383,7 @@ class LLMClient:
             "api_key": self.api_key,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
+            "stream_chunk_timeout": self.stream_chunk_timeout,
         }
         base_url = self.provider_config.get("base_url")
         if base_url:  # base_url 可选:仅当配置中提供时才传入

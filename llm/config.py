@@ -18,6 +18,9 @@
                                       团队角色分层配置于自身 agent_config.json，
                                       缺省回退 DEFAULTS，不读取全局自定义值)
     max_tokens                 int    LLM 最大生成 token 数(来源规则同 temperature)
+    stream_chunk_timeout       float  LLM 流式响应 chunk 间隔超时(秒；来源规则同
+                                      temperature。云雾网关思考型模型可能长时间零字节，
+                                      默认 300.0 以免 langchain-openai 默认 120s 误触发)
 
 Memory 层配置（由 memory/config.py 统一管理，不写入 agent_config.json）:
     memory_buffer_delay_seconds   int  记忆写入防抖延迟(秒)
@@ -83,6 +86,7 @@ DEFAULTS: dict[str, Any] = {
     "tool_timeout": 120,
     "temperature": 0.7,
     "max_tokens": 8192,
+    "stream_chunk_timeout": 300.0,
 }
 
 
