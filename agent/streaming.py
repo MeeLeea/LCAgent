@@ -86,6 +86,11 @@ class Streaming:
                         async for _ev in graph.astream_events(
                             input_or_command,
                             config=config,
+                            # 会话配置注入通道：config["configurable"] 只喂给
+                            # checkpointer，不会进入 runtime.context（ModelRequest.runtime
+                            # 是 Runtime，无 config 属性）。必须用 context= 显式传同一份
+                            # 数据，SessionConfigMW 才能读到 session_config / thread_id。
+                            context=config,
                             version="v2",
                         ):
                             await _q.put(_ev)

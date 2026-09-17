@@ -245,7 +245,7 @@ def test_arun_stops_after_user_rejects_command(monkeypatch):
             self.calls += 1
             return run_shell.invoke({"command": "python cleanup.py"})
 
-        async def ainvoke(self, value, config):
+        async def ainvoke(self, value, config, context=None):
             self.calls += 1
             return run_shell.invoke({"command": "python cleanup.py"})
 
@@ -281,7 +281,7 @@ def test_aresume_stops_after_user_rejects_command():
         def invoke(self, value, config):
             raise UserRejectedCommandError("python cleanup.py")
 
-        async def ainvoke(self, value, config):
+        async def ainvoke(self, value, config, context=None):
             raise UserRejectedCommandError("python cleanup.py")
 
         def get_state(self, config):
@@ -330,7 +330,7 @@ def test_arun_repairs_checkpoint_after_user_rejects_command():
         def invoke(self, value, config):
             raise UserRejectedCommandError("python cleanup.py")
 
-        async def ainvoke(self, value, config):
+        async def ainvoke(self, value, config, context=None):
             raise UserRejectedCommandError("python cleanup.py")
 
         def get_state(self, config):
@@ -516,7 +516,7 @@ class _FakeToolExecutor:
     def __init__(self, events):
         self.events = events
 
-    async def astream_events(self, inputs, config=None, version=None):
+    async def astream_events(self, inputs, config=None, version=None, context=None):
         for e in self.events:
             yield e
 

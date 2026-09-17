@@ -46,7 +46,11 @@ class TurnRunners:
             input_msg = HumanMessage(content=task)
 
             try:
-                result = await self.agent_executor.ainvoke({"messages": [input_msg]}, config=config)
+                # context= 与 config= 传同一份数据：config["configurable"] 只喂给
+                # checkpointer，不会进入 runtime.context，会话配置中间件依赖后者。
+                result = await self.agent_executor.ainvoke(
+                    {"messages": [input_msg]}, config=config, context=config
+                )
             except UserRejectedCommandError:
                 return await self._ahandle_rejected_command(config)
 
@@ -78,6 +82,7 @@ class TurnRunners:
                     result = await self.agent_executor.ainvoke(
                         {"messages": [HumanMessage(content=message)]},
                         config=config,
+                        context=config,
                     )
                 except UserRejectedCommandError:
                     return await self._ahandle_rejected_command(config)
@@ -109,7 +114,9 @@ class TurnRunners:
 
         try:
             resume_command = await self._abuild_resume_command(config, payload)
-            result = await self.agent_executor.ainvoke(resume_command, config=config)
+            result = await self.agent_executor.ainvoke(
+                resume_command, config=config, context=config
+            )
         except UserRejectedCommandError:
             return await self._ahandle_rejected_command(config)
 

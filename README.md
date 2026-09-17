@@ -994,7 +994,7 @@ session/
 | `WorkspaceStore`  | `session_id ↔ workspace_path` 映射（多会话工作目录隔离）                                                                                     |
 | `SessionManager`  | 对外门面 & 会话调度（封装 Agent + Memory），承接所有流式/并发/记忆调度，并提供会话配置读写与批量读取                                            |
 
-> **设计要点**：`AgentCore` 实例只持有不可变配置 + 一个共享编译图 / Store / checkpointer，可安全在多会话间复用；所有会话级可变状态通过 `session_id` 显式隔离。会话基础配置的唯一事实源是 LangGraph Store，不是 checkpoint；checkpoint 只保留用于诊断的只读配置快照。
+> **设计要点**：`AgentCore` 实例只持有不可变配置 + 一个共享编译图 / Store / checkpointer，可安全在多会话间复用；所有会话级可变状态通过 `session_id` 显式隔离。会话基础配置的唯一事实源是 LangGraph Store；checkpoint **不保存**会话配置（`LCAgentState` 只有 `summary` / `active_skills`），它只负责对话状态，配置永远从 Store 读取。
 
 ### 会话基础配置（provider / model / 角色）
 
@@ -1011,11 +1011,15 @@ session/
 | `version`        | 配置版本号                                              |
 | `system_prompt`  | 写入时解析得到的 system prompt 快照                     |
 
-配置保存在同一 SQLite 文件中的 LangGraph `Store` namespace `("lcagent", "sessions", <session_id>, "session_config")`，键为 `"current"`。`Store` 是唯一事实源，checkpoint 中的配置只作为诊断用只读快照，不参与配置读取。旧会话首次读取时，会将当时的进程级默认配置懒迁移并持久化，之后不再重新读取默认值，因此默认值改变不会使旧会话漂移。进程级默认配置保存在 `SessionRegistry.default_session_config`，由启动时 Agent 的 `llm.provider`、`llm.model` 和 `max_iterations` 推导，也可通过 `set_default_session_config()` 更新。
+配置保存在同一 SQLite 文件 `data/checkpoints_async.sqlite` 的 LangGraph **`store` 表**中，namespace 为 `("lcagent", "sessions", <session_id>, "session_config")`、键为 `"current"`（在表中 namespace 以点号拼接为 `prefix` 列，即 `lcagent.sessions.<session_id>.session_config`）。`Store` 是唯一事实源：会话配置不写入 checkpoint，`LCAgentState` 中也没有配置字段，因此读取配置不需要跑图、也不受 `aupdate_state` 与 interrupt 影响。旧会话首次读取时，会将当时的进程级默认配置懒迁移并持久化，之后不再重新读取默认值，因此默认值改变不会使旧会话漂移。进程级默认配置保存在 `SessionRegistry.default_session_config`，由启动时 Agent 的 `llm.provider`、`llm.model` 和 `max_iterations` 推导，也可通过 `set_default_session_config()` 更新。
 
 会话配置的读写使用现有的 `SessionManager._thread_locks[thread_id]` 串行化，同一会话的配置更新与执行互斥，不同会话无需全局锁即可并行。模型由 `SessionModelFactory` 通过既有 `LLMClient` 构造，并按 `(provider, model, temperature, max_tokens)` 使用有界 LRU 缓存，默认上限为 16 个不同模型配置，而不是为每个会话复制模型对象。
 
 配置优先级为：显式请求字段 > 角色目录 `team/<role>/agent_config.json` 中的字段 > 保持原值。设置角色时，会在写入时读取该角色的 `agent_config.json` 和 `AGENT.md`，将解析后的 system prompt 保存到 `system_prompt`；之后即使 `AGENT.md` 被修改，已有会话仍使用原快照。每轮开始时捕获一份不可变配置快照，轮中修改只影响下一轮。
+
+**provider 变更时 model 的重解析**：`provider` 与 `model` 是耦合取值——旧 provider 的模型通常不在新 provider 的 `models` 白名单内（如 `zhipu` 的 `glm-4.7-flash` 切到 `yunlan`）。因此当一次更新**实际改变了 provider 且未显式给出 `model`** 时，服务端会把 model 重解析为该 provider 的可用模型：优先取 `llm_config.json` 中该 provider 的默认 `model`，若该默认值未列入自身 `models`（配置不一致）则退回 `models[0]`。该规则覆盖两条路径：前端顶栏只发 `{"provider": "..."}`，以及角色目录 `agent_config.json` 只配置 `provider`、`model` 为 `null`（如 `team/worker`、`team/terminator`）。显式传入的 `model` 始终以请求为准（非法值照常 400）；provider 未实际变化时不重置 model，避免覆盖用户已选模型。
+
+**运行时注入通道（重要）**：`config["configurable"]` 只喂给 checkpointer，**不会**自动映射到 `request.runtime.context`——`ModelRequest.runtime` 是 LangGraph `Runtime`，它没有 `config` 属性，`context` 仅由调用方的 `context=` 参数填充。因此图调用处必须写 `ainvoke(..., config=config, context=config)`（见 `agent/turn_runners.py` 的 `arun_structured` / `achat_structured` / `aresume_structured` 与 `agent/streaming.py` 的 `_arun_graph_events`），把同一份 `{"configurable": {...}}` 同时经两条通道传入：`config=` 供 checkpointer 解析 `thread_id`，`context=` 供 `SessionConfigMW` 读取 `session_config`。遗漏 `context=` 时中间件会静默直通、回落构建期默认模型（前端仍提示切换成功，但本轮实际未生效）。注意工具侧不同：`ToolCallRequest.runtime` 是 `ToolRuntime`，**有** `.config`，所以 `WorkspaceSecurityMW` / `ToolExecutionErrorMW` 读 `runtime.config` 一直正常。回归守护见 `tests/agent/test_session_config_e2e.py`。
 
 `SessionManager` 推荐使用 `aget_session_config()`、`aupdate_session_config()` 和 `aget_session_configs()` 读取、更新及批量读取会话配置。
 
@@ -1080,7 +1084,7 @@ HTTP API（[api/server.py](api/server.py)）同样暴露三个 RESTful 端点，
 
 | 方法      | 路径                                 | 对应 CLI                             | 说明                                                                                                                                                                                                                                                       |
 | --------- | ------------------------------------ | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PATCH` | `/api/sessions/{thread_id}/config` | `switch:` / `model:` / `role:` | 更新该会话的配置，body 为`{provider?, model?, role?, temperature?, max_tokens?, max_iterations?, system_prompt?}`（省略或 `null` 表示不修改）；返回 `{"thread_id", "session_config"}`；provider/role/model 非法或 temperature 越界返回 **400** |
+| `PATCH` | `/api/sessions/{thread_id}/config` | `switch:` / `model:` / `role:` | 更新该会话的配置，body 为`{provider?, model?, role?, temperature?, max_tokens?, max_iterations?, system_prompt?}`（省略或 `null` 表示不修改）；返回 `{"thread_id", "session_config"}`；provider/role/model 非法或 temperature 越界返回 **400**；若实际改变了 provider 且未显式给 `model`，则 model 重解析为该 provider 的可用模型 |
 | `GET`   | `/api/providers?thread_id=<id>`    | `switch` / `model`               | 返回`providers` / `available` / `current_provider` / `current_provider_name` / `current_model` / `session_config` / `defaults`。`current_*` 为**该会话**生效值；无会话配置时回退共享 LLM                                             |
 | `GET`   | `/api/threads`                     | `thread`                           | 每个会话条目附带`session_config`，由一次批量 `aget_session_configs()` 读取（非逐会话查询）                                                                                                                                                             |
 | `GET`   | `/api/roles?thread_id=<id>`        | `role` / `roles`                 | 返回可用角色列表与`current`（该会话的角色）                                                                                                                                                                                                              |
@@ -3007,6 +3011,7 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 | `tests/session/test_session_config.py`          | 会话基础配置：SessionConfig 序列化/patch、Store 读写、双会话隔离、旧会话懒迁移并持久化、批量读取含缺失、删除连带清理                                                                        |
 | `tests/agent/test_session_config_middleware.py` | 中间件与模型工厂：按会话切换模型、无配置时透传（legacy）、角色提示词覆盖、不污染共享 Agent、缓存命中与有界淘汰、解析失败回退                                                                |
 | `tests/agent/test_session_config_wiring.py`     | 接线回归：SessionConfigMW 位于中间件首位、compaction 同时持有 resolver 与静态模型、进程默认配置推导、异步 config 注入会话配置、双会话产出不同配置、legacy 全局切换只刷新默认值              |
+| `tests/agent/test_session_config_e2e.py`        | 注入通道端到端回归（真实 `create_agent`）：`context=` 是唯一能填充 `runtime.context` 的通道（省略即静默回落默认模型）、双会话模型与提示词互不污染、`astream_events` 流式通道，以及 `TurnRunners` 三条 `ainvoke` 与 `_arun_graph_events` 的生产调用点守护（移除 `context=config` 即失败） |
 | `tests/api/test_session_config_api.py`          | 会话配置 API：PATCH 契约与 400 校验、会话隔离、角色提示词持久化、新会话自动播种、`GET /api/providers` 会话级返回值、threads 批量读取、legacy 端点的 scope/deprecated 语义且不触碰共享 LLM |
 | `tests/config/test_config.py`                   | 运行时配置：默认值合并、路径解析                                                                                                                                                            |
 | `tests/config/test_config_templates.py`         | 配置模板验证：.example 文件完整性检查                                                                                                                                                       |

@@ -589,8 +589,10 @@ class ThreadMemoryReadMiddleware(AgentMiddleware):
     def _extract_thread_id(request: ModelRequest[ContextT]) -> str | None:
         """从 ModelRequest 的 runtime context 中提取 thread_id。
 
-        LangGraph 在 ainvoke 时将 config 存入 runtime.context，
-        config 结构为 ``{"configurable": {"thread_id": "..."}}``。
+        ``runtime.context`` **不会**自动由 ``config["configurable"]`` 填充，
+        它只来自图调用处的 ``context=`` 参数（见 ``agent/turn_runners.py`` /
+        ``agent/streaming.py``）。该参数传入的结构为
+        ``{"configurable": {"thread_id": "..."}}``，与此处的解析保持一致。
         """
         try:
             context = request.runtime.context

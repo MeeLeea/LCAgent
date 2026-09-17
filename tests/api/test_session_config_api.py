@@ -205,3 +205,101 @@ def test_legacy_role_switch_with_thread_updates_prompt_without_rebuild(client, m
     assert data["session_config"]["role"] == "worker"
     assert data["session_config"]["system_prompt"] == "worker prompt"
     mock_agent.switch_llm.assert_not_called()
+
+
+def test_patch_provider_switch_resets_stale_model_to_provider_default(
+    client, mock_agent
+) -> None:
+    """切 provider 且未显式给 model 时，应回落新 provider 默认模型而非 400。
+
+    前端顶栏切换供应商只发 ``{"provider": "..."}``；若沿用旧 provider 的 model，
+    该 model 不在新 provider 的 models 白名单内，validate_session_config 会判为
+    「未知模型」并返回 400，前端只 console.error → 表现为「无法切换供应商」。
+    """
+    mock_agent.session.aget_session_config = AsyncMock(
+        return_value=SessionConfig(provider="zhipu", model="glm-4-flash")
+    )
+    with patch("api.server.load_providers", return_value=_providers()), patch(
+        "agent.role_sw.get_available_team_roles", return_value=[]
+    ):
+        response = client.patch("/api/sessions/thread-a/config", json={"provider": "deepseek"})
+
+    assert response.status_code == 200
+    data = response.json()["session_config"]
+    assert data["provider"] == "deepseek"
+    assert data["model"] == "deepseek-chat"
+
+
+def test_patch_role_that_switches_provider_also_resets_model(client, mock_agent) -> None:
+    """角色目录只覆盖 provider 不覆盖 model 时（worker/terminator 现状），model 需同步回落。"""
+    mock_agent.session.aget_session_config = AsyncMock(
+        return_value=SessionConfig(provider="zhipu", model="glm-4-flash")
+    )
+    role_patch = SessionConfigPatch(role="worker", provider="deepseek", system_prompt="p")
+    with patch("api.server.load_providers", return_value=_providers()), patch(
+        "agent.role_sw.get_available_team_roles", return_value=["worker"]
+    ), patch("api.server._resolve_role_patch", new_callable=AsyncMock, return_value=role_patch):
+        response = client.patch("/api/sessions/thread-role/config", json={"role": "worker"})
+
+    assert response.status_code == 200
+    data = response.json()["session_config"]
+    assert data["provider"] == "deepseek"
+    assert data["model"] == "deepseek-chat"
+    assert data["role"] == "worker"
+
+
+def test_patch_same_provider_keeps_existing_model(client, mock_agent) -> None:
+    """provider 未实际变化时不得重置 model，避免覆盖用户已选的模型。"""
+    mock_agent.session.aget_session_config = AsyncMock(
+        return_value=SessionConfig(provider="zhipu", model="glm-4-plus")
+    )
+    with patch("api.server.load_providers", return_value=_providers()), patch(
+        "agent.role_sw.get_available_team_roles", return_value=[]
+    ):
+        response = client.patch("/api/sessions/thread-a/config", json={"provider": "zhipu"})
+
+    assert response.status_code == 200
+    assert response.json()["session_config"]["model"] == "glm-4-plus"
+
+
+def test_patch_provider_switch_honours_explicit_model(client, mock_agent) -> None:
+    """显式给 model 时以请求为准，不被 provider 默认模型覆盖。"""
+    mock_agent.session.aget_session_config = AsyncMock(
+        return_value=SessionConfig(provider="deepseek", model="deepseek-chat")
+    )
+    with patch("api.server.load_providers", return_value=_providers()), patch(
+        "agent.role_sw.get_available_team_roles", return_value=[]
+    ):
+        response = client.patch(
+            "/api/sessions/thread-a/config",
+            json={"provider": "zhipu", "model": "glm-4-plus"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["session_config"]["model"] == "glm-4-plus"
+
+
+def test_patch_provider_switch_falls_back_to_first_model_when_default_invalid(
+    client, mock_agent
+) -> None:
+    """provider 默认 model 不在自身 models 白名单时（配置不一致），回落 models[0]。
+
+    实际案例：``config/llm_config.json`` 的 ``yunlan-gpt`` 默认模型 ``qwen3.7-max``
+    未列入其 ``models``；回落该默认值会再次触发「未知模型」400，使切换永久失败。
+    """
+    providers = {
+        "zhipu": {"name": "智谱AI", "model": "glm-4-flash", "models": ["glm-4-flash"]},
+        "inconsistent": {"name": "Inconsistent", "model": "not-listed", "models": ["ok-1", "ok-2"]},
+    }
+    mock_agent.session.aget_session_config = AsyncMock(
+        return_value=SessionConfig(provider="zhipu", model="glm-4-flash")
+    )
+    with patch("api.server.load_providers", return_value=providers), patch(
+        "agent.role_sw.get_available_team_roles", return_value=[]
+    ):
+        response = client.patch("/api/sessions/thread-a/config", json={"provider": "inconsistent"})
+
+    assert response.status_code == 200
+    data = response.json()["session_config"]
+    assert data["provider"] == "inconsistent"
+    assert data["model"] == "ok-1"

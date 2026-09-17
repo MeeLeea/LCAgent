@@ -52,7 +52,7 @@ class FakeExecutor:
         self.invoke_calls += 1
         return {"messages": [AIMessage(content="done")]}
 
-    async def ainvoke(self, value, config):
+    async def ainvoke(self, value, config, context=None):
         self.invoke_calls += 1
         return {"messages": [AIMessage(content="done")]}
 

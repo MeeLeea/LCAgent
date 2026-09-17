@@ -175,9 +175,13 @@ def validate_session_config(
 def session_config_to_configurable(config: SessionConfig) -> dict[str, Any]:
     """构造注入 ``config["configurable"]`` 的会话配置片段。
 
-    与 ``thread_id`` / ``workspace_path`` 同处 configurable：本版本的 LangGraph 会把
-    ``configurable`` 映射到 ``request.runtime.context``，middleware 据此读取
-    （项目既有先例见 ``memory/middleware.py::_extract_thread_id``）。
+    与 ``thread_id`` / ``workspace_path`` 同处 configurable。注意：LangGraph **不会**
+    把 ``configurable`` 自动映射到 ``request.runtime.context`` —— ``ModelRequest.runtime``
+    是 ``Runtime``，它没有 ``config`` 属性，且 ``context`` 只由调用方的 ``context=``
+    参数填充。因此图调用处必须写 ``ainvoke(..., config=config, context=config)``
+    （见 ``agent/turn_runners.py`` / ``agent/streaming.py``），把同一份
+    ``{"configurable": {...}}`` 同时经两条通道传入：``config=`` 供 checkpointer，
+    ``context=`` 供中间件读取。
     """
     return {CONFIGURABLE_KEY: config.to_dict()}
 

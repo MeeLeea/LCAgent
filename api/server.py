@@ -26,6 +26,7 @@ import os
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from functools import lru_cache
 from typing import Any
 
@@ -506,6 +507,22 @@ async def _ensure_session_config(thread_id: str) -> SessionConfig:
     return default
 
 
+def _preferred_model_for_provider(
+    providers: dict[str, dict[str, Any]], provider: str
+) -> str | None:
+    """取 provider 的默认模型；默认模型未列入其 ``models`` 白名单时回落首个可用模型。
+
+    配置不一致（如 ``yunlan-gpt`` 的默认 ``model`` 不在自身 ``models`` 中）不应让
+    前端「切换供应商」永久 400 —— 候选必须出自 ``models`` 才能通过显式校验。
+    """
+    conf = providers.get(provider, {})
+    default_model = conf.get("model")
+    models = conf.get("models", [])
+    if default_model is not None and (not models or default_model in models):
+        return default_model
+    return models[0] if models else None
+
+
 async def _update_session_config(thread_id: str, patch: SessionConfigPatch) -> SessionConfig:
     """应用一次会话配置更新；非法配置统一转为 HTTP 400。"""
     current = await _ensure_session_config(thread_id)
@@ -513,6 +530,9 @@ async def _update_session_config(thread_id: str, patch: SessionConfigPatch) -> S
     providers = load_providers(LLM_FILE)
     provider = patch.provider or current.provider
     models = providers.get(provider, {}).get("models", [])
+    # provider 实际发生变化时才需要重解析 model；
+    # 重复选中同一 provider 不得覆盖用户已选的 model。
+    provider_switched = patch.provider is not None and patch.provider != current.provider
     # 延迟导入避免与 agent 包形成循环依赖（与本文件其他 role_sw 用法一致）
     from agent.role_sw import get_available_team_roles
 
@@ -520,6 +540,15 @@ async def _update_session_config(thread_id: str, patch: SessionConfigPatch) -> S
         # SessionConfig.apply() 内部会做一次结构校验（如 temperature 越界），
         # 必须与显式校验同处 try 内，否则会逃逸成 500 而非 400。
         result = current.apply(patch)
+        if provider_switched and patch.model is None:
+            # 旧 provider 的 model 在新 provider 下通常不在其 models 白名单内
+            # （如 zhipu/glm-4.7-flash 切到 yunlan），沿用会让显式校验判为「未知模型」
+            # 并返回 400，前端只 console.error → 表现为「无法切换供应商」。
+            # 未显式指定 model 时重解析为新 provider 的可用模型，与 CLI `switch:`
+            # 命令、legacy `/api/providers/switch` 行为一致。
+            # 这里替换 SessionConfig 而非 patch：patch 的 None 语义是「不修改」，
+            # 无法表达「把 model 重置为新 provider 的默认值」。
+            result = replace(result, model=_preferred_model_for_provider(providers, provider))
         validate_session_config(
             result,
             providers=providers.keys(),
@@ -779,39 +808,56 @@ async def _forward_stream_with_cancel(
     - 停止信号（前端 POST /api/stop 置位 cancel_event）优先竞速响应，
       即使事件源正阻塞在 LLM 调用中也能立即取消（runner.cancel 传播
       CancelledError），随后返回 cancelled 事件。
-    - 客户端断开（request.is_disconnected）在每个事件产出后检查，
-      保留原有语义。
+    - 客户端断开（request.is_disconnected）在每个事件产出后检查；
+      另外每 3 秒空闲超时后主动检测断开，避免 LLM 长时间阻塞期间
+      页面刷新导致锁不释放、新请求被阻塞。
     """
     queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
     runner = asyncio.create_task(_drain_events(source, queue, thread_id))
     cancel_waiter = asyncio.create_task(cancel_event.wait())
+    getter = asyncio.create_task(queue.get())
     try:
         while True:
-            getter = asyncio.create_task(queue.get())
             done, _ = await asyncio.wait(
                 {getter, cancel_waiter},
+                timeout=3.0,
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            # 空闲超时：无事件产出时主动检查客户端断开（页面刷新场景）
+            if not done:
+                if await request.is_disconnected():
+                    getter.cancel()
+                    logger.info("客户端断开 [%s]，中止流式输出（空闲检测）", thread_id)
+                    break
+                continue  # getter 仍在 pending，复用
             if cancel_waiter in done and cancel_event.is_set():
                 getter.cancel()
                 logger.info("客户端停止 [%s]，中止流式输出", thread_id)
                 yield _sse({"type": "cancelled", "content": "用户已停止生成。"})
                 break
-            ev = getter.result()
-            if ev is None:
-                logger.info("完成 [%s]", thread_id)
-                break
-            if cancel_event.is_set() or await request.is_disconnected():
-                if cancel_event.is_set():
-                    logger.info("客户端停止 [%s]，中止流式输出", thread_id)
-                    yield _sse({"type": "cancelled", "content": "用户已停止生成。"})
-                else:
-                    logger.info("客户端断开 [%s]，中止流式输出", thread_id)
-                break
-            yield _sse(_enrich_done(ev)) if enrich_done else _sse(ev)
+            if getter in done:
+                ev = getter.result()
+                if ev is None:
+                    logger.info("完成 [%s]", thread_id)
+                    break
+                if cancel_event.is_set() or await request.is_disconnected():
+                    if cancel_event.is_set():
+                        logger.info("客户端停止 [%s]，中止流式输出", thread_id)
+                        yield _sse({"type": "cancelled", "content": "用户已停止生成。"})
+                    else:
+                        logger.info("客户端断开 [%s]，中止流式输出", thread_id)
+                    break
+                yield _sse(_enrich_done(ev)) if enrich_done else _sse(ev)
+                getter = asyncio.create_task(queue.get())
     finally:
         if not cancel_waiter.done():
             cancel_waiter.cancel()
+        if not getter.done():
+            getter.cancel()
+            try:
+                await getter
+            except (asyncio.CancelledError, Exception):
+                pass
         if not runner.done():
             runner.cancel()
             try:
@@ -1064,11 +1110,17 @@ async def chat(req: ChatRequest, request: Request):
                                             pass
                                         return
                                     # 竞速：队列有项 或 cancel_event 置位，先到先得（FIRST_COMPLETED）
+                                    # timeout=3.0 使空闲时也能回到循环顶部检测客户端断开
                                     getter = asyncio.create_task(output_queue.get())
                                     done, _ = await asyncio.wait(
                                         {getter, cancel_waiter},
+                                        timeout=3.0,
                                         return_when=asyncio.FIRST_COMPLETED,
                                     )
+                                    if not done:
+                                        if not getter.done():
+                                            getter.cancel()
+                                        continue  # 回到顶部检测断开
                                     # 停止信号胜出 → 取消 getter，下一轮顶部 cancel 分支统一处理
                                     if cancel_waiter in done and cancel_event.is_set():
                                         if not getter.done():
