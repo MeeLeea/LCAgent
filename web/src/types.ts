@@ -249,6 +249,7 @@ export type StreamEvent =
   | { type: 'tool_call'; id: string; name: string; args: unknown }
   | { type: 'tool_result'; id: string; name: string; content: string }
   | { type: 'tool_running'; id: string; name: string }
+  | { type: 'heartbeat' }
   | { type: 'interrupt'; prompt: string; choices: { id: string; label: string }[]; items?: InterruptItem[] }
   | { type: 'cancelled'; content: string }
   | { type: 'error'; content: string }

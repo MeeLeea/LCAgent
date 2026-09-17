@@ -107,11 +107,20 @@ class Streaming:
                             timeout=HEARTBEAT_INTERVAL,
                         )
                     except TimeoutError:
-                        # 工具执行期间长时间无事件：发心跳重置前端 watchdog
-                        for _tc_id in active_tool_call_ids.values():
-                            yield AgentEvent.tool_running(
-                                tool_call_id=_tc_id,
-                                name=active_tool_names.get(_tc_id, ""),
+                        # 长时间无事件：发心跳重置前端 watchdog。
+                        # 工具执行期间发 tool_running（携带工具名）；LLM 静默期（无活跃工具）
+                        # 也必须发 heartbeat，否则前端 90s watchdog 会早于 langchain 的
+                        # stream_chunk_timeout 误报"响应超时"。
+                        if active_tool_call_ids:
+                            for _tc_id in active_tool_call_ids.values():
+                                yield AgentEvent.tool_running(
+                                    tool_call_id=_tc_id,
+                                    name=active_tool_names.get(_tc_id, ""),
+                                    thread_id=thread_id,
+                                    trace_id=trace_id,
+                                )
+                        else:
+                            yield AgentEvent.heartbeat(
                                 thread_id=thread_id,
                                 trace_id=trace_id,
                             )

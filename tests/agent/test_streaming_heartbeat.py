@@ -1,10 +1,14 @@
-"""streaming.py 心跳机制测试 - 工具执行期间发 tool_running 事件重置前端 watchdog。
+"""streaming.py 心跳机制测试 - 事件队列静默期发心跳事件重置前端 watchdog。
+
+两种心跳：
+1. TOOL_RUNNING：工具执行期心跳（on_tool_start 后长时间无事件时发出，携带工具信息）
+2. HEARTBEAT：LLM 静默期心跳（无活跃工具时发出，不携带任何工具信息）
 
 验证：
-1. 工具执行期间（on_tool_start 后长时间无事件）发心跳事件
-2. on_tool_end 后心跳停止（active_tool_call_ids 已清空）
-3. 非工具执行期间不发心跳（无活跃工具）
-4. 心跳携带正确的 tool_call_id + tool_name
+1. 工具执行期间（on_tool_start 后长时间无事件）发 tool_running 事件
+2. LLM 静默期（无活跃工具）发 heartbeat 事件，且不发 tool_running
+3. on_tool_end 后不再发 tool_running（active 已清空），但静默期仍发 heartbeat
+4. tool_running 携带正确的 tool_call_id + tool_name；heartbeat 携带空串（避免幻影工具卡片）
 """
 import asyncio
 from types import SimpleNamespace
@@ -126,8 +130,12 @@ def test_heartbeat_during_tool_execution(monkeypatch):
     assert not any(e.event_type == EventType.TOOL_RUNNING for e in after)
 
 
-def test_no_heartbeat_without_active_tool(monkeypatch):
-    """非工具执行期间（无 active_tool_call_ids）不发心跳。"""
+def test_heartbeat_without_active_tool_uses_heartbeat_event(monkeypatch):
+    """无活跃工具的静默期应发 HEARTBEAT 事件，而非 tool_running。
+
+    回归守护：此前静默期不发任何事件，导致前端 90s watchdog 早于
+    langchain stream_chunk_timeout（120s）误报"响应超时"。
+    """
     monkeypatch.setattr("agent.streaming.HEARTBEAT_INTERVAL", 0.05)
 
     graph = _QueueGraph()
@@ -137,19 +145,27 @@ def test_no_heartbeat_without_active_tool(monkeypatch):
         collect_task = asyncio.create_task(_collect_events(streaming))
         # 发非工具事件（on_chat_model_stream 无 chunk，会被跳过）
         await graph.put(_event("on_chat_model_stream"))
-        # 等待，但无活跃工具，不应发心跳
+        # 等待，无活跃工具，应发 heartbeat（而非 tool_running）
         await asyncio.sleep(0.2)
         await graph.put(None)
         return await collect_task
 
     events = asyncio.run(_scenario())
 
-    heartbeats = [e for e in events if e.event_type == EventType.TOOL_RUNNING]
-    assert len(heartbeats) == 0, f"无活跃工具不应发心跳，实际 {len(heartbeats)}"
+    heartbeats = [e for e in events if e.event_type == EventType.HEARTBEAT]
+    tool_runnings = [e for e in events if e.event_type == EventType.TOOL_RUNNING]
+    assert len(heartbeats) >= 1, f"静默期应发 heartbeat，实际 {len(heartbeats)}"
+    assert len(tool_runnings) == 0, (
+        f"无活跃工具不应发 tool_running，实际 {len(tool_runnings)}"
+    )
 
 
 def test_heartbeat_stops_after_tool_end(monkeypatch):
-    """on_tool_end 后即使再有无事件延迟，也不发心跳（active 已清空）。"""
+    """on_tool_end 后即使再有无事件延迟，也不发 tool_running（active 已清空）。
+
+    注意：工具结束后的静默期会改发 HEARTBEAT（LLM 静默期心跳），
+    因此本测试只断言 TOOL_RUNNING 不再出现。
+    """
     monkeypatch.setattr("agent.streaming.HEARTBEAT_INTERVAL", 0.05)
 
     graph = _QueueGraph()
@@ -159,22 +175,46 @@ def test_heartbeat_stops_after_tool_end(monkeypatch):
         collect_task = asyncio.create_task(_collect_events(streaming))
         # 工具执行
         await graph.put(_event("on_tool_start", tc_id="tc1"))
-        await asyncio.sleep(0.15)  # 工具执行期间发心跳
+        await asyncio.sleep(0.15)  # 工具执行期间发 tool_running
         output = SimpleNamespace(content="done", tool_call_id="tc1")
         await graph.put(_event("on_tool_end", output=output))
-        # 工具结束后延迟，不应发心跳
+        # 工具结束后延迟，不再发 tool_running
         await asyncio.sleep(0.15)
         await graph.put(None)
         return await collect_task
 
     events = asyncio.run(_scenario())
 
-    heartbeats = [e for e in events if e.event_type == EventType.TOOL_RUNNING]
-    assert len(heartbeats) >= 1, "工具执行期间应有心跳"
-    # 所有心跳都在 tool_result 之前
+    tool_runnings = [e for e in events if e.event_type == EventType.TOOL_RUNNING]
+    assert len(tool_runnings) >= 1, "工具执行期间应有 tool_running"
+    # 所有 tool_running 都在 tool_result 之前
     result_idx = next(
         i for i, e in enumerate(events) if e.event_type == EventType.TOOL_RESULT
     )
     for i, e in enumerate(events):
         if e.event_type == EventType.TOOL_RUNNING:
-            assert i < result_idx, "心跳不应出现在 tool_result 之后"
+            assert i < result_idx, "tool_running 不应出现在 tool_result 之后"
+
+
+def test_heartbeat_carries_no_tool_info(monkeypatch):
+    """HEARTBEAT 事件不携带 tool_call_id / tool_name，避免前端渲染幻影工具卡片。"""
+    monkeypatch.setattr("agent.streaming.HEARTBEAT_INTERVAL", 0.05)
+
+    graph = _QueueGraph()
+    streaming = _StubStreaming(graph)
+
+    async def _scenario() -> list:
+        collect_task = asyncio.create_task(_collect_events(streaming))
+        # 无任何事件，静默期持续发 heartbeat
+        await asyncio.sleep(0.15)
+        await graph.put(None)
+        return await collect_task
+
+    events = asyncio.run(_scenario())
+
+    heartbeats = [e for e in events if e.event_type == EventType.HEARTBEAT]
+    assert heartbeats, "静默期应发 heartbeat"
+    assert all(h.tool_call_id == "" for h in heartbeats), (
+        "heartbeat 不应携带 tool_call_id"
+    )
+    assert all(h.tool_name == "" for h in heartbeats), "heartbeat 不应携带 tool_name"
