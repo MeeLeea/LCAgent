@@ -18,6 +18,7 @@ class FakeSessionManager:
     """模拟 SessionManager 的记忆管理接口"""
     calls: list[tuple[str, Any]] = field(default_factory=list)
     _thread_id: str = "thread-1"
+    agent_fact_count: int = 2
     session_config: SessionConfig = field(
         default_factory=lambda: SessionConfig(provider="zhipu", model="glm-4")
     )
@@ -30,6 +31,7 @@ class FakeSessionManager:
             "checkpoint_file": "checkpoints.sqlite",
             "checkpoint_messages": 3,
             "long_term_count": 2,
+            "agent_fact_count": self.agent_fact_count,
             "total_threads": 1,
         }
 
@@ -42,6 +44,17 @@ class FakeSessionManager:
             "compressed_chars": 10,
             "summary": "压缩摘要",
         }
+
+    async def acompress_agent_memory(self) -> dict[str, Any]:
+        self.calls.append(("acompress_agent_memory", None))
+        return {
+            "success": True,
+            "original_count": 2,
+            "original_chars": 100,
+            "compressed_chars": 10,
+            "summary": "压缩摘要",
+        }
+
 
     async def aclear_long_term_memory(self, session_id: str | None = None) -> int:
         self.calls.append(("aclear_long_term_memory", session_id))
@@ -421,3 +434,34 @@ def test_dispatch_agent_memory_recalls_agent_level_memory(harness: Harness) -> N
     assert ("arecall_agent_memory", None) in harness.agent.session_manager.calls
     assert any("喜欢深色主题" in msg for msg in harness.printed)
     assert harness.runners.calls == []
+
+
+def test_dispatch_compress_agent_calls_agent_compress(harness: Harness) -> None:
+    # Given: agent-level memory has facts to compress.
+    # When: compress agent is dispatched.
+    result = dispatch(harness, "compress agent")
+    # Then: it routes to agent-level compression only.
+    assert result.handled is True
+    assert ("acompress_agent_memory", None) in harness.agent.session_manager.calls
+    assert ("acompress_memory", None) not in harness.agent.session_manager.calls
+
+
+def test_dispatch_compress_default_still_thread(harness: Harness) -> None:
+    # Given: thread-level memory has facts to compress.
+    # When: the default compress command is dispatched.
+    result = dispatch(harness, "compress")
+    # Then: it still routes to thread-level compression only.
+    assert result.handled is True
+    assert ("acompress_memory", None) in harness.agent.session_manager.calls
+    assert ("acompress_agent_memory", None) not in harness.agent.session_manager.calls
+
+
+def test_dispatch_compress_agent_no_memory_skips_llm(harness: Harness) -> None:
+    # Given: agent-level memory is empty.
+    harness.agent.session_manager.agent_fact_count = 0
+    # When: compress agent is dispatched.
+    result = dispatch(harness, "compress agent")
+    # Then: the command is handled without invoking any compression.
+    assert result.handled is True
+    assert ("acompress_agent_memory", None) not in harness.agent.session_manager.calls
+    assert ("acompress_memory", None) not in harness.agent.session_manager.calls

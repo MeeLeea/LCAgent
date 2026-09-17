@@ -55,6 +55,29 @@ async def compress_memory(context: CommandContext) -> CommandOutcome:
     return HANDLED
 
 
+async def compress_agent_memory(context: CommandContext) -> CommandOutcome:
+    """压缩 agent 级（跨会话共享）长期记忆。"""
+    mem = await context.agent.session_manager.aget_memory_summary()
+    if mem["agent_fact_count"] == 0:
+        context.print("\n没有 agent 级长期记忆可压缩")
+        return HANDLED
+    context.print(f"\n开始压缩 agent 级长期记忆 (共 {mem['agent_fact_count']} 条)...")
+    result = await context.agent.session_manager.acompress_agent_memory()
+    if result["success"]:
+        context.print("压缩完成！")
+        context.print(f"  原记忆条数:   {result['original_count']} 条")
+        context.print(f"  原字符数:     {result['original_chars']} 字符")
+        context.print(f"  压缩后字符数: {result['compressed_chars']} 字符")
+        ratio = (1 - int(result["compressed_chars"]) / max(int(result["original_chars"]), 1)) * 100
+        context.print(f"  压缩率:       {ratio:.1f}%")
+        context.print("\n--- 摘要内容 ---")
+        context.print(str(result["summary"]))
+        context.print("--- 已保存到长期记忆 Store (agent 级，跨会话共享) ---")
+    else:
+        context.print(f"\n压缩失败: {result.get('error', '未知错误')}")
+    return HANDLED
+
+
 async def show_agent_memory(context: CommandContext) -> CommandOutcome:
     """召回并展示 agent 级（跨会话共享）长期记忆。"""
     text = await context.agent.session_manager.arecall_agent_memory()
