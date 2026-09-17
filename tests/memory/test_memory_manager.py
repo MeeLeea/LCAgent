@@ -198,11 +198,14 @@ class TestSubmitAndConsume:
 
     def test_consume_event_tool_result_failure_becomes_lesson(self):
         """TOOL_RESULT 失败事件经 consume_event 提取 event_type/tool_name，
-        同类失败 ≥2 次确定性沉淀为 lesson（agent 级）。"""
+        同类失败 ≥2 次沉淀为 lesson（agent 级）：分类确定性锁定，
+        内容由 LLM 蒸馏后入库（不逐字存错误原文）。"""
         async def run():
             from utils.events import AgentEvent, EventType
 
-            mgr, store = _make_manager()
+            distilled_text = "run_shell 反复超时：命令含交互等待，应改为非交互执行"
+            llm = _FakeLLM(response=distilled_text)
+            mgr, store = _make_manager(llm_getter=lambda: llm)
             for _ in range(2):
                 event = AgentEvent(
                     event_type=EventType.TOOL_RESULT,
@@ -219,6 +222,8 @@ class TestSubmitAndConsume:
             assert len(agent_facts) == 1
             assert agent_facts[0].category == "lesson"
             assert agent_facts[0].scope == "agent"
+            # 存的是蒸馏文本而非错误原文
+            assert agent_facts[0].content == distilled_text
 
         asyncio.run(run())
 

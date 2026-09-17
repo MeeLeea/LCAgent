@@ -764,7 +764,7 @@ class _RecordingLLM:
 
 
 class TestDeterministicJudgment:
-    """失败次数驱动的确定性判定：SKIP 生效 + 失败≥2 绕过 LLM 直接记 lesson。"""
+    """失败次数驱动的确定性判定：SKIP 生效 + 失败≥2 分类锁定 lesson（内容经 LLM 蒸馏）。"""
 
     def test_single_failed_tool_result_skipped(self):
         """单次失败的工具结果应被确定性丢弃，不触发 LLM 抽取也不落库。"""
@@ -788,9 +788,14 @@ class TestDeterministicJudgment:
         asyncio.run(run())
 
     def test_two_failed_tool_results_become_lesson(self):
-        """同类失败 ≥2 次应确定性记为 lesson（agent 级），绕过 LLM。"""
+        """同类失败 ≥2 次记为 lesson（agent 级）：分类确定性锁定，内容经 LLM 蒸馏。
+
+        历史 bug 回归：确定性 lesson 曾把错误原文逐字入库（含巨型命令与
+        反思指令后缀），污染跨会话共享 namespace。现在必须存蒸馏文本。
+        """
         async def run():
-            llm = _RecordingLLM(response=json.dumps([]))
+            distilled_text = "run_shell 反复超时：命令含交互式等待，应改为非交互参数后执行"
+            llm = _RecordingLLM(response=distilled_text)
             mw, store = _make_write_middleware(llm_getter=lambda: llm)
             for _ in range(2):
                 await mw.submit_event(
@@ -802,14 +807,142 @@ class TestDeterministicJudgment:
                 )
             await mw._aflush_thread("t1")
 
-            # 两次失败 → 确定性 lesson，直接写入 agent 级，无需 LLM
-            assert llm.calls == []
+            # 失败 ≥2 → 分类不再交 LLM 判定，但内容走蒸馏通道（调用一次 chat）
+            assert len(llm.calls) == 1
             agent_facts = await store.query_agent_facts()
             assert len(agent_facts) == 1
             assert agent_facts[0].category == "lesson"
             assert agent_facts[0].scope == "agent"
+            # 存的是蒸馏文本，不是错误原文
+            assert agent_facts[0].content == distilled_text
 
         asyncio.run(run())
+
+    def test_lesson_distill_failure_discards_raw_text(self):
+        """蒸馏 LLM 调用失败时该条 lesson 丢弃，绝不回退逐字存原文。"""
+        async def run():
+            class _BoomLLM:
+                def chat(self, messages):
+                    raise RuntimeError("LLM unavailable")
+
+            mw, store = _make_write_middleware(llm_getter=lambda: _BoomLLM())
+            for _ in range(2):
+                await mw.submit_event(
+                    "t1",
+                    "assistant",
+                    "[工具执行失败] run_shell 抛出了 TimeoutError: 巨型命令原文……",
+                    event_type="tool_result",
+                    tool_name="run_shell",
+                )
+            await mw._aflush_thread("t1")
+
+            assert await store.query_agent_facts() == []
+            assert await store.query_facts("t1") == []
+
+        asyncio.run(run())
+
+    def test_lesson_distill_empty_response_discarded(self):
+        """LLM 判定无教训（返回空 / 空数组）时该条 lesson 丢弃。"""
+        async def run():
+            for empty_response in ("", "[]"):
+                llm = _RecordingLLM(response=empty_response)
+                mw, store = _make_write_middleware(llm_getter=lambda llm=llm: llm)
+                for _ in range(2):
+                    await mw.submit_event(
+                        "t1",
+                        "assistant",
+                        "命令超时 run_shell",
+                        event_type="tool_result",
+                        tool_name="run_shell",
+                    )
+                await mw._aflush_thread("t1")
+                assert await store.query_agent_facts() == [], (
+                    f"空响应 {empty_response!r} 不应落库"
+                )
+
+        asyncio.run(run())
+
+    def test_hitl_interrupt_content_not_counted_as_failure(self):
+        """含 GraphInterrupt / dangerous_command 标记的 TOOL_RESULT 不算工具失败：
+        不计数、不蒸馏、不落库（安全确认是正常 HITL 流程，不是踩坑）。"""
+        async def run():
+            llm = _RecordingLLM(response="[]")
+            mw, store = _make_write_middleware(llm_getter=lambda: llm)
+            hitl_content = (
+                "[工具执行失败] GraphInterrupt: (Interrupt(value={'kind': "
+                "'dangerous_command', 'prompt': '⚠ 检测到危险命令'}, id='abc'))"
+            )
+            for _ in range(3):
+                await mw.submit_event(
+                    "t1",
+                    "assistant",
+                    hitl_content,
+                    event_type="tool_result",
+                    tool_name="run_shell",
+                )
+            await mw._aflush_thread("t1")
+
+            assert llm.calls == []
+            assert await store.query_agent_facts() == []
+            assert await store.query_facts("t1") == []
+            # 失败计数未被污染
+            assert mw._failure_counts.get(("t1", "run_shell"), 0) == 0
+
+        asyncio.run(run())
+
+    def test_distilled_lesson_deduplicated_against_existing(self):
+        """蒸馏出的 lesson 与既有 agent 级 fact 内容相同时被去重（历史 bug：
+        直接构造的 lesson 曾绕过查重）。"""
+        async def run():
+            same_text = "重复教训：路径要相对化"
+            llm = _RecordingLLM(response=same_text)
+            mw, store = _make_write_middleware(llm_getter=lambda: llm)
+            await store.save_agent_fact(
+                ThreadFactItem(content=same_text, category="lesson", scope="agent")
+            )
+            for _ in range(2):
+                await mw.submit_event(
+                    "t1",
+                    "assistant",
+                    "命令超时 run_shell",
+                    event_type="tool_result",
+                    tool_name="run_shell",
+                )
+            await mw._aflush_thread("t1")
+
+            agent_facts = await store.query_agent_facts()
+            assert len(agent_facts) == 1  # 仅预置那条，蒸馏结果被去重
+
+        asyncio.run(run())
+
+    def test_strip_tool_error_boilerplate(self):
+        """蒸馏前剥离反思指令 / workspace 提示后缀并截断超长内容。"""
+        from memory.middleware import _LESSON_SOURCE_MAX_CHARS, _strip_tool_error_boilerplate
+
+        streaming_style = (
+            "[工具执行失败] KeyError: 'dst_path'。请反思失败原因（参数是否正确、"
+            "参数组合是否合法、路径是否有效），修正后重试"
+        )
+        cleaned = _strip_tool_error_boilerplate(streaming_style)
+        assert "请反思失败原因" not in cleaned
+        assert "修正后重试" not in cleaned
+        assert "KeyError" in cleaned
+
+        mw_style = (
+            "[工具执行失败] run_shell 抛出了 FileNotFoundError: x。"
+            "工作空间根目录为 D:/work/demo。文件类工具请基于工作空间根目录使用相对路径，"
+            "若相对路径首段与工作空间目录名重复会导致路径重复拼接，应去除该前缀。"
+            "请反思失败原因（参数是否正确、路径是否有效、前置条件是否满足），修正后重试"
+        )
+        cleaned = _strip_tool_error_boilerplate(mw_style)
+        assert "请反思失败原因" not in cleaned
+        assert "工作空间根目录为" not in cleaned
+        assert "文件类工具请基于" not in cleaned
+        assert "FileNotFoundError" in cleaned
+
+        long_cleaned = _strip_tool_error_boilerplate("x" * (_LESSON_SOURCE_MAX_CHARS + 500))
+        assert len(long_cleaned) <= _LESSON_SOURCE_MAX_CHARS + 10
+        assert long_cleaned.endswith("…(已截断)")
 
     def test_important_message_marked_in_llm_prompt(self):
         """important=True 的消息应带 [用户明确要求记住] 标注传入 LLM。"""

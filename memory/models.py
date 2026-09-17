@@ -106,7 +106,8 @@ def judge_long_term_memory(event: MemoryInputEvent) -> MemoryCategory | None:
 
     返回值语义：
     - :attr:`MemoryCategory.SKIP`：确定性丢弃，不进入 LLM 抽取
-    - :attr:`MemoryCategory.LESSON_EXPERIENCE`：同类失败 ≥2 次，确定性记为经验教训
+    - :attr:`MemoryCategory.LESSON_EXPERIENCE`：同类失败 ≥2 次，分类确定性锁定
+      为经验教训（内容仍由写中间件交 LLM 蒸馏成简短教训后入库，不逐字存原文）
     - :attr:`MemoryCategory.IMPORTANT_CONVERSATION`：用户显式标记，提高 LLM 抽取优先级
     - ``None``：值得评估，分类交由 LLM 抽取决定
     """
