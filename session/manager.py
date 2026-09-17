@@ -375,6 +375,12 @@ class SessionManager:
         sid = self.current_session_id
         return await self._memory.compress(sid)
 
+    async def acompress_agent_memory(self) -> dict[str, Any]:
+        """压缩 agent 级（跨会话共享）长期记忆。"""
+        if self._memory is None:
+            return {"success": False, "error": "MemoryManager 未初始化"}
+        return await self._memory.compress_agent()
+
     async def aclear_long_term_memory(self, session_id: str | None = None) -> int:
         """清空长期记忆。"""
         if self._memory is None:

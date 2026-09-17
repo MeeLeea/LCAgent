@@ -316,7 +316,7 @@ LangChainAgent/
 │   ├── open_file.py         # 文件打开工具（系统默认程序/DB Browser）
 │   ├── skills.py            # re-export skmng.manager（向后兼容，待删）
 │   ├── skill_tool.py        # re-export skmng.tool（向后兼容，待删）
-│   ├── create_tools.py      # 动态生成工具代码，保存为 .py 并自动注册到 __init__.py
+│   ├── create_tools.py      # 动态生成工具代码，保存为 .py 并自动注册到 __init__.py（顺带生成单元测试到 tests/tools/）
 │   ├── safety.py            # 安全护栏(黑名单/白名单/交互确认/路径保护)
 │   ├── mcp_loader.py        # MCP 配置管理与工具加载器（含按工具名筛选加载 aload_mcp_tools_by_name / load_mcp_tools_by_name_sync）
 │   ├── mcp_pool.py          # MCP 连接池（per-server 隔离 + 健康探测 + 自动重连）
@@ -362,7 +362,7 @@ LangChainAgent/
 | [main.py](main.py)                                                       | 交互式命令行入口 + Agent 构建接口                                                                                                                                                                                                                                                                                                                                                                  |
 | [agent/llm_client.py](agent/llm_client.py)                               | 从`config/llm_config.json` 读取提供商配置，支持运行时切换提供商/模型                                                                                                                                                                                                                                                                                                                             |
 | [agent/config.py](agent/config.py)                                       | 加载`agent/agent_config.json`，统一运行时配置                                                                                                                                                                                                                                                                                                                                                    |
-| [memory/](memory/)                                                       | 三层架构 Memory 层：`AgentMemory`（checkpointer + Store 基础设施）/ `MemoryContext`（统一工厂，透传 `process_type` / `max_agent_facts`）/ `MemoryManager`（统一门面，含 agent 级召回接口）/ `ThreadMemoryStore`（Store 业务封装，agent 级 + thread 级两级 namespace）/ 读写中间件（防抖 + Fact 抽取 + 两级路由 + prompt 注入）/ per-thread 锁池                                        |
+| [memory/](memory/)                                                       | 三层架构 Memory 层：`AgentMemory`（checkpointer + Store 基础设施）/ `MemoryContext`（统一工厂，透传 `process_type` / `agent_key` / `max_agent_facts`）/ `MemoryManager`（统一门面，含 agent 级召回接口）/ `ThreadMemoryStore`（Store 业务封装，agent 级 + thread 级两级 namespace）/ 读写中间件（防抖 + Fact 抽取 + 两级路由 + prompt 注入）/ per-thread 锁池                                        |
 | [agent/compaction.py](agent/compaction.py)                               | 长上下文压缩中间件：增量摘要 + 工具输出 Prune + 保留近期消息，摘要随 checkpoint 持久化、per-thread 隔离                                                                                                                                                                                                                                                                                            |
 | [utils/events.py](utils/events.py)                                       | 标准化执行事件模型：`AgentEvent`（frozen dataclass）+ `EventType` 枚举（含 TOKEN/TOOL_*/INTERRUPT/ERROR/DONE/NODE_*）+ SSE dict 序列化，三层架构唯一通信载体                                                                                                                                                                                                                                 |
 | [utils/metrics.py](utils/metrics.py)                                     | `MetricsCollector`：线程安全的运行时指标收集（LLM 调用 / 工具执行 / 压缩统计）                                                                                                                                                                                                                                                                                                                   |
@@ -466,13 +466,13 @@ Agent 有三种执行模式，对应三种不同的交互入口：
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-> **agent_key**：`process_type or "default"`，由 `MemoryContext` 经 `ThreadMemoryStore` 构造参数透传，用于隔离不同进程（server / scheduler / feishu）的 agent 级记忆，防止多进程同库串号。
+> **agent_key**：由 `MemoryContext.acreate(..., agent_key=...)` 经 `ThreadMemoryStore(agent_key=...)` 透传的显式参数，默认 `"global"`（`memory/config.py` 的 `MEMORY_AGENT_KEY`），**跨进程共享**——CLI / API / 调度器 / 飞书 共用同一 `("global", "global_facts")`。`process_type` 不再参与 agent 级 namespace，仅用于 thread_id 前缀（会话可见性）。
 
 **数据流**（读写分离，两级作用域）：
 
 ```
 写: SessionManager 消费 AgentEvent 流（submit_user_message / consume_event）
-     → 非阻塞投递到 WriteMiddleware 防抖 buffer（20s 窗口）
+     → 非阻塞投递到 WriteMiddleware 防抖 buffer（30s 窗口）
      → LLM Fact 抽取（content + category + confidence）
      → 无效过滤 / 两级 existing 去重（agent 优先）
      → 按 category 路由作用域：
@@ -480,12 +480,12 @@ Agent 有三种执行模式，对应三种不同的交互入口：
          • conv / business    → thread namespace（会话隔离）
      → 分流批量写入 → 分流 LRU 淘汰
          • agent 级超 200 条（memory_max_agent_facts）淘汰
-         • thread 级超 50 条（memory_max_facts_per_thread）淘汰
+         • thread 级超 60 条（memory_max_facts_per_thread）淘汰
 
 读: ThreadMemoryReadMiddleware.awrap_model_call（每个 model 调用前）
      → 并行 query_agent_facts() + query_facts(thread_id)
      → 合并 + content 精确去重（agent 优先，保留 agent 级版本）
-     → 按 create_time 升序，截取 recall_limit（默认 10）条
+     → 按 create_time 升序，截取 recall_limit（默认 20）条
      → 格式化为文本追加到 SystemMessage（【长期记忆】块）
      → 非阻塞 touch 更新 last_used_at（按 scope 分发到两级 namespace）
 ```
@@ -494,10 +494,10 @@ Agent 有三种执行模式，对应三种不同的交互入口：
 
 | 组件                            | 文件                                            | 职责                                                                                                                                                                                                                                                                                                   |
 | ------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `MemoryManager`               | [memory/manager.py](memory/manager.py)           | 统一门面：`recall` / `recall_text`（thread 级）+ `recall_agent` / `recall_agent_text` / `count_agent_facts` / `clear_agent_facts`（agent 级）+ `submit_user_message` / `consume_event` / `compress` / `clear` / `flush_all`                                                      |
-| `MemoryContext`               | [memory/context.py](memory/context.py)           | 统一工厂：入口程序（main/api/scheduler）调用`acreate()` 组装全部组件，透传 `process_type` / `max_agent_facts`，暴露 checkpointer / store / read_middleware / memory_manager                                                                                                                      |
-| `AgentMemory`                 | [memory/agent_memory.py](memory/agent_memory.py) | checkpointer（`AsyncSqliteSaver`）+ 长期记忆 Store（`AsyncSqliteStore`）基础设施；`process_type` 用于 thread_id 前缀与 agent 级记忆多进程隔离                                                                                                                                                    |
-| `ThreadMemoryStore`           | [memory/store.py](memory/store.py)               | Store 业务封装：thread 级 facts 增/查/批量写/LRU 淘汰/摘要替换/会话级清空；新增 agent 级方法族（`query_agent_facts` / `save_agent_facts_batch` / `count_agent_facts` / `clear_agent_facts` / `prune_agent_facts` / `touch_agent_fact`），构造参数含 `max_agent_facts` / `process_type` |
+| `MemoryManager`               | [memory/manager.py](memory/manager.py)           | 统一门面：`recall` / `recall_text`（thread 级）+ `recall_agent` / `recall_agent_text` / `count_agent_facts` / `clear_agent_facts` / `compress_agent`（agent 级）+ `submit_user_message` / `consume_event` / `compress` / `clear` / `flush_all`                                                      |
+| `MemoryContext`               | [memory/context.py](memory/context.py)           | 统一工厂：入口程序（main/api/scheduler）调用`acreate()` 组装全部组件，透传 `process_type` / `agent_key` / `max_agent_facts`，暴露 checkpointer / store / read_middleware / memory_manager                                                                                                                      |
+| `AgentMemory`                 | [memory/agent_memory.py](memory/agent_memory.py) | checkpointer（`AsyncSqliteSaver`）+ 长期记忆 Store（`AsyncSqliteStore`）基础设施；`process_type` 仅用于 thread_id 前缀（会话可见性），agent 级 namespace 由 `agent_key` 决定（默认跨进程共享）                                                                                                       |
+| `ThreadMemoryStore`           | [memory/store.py](memory/store.py)               | Store 业务封装：thread 级 facts 增/查/批量写/LRU 淘汰/摘要替换/会话级清空；新增 agent 级方法族（`query_agent_facts` / `save_agent_facts_batch` / `count_agent_facts` / `clear_agent_facts` / `prune_agent_facts` / `touch_agent_fact` / `replace_agent_facts_with_summary`），构造参数含 `max_agent_facts` / `agent_key` |
 | `ThreadMemoryWriteMiddleware` | [memory/middleware.py](memory/middleware.py)     | 写服务：事件接收 + 防抖 buffer + Fact 抽取流水线（非 AgentMiddleware）；按`category` 路由到 agent / thread 两级作用域                                                                                                                                                                                |
 | `ThreadMemoryReadMiddleware`  | [memory/middleware.py](memory/middleware.py)     | 读中间件（AgentMiddleware）：`awrap_model_call` 并行读取两级 facts，合并去重（agent 优先）后注入 SystemMessage                                                                                                                                                                                       |
 | `ThreadMemoryLockPool`        | [memory/lock_pool.py](memory/lock_pool.py)       | per-thread`asyncio.Lock` 池：串行化同一 thread 的写入，不同 thread 并行                                                                                                                                                                                                                              |
@@ -512,10 +512,10 @@ Agent 有三种执行模式，对应三种不同的交互入口：
 
 | 作用域              | namespace                       | 写入的 category                | 可见范围                           | LRU 上限（配置键）                         |
 | ------------------- | ------------------------------- | ------------------------------ | ---------------------------------- | ------------------------------------------ |
-| **agent 级**  | `(agent_key, "global_facts")` | `user_fact` / `lesson`     | 同一`agent_key` 下的所有会话共享 | `memory_max_agent_facts`（默认 200）     |
-| **thread 级** | `(thread_id, "thread_facts")` | `conv` / `business` / 兜底 | 仅当前`thread_id` 可见           | `memory_max_facts_per_thread`（默认 50） |
+| **agent 级**  | `(agent_key, "global_facts")` | `user_fact` / `lesson`     | 跨进程共享（CLI / API / 调度器 / 飞书 共用 `("global", "global_facts")`） | `memory_max_agent_facts`（默认 200）     |
+| **thread 级** | `(thread_id, "thread_facts")` | `conv` / `business` / 兜底 | 仅当前`thread_id` 可见           | `memory_max_facts_per_thread`（默认 60） |
 
-**`agent_key` 来源**：`agent_key = process_type or "default"`。`process_type` 由 `MemoryContext.acreate(..., process_type=...)` → `ThreadMemoryStore(process_type=...)` 透传，用于隔离不同进程（CLI / API / 调度器 / 飞书）的 agent 级记忆，避免多进程同库串号。
+**`agent_key` 来源**：`agent_key` 是 `MemoryContext.acreate(..., agent_key=...)` 的显式参数，默认 `"global"`（`memory/config.py` 的 `MEMORY_AGENT_KEY`），经 `ThreadMemoryStore(agent_key=...)` 透传，决定 agent 级 namespace。**默认跨进程共享**：CLI / API / 调度器 / 飞书 共用 `("global", "global_facts")`，agent 级记忆可跨进程沉淀；如需隔离可显式覆盖 `agent_key`。`process_type` 仍由 `MemoryContext.acreate(..., process_type=...)` 透传，但只用于 thread_id 前缀（会话可见性），不再参与 agent 级 namespace。
 
 **读取侧聚合**（每次 LLM 调用前）：
 
@@ -523,7 +523,7 @@ Agent 有三种执行模式，对应三种不同的交互入口：
 awrap_model_call
    ↓ asyncio.gather(query_agent_facts(), query_facts(thread_id))
    ↓ 合并 + content 精确去重（agent 级优先，保留 agent 级版本）
-   ↓ 按 create_time 升序，截取 recall_limit（默认 10）条
+   ↓ 按 create_time 升序，截取 recall_limit（默认 20）条
    ↓ 注入 SystemMessage（【长期记忆】块）
    ↓ 非阻塞 touch：agent 级调 touch_agent_fact，thread 级调 touch_fact
 ```
@@ -535,6 +535,20 @@ awrap_model_call
 - 去重基准同时读取两级 existing，按 `content` 精确比对，agent 级优先（避免同一条 fact 跨作用域重复）。
 
 > **写入路径**：事件筛选（`is_memory_worthy`：DONE / TOOL_RESULT 且 content 非空）→ 防抖 → `judge_long_term_memory` 确定性预判定（SKIP 丢弃 / 失败≥2 记 lesson / 其余交 LLM）→ LLM 抽取 → 按 `category` 路由到 agent / thread 作用域 → 去重 → 写入 → LRU 淘汰。本次分层只改变了"写到哪一级 namespace"和"读时如何聚合"。
+
+> **历史数据迁移（旧 `server` namespace）**：`agent_key` 与 `process_type` 解耦前，agent 级记忆写在 `("server", "global_facts")`。升级后请用一次性脚本把旧数据复制到共享 namespace `("global", "global_facts")`（默认 dry-run，确认后再 `--apply`）：
+>
+> - 预演（只读，不写库）：`uv run python scripts/migrate_agent_memory_namespace.py --dry-run`
+> - 真正复制：`uv run python scripts/migrate_agent_memory_namespace.py --apply`
+> - （可选）校验通过后删除旧数据：`uv run python scripts/migrate_agent_memory_namespace.py --apply --delete-source`
+>
+> 脚本复用项目自身的 `AsyncSqliteStore`，按 `fact_id` 幂等、可安全重跑；详见 [scripts/README.md](scripts/README.md)。
+
+> **跨进程共享的已知取舍**：agent 级 namespace 默认跨进程共享，带来以下代价：
+>
+> - **跨进程重复 fact**：去重只在单进程写入时按 `content` 精确比对（best-effort），CLI / API / 调度器 / 飞书 并发写入同一 namespace 时可能产生重复条目。
+> - **并发 LRU 淘汰**：`prune_agent_facts` 在各自进程内读取全量后按 `last_used_at` 淘汰，多进程并发 prune 可能略微过量淘汰（over-evict）。
+> - **`clear agent` 无跨进程锁**：清空只作用于当前进程可见的数据；清空后另一进程的在途写入（防抖 flush）可能立即重新写回 facts。
 
 ### 上下文注入机制（重要）
 
@@ -610,17 +624,17 @@ self.agent_executor = self._create_agent_executor(
 
 > ⚠️ **作用域分层（重要）**：长期记忆按 `category` 自动分流到两级 namespace：
 >
-> - **agent 级**（`namespace=(agent_key, "global_facts")`，跨会话共享）：`user_fact`（用户事实偏好）/ `lesson`（经验教训）。`agent_key = process_type or "default"`，同一进程的所有会话共享，体现长期记忆跨会话价值；切到新 thread 后这部分 facts 仍会被 ReadMiddleware 召回。
+> - **agent 级**（`namespace=(agent_key, "global_facts")`，跨会话共享）：`user_fact`（用户事实偏好）/ `lesson`（经验教训）。`agent_key` 默认 `"global"`（`memory/config.py` 的 `MEMORY_AGENT_KEY`），**跨进程共享**（CLI / API / 调度器 / 飞书 共用同一 namespace），体现长期记忆跨会话、跨进程价值；切到新 thread 后这部分 facts 仍会被 ReadMiddleware 召回。
 > - **thread 级**（`namespace=(thread_id, "thread_facts")`，会话隔离）：`conv`（重要对话）/ `business`（业务实体）。仅当前会话可见，切到新 thread 后不再注入。
 >
-> 读取侧每次 LLM 调用前聚合两级 facts，按 `content` 精确去重（agent 优先保留），按 `create_time` 升序截取 `recall_limit`（默认 10）条注入 SystemMessage。
+> 读取侧每次 LLM 调用前聚合两级 facts，按 `content` 精确去重（agent 优先保留），按 `create_time` 升序截取 `recall_limit`（默认 20）条注入 SystemMessage。
 
 ### 两层存储对比
 
 | 类型                 | 存储方式                                   | 触发时机                               | 保存内容                                 | 作用域（namespace）                                                                                                           | 持久化  | 用途                                                         |
 | -------------------- | ------------------------------------------ | -------------------------------------- | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ------- | ------------------------------------------------------------ |
 | **Checkpoint** | `data/checkpoints_async.sqlite` (SQLite) | Agent 每步执行后自动                   | 完整状态(消息+工具调用链+中间变量)       | per-thread（按`thread_id`）                                                                                                 | ✅ 永久 | 程序重启恢复对话、多会话隔离                                 |
-| **长期记忆**   | 同一 SQLite 文件（`AsyncSqliteStore`）   | 事件驱动 + LLM 抽取（防抖 20s 后批量） | facts（content + category + confidence） | 两级：agent 级`(agent_key, "global_facts")`（user_fact/lesson）+ thread 级 `(thread_id, "thread_facts")`（conv/business） | ✅ 永久 | 跨会话共享关键信息 + 会话隔离业务事实、注入 prompt、compress |
+| **长期记忆**   | 同一 SQLite 文件（`AsyncSqliteStore`）   | 事件驱动 + LLM 抽取（防抖 30s 后批量） | facts（content + category + confidence） | 两级：agent 级`(agent_key, "global_facts")`（user_fact/lesson）+ thread 级 `(thread_id, "thread_facts")`（conv/business） | ✅ 永久 | 跨会话共享关键信息 + 会话隔离业务事实、注入 prompt、compress |
 
 ### 三种模式的记忆行为
 
@@ -703,7 +717,7 @@ _a_run_pipeline()  （buffer 超时后批量处理）
    ↓
 ⑦ 分流 LRU 淘汰：
      • prune_agent_facts()：agent 级超 memory_max_agent_facts（默认 200）时淘汰
-     • prune_facts(thread_id)：thread 级超 memory_max_facts_per_thread（默认 50）时淘汰
+     • prune_facts(thread_id)：thread 级超 memory_max_facts_per_thread（默认 60）时淘汰
 ```
 
 **事件来源**：SessionManager 消费 AgentEvent 流时调用：
@@ -763,10 +777,10 @@ CHECKPOINT_FILE = os.path.join(BASE_DIR, "data", "checkpoints_async.sqlite")
 
 > **长期记忆存储**：长期记忆由 LangGraph `BaseStore`（`AsyncSqliteStore`，见 [memory/store.py](memory/store.py) 的 `ThreadMemoryStore`）管理，与 checkpoint 复用同一 SQLite 文件，按**两级 namespace**天然实现分层隔离：
 >
-> - **agent 级**：`(agent_key, "global_facts")`，存放 `user_fact` / `lesson`，跨会话共享；`agent_key = process_type or "default"`，多进程隔离防串号。
+> - **agent 级**：`(agent_key, "global_facts")`，存放 `user_fact` / `lesson`，跨会话共享；`agent_key` 默认 `"global"`（跨进程共享，可显式覆盖以隔离）。
 > - **thread 级**：`(thread_id, "thread_facts")`，存放 `conv` / `business`，仅当前会话可见。
 >
-> `compress` 命令现改为对 thread 级 Store 中的 facts 做摘要替换（`replace_with_summary`），不影响 agent 级记忆。
+> `compress` 命令对 thread 级 Store 中的 facts 做摘要替换（`replace_with_summary`），不影响 agent 级记忆；`compress agent` 则对 agent 级 facts 做摘要替换（`replace_agent_facts_with_summary`），不影响 thread 级记忆。
 
 > checkpoint 与 Store 各持有**独立的 `aiosqlite` 连接**（均启用 WAL 模式 + `busy_timeout=10000`），支持多进程（CLI / API / 调度器 / 飞书）并发读写。
 
@@ -783,7 +797,8 @@ CHECKPOINT_FILE = os.path.join(BASE_DIR, "data", "checkpoints_async.sqlite")
 | `clear agent` 或 `clear 全局` | 清空 agent 级（跨会话共享）长期记忆（`MemoryManager.clear_agent_facts`） |
 | `clear all`                     | 全部清空（长期 facts + agent 级 + 新会话）                                 |
 | `agent memory`                  | 召回并展示 agent 级长期记忆（跨会话共享的`user_fact` / `lesson`）      |
-| `compress` 或 `压缩`          | 压缩长期记忆(LLM 摘要后替换单个摘要 fact)                                  |
+| `compress` 或 `压缩`          | 压缩当前 thread 级长期记忆(LLM 摘要后替换单个摘要 fact；默认作用域为 thread) |
+| `compress agent` 或 `压缩 agent` | 压缩 agent 级（跨会话共享）长期记忆(LLM 摘要后替换单个摘要 fact；别名 `compress:agent`) |
 | `thread`                        | 方向键选择切换会话                                                         |
 | `thread:new`                    | 开启新会话                                                                 |
 | `thread:delete <id>`            | 删除指定会话(二次确认)                                                     |
@@ -798,18 +813,18 @@ API地址:    https://api.deepseek.com
 
 --- 记忆状态 ---
 当前会话:   thread-a4d099d2
-Checkpoint: sqlite → D:\work\LangChainAgent\data\checkpoints_async.sqlite
+Checkpoint: sqlite → D:\work\LCAgent\data\checkpoints_async.sqlite
 已存消息:   8 条
-长期记忆:   5 条 (thread 级，会话隔离)
+长期记忆:   5 条
 agent 级记忆: 12 条 (跨会话共享)
 总会话数:   2
 ```
 
 ### 压缩长期记忆（compress）
 
-随着对话不断积累，thread 级 Store 中的 facts 会越来越多（单 thread 上限 `memory_max_facts_per_thread` 默认 50 条，超出 LRU 淘汰；agent 级另有 `memory_max_agent_facts` 默认 200 条上限）。`compress` 命令通过 LLM 把当前 thread 的 facts 压缩成一份摘要，再替换为**单条摘要 fact**。
+随着对话不断积累，thread 级 Store 中的 facts 会越来越多（单 thread 上限 `memory_max_facts_per_thread` 默认 60 条，超出 LRU 淘汰；agent 级另有 `memory_max_agent_facts` 默认 200 条上限）。`compress` 命令通过 LLM 把当前 thread 的 facts 压缩成一份摘要，再替换为**单条摘要 fact**；`compress agent` 则对 agent 级（跨会话共享）facts 做同样处理。
 
-> **注意**：compress 只压缩**当前 thread 级长期记忆 facts**（`conv` / `business`），不影响 checkpoint（完整对话历史保留在 `checkpoints_async.sqlite`），也不影响 agent 级记忆（`user_fact` / `lesson` 跨会话共享，需通过 `MemoryManager.clear_agent_facts` 单独清空）。
+> **注意**：`compress` 只压缩**当前 thread 级长期记忆 facts**（`conv` / `business`），不影响 checkpoint（完整对话历史保留在 `checkpoints_async.sqlite`），也不影响 agent 级记忆（`user_fact` / `lesson` 跨会话共享，需通过 `MemoryManager.clear_agent_facts` 单独清空；如需压缩 agent 级记忆，用 `compress agent`）。
 
 #### 工作流程
 
@@ -869,6 +884,41 @@ ThreadMemoryStore.replace_with_summary(thread_id, summary)
 
 `MemoryManager.compress()` 返回 `{"success", "original_count", "original_chars", "compressed_chars", "summary"}`，其中保留压缩前的条数与字符数，便于追溯。
 
+#### agent 级压缩（compress agent）
+
+`compress agent`（别名 `压缩 agent` / `compress:agent`）与 thread 级 `compress` 使用同一套 LLM 摘要提示词，但作用域是 **agent 级（跨会话共享）** 的长期记忆 facts（`user_fact` / `lesson`），namespace 为 `(agent_key, "global_facts")`（`agent_key` 默认 `"global"`，跨进程共享）。
+
+> **注意**：agent 级压缩**不可逆**——压缩后原 agent 级 facts 被删除并替换为单条摘要；**不影响 thread 级 facts**，也不影响 checkpoint。仅当 agent 级记忆条数为 0 时拒绝执行（提示「没有 agent 级长期记忆可压缩」）。
+
+工作流程：
+
+```
+agent 级 Store facts (N条原始记忆)
+       ↓
+MemoryManager.compress_agent() 拼接为文本 + 压缩提示词
+       ↓
+LLM 生成摘要（阻塞调用放入 asyncio.to_thread，不阻塞事件循环）
+       ↓
+ThreadMemoryStore.replace_agent_facts_with_summary(summary)
+       ↓
+删除 agent namespace 全部旧 facts → 写入 1 条摘要 fact
+```
+
+摘要作为单条 `ThreadFactItem` 写入 agent 级 Store（namespace `(agent_key, "global_facts")`）：
+
+| 字段           | 值                            |
+| -------------- | ----------------------------- |
+| `content`    | `[历史记忆摘要]\n{summary}` |
+| `category`   | `conv`（重要对话）          |
+| `confidence` | `1.0`                       |
+| `scope`      | `agent`（跨会话共享）        |
+| `thread_id`  | `agent_key`（默认 `global`） |
+| `fact_id`    | 新生成的 uuid hex             |
+
+`MemoryManager.compress_agent()` 返回与 `compress()` 相同的 `{"success", "original_count", "original_chars", "compressed_chars", "summary"}` 结构。
+
+> **HTTP API 限制**：目前没有 agent 级压缩/清空端点。`POST /api/compress` 只压缩 thread 级；`DELETE /api/memory?scope=long|short|all` 也只清 thread 级（`all` 仅额外开启新会话，不含 agent 级，且 `scope=agent` 会返回 400）。agent 级压缩/清空目前仅 CLI 提供。
+
 #### 特点与注意事项
 
 | 特性                | 说明                                                                                                      |
@@ -880,9 +930,10 @@ ThreadMemoryStore.replace_with_summary(thread_id, summary)
 | LLM 失败不丢数据    | 调用失败则原 facts 不变，不会替换                                                                         |
 | **不可逆**    | 压缩后原 facts 无法恢复，重要数据可先用`export` 备份                                                    |
 | 不影响 checkpoint   | 只压缩 thread 级 Store facts，checkpoints_async.sqlite 保留完整历史                                       |
-| 不影响 agent 级记忆 | 只压缩 thread 级（`conv` / `business`），agent 级（`user_fact` / `lesson`）跨会话共享，不参与压缩 |
+| 不影响 agent 级记忆 | thread 级 `compress` 只压缩 thread 级（`conv` / `business`），agent 级（`user_fact` / `lesson`）跨会话共享，不参与压缩 |
+| agent 级压缩        | `compress agent` 只压缩 agent 级（`user_fact` / `lesson`），不影响 thread 级 facts 与 checkpoint         |
 
-> 💡 **建议**：在 thread 级长期记忆较多时（如 `memory_max_facts_per_thread` 默认 50 条上限附近）使用，平时少量记忆无需压缩。
+> 💡 **建议**：在 thread 级长期记忆较多时（如 `memory_max_facts_per_thread` 默认 60 条上限附近）使用，平时少量记忆无需压缩。
 
 ### 记忆相关 API
 
@@ -892,7 +943,7 @@ ThreadMemoryStore.replace_with_summary(thread_id, summary)
 
 | 成员                                 | 说明                                                                             |
 | ------------------------------------ | -------------------------------------------------------------------------------- |
-| `await MemoryContext.acreate(...)` | 异步创建全部记忆组件（checkpointer + Store + 锁池 + 读写中间件 + MemoryManager） |
+| `await MemoryContext.acreate(...)` | 异步创建全部记忆组件（checkpointer + Store + 锁池 + 读写中间件 + MemoryManager）；关键参数：`process_type`（仅 thread_id 前缀）/ `agent_key`（agent 级 namespace，默认 `"global"` 跨进程共享）/ `max_facts_per_thread` / `max_agent_facts` / `recall_limit` |
 | `ctx.checkpointer`                 | LangGraph checkpointer（传给`AgentCore` / `SessionRegistry`）                |
 | `ctx.store`                        | LangGraph`BaseStore`（传给 `create_agent(store=...)`）                       |
 | `ctx.read_middleware`              | `ThreadMemoryReadMiddleware`（传给 `extra_middleware`）                      |
@@ -907,7 +958,7 @@ ThreadMemoryStore.replace_with_summary(thread_id, summary)
 
 | 方法                                                               | 说明                                                                                    |
 | ------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
-| `await recall(thread_id, limit=None)`                            | 召回该 thread 的长期记忆 facts（按创建时间升序，截取最近 limit 条，默认 10）            |
+| `await recall(thread_id, limit=None)`                            | 召回该 thread 的长期记忆 facts（按创建时间升序，截取最近 limit 条，默认 20）            |
 | `await recall_text(thread_id, limit=None)`                       | 召回并格式化为文本片段（`【长期记忆】` 块，供注入 prompt）                            |
 | `await submit_user_message(thread_id, content, important=False)` | 提交用户消息到写中间件（非阻塞，防抖）                                                  |
 | `await consume_event(event)`                                     | 消费 AgentEvent（`is_memory_worthy` 的 DONE / TOOL_RESULT），提交到写中间件（非阻塞） |
@@ -924,6 +975,7 @@ ThreadMemoryStore.replace_with_summary(thread_id, summary)
 | `await recall_agent(limit=None)`      | 召回 agent 级长期记忆 facts（跨会话共享，按`create_time` 升序，截取最近 `limit` 条；不进行 touch 更新，LRU 依赖 `prune_agent_facts`） |
 | `await recall_agent_text(limit=None)` | 召回 agent 级记忆并格式化为文本片段（`【长期记忆】` 块）                                                                                  |
 | `await count_agent_facts()`           | 统计 agent 级长期记忆条数                                                                                                                   |
+| `await compress_agent()`              | 压缩 agent 级长期记忆（LLM 摘要替换为单条 fact，仅作用于 agent 级，不可逆）                                                                 |
 | `await clear_agent_facts()`           | 清空 agent 级全部长期记忆，返回清除数量                                                                                                     |
 
 #### ThreadMemoryReadMiddleware（读，LangGraph 中间件）
@@ -934,7 +986,7 @@ ThreadMemoryStore.replace_with_summary(thread_id, summary)
 
 #### ThreadMemoryStore（存储封装，底层）
 
-构造参数：`max_facts`（thread 级 LRU 上限，默认 `memory_max_facts_per_thread=50`）/ `max_agent_facts`（agent 级 LRU 上限，默认 `memory_max_agent_facts=200`）/ `process_type`（进程类型标识，决定 `agent_key`，`None` 时取 `"default"`）。
+构造参数：`max_facts`（thread 级 LRU 上限，默认 `memory_max_facts_per_thread=60`）/ `max_agent_facts`（agent 级 LRU 上限，默认 `memory_max_agent_facts=200`）/ `agent_key`（agent 级 namespace 标识，默认 `"global"`，跨进程共享，可显式覆盖以隔离）。
 
 **thread 级方法**：
 
@@ -964,6 +1016,7 @@ ThreadMemoryStore.replace_with_summary(thread_id, summary)
 | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `await aget_memory_summary()`     | 记忆状态统计（thread_id / checkpoint 消息数 / 长期记忆条数`long_term_count` / **agent 级长期记忆条数 `agent_fact_count`** / 总会话数） |
 | `await acompress_memory()`        | 压缩当前线程长期记忆（阻塞 LLM 调用放入`asyncio.to_thread`，仅作用于 thread 级）                                                               |
+| `await acompress_agent_memory()`  | 压缩 agent 级（跨会话共享）长期记忆（阻塞 LLM 调用放入`asyncio.to_thread`，仅作用于 agent 级）                                               |
 | `await aclear_long_term_memory()` | 清空当前线程长期记忆（仅 thread 级；agent 级用`aclear_agent_memory` 或 `MemoryManager.clear_agent_facts`）                                   |
 | `await aclear_agent_memory()`     | 清空 agent 级（跨会话共享）长期记忆，返回清除数量                                                                                                |
 | `await arecall_agent_memory()`    | 召回 agent 级长期记忆并格式化为文本片段（`【长期记忆】` 块）                                                                                   |
@@ -1031,7 +1084,7 @@ session/
 | --------------------------------- | ----------------------------------------------------------------------------- |
 | `thread-a4d099d2`               | 普通会话                                                                      |
 | `workflow-simple-thread-abc123` | 专属工作流会话（`workflow-{名称}-thread-{后缀}`）                           |
-| `server-thread-...`             | 带`process_type` 前缀（多进程隔离，server/scheduler/feishu 各进程前缀不同） |
+| `server-thread-...`             | 带`process_type` 前缀（仅用于 thread_id / 会话可见性，server/scheduler/feishu 各进程前缀不同；与 agent 级记忆 namespace 无关） |
 
 - `is_workflow_session(session_id)` / `workflow_name_of(session_id)`：判断并反解工作流会话。
 - `current_session_id` 是 **CLI 单会话语义**的当前指针；**并发场景必须显式传 `session_id`**，不依赖该共享指针。
@@ -1169,7 +1222,7 @@ Agent 的工具分为两类：
 | `open_file`      | [tools/open_file.py](tools/open_file.py)           | 用系统默认/指定程序打开文件或文件夹                                                                                                                                                                                                                                                                                                                      | `file_path`, `app_path`                                                                  |
 | `open_sqlite`    | [tools/open_file.py](tools/open_file.py)           | 用 DB Browser for SQLite 打开 .sqlite/.db                                                                                                                                                                                                                                                                                                                | `file_path`                                                                                |
 | `read_skill`     | [skmng/tool.py](skmng/tool.py)                     | 读取本地技能(SKILL.md)的指引正文                                                                                                                                                                                                                                                                                                                         | `skill_name`(可空)                                                                         |
-| `create_tool`    | [tools/create_tools.py](tools/create_tools.py)     | 动态生成工具代码并保存为 .py 文件（默认保存到 tools/ 目录并自动注册到 tools/__init__.py；tool_logic 支持含 f-string/多行字符串的代码，内容行不会被误缩进）。安全边界：工具名须为合法 Python 标识符、路径限制在 tools/ 目录内禁止逃逸、默认禁止覆盖已有文件（`force=True` 可覆盖）、生成源码经 AST 校验禁止导入 os/subprocess/socket 等高风险模块 | `tool_name`, `tool_description`, `args_spec`, `tool_logic`, `tool_path`, `force` |
+| `create_tool`    | [tools/create_tools.py](tools/create_tools.py)     | 动态生成工具代码并保存为 .py 文件（默认保存到 tools/ 目录、自动注册到 tools/__init__.py，并顺带生成单元测试到 tests/tools/test_<tool>.py；tool_logic 支持含 f-string/多行字符串的代码，内容行不会被误缩进）。安全边界：工具名须为合法 Python 标识符、工具路径限制在 tools/ 内且测试路径限制在 tests/tools/ 内禁止逃逸、默认禁止覆盖已有文件（`force=True` 可覆盖）、生成源码经 AST 校验禁止导入 os/subprocess/socket 等高风险模块 | `tool_name`, `tool_description`, `args_spec`, `tool_logic`, `tool_path`, `force`, `with_test` |
 | `ask_human`      | [cli/human_input.py](cli/human_input.py)           | 暂停 LangGraph 图并请求人工结构化选择                                                                                                                                                                                                                                                                                                                    | `prompt`, `choices`                                                                      |
 
 > `open_sqlite` 会自动查找 DB Browser for SQLite 路径（环境变量 `SQLITE_BROWSER_PATH` → 常见安装位置 → `shutil.which`），找不到则返回下载链接。Linux 下安装 `sqlitebrowser` 包即可使用。
@@ -1468,15 +1521,19 @@ LLM 决定是否调用工具
 
 设计决策：工具失败发 `TOOL_RESULT`（携带错误信息）而非 `ERROR`——`ERROR` 是终止事件会中断整个流，而工具失败应让 LLM 看到错误并调整策略（ReAct 模式标准行为）。异常最终仍会逃逸到 `except Exception` 发 `ERROR` 终止流（因 Pregel 的 `_panic_or_proceed` 在第一个工具崩后立即 raise，无法继续执行后续节点）。
 
-**工具执行心跳（防 watchdog 误触发）**
+**心跳机制（防 watchdog 误触发）**
 
-长耗时工具执行（如 60s 超时命令）期间，`graph.astream_events` 阻塞无事件，前端 watchdog（90s 无事件 → 标记响应超时）会误触发把助手消息标红。`_arun_graph_events` 的主循环改为 queue 模式：
+长耗时操作期间 `graph.astream_events` 阻塞无事件，前端 watchdog（90s 无事件 → 标记响应超时）会误触发把助手消息标红。`_arun_graph_events` 的主循环改为 queue 模式，并按「是否有活跃工具」发出两类心跳：
 
 - 独立 `_consume_graph` task 消费 graph 事件到 `asyncio.Queue`，主循环从 queue 取
-- 主循环 `asyncio.wait_for(queue.get(), timeout=HEARTBEAT_INTERVAL=15s)` 超时时，若 `active_tool_call_ids` 非空（有工具在执行），发 `TOOL_RUNNING` 事件
-- 前端收到 `tool_running` 事件后重置 watchdog（不渲染 UI、不写 message）
-- `on_tool_end`/`on_tool_error` 清空 `active_tool_call_ids`，心跳停止
+- 主循环 `asyncio.wait_for(queue.get(), timeout=HEARTBEAT_INTERVAL=15s)` 超时时分流：
+  - `active_tool_call_ids` 非空（工具在执行）→ 发 `TOOL_RUNNING` 事件（携带 `tool_call_id` + 工具名）
+  - 为空（LLM 流静默、无工具在执行）→ 发 `HEARTBEAT` 事件（纯保活，不携带任何工具信息）
+- 前端收到 `tool_running` / `heartbeat` 后仅重置 watchdog（不渲染 UI、不写 message）
+- `on_tool_end`/`on_tool_error` 清空 `active_tool_call_ids`，此后转为 `HEARTBEAT`
 - 用 queue 模式而非 `wait_for(__anext__)`：后者超时 cancel 会终止 async generator，导致后续事件丢失
+
+> **为什么必须有 `HEARTBEAT`**：前端 watchdog 为 90s，而 `langchain-openai` 的 `stream_chunk_timeout` 默认为 120s。LLM 流中途静默（网关连接活着但长时间零字节——实测云雾网关全程不发 `: keepalive` 注释，因此 httpx 的 read timeout 也不会触发）时，若只发 `TOOL_RUNNING`（无活跃工具 → 一个事件都不发），前端会**早于底层库 30 秒**误报"响应超时"。`HEARTBEAT` 补齐这段静默期。
 
 ### 6. System Prompt 强化
 
@@ -1583,7 +1640,7 @@ if __name__ == "__main__":
 
 #### 方式 3：动态生成工具
 
-除手动编写外，Agent 还可通过内置元工具 [`create_tool`](tools/create_tools.py) **动态生成新的本地工具**：它按统一模板生成 `@tool` 装饰器工具源码，保存为 `.py` 文件，并自动注册到 `tools/__init__.py`。
+除手动编写外，Agent 还可通过内置元工具 [`create_tool`](tools/create_tools.py) **动态生成新的本地工具**：它按统一模板生成 `@tool` 装饰器工具源码，保存为 `.py` 文件，自动注册到 `tools/__init__.py`，并**顺带生成该工具的单元测试**（保存到 `tests/tools/test_<tool_name>.py`）。
 
 **参数说明：**
 
@@ -1594,7 +1651,8 @@ if __name__ == "__main__":
 | `args_spec`        | `str`        | 参数定义说明，分号`;` 分隔，每项格式 `参数名:参数类型=参数说明`             |
 | `tool_logic`       | `str`        | 工具主体业务逻辑（函数体内部实现代码，不要写函数定义/装饰器）                   |
 | `tool_path`        | `str \| None` | 保存路径，可传目录或`.py` 文件；为空默认保存到 `tools/` 下 `tool_name.py` |
-| `force`            | `bool`       | 是否覆盖已存在文件，默认`False` 禁止覆盖                                      |
+| `force`            | `bool`       | 是否覆盖已存在文件（同时作用于测试文件），默认`False` 禁止覆盖                |
+| `with_test`        | `bool`       | 是否顺带生成单元测试，默认`True`（生成到 `tests/tools/` 下）                  |
 
 `args_spec` 示例：`file_path:str=本地文件路径;encoding:str=utf-8文件编码，可选`
 
@@ -1607,11 +1665,12 @@ if __name__ == "__main__":
     "source_code": "...",      # 生成的完整源码
     "file_path": "...",        # 保存的文件路径
     "registered": True,        # 是否已自动注册到 tools/__init__.py
-    "message": "工具代码已保存到 ...，并已注册到 tools/__init__.py"
+    "test_file_path": "...",   # 生成的测试文件路径（with_test=False 或生成失败时为 None）
+    "message": "工具代码已保存到 ...，并已注册到 tools/__init__.py，并已生成单元测试 ..."
 }
 ```
 
-失败时返回 `{"success": False, "error": "工具生成失败：...", ...}`。
+失败时返回 `{"success": False, "error": "工具生成失败：...", ...}`。测试生成失败**不会**影响工具本身的生成结果，只在 `message` 中提示原因。
 
 **调用示例：**
 
@@ -1625,12 +1684,30 @@ create_tool(
 )
 ```
 
-生成后代码自动保存到 `tools/read_markdown_file.py` 并注册到 `tools/__init__.py` 的 `all_tools`，重启后 Agent 即可调用。
+生成后代码自动保存到 `tools/read_markdown_file.py` 并注册到 `tools/__init__.py` 的 `all_tools`，重启后 Agent 即可调用；同时生成 `tests/tools/test_read_markdown_file.py`。
+
+**生成单元测试（`creat_tool_tests`）：**
+
+`create_tool` 内部调用同模块的公开函数 `creat_tool_tests(tool_name, tool_description, args_spec, tool_path=None, test_path=None, force=False)`，也可单独调用为已有工具补测试。生成内容为**结构冒烟测试**（业务断言需人工补充）：
+
+| 生成的用例                                   | 断言内容                                                                             |
+| -------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `test_<tool>_is_langchain_tool`            | 工具是 `BaseTool` 实例，名称与生成时一致                                            |
+| `test_<tool>_exposes_declared_params`      | 工具入参集合与 `args_spec` 声明一致                                                |
+| `test_<tool>_source_follows_project_template` | 源码含`@tool`、统一返回结构（`success` 真/假分支）与异常兜底 `"error": str(e)` |
+| `test_<tool>_returns_structured_result`    | 用按类型推导的示例入参调用工具，返回统一结构且不抛异常（在`tmp_path` 内执行，避免污染工作区）；示例入参无法通过类型校验时自动 `skip` |
+
+要点：
+
+- 测试文件通过绝对路径 + `importlib` 加载工具，因此不依赖工具是否位于 `tools/` 包内
+- 示例入参按 `args_spec` 类型推导（`str`→`"test"`、`int`→`1`、`list[int]`→`[1]` 等），未识别类型回退 `"test"`
+- 测试文件路径限制在 `tests/tools/` 内，禁止路径逃逸；默认禁止覆盖已存在测试文件（`force=True` 才可覆盖）
+- 生成的测试源码同样经 `ast.parse` 语法校验，不合法则不写盘
 
 **安全边界：**
 
 - 工具名必须是合法 Python 标识符且不能以下划线开头
-- 保存路径限制在 `tools/` 目录内，禁止路径逃逸
+- 工具保存路径限制在 `tools/` 目录内、测试保存路径限制在 `tests/tools/` 目录内，禁止路径逃逸
 - 生成源码经 `ast.parse` 语法校验
 - 禁止导入高风险模块：`os`、`subprocess`、`socket`、`sys`、`pathlib`、`shutil`、`ctypes`、`importlib`、`requests`、`urllib`
 - 默认禁止覆盖已有文件（`force=True` 才可覆盖）
@@ -1767,6 +1844,17 @@ with TraceContext(trace_id="req-123", thread_id="thread-abc"):
 
 默认覆盖：`ask_human` 600s、`schedule_task` 120s、`search` 90s、`run_shell` 600s（vivado/xsim 批处理耗时 3-10 分钟）。
 
+> **两层超时预算（重要）**：上述 `TOOL_TIMEOUTS` / `DEFAULT_TIMEOUT` 是**外层硬超时**（`tool_wrapper` 的 `asyncio.wait_for`），触发后只返回裸 `{"error": "tool_timeout"}`，既无 partial 输出也无超时原因。终端工具函数自身的 `timeout` 参数是**内层软超时**，触发后返回富结果（`timeout_reason` + `partial_stdout` + `partial_stderr`）。软超时由 [`tools/config.py`](tools/config.py) 的 `soft_timeout_for()` 从硬超时派生（`hard - SOFT_TIMEOUT_MARGIN(10s)`），保证**严格小于**硬超时——否则外层先触发，模型只能拿到无信息的裸错误。10s 余量必须大于 `_GRACE_PERIOD`(5s)，为 ctrl+c + 收集缓冲输出 + 强杀进程树留出时间。
+
+### LLM 流式 chunk 超时（stream_chunk_timeout）
+
+`langchain-openai` 对异步流式响应有 **per-chunk 墙钟超时**：连续 `stream_chunk_timeout` 秒没有解析出任何 chunk 就抛 `StreamChunkTimeoutError`。它**不等于** httpx 的 `timeout.read`——后者按字节重置，会被 SSE 注释（`: keepalive`）不断刷新，因此"连接活着但不出内容"只有按 chunk 计数才能发现。
+
+- **默认值显式化**：`LLMClient` 通过 `llm/config.py` 的 `DEFAULTS` / `agent/agent_config.json` 的 `stream_chunk_timeout`（默认 **300.0s**）显式传入，覆盖 `langchain-openai` 的 120s 默认值，并经 `kwargs` 透传两条构造路径（`CloudmistChat[OI]` 子类与 `init_chat_model`）。该字段在库中是 `exclude=True` 的 pydantic 字段，**不会**进入 HTTP 请求负载。
+- **优先级**：显式构造参数 > `agent/agent_config.json` > `DEFAULTS`（与 `temperature` / `max_tokens` 同规则）。
+- **触发后的行为**：`StreamChunkTimeoutError` 同时继承 `asyncio.TimeoutError` 与 `TimeoutError`，会被 `llm_client.should_retry()` 判为可重试；`agent/streaming.py` 最多重试 `RETRY_ATTEMPTS`(3) 次并指数退避。若此前已吐过 token（`emitted=True`）则不重试，直接发 `ERROR` 事件终止流。
+- **实测背景**：云雾网关（`v2.cloudmist.cloud`）偶发中段停摆——HTTP 200 已返回、流已开始，随后连续 120s 零字节（实测一次 122s），恰好在库默认值上触发告警。常态路径经 12 次请求（含 6 路并发、最大 209KB 上下文）实测 TTFT 仅 5-13s、最大 chunk 间隔 ≤13s，故属偶发异常路径而非常态。
+
 ### 终端命令超时重试与分类（Terminal Timeout Retry）
 
 [`tools/terminal_tools.py`](tools/terminal_tools.py) 对 `run_shell` / `run_python` / `run_cmd` 三个终端工具叠加 ctrl+c 软中断 + 超时分类 + 重试上限机制，防止命令卡死导致 Agent 无限等待或无限重试：
@@ -1774,6 +1862,7 @@ with TraceContext(trace_id="req-123", thread_id="thread-abc"):
 - **ctrl+c 软中断**：超时后先发 ctrl+c（Windows `CTRL_BREAK_EVENT` / Unix `SIGINT`），等 5 秒 grace period 收集 partial 输出，再强杀进程树（Windows `taskkill /T` / Unix `killpg`）。相比直接 kill，子进程有机会刷出缓冲输出供 LLM 判断超时原因。
 - **超时原因分类**（`_classify_timeout`）：启发式识别交互式命令 / 网络阻塞 / IO 阻塞 / 命令错误 / 死循环，写入返回结果的 `timeout_reason` 字段，供主模型判断如何修改命令重试。
 - **富结果返回**：超时返回 `{error_type: "timeout", timeout_reason, partial_stdout, partial_stderr, ...}`，主模型读到后自行反思修改命令重试（方案 B，每次重试是模型新发的 tool_call，事件干净）。
+- **软超时由硬超时派生**（[`tools/config.py`](tools/config.py) 的 `soft_timeout_for()`）：三个终端工具函数级 `timeout` 默认值不再是固定的 `DEFAULT_TIMEOUT`，而是 `hard - SOFT_TIMEOUT_MARGIN(10s)`，实测值 `run_shell` **590s**（硬 600s）、`run_python` / `run_cmd` **50s**（硬 60s）。此前 `run_shell` 内层默认 60s 会把 vivado/xsim 长批处理提前掐断（与文档宣称的 600s 矛盾），而 `run_python` / `run_cmd` 内外层同为 60s 则让外层抢先触发，模型只能拿到无信息的裸错误。
 - **重试上限中间件**（[`agent/terminal_retry_cap_mw.py`](agent/terminal_retry_cap_mw.py) `TerminalRetryCapMW`）：无状态中间件，读 `request.state["messages"]` 统计当前会话内 exec 工具（`run_shell`/`run_python`/`run_cmd`）的超时累计次数，达 `MAX_TIMEOUT_RETRIES`（3 次）则拦截返回失败 `ToolMessage(status="error")`，阻止主模型无限重试。注册在 `create_agent` middleware 链最外层（最先拦截）。
 - **前端超时展示**：工具卡片（`web/src/components/ToolCallCard.tsx`）识别 `error_type:"timeout"` / `"error":"tool_timeout"` / "执行超时" 等标记，显示橙色边框 + Clock 图标 + "超时"文字，区别于红色"异常"和绿色"已完成"。
 
@@ -2137,7 +2226,8 @@ output = chat_until_completion(agent, "需要人工选择时请先问我")
 | `tools`                                       | 查看可用工具列表（含 MCP 工具）                                              |
 | `clear [long\|short\|agent\|all]`                | 清理记忆（默认 long；agent 清 agent 级跨会话记忆）                           |
 | `agent memory`                                | 召回并展示 agent 级（跨会话共享）长期记忆                                    |
-| `compress` 或 `压缩`                        | 压缩长期记忆（LLM 摘要后替换原内容）                                         |
+| `compress` 或 `压缩`                        | 压缩当前会话(thread 级)长期记忆（LLM 摘要后替换原内容；默认作用域为 thread） |
+| `compress agent` 或 `压缩 agent`             | 压缩 agent 级（跨会话共享）长期记忆（LLM 摘要后替换原内容；别名 `compress:agent`） |
 | `compact`                                     | 手动压缩当前会话上下文（增量摘要 + 工具输出 Prune，`force=True` 跳过阈值） |
 | `metrics` 或 `metrics:status`               | 查看运行时指标（LLM 调用 / 工具执行 / 压缩统计）                             |
 | `metrics:reset`                               | 重置所有运行时指标                                                           |
@@ -2534,7 +2624,7 @@ MCP工具:
 
 ```
 你: 帮我创建一个叫 test 的文件夹
-助手: 已为你创建文件夹 test，路径：D:\work\LangChainAgent\test
+助手: 已为你创建文件夹 test，路径：D:\work\LCAgent\test
 ```
 
 ### 3. 模型与状态管理
@@ -2561,9 +2651,10 @@ API地址:    https://api.deepseek.com
 
 --- 记忆状态 ---
 当前会话:   thread-a4d099d2
-Checkpoint: sqlite → D:\work\LangChainAgent\data\checkpoints_async.sqlite
+Checkpoint: sqlite → D:\work\LCAgent\data\checkpoints_async.sqlite
 已存消息:   8 条
 长期记忆:   2 条
+agent 级记忆: 12 条 (跨会话共享)
 总会话数:   1
 ```
 
@@ -2674,13 +2765,13 @@ async def main() -> None:
     memory_ctx = await MemoryContext.acreate(
         checkpoint_file="data/checkpoints_async.sqlite",  # Checkpoint + 长期记忆 Store（同一 SQLite 文件）
         llm_getter=lambda: llm,                            # 供 LLM 抽取/压缩记忆使用（支持热切换）
-        short_term_size=10,
-        buffer_delay_seconds=20,                           # 记忆防抖窗口（秒）
-        max_buffer_messages=30,                            # 单 thread 防抖 buffer 上限
-        max_facts_per_thread=50,                           # 单 thread 最大 fact 条数（thread 级 LRU 淘汰）
+        buffer_delay_seconds=30,                           # 记忆防抖窗口（秒）
+        max_buffer_messages=40,                            # 单 thread 防抖 buffer 上限
+        max_facts_per_thread=60,                           # 单 thread 最大 fact 条数（thread 级 LRU 淘汰）
         max_agent_facts=200,                               # agent 级（跨会话共享）最大 fact 条数（agent 级 LRU 淘汰）
-        process_type=None,                                 # 进程类型标识（None→"default"；server/scheduler/feishu 多进程隔离 agent 级记忆）
-        recall_limit=10,                                   # 召回默认条数上限（聚合 agent 级 + thread 级后截取）
+        process_type=None,                                 # 进程类型标识（仅用于 thread_id 前缀；与 agent 级 namespace 无关）
+        agent_key="global",                                # agent 级 namespace 标识（默认跨进程共享；显式覆盖可隔离）
+        recall_limit=20,                                   # 召回默认条数上限（聚合 agent 级 + thread 级后截取）
     )
 
     agent = await AgentCore.acreate(
@@ -2805,6 +2896,7 @@ asyncio.run(main())
 | `tool_timeout`          | int   | 120                         | 工具调用超时（秒）                                                                                     |
 | `temperature`           | float | 0.7                         | LLM 采样温度（主对话/调度器/API 默认；团队角色分层配置于自身`agent_config.json`，缺省回退 DEFAULTS） |
 | `max_tokens`            | int   | 8192                        | LLM 最大生成 token 数（覆盖来源同`temperature`）                                                     |
+| `stream_chunk_timeout`  | float | 300.0                       | LLM 流式响应 chunk 间隔超时（秒；覆盖来源同`temperature`）。显式替代 `langchain-openai` 默认 120s，避免思考型模型网关长时间零字节时误触发告警（详见「LLM 流式 chunk 超时」） |
 | `latest_msg_cnt`        | int   | 10                          | 短期上下文窗口消息条数：取最近 N 条消息（传递给`SessionRegistry.aget_short_term`）                   |
 
 > **采样参数分层隔离**：团队场景只用 `team/<角色>/agent_config.json`（`temperature`/`max_tokens` 经 `build_team_agent` 解析后作为显式参数传入，未配置时回退 `llm/config.py` 的 `DEFAULTS`，**不读取全局自定义值**）；非团队场景（主对话/调度器/API/飞书）由 `LLMClient` 内部自动读取全局 `agent/agent_config.json`（含 DEFAULTS 兜底），外部无需传参。显式构造参数（`LLMClient(..., temperature=...)` / `build_team_agent(..., temperature=...)`）始终优先。
@@ -2813,11 +2905,12 @@ asyncio.run(main())
 
 | 键                              | 类型 | 默认值 | 说明                                                                                                       |
 | ------------------------------- | ---- | ------ | ---------------------------------------------------------------------------------------------------------- |
-| `memory_buffer_delay_seconds` | int  | 20     | 记忆写入防抖延迟（秒）                                                                                     |
-| `memory_max_buffer_messages`  | int  | 30     | 防抖 buffer 最大消息数（超出强制刷新）                                                                     |
-| `memory_max_facts_per_thread` | int  | 50     | 单线程最大 fact 条数（thread 级 LRU 淘汰上限；对应`conv` / `business` 类）                             |
+| `memory_buffer_delay_seconds` | int  | 30     | 记忆写入防抖延迟（秒）                                                                                     |
+| `memory_max_buffer_messages`  | int  | 40     | 防抖 buffer 最大消息数（超出强制刷新）                                                                     |
+| `memory_max_facts_per_thread` | int  | 60     | 单线程最大 fact 条数（thread 级 LRU 淘汰上限；对应`conv` / `business` 类）                             |
 | `memory_max_agent_facts`      | int  | 200    | agent 级（跨会话共享）最大 fact 条数（agent 级 LRU 淘汰上限；对应`user_fact` / `lesson` 类）           |
-| `memory_recall_limit`         | int  | 10     | 召回长期记忆时的默认条数上限（聚合 agent 级 + thread 级去重后截取，同时约束每次 LLM 调用注入的 fact 条数） |
+| `memory_agent_key`            | str  | `global` | agent 级长期记忆 namespace 标识（默认跨进程共享，可显式覆盖以隔离不同 agent 级记忆）                     |
+| `memory_recall_limit`         | int  | 20     | 召回长期记忆时的默认条数上限（聚合 agent 级 + thread 级去重后截取，同时约束每次 LLM 调用注入的 fact 条数） |
 | `session_enable_memory`       | bool | true   | SessionManager 是否启用长期记忆处理                                                                        |
 
 #### Agent 核心提示词（`agent/AGENT.md`）
@@ -3023,7 +3116,7 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 | `tests/agent/test_human_input.py`               | LangGraph HITL：interrupt、恢复、并行选择和线程隔离                                                                                                                                         |
 | `tests/tools/test_terminal.py`                  | 终端工具：输出截断、护栏拒绝、安全执行、超时分类、ctrl+c 软中断(mock Popen)                                                                                                                 |
 | `tests/agent/test_terminal_retry_cap_mw.py`     | TerminalRetryCapMW：超时计数 cap、达上限拦截、非 exec 工具放行、state 容错                                                                                                                  |
-| `tests/agent/test_streaming_heartbeat.py`       | streaming 心跳：工具执行期间发 tool_running、on_tool_end 后停止、非工具期不发                                                                                                               |
+| `tests/agent/test_streaming_heartbeat.py`       | streaming 心跳：工具执行期间发 tool_running、静默期（无活跃工具）发 heartbeat、on_tool_end 后不再发 tool_running、heartbeat 不携带工具信息                                                                                                               |
 | `tests/tools/test_calculator.py`                | 计算器工具：表达式求值、错误处理                                                                                                                                                            |
 | `tests/memory/test_memory.py`                   | memory/ 包`AgentMemory`：checkpointer + Store 基础设施的初始化、SQLite/acreate/aclose                                                                                                     |
 | `tests/agent/test_agent_core_regressions.py`    | Agent 核心回归：HITL 恢复、会话隔离、技能匹配、长上下文裁剪等                                                                                                                               |
@@ -3034,6 +3127,7 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 | `tests/llm/test_llm_client_config.py`           | LLMClient 采样参数默认值来源：显式参数 > 全局配置 > DEFAULTS 兜底                                                                                                                           |
 | `tests/agent/test_compaction.py`                | 长上下文压缩中间件：增量摘要、工具输出 Prune、安全切割                                                                                                                                      |
 | `tests/tools/test_create_tool.py`               | `create_tool` 动态生成工具代码并自动注册到 `tools/__init__.py`                                                                                                                          |
+| `tests/tools/test_create_tool_tests.py`         | `creat_tool_tests` 自动生成工具单元测试：默认落到 `tests/tools/`、`with_test` 开关、示例入参按类型推导、覆盖保护与测试路径逃逸拦截，并用真实 pytest 进程验证生成的测试全绿 |
 | `tests/agent/test_graph_rebuild.py`             | Graph 重建：MCP 工具变化触发重建、技能变化不重建                                                                                                                                            |
 | `tests/tools/test_mcp_pool.py`                  | `MCPPool` 连接池：连接管理、健康探测、重连（mock 注入）                                                                                                                                   |
 | `tests/cli/test_threads_preview.py`             | 会话菜单预览：首条用户消息提取与截断                                                                                                                                                        |
