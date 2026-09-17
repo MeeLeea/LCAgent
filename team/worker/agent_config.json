@@ -13,6 +13,7 @@
     "tool_timeout": 120,
     "temperature": 0.3,
     "max_tokens": 4096,
+    "stream_chunk_timeout": 300.0,
     "latest_msg_cnt": 10,
     "provider": "zhipu",
     "model": null

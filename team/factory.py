@@ -45,6 +45,7 @@ def build_team_agent(
     # 未显式配置时自动落到 DEFAULTS 默认值），overrides 经 config.update 已优先覆盖
     temperature = config.get("temperature")
     max_tokens = config.get("max_tokens")
+    stream_chunk_timeout = config.get("stream_chunk_timeout")
     
     # 解析角色 AGENT.md 绝对路径(system_prompt 与工作流模板均由 TeamAgent 自动解析)
     prompt_file = resolve_path(config.get("agent_prompt_file", "agent/AGENT.md"), base_dir)
@@ -64,6 +65,7 @@ def build_team_agent(
         prompt_file=prompt_file,
         temperature=temperature,
         max_tokens=max_tokens,
+        stream_chunk_timeout=stream_chunk_timeout,
         tool_timeout=config.get("tool_timeout"),
         skills_dir=skills_dir,
         auto_match_skills=config.get("auto_match_skills", True),

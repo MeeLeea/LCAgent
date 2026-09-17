@@ -99,6 +99,72 @@ def test_overrides_beat_role_config(tmp_path):
     assert agent.kwargs["max_tokens"] == 1234
 
 
+def test_role_stream_chunk_timeout_wins_over_class_default(tmp_path):
+    """角色级 agent_config.json 的 stream_chunk_timeout 优先于类属性默认值(300.0)"""
+    base = _make_role_tree(
+        tmp_path,
+        role="my_role",
+        role_cfg={
+            "provider": "zhipu",
+            "model": "glm-4-flash",
+            "stream_chunk_timeout": 45.0,
+        },
+        global_cfg={"stream_chunk_timeout": 999.0},  # 全局自定义值不参与
+    )
+    agent = build_team_agent(_DummyAgent, "team/my_role/agent_config.json", base)
+    assert agent.kwargs["stream_chunk_timeout"] == 45.0
+
+
+def test_role_missing_stream_chunk_timeout_falls_to_defaults(tmp_path):
+    """角色级未配置 stream_chunk_timeout 时，落到 DEFAULTS(300.0)，全局自定义值不参与"""
+    base = _make_role_tree(
+        tmp_path,
+        role="my_role",
+        role_cfg={"provider": "zhipu", "model": "glm-4-flash"},  # 未配置该键
+        global_cfg={"stream_chunk_timeout": 999.0},  # 全局自定义值不生效
+    )
+    agent = build_team_agent(_DummyAgent, "team/my_role/agent_config.json", base)
+    # load_agent_config 已合并 DEFAULTS，故 config.get(...) 返回 300.0 而非 None
+    assert agent.kwargs["stream_chunk_timeout"] == 300.0
+
+
+def test_stream_chunk_timeout_override_beats_role_config(tmp_path):
+    """build_team_agent 的 stream_chunk_timeout 显式 override 优先级最高"""
+    base = _make_role_tree(
+        tmp_path,
+        role="my_role",
+        role_cfg={"stream_chunk_timeout": 45.0},
+        global_cfg=None,
+    )
+    agent = build_team_agent(
+        _DummyAgent,
+        "team/my_role/agent_config.json",
+        base,
+        stream_chunk_timeout=77.0,
+    )
+    assert agent.kwargs["stream_chunk_timeout"] == 77.0
+
+
+def test_stream_chunk_timeout_reaches_llm_client(tmp_path, monkeypatch):
+    """全链路：角色配置值经 factory → TeamAgent → LLMClient 透传(复用 _DummyAgent 捕获构造参数)"""
+    base = _make_role_tree(
+        tmp_path,
+        role="my_role",
+        role_cfg={
+            "provider": "zhipu",
+            "model": "glm-4-flash",
+            "stream_chunk_timeout": 45.0,
+        },
+        global_cfg=None,
+    )
+    # 复用 _DummyAgent 作为 LLMClient 替身，捕获其构造 kwargs（不联网、不需 API key）
+    monkeypatch.setattr("team.base.LLMClient", _DummyAgent)
+    agent = build_team_agent(TeamAgent, "team/my_role/agent_config.json", base)
+    # 角色配置值覆盖类属性默认值(300.0)，并原样传入 LLMClient
+    assert agent.stream_chunk_timeout == 45.0
+    assert agent.llm.kwargs["stream_chunk_timeout"] == 45.0
+
+
 def test_team_agent_class_attr_still_applies(tmp_path, monkeypatch):
     """直接构造 TeamAgent（不经 factory）时，类属性默认值仍然生效"""
     from tests.team.test_team_base import _FakeLLM
@@ -107,3 +173,4 @@ def test_team_agent_class_attr_still_applies(tmp_path, monkeypatch):
     agent = TeamAgent(name="plain", prompt_file=str(tmp_path / "no_such.md"))
     assert agent.temperature == TeamAgent.temperature  # 0.7
     assert agent.max_tokens == TeamAgent.max_tokens  # 2048
+    assert agent.stream_chunk_timeout == TeamAgent.stream_chunk_timeout  # 300.0

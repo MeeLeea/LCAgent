@@ -45,6 +45,8 @@ class TeamAgent:
     # LLM 采样参数默认值(子类可通过类属性或 __init__ 参数覆盖)
     temperature: float = 0.7
     max_tokens: int = 2048
+    # 流式响应 chunk 间隔超时(秒):显式替代 langchain-openai 默认 120s
+    stream_chunk_timeout: float = 300.0
 
     # 工作流节点提示词的默认模板(子类覆盖;仅 AGENT.md 缺失或未定义小节时兜底)
     default_templates: ClassVar[dict[str, str]] = {}
@@ -66,6 +68,7 @@ class TeamAgent:
         config_file: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        stream_chunk_timeout: float | None = None,
         tool_timeout: float | None = None,
         prompt_file: str | None = None,
         skills_dir: str | None = None,
@@ -86,6 +89,8 @@ class TeamAgent:
             config_file: LLM 配置文件路径(默认 config/llm_config.json)
             temperature: LLM 采样温度,不传则用类属性默认值
             max_tokens: LLM 最大生成 token 数,不传则用类属性默认值
+            stream_chunk_timeout: LLM 流式响应 chunk 间隔超时(秒),不传(None)时
+                回退类属性默认值(300.0),显式替代 langchain-openai 默认 120s
             tool_timeout: 工具执行超时秒数(0 或 None 时使用 tools.tool_wrapper 的
                 默认超时策略:全局 60 秒 + 工具级覆盖如 ask_human 600 秒)
             prompt_file: 角色 AGENT.md 路径,同时提供系统提示词与工作流节点提示词模板
@@ -100,6 +105,11 @@ class TeamAgent:
         # 参数优先,否则回退到类属性默认值
         self.temperature = temperature if temperature is not None else self.temperature
         self.max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+        self.stream_chunk_timeout = (
+            stream_chunk_timeout
+            if stream_chunk_timeout is not None
+            else self.stream_chunk_timeout
+        )
         # 工具超时:0 或 None 视为未配置,由 wrap_tools_with_timeout 落默认策略
         self.tool_timeout = (
             tool_timeout if tool_timeout is not None and tool_timeout > 0 else None
@@ -114,6 +124,7 @@ class TeamAgent:
             config_file=config_file,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
+            stream_chunk_timeout=self.stream_chunk_timeout,
         )
         self.name = name
         self.prompt_file = prompt_file
