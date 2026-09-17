@@ -270,6 +270,40 @@ uv run python scripts/migrate_agent_memory_namespace.py --apply --delete-source
 > `--delete-source`）并确认校验通过、新 namespace 数据正常后，再执行
 > `--apply --delete-source`；单独传 `--delete-source`（不带 `--apply`）会被忽略并打印警告。
 
+## 🧹 一次性数据清理脚本
+
+### `cleanup_polluted_agent_lessons.py`
+
+**用途**：删除 agent 级长期记忆（`(agent_key, "global_facts")`）中被污染的
+`lesson` 条目。背景是历史 bug：危险命令确认（工具内 `interrupt()` 抛
+`GraphInterrupt`）被事件流误映射为 `[工具执行失败]` TOOL_RESULT，确定性
+lesson 路径又把错误原文逐字写入跨会话共享 namespace（完整命令脚本 +
+反思指令后缀以"经验教训"形式注入所有会话）。代码层已修复，本脚本清理存量。
+
+**判定标准**：`category == "lesson"` 且 content 含
+`[工具执行失败]` / `请反思失败原因` / `GraphInterrupt` / `dangerous_command` 任一标记。
+
+**先 dry-run，再 apply**：
+
+```bash
+# 1. 预演（只读，确认待删条数与内容符合预期）
+uv run python scripts/cleanup_polluted_agent_lessons.py --dry-run
+
+# 2. 确认后真正删除（不可逆）
+uv run python scripts/cleanup_polluted_agent_lessons.py --apply
+```
+
+**参数**：
+
+| 参数          | 说明                                                              |
+| ------------- | ----------------------------------------------------------------- |
+| `--apply`     | 真正执行删除（默认仅 dry-run；删除不可逆）                        |
+| `--dry-run`   | 仅报告将要删除的条目（默认行为；与 `--apply` 互斥）               |
+| `--db`        | SQLite 数据库路径，相对路径基于项目根目录（默认 `data/checkpoints_async.sqlite`） |
+| `--agent-key` | agent 级 namespace 标识（默认 `global`）                          |
+
+> ⚠️ 建议在 `api/server.py` / CLI 进程停止时运行，防止在途防抖 buffer 把旧事件重新写回。
+
 ## 📖 更多文档
 
 - [Web 前端文档](../web/README.md)

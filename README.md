@@ -534,7 +534,7 @@ awrap_model_call
 - 抽取结果中 `category ∈ {conv, business}` 或非法回退为 `conv` → 组装 `scope="thread"` 的 `ThreadFactItem`，写入 thread namespace，触发 `prune_facts(thread_id)`；
 - 去重基准同时读取两级 existing，按 `content` 精确比对，agent 级优先（避免同一条 fact 跨作用域重复）。
 
-> **写入路径**：事件筛选（`is_memory_worthy`：DONE / TOOL_RESULT 且 content 非空）→ 防抖 → `judge_long_term_memory` 确定性预判定（SKIP 丢弃 / 失败≥2 记 lesson / 其余交 LLM）→ LLM 抽取 → 按 `category` 路由到 agent / thread 作用域 → 去重 → 写入 → LRU 淘汰。本次分层只改变了"写到哪一级 namespace"和"读时如何聚合"。
+> **写入路径**：事件筛选（`is_memory_worthy`：DONE / TOOL_RESULT 且 content 非空）→ 防抖 → `judge_long_term_memory` 确定性预判定（SKIP 丢弃 / 失败≥2 锁定 lesson 分类、内容走 LLM 蒸馏 / 其余交 LLM）→ LLM 抽取 → 按 `category` 路由到 agent / thread 作用域 → 去重 → 写入 → LRU 淘汰。本次分层只改变了"写到哪一级 namespace"和"读时如何聚合"。
 
 > **历史数据迁移（旧 `server` namespace）**：`agent_key` 与 `process_type` 解耦前，agent 级记忆写在 `("server", "global_facts")`。升级后请用一次性脚本把旧数据复制到共享 namespace `("global", "global_facts")`（默认 dry-run，确认后再 `--apply`）：
 >
@@ -700,7 +700,8 @@ submit_event(thread_id, role, content, important, event_type, tool_name)   # Ses
 _a_run_pipeline()  （buffer 超时后批量处理）
    ↓
 ① 确定性预判定  judge_long_term_memory(MemoryInputEvent)
-   ↓ 返回 SKIP → 确定性丢弃；LESSON（同类失败≥2）→ 直接构造（绕过 LLM）；
+   ↓ 返回 SKIP → 确定性丢弃；LESSON（同类失败≥2）→ 分类锁定 lesson（免 LLM 判定），
+   ↓ 内容剥离指令后缀后交 LLM 蒸馏成简短教训再入库（蒸馏失败则丢弃，绝不逐字存原文）；
    ↓ IMPORTANT_CONVERSATION / None → 进入 LLM 抽取
 ② LLM Fact 抽取  _a_extract_facts()
    ↓ 从原始消息提取 {"content", "category", "confidence"} JSON 列表
@@ -741,7 +742,7 @@ if self._memory is not None:
 
 | 返回值                     | 取值       | 作用域/行为                                                                             |
 | -------------------------- | ---------- | --------------------------------------------------------------------------------------- |
-| `LESSON_EXPERIENCE`      | `lesson` | **agent 级**（跨会话共享）——同类工具失败 ≥2 次，确定性绕过 LLM 直接记          |
+| `LESSON_EXPERIENCE`      | `lesson` | **agent 级**（跨会话共享）——同类工具失败 ≥2 次，分类确定性锁定；内容由写中间件交 LLM 蒸馏（`_a_distill_lesson`）后入库，蒸馏失败/判定无教训则丢弃 |
 | `IMPORTANT_CONVERSATION` | `conv`   | 用户显式说"记住"，进入 LLM 抽取并带「用户明确要求记住」标注提高优先级                   |
 | `SKIP`                   | `skip`   | 单次失败的工具结果（且非显式记住）→ 确定性丢弃，不进 LLM 也不落库                      |
 | `None`                   | —         | 值得评估，分类交由 LLM 抽取（`user_fact` / `lesson` / `business` / `conv`）决定 |
@@ -1517,6 +1518,7 @@ LLM 决定是否调用工具
 `AgentCore._arun_graph_events` 的事件循环处理 `on_tool_error` 事件（LangGraph 在工具异常时不发射 `on_tool_end`，改发射 `on_tool_error`）：
 
 - **单工具异常**：`on_tool_error` → 映射为 `TOOL_RESULT` 事件（content 以 `[工具执行失败]` 前缀标记，含异常类型名 + 修正提示），前端工具卡片显示失败状态；异常逃逸到 `except Exception` → 发 `ERROR` 事件终止流
+- **控制流信号排除**：`on_tool_error` 的 error 若是 `GraphBubbleUp`（含 `GraphInterrupt`——危险命令确认、`ask_human` 等工具内 `interrupt()` 的正常暂停），**不映射为 `[工具执行失败]` TOOL_RESULT**，只清理 run_id 映射。历史 bug：HITL 确认曾被误记为工具失败，同类累积 ≥2 次后把巨型命令原文沉淀为跨会话"经验教训"（记忆层另有独立防线：`memory/middleware.py` 的 `_CONTROL_FLOW_MARKERS` 使这类内容不计入失败）
 - **并行工具异常**：第一个工具崩后 Pregel 立即 `raise`，其余已 `on_tool_start` 但未 `on_tool_end`/`on_tool_error` 的 tool_call（孤儿）在 `except` 块中补发失败 `TOOL_RESULT`，避免前端工具卡片永远卡在"执行中"
 
 设计决策：工具失败发 `TOOL_RESULT`（携带错误信息）而非 `ERROR`——`ERROR` 是终止事件会中断整个流，而工具失败应让 LLM 看到错误并调整策略（ReAct 模式标准行为）。异常最终仍会逃逸到 `except Exception` 发 `ERROR` 终止流（因 Pregel 的 `_panic_or_proceed` 在第一个工具崩后立即 raise，无法继续执行后续节点）。
