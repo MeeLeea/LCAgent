@@ -4,6 +4,7 @@
 1. 单工具崩 → 发 tool_result（content 含错误）+ error 事件
 2. 并行多工具崩 → 第一个崩的发 tool_result，其余孤儿补发失败 tool_result + error
 3. 正常工具调用不受影响（on_tool_end 正常发 tool_result）
+4. GraphInterrupt（危险命令确认 / ask_human）→ 不转 [工具执行失败] tool_result、不发 error
 
 设计：
 - 用 FakeToolLLM（支持 bind_tools）+ 真实 create_agent 构造最小 graph
@@ -25,6 +26,7 @@ from langchain_core.language_models.fake_chat_models import FakeMessagesListChat
 from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import interrupt
 
 from agent.agent_core import AgentCore
 from utils.events import AgentEvent, EventType
@@ -51,6 +53,26 @@ def crash_tool(x: str) -> str:
 def ok_tool(x: str) -> str:
     """正常工具，返回输入的 echo。"""
     return f"echo: {x}"
+
+
+@tool
+def interrupt_tool(x: str) -> str:
+    """内部调用 interrupt() 的工具，复现危险命令确认 / ask_human 的暂停路径。
+
+    interrupt() 抛 GraphInterrupt（GraphBubbleUp 子类）→ LangGraph 发射
+    on_tool_error 后暂停图。这是控制流信号，不是工具失败。
+    """
+    decision = interrupt(
+        {
+            "kind": "dangerous_command",
+            "prompt": f"确认执行 {x}?",
+            "choices": [
+                {"id": "approve", "label": "确认执行"},
+                {"id": "deny", "label": "拒绝执行"},
+            ],
+        }
+    )
+    return f"resumed: {decision}"
 
 
 def _make_core(graph: Any) -> AgentCore:
@@ -196,3 +218,46 @@ class TestNormalToolUnaffected:
         # And: 无 error 事件
         errors = [e for e in events if e.event_type == EventType.ERROR]
         assert len(errors) == 0, f"正常调用不应有 error 事件，实际 {len(errors)}"
+
+
+class TestInterruptNotToolError:
+    """GraphInterrupt 控制流信号：不得转成 [工具执行失败] tool_result。
+
+    历史 bug 回归：危险命令确认（工具内部 interrupt()）经 on_tool_error 被
+    映射为 [工具执行失败] TOOL_RESULT，记忆流水线把 HITL 确认计为工具失败，
+    同类累积 ≥2 次后把巨型命令原文沉淀为跨会话"经验教训"。
+    """
+
+    def test_graph_interrupt_yields_no_failed_tool_result(self):
+        # Given: LLM 第一轮调用 interrupt_tool（工具内部触发危险命令确认中断）
+        llm = FakeToolLLM(responses=[
+            AIMessage(
+                content="调用需要确认的工具",
+                tool_calls=[{
+                    "name": "interrupt_tool",
+                    "args": {"x": "Remove-Item -Recurse"},
+                    "id": "call_int_1",
+                    "type": "tool_call",
+                }],
+            ),
+        ])
+        graph = create_agent(
+            model=llm,
+            tools=[interrupt_tool],
+            checkpointer=MemorySaver(),
+        )
+        core = _make_core(graph)
+
+        # When: 跑 _arun_graph_events（图在 interrupt 处暂停，生成器正常返回）
+        events = _collect_events(core, {"messages": [("user", "go")]})
+
+        # Then: 没有任何携带 [工具执行失败] 的 tool_result
+        tool_results = [e for e in events if e.event_type == EventType.TOOL_RESULT]
+        for tr in tool_results:
+            assert "[工具执行失败]" not in tr.content, (
+                f"GraphInterrupt 不得转为工具失败事件: {tr.content[:120]}"
+            )
+
+        # And: 无 error 终止事件（interrupt 是正常暂停，不是异常）
+        errors = [e for e in events if e.event_type == EventType.ERROR]
+        assert errors == [], f"interrupt 暂停不应发 error 事件，实际 {len(errors)}"

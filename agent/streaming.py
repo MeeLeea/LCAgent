@@ -16,6 +16,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langgraph.errors import GraphBubbleUp
 
 from llm.llm_client import RETRY_ATTEMPTS, RETRY_MAX_DELAY, should_retry
 from llm.message_utils import extract_llm_error, stringify_content
@@ -220,6 +221,18 @@ class Streaming:
                         # handle_tool_error 逃逸到 on_tool_error 事件。此处增强错误信息，
                         # 加入异常类型名 + 修正提示，让 LLM 即使在异常逃逸时也能自愈。
                         error_obj = data_dict.get("error")
+                        if isinstance(error_obj, GraphBubbleUp):
+                            # 中断/父命令传播类控制流信号（危险命令确认、ask_human 等）
+                            # 不是工具失败：LangGraph 以 interrupt 状态暂停图，用户交互
+                            # 由 INTERRUPT 事件通道承载。绝不能转成 [工具执行失败]
+                            # TOOL_RESULT——否则前端工具卡片误显示失败，且记忆流水线会把
+                            # HITL 确认计为工具失败、累积成跨会话"经验教训"（历史 bug）。
+                            # 仅清理 run_id 映射，不发任何内容事件。
+                            run_id = ev.get("run_id", "")
+                            tc_id = active_tool_call_ids.pop(run_id, "")
+                            if tc_id:
+                                active_tool_names.pop(tc_id, None)
+                            continue
                         if error_obj is not None:
                             exc_type = type(error_obj).__name__
                             exc_msg = str(error_obj).strip() or "无详细信息"
