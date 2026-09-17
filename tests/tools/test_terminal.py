@@ -8,12 +8,21 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+from tools.config import (
+    DEFAULT_TIMEOUT,
+    SOFT_TIMEOUT_MARGIN,
+    TOOL_TIMEOUTS,
+    soft_timeout_for,
+)
 from tools.terminal_tools import (
+    _GRACE_PERIOD,
     UserRejectedCommandError,
     _classify_timeout,
     _guard_command,
     _redact_command,
     _truncate,
+    run_cmd,
+    run_python,
     run_shell,
 )
 
@@ -190,3 +199,55 @@ def test_classify_timeout_command_error():
 def test_classify_timeout_dead_loop():
     """无明显特征，兜底为死循环。"""
     assert _classify_timeout("while true; do :; done", "", None) == "dead_loop"
+
+
+# --- 软/硬超时分层不变量 ---------------------------------------------------
+
+_TERMINAL_TOOLS = [run_shell, run_python, run_cmd]
+
+
+def _tool_timeout_default(tool) -> float:
+    """从 @tool 暴露给 LLM 的 args schema 读取 timeout 参数默认值。"""
+    return float(tool.args["timeout"]["default"])
+
+
+def test_soft_timeout_margin_exceeds_ctrl_c_grace_period():
+    """软/硬超时余量必须大于 ctrl+c grace period，保证软中断流程先跑完。"""
+    assert SOFT_TIMEOUT_MARGIN > _GRACE_PERIOD
+
+
+@pytest.mark.parametrize("tool", _TERMINAL_TOOLS, ids=lambda t: t.name)
+def test_terminal_tool_soft_timeout_strictly_less_than_hard(tool):
+    """每个终端工具的内层软超时必须严格小于外层硬超时，否则外层先触发丢富结果。"""
+    hard = TOOL_TIMEOUTS.get(tool.name, DEFAULT_TIMEOUT)
+    soft = _tool_timeout_default(tool)
+
+    assert soft < hard
+
+
+@pytest.mark.parametrize("tool", _TERMINAL_TOOLS, ids=lambda t: t.name)
+def test_terminal_tool_default_equals_derived_soft_timeout(tool):
+    """函数签名默认值必须由 soft_timeout_for 派生，避免手写魔法数漂移。"""
+    assert _tool_timeout_default(tool) == soft_timeout_for(tool.name)
+
+
+@pytest.mark.parametrize("name", sorted(TOOL_TIMEOUTS))
+def test_soft_timeout_derivation_less_than_hard_for_every_configured_tool(name):
+    """TOOL_TIMEOUTS 中每个工具派生出的软超时都必须小于其硬超时。"""
+    assert soft_timeout_for(name) < TOOL_TIMEOUTS[name]
+
+
+def test_run_shell_default_is_590():
+    """run_shell 硬超时 600s - 余量 10s = 590s。"""
+    assert _tool_timeout_default(run_shell) == 590.0
+
+
+def test_run_python_and_run_cmd_default_are_50():
+    """未在 TOOL_TIMEOUTS 覆盖的工具回退 DEFAULT_TIMEOUT 60s - 余量 10s = 50s。"""
+    assert _tool_timeout_default(run_python) == 50.0
+    assert _tool_timeout_default(run_cmd) == 50.0
+
+
+def test_soft_timeout_for_unknown_tool_falls_back_to_default_minus_margin():
+    """未知工具名回退 DEFAULT_TIMEOUT - SOFT_TIMEOUT_MARGIN。"""
+    assert soft_timeout_for("__unknown_tool__") == DEFAULT_TIMEOUT - SOFT_TIMEOUT_MARGIN
