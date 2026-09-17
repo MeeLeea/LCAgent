@@ -1855,6 +1855,18 @@ with TraceContext(trace_id="req-123", thread_id="thread-abc"):
 - **触发后的行为**：`StreamChunkTimeoutError` 同时继承 `asyncio.TimeoutError` 与 `TimeoutError`，会被 `llm_client.should_retry()` 判为可重试；`agent/streaming.py` 最多重试 `RETRY_ATTEMPTS`(3) 次并指数退避。若此前已吐过 token（`emitted=True`）则不重试，直接发 `ERROR` 事件终止流。
 - **实测背景**：云雾网关（`v2.cloudmist.cloud`）偶发中段停摆——HTTP 200 已返回、流已开始，随后连续 120s 零字节（实测一次 122s），恰好在库默认值上触发告警。常态路径经 12 次请求（含 6 路并发、最大 209KB 上下文）实测 TTFT 仅 5-13s、最大 chunk 间隔 ≤13s，故属偶发异常路径而非常态。
 
+#### 流式停滞自动重启（StreamStallRetryMixin）
+
+针对上述中段停摆，[`llm/llm_client.py`](llm/llm_client.py) 的 `StreamStallRetryMixin` 覆写 `_astream`，在 **HTTP 流层**透明重启停滞的请求：
+
+- **为什么必须在 `_astream` 这一层**：`on_llm_new_token` 在 `_astream` 内部每解析一个 chunk 就立即触发，与上层中间件返回值无关。把重试放在图级或 `awrap_model_call` 层，会把**已流给用户的文本完整重放**，且图级重放还可能**重复执行工具副作用**。`_astream` 是唯一位于「token 发射边界之下」的层。
+- **安全重启谓词**：`isinstance(err, StreamChunkTimeoutError)` **且本轮尚未交付任何 `chunk.text` 非空的 chunk** 且 `attempt < STREAM_RETRY_ATTEMPTS(2)` 且 距本次调用开始 `< STREAM_CALL_DEADLINE(900s)`。任一不满足即**原样上抛，绝不吞异常**。
+  - 用 `chunk.text` 而非异常上的 `.chunks_received` 做门控：后者统计全部 chunk（含思考型模型 `text` 为空的 reasoning chunk），会把「本可安全重启」误判为「已输出」。
+- **与图级重试解耦**：`should_retry()` 首行显式对 `StreamChunkTimeoutError` 返回 `False`。该异常是 `TimeoutError` 子类，若不排除，图级重试（`RETRY_ATTEMPTS=3`）会与流层重试叠加成 3×N 嵌套、延迟线性放大。模型级重试耗尽后，异常上抛至 `agent/streaming.py` 命中 `not should_retry(error)` → 立即发 `ERROR` 事件（预期行为）。
+- **与压缩/工具重试无冲突**：`create_agent` 把 `before_model` 编译为**独立节点**（独立 superstep），模型节点崩溃时 `next=("model",)`，重放不会重入压缩 → 无双重压缩；`TerminalRetryCapMW` 统计的是已提交的 `state.messages` 中的超时 ToolMessage，模型级重启不产生消息 → 无交互。
+- **作用域**：仅 `provider ∈ {yunlan, yunlan-gpt}` 的 `CloudmistChatOpenAI` 具备此重启能力；其他 provider 走 `init_chat_model`，暂无流层重试（症状集中于云雾网关，属有意收敛的作用域限制）。
+- **已知边界**：若停滞发生在**已有可见内容之后**，任何重试方案都会重复文本，故此时直接上抛。若产品要求「内容已开始后仍零错误重试」，唯一无重复路径是牺牲实时流式（改非流式缓冲整段再合成 token），属产品级取舍。
+
 ### 终端命令超时重试与分类（Terminal Timeout Retry）
 
 [`tools/terminal_tools.py`](tools/terminal_tools.py) 对 `run_shell` / `run_python` / `run_cmd` 三个终端工具叠加 ctrl+c 软中断 + 超时分类 + 重试上限机制，防止命令卡死导致 Agent 无限等待或无限重试：
