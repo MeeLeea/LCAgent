@@ -20,6 +20,9 @@ MEMORY_MAX_FACTS_PER_THREAD = 60
 MEMORY_MAX_AGENT_FACTS = 200
 """agent 级长期记忆最大 fact 条数（超出 LRU 淘汰）"""
 
+MEMORY_AGENT_KEY = "global"
+"""agent 级长期记忆 namespace 标识：默认跨进程共享，可显式覆盖以隔离"""
+
 MEMORY_RECALL_LIMIT = 20
 """召回长期记忆时的默认条数上限"""
 
@@ -33,6 +36,7 @@ CONFIG_KEYS = [
     "memory_max_buffer_messages",
     "memory_max_facts_per_thread",
     "memory_max_agent_facts",
+    "memory_agent_key",
     "memory_recall_limit",
     "session_enable_memory",
 ]
@@ -43,6 +47,7 @@ DEFAULTS = {
     "memory_max_buffer_messages": MEMORY_MAX_BUFFER_MESSAGES,
     "memory_max_facts_per_thread": MEMORY_MAX_FACTS_PER_THREAD,
     "memory_max_agent_facts": MEMORY_MAX_AGENT_FACTS,
+    "memory_agent_key": MEMORY_AGENT_KEY,
     "memory_recall_limit": MEMORY_RECALL_LIMIT,
     "session_enable_memory": SESSION_ENABLE_MEMORY,
 }

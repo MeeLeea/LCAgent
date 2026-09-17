@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
-from unittest.mock import MagicMock
+from typing import Any, Self
+from unittest.mock import MagicMock, patch
 
 from memory.lock_pool import ThreadMemoryLockPool
 from memory.middleware import (
@@ -824,5 +824,117 @@ class TestDeterministicJudgment:
             conversation = llm.calls[0][-1]["content"]
             assert "用户明确要求记住" in conversation
             assert "我喜欢蓝色" in conversation
+
+        asyncio.run(run())
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  Agent 级写入/淘汰：条件化 prune + agent 锁（FIX 1 / FIX 2d）
+# ════════════════════════════════════════════════════════════════════════
+
+
+class _FakeAgentLock:
+    """agent 锁测试替身：仅实现 async 上下文协议并记录持锁状态。"""
+
+    def __init__(self) -> None:
+        self.held = False
+
+    async def __aenter__(self) -> Self:
+        self.held = True
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self.held = False
+
+
+class TestAgentPruneConditional:
+    """仅当本批次确实写入 agent facts 时才触发 prune_agent_facts。"""
+
+    def test_prune_agent_facts_not_called_when_no_agent_items(self):
+        """仅抽出 thread 级 category（conv）时不得调用 prune_agent_facts。"""
+
+        async def run():
+            llm = _FakeLLM(response=json.dumps([
+                {"content": "本次对话要点", "category": "conv", "confidence": 0.8}
+            ]))
+            mw, store = _make_write_middleware(llm_getter=lambda: llm)
+            calls: list[str] = []
+            original_prune = store.prune_agent_facts
+
+            async def spy_prune() -> int:
+                calls.append("prune_agent_facts")
+                return await original_prune()
+
+            with patch.object(store, "prune_agent_facts", spy_prune):
+                await mw.submit_event("t1", "user", "讨论要点")
+                await mw._aflush_thread("t1")
+
+            assert calls == []
+            assert await store.query_agent_facts() == []
+            assert len(await store.query_facts("t1")) == 1
+
+        asyncio.run(run())
+
+    def test_prune_agent_facts_called_when_agent_items_written(self):
+        """抽出 user_fact（agent 级）时应调用 prune_agent_facts。"""
+
+        async def run():
+            llm = _FakeLLM(response=json.dumps([
+                {"content": "用户偏好深色主题", "category": "user_fact", "confidence": 0.9}
+            ]))
+            mw, store = _make_write_middleware(llm_getter=lambda: llm)
+            calls: list[str] = []
+            original_prune = store.prune_agent_facts
+
+            async def spy_prune() -> int:
+                calls.append("prune_agent_facts")
+                return await original_prune()
+
+            with patch.object(store, "prune_agent_facts", spy_prune):
+                await mw.submit_event("t1", "user", "我喜欢深色主题")
+                await mw._aflush_thread("t1")
+
+            assert calls == ["prune_agent_facts"]
+            assert await store.count_agent_facts() == 1
+
+        asyncio.run(run())
+
+    def test_agent_write_and_prune_hold_agent_lock(self):
+        """agent 级批量写入与 prune 必须在 agent 锁持有期间执行。"""
+
+        async def run():
+            llm = _FakeLLM(response=json.dumps([
+                {"content": "用户偏好深色主题", "category": "user_fact", "confidence": 0.9}
+            ]))
+            store = ThreadMemoryStore()
+            fake_lock = _FakeAgentLock()
+            mw = ThreadMemoryWriteMiddleware(
+                memory_store=store,
+                lock_pool=ThreadMemoryLockPool(),
+                llm_getter=lambda: llm,
+                buffer_delay_seconds=999,
+                max_buffer_messages=30,
+                agent_lock=fake_lock,
+            )
+            observed: list[bool] = []
+            original_save = store.save_agent_facts_batch
+            original_prune = store.prune_agent_facts
+
+            async def spy_save(items: list[ThreadFactItem]) -> None:
+                observed.append(fake_lock.held)
+                await original_save(items)
+
+            async def spy_prune() -> int:
+                observed.append(fake_lock.held)
+                return await original_prune()
+
+            with patch.object(store, "save_agent_facts_batch", spy_save), patch.object(
+                store, "prune_agent_facts", spy_prune
+            ):
+                await mw.submit_event("t1", "user", "我喜欢深色主题")
+                await mw._aflush_thread("t1")
+
+            assert observed == [True, True]
+            assert fake_lock.held is False
 
         asyncio.run(run())

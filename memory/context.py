@@ -27,17 +27,19 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any
 
 from .agent_memory import AgentMemory
 from .config import (
+    MEMORY_AGENT_KEY,
     MEMORY_BUFFER_DELAY_SECONDS,
     MEMORY_MAX_AGENT_FACTS,
     MEMORY_MAX_BUFFER_MESSAGES,
     MEMORY_MAX_FACTS_PER_THREAD,
     MEMORY_RECALL_LIMIT,
 )
-from .lock_pool import ThreadMemoryLockPool
+from .lock_pool import AgentMemoryLock, ThreadMemoryLockPool
 from .manager import MemoryManager
 from .middleware import ThreadMemoryReadMiddleware
 from .store import ThreadMemoryStore
@@ -140,6 +142,7 @@ class MemoryContext:
         thread_id: str | None = None,
         use_sqlite: bool = True,
         process_type: str | None = None,
+        agent_key: str = MEMORY_AGENT_KEY,
         llm_getter: Any = None,
         buffer_delay_seconds: int = MEMORY_BUFFER_DELAY_SECONDS,
         max_buffer_messages: int = MEMORY_MAX_BUFFER_MESSAGES,
@@ -155,7 +158,9 @@ class MemoryContext:
             checkpoint_file: SQLite checkpoint 文件路径
             thread_id: 会话线程 ID
             use_sqlite: True=SQLite持久化, False=内存
-            process_type: 进程类型标识
+            process_type: 进程类型标识（仍用于 thread_id 前缀，决定 AgentMemory 的会话前缀）
+            agent_key: agent 级长期记忆 namespace 标识（跨进程共享，默认 ``"global"``；
+                可显式覆盖以隔离不同的 agent 级记忆）
             llm_getter: 返回当前 LLMClient 的 callable（支持热切换）
             buffer_delay_seconds: 防抖缓冲窗口
             max_buffer_messages: 缓冲区上限
@@ -172,13 +177,13 @@ class MemoryContext:
         )
 
         # 2. 创建 ThreadMemoryStore（复用 AgentMemory 的 Store backend）
-        #    process_type 用于隔离 agent 级记忆的多进程防串号；
+        #    agent_key 决定 agent 级 namespace（默认 "global"，跨进程共享，可覆盖以隔离）；
         #    max_facts 限单 thread 容量，max_agent_facts 限 agent 级容量。
         memory_store = ThreadMemoryStore(
             backend=agent_memory.get_long_term_store(),
             max_facts=max_facts_per_thread,
             max_agent_facts=max_agent_facts,
-            process_type=process_type,
+            agent_key=agent_key,
         )
 
         # 3. 创建 per-thread 并发锁池
@@ -189,7 +194,17 @@ class MemoryContext:
             memory_store, recall_limit=recall_limit
         )
 
-        # 5. 创建 MemoryManager（内部自建写中间件；读中间件复用上面创建的实例，
+        # 5. 创建 agent 级跨进程互斥锁：锁文件与 checkpoint 同目录（仅作 OS 级
+        #    文件锁的目标，不承载任何数据）；checkpoint_file 为 None（内存/测试）
+        #    时传 path=None 退化为进程内锁
+        lock_path = (
+            os.path.join(os.path.dirname(checkpoint_file), "agent_memory.lock")
+            if checkpoint_file
+            else None
+        )
+        agent_lock = AgentMemoryLock(path=lock_path)
+
+        # 6. 创建 MemoryManager（内部自建写中间件；读中间件复用上面创建的实例，
         #    避免 manager 内部再自建一套造成双实例导致配置分叉）
         memory_manager = MemoryManager(
             memory_store=memory_store,
@@ -199,6 +214,7 @@ class MemoryContext:
             buffer_delay_seconds=buffer_delay_seconds,
             max_buffer_messages=max_buffer_messages,
             read_middleware=read_middleware,
+            agent_lock=agent_lock,
         )
 
         return cls(

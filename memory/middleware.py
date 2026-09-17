@@ -7,6 +7,8 @@
 - 防抖缓冲：同一 thread 的事件合并，20s 窗口后批量处理
 - Fact 处理流水线：消息过滤 → LLM 抽取 → 去重 → 写入 Store
 - 使用 ThreadMemoryLockPool 保护同一 thread 的写入
+- agent namespace（跨进程共享）的批量写入与 LRU 淘汰使用 AgentMemoryLock
+  保护（基于 OS 级文件锁，跨进程互斥）
 
 **ThreadMemoryReadMiddleware**（读，AgentMiddleware）：
 - 在 ``awrap_model_call`` 中从 Store 读取 thread 的 facts
@@ -29,7 +31,7 @@ from langchain.agents.middleware.types import ContextT, ModelRequest
 from langchain_core.messages import SystemMessage
 
 from .config import MEMORY_BUFFER_DELAY_SECONDS, MEMORY_MAX_BUFFER_MESSAGES
-from .lock_pool import ThreadMemoryLockPool
+from .lock_pool import AgentMemoryLock, ThreadMemoryLockPool
 from .models import (
     MemoryCategory,
     MemoryInputEvent,
@@ -70,6 +72,9 @@ class ThreadMemoryWriteMiddleware:
         llm_getter: 返回当前 LLMClient 的 callable（支持 LLM 热切换）
         buffer_delay_seconds: 防抖缓冲窗口（秒），默认 MEMORY_BUFFER_DELAY_SECONDS
         max_buffer_messages: 单 thread 缓冲区上限，默认 MEMORY_MAX_BUFFER_MESSAGES
+        agent_lock: agent 级跨进程互斥锁（保护 agent namespace 的批量写入与
+            LRU 淘汰）。为 None 时内部自建进程内锁 ``AgentMemoryLock(path=None)``，
+            供测试等无外部注入场景使用
     """
 
     def __init__(
@@ -79,10 +84,13 @@ class ThreadMemoryWriteMiddleware:
         llm_getter: Callable[[], Any],
         buffer_delay_seconds: int | None = None,
         max_buffer_messages: int | None = None,
+        agent_lock: AgentMemoryLock | None = None,
     ) -> None:
         self._store = memory_store
         self._lock_pool = lock_pool
         self._llm_getter = llm_getter
+        # agent 级互斥锁：agent namespace 跨进程共享，写流水线必须持锁
+        self._agent_lock = agent_lock if agent_lock is not None else AgentMemoryLock()
         self._buffer_delay_seconds = buffer_delay_seconds if buffer_delay_seconds is not None else MEMORY_BUFFER_DELAY_SECONDS
         self._max_buffer_messages = max_buffer_messages if max_buffer_messages is not None else MEMORY_MAX_BUFFER_MESSAGES
 
@@ -284,15 +292,18 @@ class ThreadMemoryWriteMiddleware:
                     self._build_fact_item(content, category, fact_data, scope="thread")
                 )
 
-        # ⑥ 分流批量写入 + LRU 淘汰
+        # ⑥ 分流批量写入 + LRU 淘汰（agent 级写入与 prune 必须持有 agent 锁，
+        #    且仅在本次确实产生了 agent facts 时才执行——空批次也 prune 会在
+        #    多进程并发时各自按本地快照计算溢出并删除不相交的集合，造成过量淘汰）
         if agent_items:
-            await self._store.save_agent_facts_batch(agent_items)
-            logger.info(
-                "[长期记忆-agent级] thread=%s 写入 %d 条 (跨会话共享, namespace=global_facts)",
-                thread_id,
-                len(agent_items),
-            )
-        await self._store.prune_agent_facts()
+            async with self._agent_lock:
+                await self._store.save_agent_facts_batch(agent_items)
+                logger.info(
+                    "[长期记忆-agent级] thread=%s 写入 %d 条 (跨会话共享, namespace=global_facts)",
+                    thread_id,
+                    len(agent_items),
+                )
+                await self._store.prune_agent_facts()
 
         if thread_items:
             await self._store.save_facts_batch(thread_id, thread_items)

@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
-from unittest.mock import MagicMock
+from typing import Any, Self
+from unittest.mock import MagicMock, patch
 
 from memory.lock_pool import ThreadMemoryLockPool
 from memory.manager import MemoryManager
@@ -267,6 +267,88 @@ class TestCompressAndClear:
             result = await mgr.compress("t1")
             assert result["success"] is False
             assert "LLM" in result["error"] or "空摘要" in result["error"]
+
+        asyncio.run(run())
+
+    def test_compress_agent_with_llm(self):
+        """agent 级 facts 经 LLM 摘要后替换为单条摘要 fact。"""
+        async def run():
+            summary = "压缩后的 agent 摘要内容"
+            llm = _FakeLLM(response=summary)
+            mgr, store = _make_manager(llm_getter=lambda: llm)
+            seeded = [
+                ThreadFactItem(content="agent-fact-1", category="user_fact", scope="agent"),
+                ThreadFactItem(content="agent-fact-2", category="lesson", scope="agent"),
+            ]
+            await store.save_agent_facts_batch(seeded)
+
+            result = await mgr.compress_agent()
+            assert result["success"] is True
+            assert result["original_count"] == 2
+            assert result["summary"] == summary
+            assert result["compressed_chars"] == len(summary)
+            assert result["original_chars"] == sum(len(f.content) for f in seeded)
+
+            # 压缩后 agent 级只剩 1 条摘要
+            facts = await store.query_agent_facts()
+            assert len(facts) == 1
+            assert facts[0].content.startswith("[历史记忆摘要]")
+
+        asyncio.run(run())
+
+    def test_compress_agent_empty_returns_error(self):
+        """无 agent 级 facts 时返回错误，且不调用 LLM。"""
+        async def run():
+            llm = _FakeLLM(response="不应被调用")
+            mgr, _ = _make_manager(llm_getter=lambda: llm)
+
+            result = await mgr.compress_agent()
+            assert result["success"] is False
+            assert "没有" in result["error"]
+            assert llm.calls == []
+
+        asyncio.run(run())
+
+    def test_compress_agent_llm_failure_keeps_facts(self):
+        """LLM 返回空摘要时压缩失败，原 agent 级 facts 不丢（不变量）。"""
+        async def run():
+            llm = _FakeLLM(response="")
+            mgr, store = _make_manager(llm_getter=lambda: llm)
+            await store.save_agent_facts_batch([
+                ThreadFactItem(content="agent-fact-1", category="user_fact", scope="agent"),
+                ThreadFactItem(content="agent-fact-2", category="lesson", scope="agent"),
+            ])
+
+            result = await mgr.compress_agent()
+            assert result["success"] is False
+            assert "LLM" in result["error"] or "空摘要" in result["error"]
+
+            # 关键不变量：LLM 失败不丢数据
+            facts = await store.query_agent_facts()
+            assert len(facts) == 2
+            assert {f.content for f in facts} == {"agent-fact-1", "agent-fact-2"}
+
+        asyncio.run(run())
+
+    def test_compress_thread_does_not_affect_agent(self):
+        """compress 只压缩 thread 级记忆，agent 级跨会话记忆保持不变。"""
+        async def run():
+            llm = _FakeLLM(response="thread 压缩摘要")
+            mgr, store = _make_manager(llm_getter=lambda: llm)
+            await store.save_fact("t1", ThreadFactItem(content="thread-1"))
+            await store.save_fact("t1", ThreadFactItem(content="thread-2"))
+            await store.save_agent_facts_batch([
+                ThreadFactItem(content="global-1", category="user_fact", scope="agent"),
+                ThreadFactItem(content="global-2", category="lesson", scope="agent"),
+            ])
+
+            result = await mgr.compress("t1")
+            assert result["success"] is True
+
+            # agent 级 facts 不受 thread 压缩影响
+            agent_facts = await store.query_agent_facts()
+            assert len(agent_facts) == 2
+            assert {f.content for f in agent_facts} == {"global-1", "global-2"}
 
         asyncio.run(run())
 
@@ -564,5 +646,76 @@ class TestAgentInterfaces:
             cleared = await mgr.clear_agent_facts()
             assert cleared == 2
             assert await mgr.count_agent_facts() == 0
+
+        asyncio.run(run())
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  clear_agent_facts 的顺序与持锁不变量（FIX 2c）
+# ════════════════════════════════════════════════════════════════════════
+
+
+class _FakeAgentLock:
+    """agent 锁测试替身：仅实现 async 上下文协议并记录持锁状态。"""
+
+    def __init__(self) -> None:
+        self.held = False
+
+    async def __aenter__(self) -> Self:
+        self.held = True
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self.held = False
+
+
+class TestClearAgentFactsOrdering:
+    """clear_agent_facts 必须先冲刷在途 buffer，再持 agent 锁清空。"""
+
+    def test_clear_agent_facts_flushes_before_clear(self):
+        """调用顺序必须为 flush_all → store.clear_agent_facts。"""
+
+        async def run():
+            mgr, store = _make_manager()
+            calls: list[str] = []
+
+            async def spy_flush_all() -> None:
+                calls.append("flush_all")
+
+            async def spy_clear() -> int:
+                calls.append("clear_agent_facts")
+                return 0
+
+            with patch.object(
+                mgr.write_middleware, "flush_all", spy_flush_all
+            ), patch.object(store, "clear_agent_facts", spy_clear):
+                cleared = await mgr.clear_agent_facts()
+
+            assert calls == ["flush_all", "clear_agent_facts"]
+            assert cleared == 0
+
+        asyncio.run(run())
+
+    def test_clear_agent_facts_holds_agent_lock(self):
+        """清空 store 期间必须持有 manager 的 agent 锁。"""
+
+        async def run():
+            mgr, store = _make_manager()
+            fake_lock = _FakeAgentLock()
+            mgr._agent_lock = fake_lock
+
+            observed: list[bool] = []
+            original_clear = store.clear_agent_facts
+
+            async def spy_clear() -> int:
+                observed.append(fake_lock.held)
+                return await original_clear()
+
+            with patch.object(store, "clear_agent_facts", spy_clear):
+                await mgr.clear_agent_facts()
+
+            assert observed == [True]
+            assert fake_lock.held is False
+            assert mgr.agent_lock is fake_lock
 
         asyncio.run(run())

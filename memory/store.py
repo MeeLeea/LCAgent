@@ -6,9 +6,9 @@
 隔离方式（两级 namespace）：
 - thread 级 namespace = ``(thread_id, "thread_facts")``，按 thread_id 天然隔离
   （conv / business 类记忆，会话内有效）
-- agent 级 namespace = ``(agent_key, "global_facts")``，跨会话共享
-  （user_fact / lesson 类记忆，按 process_type 隔离多进程防串号）
-- 不同 thread / 不同 process 完全并行，无需加锁
+- agent 级 namespace = ``(agent_key, "global_facts")``，agent 级 namespace 跨进程共享
+  （user_fact / lesson 类记忆；agent_key 默认 ``"global"``，可显式覆盖以隔离）
+- 不同 thread 完全并行，无需加锁
 - 同一 namespace 的写入由上层 :class:`ThreadMemoryLockPool` 保护
 
 存储后端：
@@ -45,8 +45,8 @@ class ThreadMemoryStore:
         backend: 底层 BaseStore 实例。为 None 时用 InMemoryStore。
         max_facts: 单 thread 最大 fact 条数（超出时 LRU 淘汰）。
         max_agent_facts: agent 级（跨会话共享）最大 fact 条数（超出时 LRU 淘汰）。
-        process_type: 进程 / Agent 类型标识，用于隔离不同进程的 agent 级记忆，
-            默认 ``"default"``。
+        agent_key: agent 级 namespace 标识，agent 级 namespace 跨进程共享，
+            默认 ``"global"``，可显式覆盖以隔离不同的 agent 级记忆。
     """
 
     def __init__(
@@ -54,12 +54,12 @@ class ThreadMemoryStore:
         backend: BaseStore | None = None,
         max_facts: int = 50,
         max_agent_facts: int = 200,
-        process_type: str | None = None,
+        agent_key: str = "global",
     ):
         self._store: BaseStore = backend or InMemoryStore()
         self._max_facts = max_facts
         self._max_agent_facts = max_agent_facts
-        self._agent_key = process_type or "default"
+        self._agent_key = agent_key
 
     @property
     def backend(self) -> BaseStore:
@@ -75,6 +75,11 @@ class ThreadMemoryStore:
         """agent 级记忆容量上限。"""
         return self._max_agent_facts
 
+    @property
+    def agent_key(self) -> str:
+        """agent 级 namespace 标识（跨进程共享，默认 ``"global"``）。"""
+        return self._agent_key
+
     # ============ namespace 构建 ============
 
     def _facts_namespace(
@@ -83,7 +88,7 @@ class ThreadMemoryStore:
         """构建 facts 的 namespace tuple。
 
         - ``scope == "agent"``：返回 ``(self._agent_key, "global_facts")``，
-          跨会话共享的 agent 级记忆（按 process_type 隔离多进程防串号）
+          agent 级 namespace 跨进程共享（agent_key 默认 ``"global"``，可显式覆盖以隔离）
         - 其它（默认 ``"thread"``）：返回 ``(thread_id, "thread_facts")``，
           per-thread 隔离的会话级记忆
 
@@ -306,6 +311,43 @@ class ThreadMemoryStore:
             thread_id,
             original_count,
         )
+        return {
+            "success": True,
+            "original_count": original_count,
+            "summary": summary,
+        }
+
+    async def replace_agent_facts_with_summary(self, summary: str) -> dict[str, Any]:
+        """用摘要替换全部 agent 级 facts（:meth:`replace_with_summary` 的 agent 作用域孪生）。
+
+        删除 agent namespace（``(agent_key, "global_facts")``）下的全部旧 facts，
+        替换为单条摘要条目，供 agent 级记忆压缩使用；不影响 thread 级记忆。
+
+        Args:
+            summary: LLM 生成的摘要文本
+
+        Returns:
+            ``{"success": bool, "original_count": int, "summary": str}``
+        """
+        ns = self._facts_namespace("", scope="agent")
+        facts = await self._query_facts_ns(ns)
+        original_count = len(facts)
+
+        # 清空旧 facts
+        for fact in facts:
+            await self._store.adelete(ns, key=fact.fact_id)
+
+        # 写入摘要条目（dataclass 默认 scope="thread"，此处必须显式指定 "agent"）
+        summary_item = ThreadFactItem(
+            thread_id=self._agent_key,
+            content=f"[历史记忆摘要]\n{summary}",
+            category=MemoryCategory.IMPORTANT_CONVERSATION.value,
+            confidence=1.0,
+            scope="agent",
+        )
+        await self._store.aput(ns, key=summary_item.fact_id, value=summary_item.to_dict())
+
+        logger.info("agent %s 记忆压缩: %d 条 → 1 条摘要", self._agent_key, original_count)
         return {
             "success": True,
             "original_count": original_count,
