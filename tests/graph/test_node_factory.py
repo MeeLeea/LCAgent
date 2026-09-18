@@ -3,7 +3,7 @@
 
 覆盖:
 - load_agent_rules: 默认仅返回「重要规则」通用节; include_tool_rules=True 追加「工具规则」
-- load_agent_rules: 缺失文件 / 无对应小节时返回空串
+- load_agent_rules: 缺失文件时回退内置默认提示词(含同样小节); 无对应小节时返回空串
 - create_llm_node: 按角色能力运行时解析(持有工具才注入「工具规则」)
 - create_llm_node: base_prompts="" 关闭注入; 传字符串覆盖默认解析
 - prompt 顺序: 基础提示词 → 节点模板 → 技能块
@@ -94,12 +94,16 @@ def test_load_agent_rules_with_tool_rules_appends_tool_section():
     assert "schedule_task" not in universal
 
 
-def test_load_agent_rules_missing_file_returns_empty(tmp_path):
-    """文件缺失时返回空串(不注入), 而非回退整份提示词。"""
+def test_load_agent_rules_missing_file_falls_back_to_builtin_sections(tmp_path):
+    """文件缺失时回退内置默认提示词; 默认提示词与 AGENT.md 同构, 规则小节仍会被提取。"""
     missing = str(tmp_path / "nonexistent" / "AGENT.md")
 
-    assert load_agent_rules(missing) == ""
-    assert load_agent_rules(missing, include_tool_rules=True) == ""
+    universal = load_agent_rules(missing)
+    with_tool = load_agent_rules(missing, include_tool_rules=True)
+
+    assert universal.startswith(RULES_HEADING)
+    assert TOOL_RULES_HEADING not in universal
+    assert TOOL_RULES_HEADING in with_tool
 
 
 def test_load_agent_rules_without_sections_returns_empty(tmp_path):
