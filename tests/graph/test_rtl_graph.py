@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from dataclasses import dataclass, field
 
 from langgraph.graph import END
@@ -672,7 +671,7 @@ async def _run_sim_check(workspace, monkeypatch, rc=0):
         return _FakeProc(rc)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake)
-    return await sim_exec_check_node(dict(), agent, config=config)
+    return await sim_exec_check_node({}, agent, config=config)
 
 
 def test_sim_exec_check_node_pass(tmp_path, monkeypatch):

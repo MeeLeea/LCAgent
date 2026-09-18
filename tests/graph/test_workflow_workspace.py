@@ -298,8 +298,8 @@ def test_register_nodes_passes_config_to_node():
     """
     from typing import Optional, TypedDict
 
-    from langchain_core.runnables import RunnableConfig
     from langchain_core.messages import AIMessage
+    from langchain_core.runnables import RunnableConfig
     from langgraph.checkpoint.memory import MemorySaver
     from langgraph.graph import END, START, StateGraph
 

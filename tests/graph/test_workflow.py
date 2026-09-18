@@ -500,9 +500,10 @@ def test_build_workflow_mcp_tools_injection():
     - 未声明 mcp_tools 的角色,tools 保持原样(本地 tools 或 None)
     - MCP 加载失败(返回空)时,角色降级为纯文本模式(tools=None)
     """
-    from graph.common import AGENT_REGISTRY, register_agent, build_workflow
-    from team.base import TeamAgent
     from dataclasses import dataclass
+
+    from graph.common import AGENT_REGISTRY, build_workflow, register_agent
+    from team.base import TeamAgent
 
     @dataclass
     class FakeTool:
