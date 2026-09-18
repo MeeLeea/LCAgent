@@ -25,7 +25,7 @@ import logging
 import os
 import sys
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from functools import lru_cache
 from typing import Any
@@ -113,6 +113,115 @@ _THREAD_LOCKS_MAX = 200
 # 流式生成器在 LLM 阻塞调用期间也能感知取消，立即中断执行（含 openai 内部重试）。
 # 流结束时在生成器 finally 中移除，防止长期运行后内存无限增长。
 _cancel_events: dict[str, asyncio.Event] = {}
+
+
+class _ActiveStream:
+    """一个线程的活跃流式执行：支持客户端断开后重连（attach）恢复实时输出。
+
+    - publish：执行侧每个事件先写入 event_log（供重放），再转发给全部订阅者
+      （原始连接 + 刷新后的 attach 连接）。
+    - subscribe：attach 时先重放 event_log，再实时接收；已结束则直接给 None 哨兵。
+    - 注册表条目由创建方收尾时移除（正常结束在 event_stream finally；
+      客户端断开转移后台时在 _detached_stream_cleanup）。
+    """
+
+    def __init__(self) -> None:
+        self.event_log: list[dict[str, Any]] = []
+        self.subscribers: list[asyncio.Queue[dict[str, Any] | None]] = []
+        self.finished = False
+        self._mu = asyncio.Lock()
+
+    async def publish(self, ev: dict[str, Any]) -> None:
+        async with self._mu:
+            self.event_log.append(ev)
+            subs = list(self.subscribers)
+        for q in subs:
+            q.put_nowait(ev)
+
+    async def subscribe(self) -> asyncio.Queue[dict[str, Any] | None]:
+        q: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        async with self._mu:
+            for ev in self.event_log:
+                q.put_nowait(ev)
+            if self.finished:
+                q.put_nowait(None)
+            else:
+                self.subscribers.append(q)
+        return q
+
+    async def unsubscribe(self, q: asyncio.Queue[dict[str, Any] | None]) -> None:
+        async with self._mu:
+            if q in self.subscribers:
+                self.subscribers.remove(q)
+
+    async def finish(self) -> None:
+        async with self._mu:
+            if self.finished:
+                return
+            self.finished = True
+            subs = list(self.subscribers)
+            self.subscribers.clear()
+        for q in subs:
+            q.put_nowait(None)
+
+
+# per-thread 活跃流注册表：/api/chat 与 /api/chat/resume 的普通对话路径注册，
+# 管理命令路径（dispatch_command）不注册（工作流有自己的状态恢复机制）。
+_active_streams: dict[str, _ActiveStream] = {}
+
+
+class _DetachState:
+    """_forward_stream_with_cancel 与 event_stream 之间的断开转移标志。
+
+    detached=True 表示客户端已断开且执行转移到后台任务，
+    event_stream 的 finally 不得清理 stream/注册表/cancel_event（后台任务负责）。
+    """
+
+    def __init__(self) -> None:
+        self.detached = False
+
+
+async def _detached_stream_cleanup(
+    thread_id: str,
+    runner: asyncio.Task[None],
+    stream: _ActiveStream,
+    cancel_event: asyncio.Event,
+) -> None:
+    """客户端断开后接管执行：等待 LangGraph 完成（或用户经 /api/stop 取消）。
+
+    runner 不被取消 → LangGraph 正常跑完 → checkpoint 保存完整消息，
+    前端刷新后可经 attach 重放或历史接口看到完整响应。
+    持有会话锁直到后台执行结束：原响应任务退出会释放锁，若不加锁，
+    刷新后同线程新请求会与后台执行并发写 checkpoint 产生分支。
+    """
+    async with _thread_lock(thread_id):
+        cancel_waiter = asyncio.create_task(cancel_event.wait())
+        try:
+            done, _ = await asyncio.wait({runner, cancel_waiter}, return_when=asyncio.FIRST_COMPLETED)
+            if cancel_waiter in done and not runner.done():
+                logger.info("后台执行收到停止信号 [%s]，取消执行", thread_id)
+                runner.cancel()
+                try:
+                    await runner
+                except asyncio.CancelledError:
+                    pass
+                # attach 订阅者需要终止事件复位流式状态（写入事件日志，重放同样可见）
+                await stream.publish({"type": "cancelled", "content": "用户已停止生成。"})
+                await _cancel_pending_memory(thread_id)
+            else:
+                # 异常已在 _drain_events 内记录并转为 error 事件
+                with suppress(Exception):
+                    await runner
+                logger.info("后台执行完成 [%s]", thread_id)
+        finally:
+            if not cancel_waiter.done():
+                cancel_waiter.cancel()
+            await stream.finish()
+            # 身份检查：旧执行的收尾不得误删新请求注册的条目
+            if _active_streams.get(thread_id) is stream:
+                _active_streams.pop(thread_id, None)
+            if _cancel_events.get(thread_id) is cancel_event:
+                _cancel_events.pop(thread_id, None)
 
 
 def _cancel_event_for(thread_id: str) -> asyncio.Event:
@@ -777,6 +886,7 @@ async def _drain_events(
     source: AsyncIterator[dict[str, Any]],
     queue: asyncio.Queue[dict[str, Any] | None],
     thread_id: str,
+    stream: _ActiveStream | None = None,
 ) -> None:
     """消费事件源并把事件放入队列；流结束或异常时放入 None 哨兵。
 
@@ -791,7 +901,12 @@ async def _drain_events(
         raise
     except Exception as e:
         logger.error("异常 [%s]: %s", thread_id, e)
-        queue.put_nowait({"type": "error", "content": f"内部错误: {e}"})
+        err_ev: dict[str, Any] = {"type": "error", "content": f"内部错误: {e}"}
+        queue.put_nowait(err_ev)
+        # 客户端断开转后台后队列无人消费，异常事件同步 publish 给 attach 订阅者与事件日志
+        if stream is not None:
+            with suppress(Exception):
+                await stream.publish(err_ev)
     finally:
         queue.put_nowait(None)
 
@@ -802,6 +917,8 @@ async def _forward_stream_with_cancel(
     request: Request,
     thread_id: str,
     enrich_done: bool = True,
+    stream: _ActiveStream | None = None,
+    detach: _DetachState | None = None,
 ) -> AsyncIterator[str]:
     """把事件源转为 SSE 字符串，支持停止信号 / 客户端断开即时中断。
 
@@ -811,11 +928,33 @@ async def _forward_stream_with_cancel(
     - 客户端断开（request.is_disconnected）在每个事件产出后检查；
       另外每 3 秒空闲超时后主动检测断开，避免 LLM 长时间阻塞期间
       页面刷新导致锁不释放、新请求被阻塞。
+    - 断开时若提供 stream/detach（普通对话路径），执行转移到后台继续完成
+      （checkpoint 保存完整消息，前端可经 attach 恢复），否则取消执行。
     """
     queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
-    runner = asyncio.create_task(_drain_events(source, queue, thread_id))
+    runner = asyncio.create_task(_drain_events(source, queue, thread_id, stream))
     cancel_waiter = asyncio.create_task(cancel_event.wait())
     getter = asyncio.create_task(queue.get())
+
+    def _try_detach() -> bool:
+        """客户端断开时尝试转移后台执行；返回 True 表示已转移（调用方应直接 return）。
+
+        幂等：重复调用（如主动检测与 CancelledError 捕获竞逐）只转移一次。
+        """
+        if stream is None or detach is None:
+            return False
+        if detach.detached:
+            return True
+        detach.detached = True
+        logger.info("客户端断开 [%s]，转后台继续执行", thread_id)
+        try:
+            asyncio.create_task(_detached_stream_cleanup(thread_id, runner, stream, cancel_event))
+        except RuntimeError:
+            # 事件循环关闭中（服务关停），无法转移后台；回退为取消执行
+            detach.detached = False
+            return False
+        return True
+
     try:
         while True:
             done, _ = await asyncio.wait(
@@ -826,6 +965,8 @@ async def _forward_stream_with_cancel(
             # 空闲超时：无事件产出时主动检查客户端断开（页面刷新场景）
             if not done:
                 if await request.is_disconnected():
+                    if _try_detach():
+                        return
                     getter.cancel()
                     logger.info("客户端断开 [%s]，中止流式输出（空闲检测）", thread_id)
                     break
@@ -845,20 +986,29 @@ async def _forward_stream_with_cancel(
                         logger.info("客户端停止 [%s]，中止流式输出", thread_id)
                         yield _sse({"type": "cancelled", "content": "用户已停止生成。"})
                     else:
+                        if _try_detach():
+                            return
                         logger.info("客户端断开 [%s]，中止流式输出", thread_id)
                     break
                 yield _sse(_enrich_done(ev)) if enrich_done else _sse(ev)
                 getter = asyncio.create_task(queue.get())
+    except (asyncio.CancelledError, GeneratorExit):
+        # 客户端断开时 Starlette 检测到 http.disconnect 会直接取消响应任务，
+        # CancelledError 注入当前 await 点（生成器被回收时则注入 GeneratorExit），
+        # 两者都绕过上面的主动断开检测，导致 finally 误杀 runner、流被注销。
+        # 统一按客户端断开处理：转后台继续执行，然后继续传播终止本生成器。
+        _try_detach()
+        raise
     finally:
         if not cancel_waiter.done():
             cancel_waiter.cancel()
         if not getter.done():
             getter.cancel()
-            try:
+            with suppress(asyncio.CancelledError, Exception):
                 await getter
-            except (asyncio.CancelledError, Exception):
-                pass
-        if not runner.done():
+        # 已转移后台时 runner 由 _detached_stream_cleanup 接管，不得取消
+        detached = detach is not None and detach.detached
+        if not detached and not runner.done():
             runner.cancel()
             try:
                 await runner
@@ -1010,6 +1160,9 @@ async def chat(req: ChatRequest, request: Request):
         async with lock:
             # per-thread 停止信号：POST /api/stop 置位后在 LLM 阻塞期间也能感知
             cancel_event = _cancel_event_for(tid)
+            # 断开转移标志：普通对话路径客户端断开时执行转后台完成，
+            # finally 据此跳过清理（由 _detached_stream_cleanup 收尾）
+            detach = _DetachState()
             try:
                 if is_new_thread:
                     yield _sse({"type": "thread_created", "thread_id": tid})
@@ -1160,23 +1313,42 @@ async def chat(req: ChatRequest, request: Request):
                         return
                 
                 # 普通对话模式（显式传 thread_id 实现多会话隔离）
+                # 注册活跃流：事件 publish 到 _ActiveStream（重放日志 + 多订阅者），
+                # 客户端断开时执行转后台完成，前端刷新后可经 attach 恢复实时输出。
+                stream = _ActiveStream()
+                _active_streams[tid] = stream
+
+                async def source() -> AsyncIterator[dict[str, Any]]:
+                    async for ev_dict in agent.session_manager.achat_stream(message, thread_id=tid):
+                        await stream.publish(ev_dict)
+                        yield ev_dict
+
                 try:
                     async for sse in _forward_stream_with_cancel(
-                        agent.session_manager.achat_stream(message, thread_id=tid),
+                        source(),
                         cancel_event,
                         request,
                         tid,
+                        stream=stream,
+                        detach=detach,
                     ):
                         yield sse
                 except Exception as e:
                     logger.error("异常 [%s]: %s", tid, e)
                     yield _sse({"type": "error", "content": f"内部错误: {e}"})
+                finally:
+                    if not detach.detached:
+                        await stream.finish()
+                        if _active_streams.get(tid) is stream:
+                            _active_streams.pop(tid, None)
             finally:
                 # 流因停止信号取消结束时，清理该会话待处理的记忆沉淀，
                 # 防止 20s 防抖窗口到期后仍触发后台 LLM fact 抽取（停止后不应再请求）
                 if cancel_event.is_set():
                     await _cancel_pending_memory(tid)
-                _cancel_events.pop(tid, None)
+                # 已转移后台时 cancel_event 由 _detached_stream_cleanup 清理
+                if not detach.detached and _cancel_events.get(tid) is cancel_event:
+                    _cancel_events.pop(tid, None)
 
     return StreamingResponse(
         event_stream(),
@@ -1199,28 +1371,92 @@ async def chat_resume(req: ResumeRequest, request: Request):
         logger.info("恢复会话 [%s]", tid)
         async with _thread_lock(tid):
             cancel_event = _cancel_event_for(tid)
+            detach = _DetachState()
+            stream = _ActiveStream()
+            _active_streams[tid] = stream
+
+            async def source() -> AsyncIterator[dict[str, Any]]:
+                async for ev_dict in agent.session_manager.aresume_stream(req.payload, thread_id=tid):
+                    await stream.publish(ev_dict)
+                    yield ev_dict
+
             try:
                 async for sse in _forward_stream_with_cancel(
-                    agent.session_manager.aresume_stream(req.payload, thread_id=tid),
+                    source(),
                     cancel_event,
                     request,
                     tid,
                     enrich_done=False,
+                    stream=stream,
+                    detach=detach,
                 ):
                     yield sse
             except Exception as e:
                 logger.error("恢复异常 [%s]: %s", tid, e)
                 yield _sse({"type": "error", "content": f"内部错误: {e}"})
             finally:
+                if not detach.detached:
+                    await stream.finish()
+                    if _active_streams.get(tid) is stream:
+                        _active_streams.pop(tid, None)
                 # 流因停止信号取消结束时，清理该会话待处理的记忆沉淀（同 /api/chat）
                 if cancel_event.is_set():
                     await _cancel_pending_memory(tid)
-                _cancel_events.pop(tid, None)
+                # 已转移后台时 cancel_event 由 _detached_stream_cleanup 清理
+                if not detach.detached and _cancel_events.get(tid) is cancel_event:
+                    _cancel_events.pop(tid, None)
 
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/threads/{thread_id}/stream-status")
+async def thread_stream_status(thread_id: str):
+    """查询指定线程是否有正在进行的流式生成（前端刷新后据此决定是否 attach）。"""
+    return {"thread_id": thread_id, "streaming": thread_id in _active_streams}
+
+
+@app.get("/api/chat/attach/{thread_id}")
+async def chat_attach(thread_id: str, request: Request):
+    """重连到正在进行的流式执行（页面刷新后恢复实时输出）。
+
+    订阅 _ActiveStream：先重放事件日志（页面刷新期间错过的事件），
+    再实时转发后续事件。无活跃流时返回 attach_expired 事件，
+    前端据此回退到历史消息加载。
+    """
+    stream = _active_streams.get(thread_id)
+
+    async def attach_gen() -> AsyncIterator[str]:
+        if stream is None:
+            yield _sse({"type": "attach_expired"})
+            return
+        q = await stream.subscribe()
+        try:
+            while True:
+                try:
+                    ev = await asyncio.wait_for(q.get(), timeout=3.0)
+                except TimeoutError:
+                    # 空闲超时：检测 attach 客户端自身断开（用户再次刷新/切走）
+                    if await request.is_disconnected():
+                        break
+                    continue
+                if ev is None:
+                    break
+                yield _sse(_enrich_done(ev))
+        finally:
+            await stream.unsubscribe(q)
+
+    return StreamingResponse(
+        attach_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
     )
 
 
