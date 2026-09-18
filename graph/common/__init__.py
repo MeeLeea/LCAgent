@@ -14,12 +14,8 @@
 """
 from __future__ import annotations
 
-# 节点跟踪
-from graph.common.node_tracking import (
-    NodeCallback,
-    NodeTrackingHandler,
-    _extract_node_output,
-)
+# 压缩中间件构造工具
+from graph.common.compaction_utils import _build_compaction_middleware
 
 # 中断转发
 from graph.common.interrupt_forward import run_team_turn_with_interrupt
@@ -27,23 +23,22 @@ from graph.common.interrupt_forward import run_team_turn_with_interrupt
 # 节点工厂
 from graph.common.node_factory import create_llm_node
 
-# 通用运行器
-from graph.common.workflow_runner import (
-    _aget_previous_workflow_summary,
-    arun_compiled_workflow,
-)
-
-# 压缩中间件构造工具
-from graph.common.compaction_utils import _build_compaction_middleware
-
 # 声明式节点规格与注册
 from graph.common.node_spec import NodeSpec, register_nodes
+
+# 节点跟踪
+from graph.common.node_tracking import (
+    NodeCallback,
+    NodeTrackingHandler,
+    _extract_node_output,
+)
 
 # 注册表
 from graph.common.registry import (
     AGENT_REGISTRY,
     BASE_DIR,
     WORKFLOWS,
+    _load_builtin_workflows,
     arun_workflow_by_name,
     build_workflow,
     get_workflow_runner,
@@ -52,22 +47,26 @@ from graph.common.registry import (
     register_workflow,
 )
 
+# 通用运行器
+from graph.common.workflow_runner import (
+    _aget_previous_workflow_summary,
+    arun_compiled_workflow,
+)
+
 # 加载内置工作流模块（触发自注册）— 放在所有子模块导入完成后调用，
 # 避免 graph.simple 等模块 import graph.common 时因 __init__ 未完成而循环导入
-from graph.common.registry import _load_builtin_workflows
-
 _load_builtin_workflows()
 
 __all__ = [
     "AGENT_REGISTRY",
     "BASE_DIR",
+    "WORKFLOWS",
     "NodeCallback",
     "NodeSpec",
     "NodeTrackingHandler",
-    "WORKFLOWS",
+    "_aget_previous_workflow_summary",
     "_build_compaction_middleware",
     "_extract_node_output",
-    "_aget_previous_workflow_summary",
     "arun_compiled_workflow",
     "arun_workflow_by_name",
     "build_workflow",

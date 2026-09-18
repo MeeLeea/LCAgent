@@ -69,9 +69,11 @@ class McpTools:
                 self.tools = list(self.local_tools) + list(self.mcp_tools)
                 new_signature = frozenset(t.name for t in self.tools)
 
-                if getattr(self, "agent_executor", None) is not None:
-                    if new_signature != old_signature:
-                        await self._arebuild_agent_executor()
+                if (
+                    getattr(self, "agent_executor", None) is not None
+                    and new_signature != old_signature
+                ):
+                    await self._arebuild_agent_executor()
                 return success
             except Exception:
                 logger.exception("MCP %s: 重连失败", name)

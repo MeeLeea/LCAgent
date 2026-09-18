@@ -8,16 +8,13 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from langgraph.graph import StateGraph
 
 from graph.common.node_tracking import NodeCallback, NodeTrackingHandler
 from utils.events import AgentEvent
 from utils.logging_config import TraceContext
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
