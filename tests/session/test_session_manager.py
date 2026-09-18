@@ -4,11 +4,10 @@
   pytest tests/session/test_session_manager.py -v
 """
 import asyncio
-from typing import Any
 
 from memory.lock_pool import ThreadMemoryLockPool
 from memory.manager import MemoryManager
-from memory.models import MemoryCategory, ThreadFactItem
+from memory.models import ThreadFactItem
 from memory.store import ThreadMemoryStore
 from session.manager import SessionManager
 
