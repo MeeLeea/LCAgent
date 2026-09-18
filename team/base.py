@@ -320,6 +320,7 @@ class TeamAgent:
         # 且 agent_core 早已在顶层导入该模块,此处只是保险)
         from agent.terminal_retry_cap_mw import TerminalRetryCapMW
         from agent.tool_error_mw import ToolExecutionErrorMW
+        from agent.tool_retry_cap_mw import ToolRetryCapMW
         from agent.workspace_mw import WorkspaceSecurityMW
         from tools.tool_wrapper import wrap_tools_with_timeout
 
@@ -332,14 +333,20 @@ class TeamAgent:
             self.tools, getattr(self, "tool_timeout", None)
         )
 
-        # 中间件链:终端超时重试上限(达3次超时则拦截) + 工具错误纠错
+        # 中间件链:终端超时重试上限(达3次超时则拦截) + 重复调用熔断
+        # (同一工具同一参数失败达2次则拦截) + 工具错误纠错
         # (异常 → ToolMessage(status="error") + 反思指令) + 工作空间安全
         # (路径解析 + 逃逸校验),使工作流内工具调用同样受 workspace 隔离约束
         self.agent_executor = create_agent(
             model=chat_model,
             tools=wrapped_tools,
             system_prompt=self.system_prompt,
-            middleware=[TerminalRetryCapMW(), ToolExecutionErrorMW(), WorkspaceSecurityMW()],
+            middleware=[
+                TerminalRetryCapMW(),
+                ToolRetryCapMW(),
+                ToolExecutionErrorMW(),
+                WorkspaceSecurityMW(),
+            ],
             checkpointer=getattr(self, "_checkpointer", None),
         )
     

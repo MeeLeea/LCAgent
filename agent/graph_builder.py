@@ -28,6 +28,7 @@ from .session_config_middleware import (
 from .terminal_retry_cap_mw import TerminalRetryCapMW
 from .tool_arg_validator_mw import ToolArgValidatorMW
 from .tool_error_mw import ToolExecutionErrorMW
+from .tool_retry_cap_mw import ToolRetryCapMW
 from .workspace_mw import WorkspaceSecurityMW
 
 logger = logging.getLogger(__name__)
@@ -95,6 +96,11 @@ class GraphBuilder:
         # 放在 middleware 列表最前 = 最外层，最先拦截，包住 tool_error_mw
         terminal_retry_middleware = TerminalRetryCapMW()
 
+        # 重复调用熔断中间件：读 state 统计「同一工具 + 同一参数」的历史失败次数，
+        # 达上限(2次)则拦截后续相同调用，阻止主模型在路径/参数/MCP 报错上原样重试
+        # （与 terminal_retry_middleware 互补：后者只管终端超时，本中间件管所有工具）
+        retry_cap_middleware = ToolRetryCapMW()
+
         # 工具错误纠错中间件：捕获工具执行异常 → 转 ToolMessage(status="error")，
         # 附加异常类型 + workspace 提示 + 反思指令，使 LLM 能读到报错并修正重试
         tool_error_middleware = ToolExecutionErrorMW()
@@ -112,6 +118,7 @@ class GraphBuilder:
                 # 会话配置必须最外层，先覆盖模型和角色提示词，再由压缩与技能中间件叠加。
                 session_config_middleware,
                 terminal_retry_middleware,
+                retry_cap_middleware,
                 tool_error_middleware,
                 compaction_middleware,
                 skill_middleware,

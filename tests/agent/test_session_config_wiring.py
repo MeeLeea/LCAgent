@@ -53,6 +53,7 @@ def test_create_executor_registers_session_middleware_and_dynamic_compaction(mon
     monkeypatch.setattr(graph_builder, "LCAgentCompactionMiddleware", FakeCompaction)
     monkeypatch.setattr(graph_builder, "SkillInjectionMW", FakeSkill)
     monkeypatch.setattr(graph_builder, "TerminalRetryCapMW", lambda: object())
+    monkeypatch.setattr(graph_builder, "ToolRetryCapMW", lambda: object())
     monkeypatch.setattr(graph_builder, "ToolExecutionErrorMW", lambda: object())
     monkeypatch.setattr(graph_builder, "ToolArgValidatorMW", lambda: object())
     monkeypatch.setattr(graph_builder, "WorkspaceSecurityMW", lambda: object())
