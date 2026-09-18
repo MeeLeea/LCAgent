@@ -90,12 +90,20 @@ DEFAULTS: dict[str, Any] = {
 }
 
 
+# 项目根目录(本文件位于 <root>/llm/config.py)
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 # 全局 agent 配置路径(供 LLMClient 等模块内部读取采样参数默认值)
-DEFAULT_AGENT_CONFIG_FILE = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "agent",
-    "agent_config.json",
-)
+DEFAULT_AGENT_CONFIG_FILE = os.path.join(_PROJECT_ROOT, "agent", "agent_config.json")
+
+# 全局 Agent 核心提示词路径(供工作流节点等非主对话模块复用同一份 agent/AGENT.md)
+DEFAULT_AGENT_PROMPT_FILE = os.path.join(_PROJECT_ROOT, "agent", "AGENT.md")
+
+# agent/AGENT.md 的规则小节标题(按角色能力划分,供工作流节点按需继承):
+#   - 重要规则: 通用行为规则,所有角色均继承
+#   - 工具规则: 依赖具体工具的规则,仅持有工具的角色继承
+AGENT_RULES_HEADING = "## 重要规则"
+AGENT_TOOL_RULES_HEADING = "## 工具规则"
 
 
 def load_agent_config(config_file: str) -> dict[str, Any]:
@@ -147,6 +155,55 @@ def _load_agent_prompt(prompt_file: str) -> str:
     
     # Fallback 到默认提示词
     return _DEFAULT_AGENT_CORE_PROMPT
+
+
+def load_agent_rules(
+    prompt_file: str = DEFAULT_AGENT_PROMPT_FILE,
+    include_tool_rules: bool = False,
+) -> str:
+    """
+    加载 agent/AGENT.md 的行为规则小节（供工作流节点按角色能力继承）
+
+    仅提取规则小节，剔除文件标题、说明等其余内容，并按角色是否持有工具过滤：
+
+    - `## 重要规则`：通用行为规则，所有角色均继承
+    - `## 工具规则`：依赖具体工具的规则（调用工具、长流程等），仅当
+      `include_tool_rules=True`（角色持有工具）时追加
+
+    这样可避免「必须调用工具」等条款落在 Manager / Terminator 等不持有工具的
+    纯文本角色节点上，既省 token 也避免误导模型去调不存在的工具。
+
+    文件缺失时 `_load_agent_prompt` 回退内置默认提示词，其中不含这些小节标题，
+    因而返回空串（即不注入）。
+
+    Args:
+        prompt_file: 提示词文件路径（默认 agent/AGENT.md）
+        include_tool_rules: 是否附带「工具规则」小节（持有工具的角色传 True）
+
+    Returns:
+        规则文本（多小节以空行分隔）；文件缺失、内容为空或无对应小节时返回空串
+    """
+    lines = _load_agent_prompt(prompt_file).splitlines()
+    headings = [AGENT_RULES_HEADING]
+    if include_tool_rules:
+        headings.append(AGENT_TOOL_RULES_HEADING)
+
+    sections: list[str] = []
+    for heading in headings:
+        start = next((i for i, ln in enumerate(lines) if ln.strip() == heading), None)
+        if start is None:
+            continue
+        # 从标题行起收集，遇下一个二级标题即截止
+        end = next(
+            (
+                i
+                for i in range(start + 1, len(lines))
+                if lines[i].strip().startswith("## ")
+            ),
+            len(lines),
+        )
+        sections.append("\n".join(lines[start:end]).strip())
+    return "\n\n".join(section for section in sections if section)
 
 
 def resolve_path(path: str, base_dir: str) -> str:

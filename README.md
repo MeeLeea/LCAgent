@@ -2942,6 +2942,15 @@ Agent 的核心系统提示词（行为规则）已从 `agent_config.json` 中�
 
 > **注意**：`agent_prompt_file` 指定的 AGENT.md 同时也承载工作流提示词模板（`## workflow:*` 小节）。构建 TeamAgent 时（`team/factory.py`）只需传 `prompt_file`，`TeamAgent.__init__` 会自动经 `parse_prompt_sections` 剥离这些小节并解析出 system prompt，避免模板内容混入（详见「工作流提示词外置」）。
 
+> **工作流节点的提示词继承**：`agent/AGENT.md` 中的规则按**角色是否持有工具**分为两个小节，由 `llm.config.load_agent_rules` 按需提取，`graph/common/node_factory.py` 的 `create_llm_node` 生成的节点会把它前置到节点模板之前（在技能注入之前）：
+>
+> | 小节 | 内容 | 继承范围 |
+> | --- | --- | --- |
+> | `## 重要规则` | 通用行为规则（技能读取、路径语义、中文回答） | **所有角色** |
+> | `## 工具规则` | 依赖具体工具的规则（工具调用、默认路径、危险命令、`ask_human`、定时任务流程等） | **仅持有工具的角色** |
+>
+> 因 `create_llm_node` 在模块级定义、构建期拿不到 Agent 实例，节点在**执行时**按 `agent.tools` 判定该角色是否持有工具，从而避免「必须调用工具」等条款落在 Manager / Terminator / Architect 等纯文本角色节点上（既省 token，也避免误导模型调用不存在的工具）。文件缺失或未定义小节时自动跳过；`create_llm_node(..., base_prompts="")` 可关闭注入，传字符串则覆盖默认解析结果。注意主对话 Agent（`AgentCore`）仍读取**完整** `agent/AGENT.md`（两个小节都生效）。
+
 #### 长上下文裁剪（Long-Context Trimming）
 
 当某个会话的消息数超过 `max_context_messages` 时，Agent 会自动：
