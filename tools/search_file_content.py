@@ -1,8 +1,13 @@
+import logging
+from typing import Any
+
 from langchain_core.tools import tool
-from typing import Dict, Any
+
+logger = logging.getLogger(__name__)
+
 
 @tool
-def search_file_content(search_dir: str, pattern: str, file_pattern: str, case_sensitive: bool, show_context: int, max_results: int, recursive: bool) -> Dict[str, Any]:
+def search_file_content(search_dir: str, pattern: str, file_pattern: str, case_sensitive: bool, show_context: int, max_results: int, recursive: bool) -> dict[str, Any]:
     """
     在文件中搜索指定内容，支持正则表达式匹配。可以在指定目录下搜索文件，支持多种搜索模式和输出格式。适用于代码审查、日志分析、文档搜索等场景。
 
@@ -51,7 +56,7 @@ def search_file_content(search_dir: str, pattern: str, file_pattern: str, case_s
     except Exception as e:
         return {
             'success': False,
-            'error': f'文件搜索失败: {str(e)}',
+            'error': f'文件搜索失败: {e!s}',
             'results': []
         }
     
@@ -69,7 +74,7 @@ def search_file_content(search_dir: str, pattern: str, file_pattern: str, case_s
     except re.error as e:
         return {
             'success': False,
-            'error': f'正则表达式错误: {str(e)}',
+            'error': f'正则表达式错误: {e!s}',
             'results': []
         }
     
@@ -80,7 +85,8 @@ def search_file_content(search_dir: str, pattern: str, file_pattern: str, case_s
         try:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 lines = f.readlines()
-        except Exception:
+        except Exception as e:
+            logger.debug("跳过无法读取的文件: %s (%s)", file_path, e)
             continue
         
         matches = []

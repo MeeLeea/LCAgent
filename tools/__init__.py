@@ -18,8 +18,8 @@ from .scheduler_tool import (
     schedule_task,
 )
 from .search import search
-from .terminal_tools import run_cmd, run_python, run_shell
 from .search_file_content import search_file_content
+from .terminal_tools import run_cmd, run_python, run_shell
 
 # 导出所有本地工具供Agent使用
 all_tools = [
