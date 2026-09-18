@@ -255,4 +255,5 @@ export type StreamEvent =
   | { type: 'error'; content: string }
   | { type: 'workflow_node'; node: string; status: 'running' | 'done' | 'error'; content?: string }
   | { type: 'workflow_status'; status: 'idle' | 'running' | 'done' }
+  | { type: 'attach_expired' }
   | { type: 'done'; content?: string; total_tokens?: number }

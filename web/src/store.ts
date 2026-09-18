@@ -127,6 +127,8 @@ interface AppState {
   newThread: () => Promise<void>
   newWorkflowThread: (workflowName: string) => Promise<void>
   deleteThread: (id: string) => Promise<void>
+  /** 页面刷新后重连进行中的流式执行：重放错过的事件并继续实时接收 */
+  reattachStream: (threadId: string) => Promise<void>
 
   // 聊天
   sendMessage: (text: string) => void
@@ -772,6 +774,77 @@ export const useStore = create<AppState>((set, get) => ({
     } catch {
       /* ignore */
     }
+    // 页面刷新后：若该线程仍在后台流式生成，重连恢复实时输出
+    void get().reattachStream(id)
+  },
+
+  reattachStream: async (threadId) => {
+    // 本页面已有该线程的活跃流（sendMessage/resume 发起），无需重连
+    if (get().streamingThreads[threadId]) return
+    if (abortFns[threadId]) return
+
+    let status: { streaming: boolean }
+    try {
+      status = await api.getStreamStatus(threadId)
+    } catch {
+      return
+    }
+    if (!status.streaming) return
+    // 查询期间用户可能已切换线程或发起新消息，二次确认
+    if (get().streamingThreads[threadId] || abortFns[threadId]) return
+
+    console.log('[前端] 检测到进行中的流，重连恢复:', threadId)
+
+    // 截尾到最后一条 user 消息：其后由历史 checkpoint 序列化的 assistant 回合
+    // 与 attach 重放的事件会重复，重放重建的流式气泡才是实时权威数据源。
+    const arr = [...(get().messagesByThread[threadId] ?? [])]
+    let base = arr
+    for (let i = arr.length - 1; i >= 0; i--) {
+      if (arr[i].role === 'user') {
+        base = arr.slice(0, i + 1)
+        break
+      }
+    }
+    const streamMsg: ChatMessage = {
+      id: nextId(),
+      role: 'assistant',
+      content: '',
+      toolCalls: [],
+      toolResults: [],
+      streaming: true,
+      timestamp: Date.now(),
+    }
+    commitThreadMessages(get, set, threadId, [...base, streamMsg])
+    markStreaming(get, set, threadId, true)
+    terminatedThreads.delete(threadId)
+
+    const finish = makeFinish(get, set, threadId)
+    const watchdogHandler = makeWatchdogHandler(get, set, threadId, finish)
+    armWatchdog(threadId, watchdogHandler)
+
+    // 流终止后全量重载历史：对齐 checkpoint 权威状态
+    // （补全刷新瞬间尚未 checkpoint 的用户消息、修正序列化差异）
+    const reloadHistory = () => {
+      void api.getMessages(threadId).then((r) => {
+        // 仅当该线程没有新的进行中流时才覆盖（避免冲掉新一轮流式气泡）
+        if (get().streamingThreads[threadId]) return
+        commitThreadMessages(get, set, threadId, rawToMessages(r.messages))
+      }).catch(() => {})
+    }
+
+    abortFns[threadId] = api.attachChat(threadId, (ev) => {
+      if (ev.type === 'attach_expired') {
+        // 竞态：查询状态后执行刚好完成并清理。回退到历史加载。
+        finish()
+        reloadHistory()
+        return
+      }
+      handleStreamEvent(get, set, threadId, ev, { finish })
+      if (!terminatedThreads.has(threadId)) armWatchdog(threadId, watchdogHandler)
+      if (ev.type === 'done' || ev.type === 'error' || ev.type === 'cancelled') {
+        reloadHistory()
+      }
+    })
   },
 
   newThread: async () => {
