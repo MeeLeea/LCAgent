@@ -217,3 +217,56 @@ def test_cap_counts_only_exec_timeouts():
     result = mw.wrap_tool_call(request, handler)
     assert len(called) == 1
     assert result.content == "ok"
+
+
+# ============ 连续 streak 语义（回归：旧累计逻辑会误拦） ============
+
+def test_cap_resets_after_success():
+    """历史 [超时, 超时, 成功, 超时] → 连续超时被成功重置为 1，放行。
+
+    旧累计逻辑会数到 3 次超时并永久拦截；新语义只数末尾连续 streak。
+    """
+    mw = TerminalRetryCapMW()
+    state = {
+        "messages": [
+            _make_timeout_tool_msg("run_shell", "c1"),
+            _make_timeout_tool_msg("run_shell", "c2"),
+            ToolMessage(
+                content='{"success": true, "stdout": "ok"}',
+                tool_call_id="c3",
+                name="run_shell",
+            ),
+            _make_timeout_tool_msg("run_shell", "c4"),
+        ]
+    }
+    request = _make_request("run_shell", state)
+    called = []
+
+    def handler(req):
+        called.append(req)
+        return ToolMessage(content="ok", tool_call_id="current_call", name="run_shell")
+
+    result = mw.wrap_tool_call(request, handler)
+    assert len(called) == 1
+    assert result.content == "ok"
+
+
+def test_cap_is_per_tool():
+    """3 次 run_python 超时不影响 run_shell（各工具独立计数），放行。"""
+    mw = TerminalRetryCapMW()
+    state = {
+        "messages": [
+            _make_timeout_tool_msg("run_python", f"p{i}")
+            for i in range(MAX_TIMEOUT_RETRIES)
+        ]
+    }
+    request = _make_request("run_shell", state)
+    called = []
+
+    def handler(req):
+        called.append(req)
+        return ToolMessage(content="ok", tool_call_id="current_call", name="run_shell")
+
+    result = mw.wrap_tool_call(request, handler)
+    assert len(called) == 1
+    assert result.content == "ok"
