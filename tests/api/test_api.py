@@ -62,7 +62,8 @@ def mock_agent():
     agent.session.is_workflow_session = MagicMock(return_value=False)
     agent.session.workflow_name_of = MagicMock(return_value=None)
     agent.session.aswitch_session = AsyncMock()
-    agent.session.aexport_session = AsyncMock()
+    # 导出端点已改为委托 aexport_session，需返回字符串（否则 MagicMock 会被 FastAPI 序列化导致 RecursionError）
+    agent.session.aexport_session = AsyncMock(return_value="对话导出 - test-thread-123")
     # workspace 绑定（GET/POST/DELETE /api/threads/{thread_id}/workspace）
     agent.session.aget_workspace = AsyncMock(return_value=None)
     agent.session.aset_workspace = AsyncMock(return_value="/real/abs/workspace")
@@ -1674,11 +1675,12 @@ def test_get_skills(client, mock_agent):
 # 会话导出
 # --------------------------------------------------------------------------- #
 def test_export_thread(client, mock_agent, temp_checkpoint_db):
-    """测试导出会话为文本"""
-    mock_agent.session.aget_messages.return_value = [
-        HumanMessage(content="测试消息1"),
-        AIMessage(content="回复1"),
-    ]
+    """测试导出会话为文本：端点委托 aexport_session 并透传 thread_id/fmt"""
+    mock_agent.session.aexport_session.return_value = (
+        "对话导出 - thread-1\n"
+        + "=" * 40
+        + "\n\n【用户】\n测试消息1\n\n【助手】\n回复1"
+    )
     response = client.get("/api/threads/thread-1/export")
     assert response.status_code == 200
 
@@ -1686,21 +1688,22 @@ def test_export_thread(client, mock_agent, temp_checkpoint_db):
     assert data["thread_id"] == "thread-1"
     assert data["format"] == "text"
     assert "测试消息" in data["content"]
-    mock_agent.session.aget_messages.assert_awaited_once_with(session_id="thread-1")
+    mock_agent.session.aexport_session.assert_awaited_once_with("thread-1", fmt="text")
 
 
 def test_export_thread_markdown(client, mock_agent, temp_checkpoint_db):
-    """测试导出会话为 Markdown"""
-    mock_agent.session.aget_messages.return_value = [
-        HumanMessage(content="测试消息1"),
-        AIMessage(content="回复1"),
-    ]
+    """测试导出会话为 Markdown：端点委托 aexport_session 并透传 fmt=markdown"""
+    mock_agent.session.aexport_session.return_value = (
+        "# 对话导出 - thread-1\n\n**用户**:\n\n测试消息1\n\n---\n\n**助手**:\n\n回复1"
+    )
     response = client.get("/api/threads/thread-1/export?fmt=markdown")
     assert response.status_code == 200
 
     data = response.json()
+    assert data["thread_id"] == "thread-1"
     assert data["format"] == "markdown"
-    mock_agent.session.aget_messages.assert_awaited_once_with(session_id="thread-1")
+    assert "测试消息" in data["content"]
+    mock_agent.session.aexport_session.assert_awaited_once_with("thread-1", fmt="markdown")
 
 
 def test_export_thread_invalid_format(client, mock_agent):
