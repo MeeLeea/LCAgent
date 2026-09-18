@@ -1,5 +1,4 @@
 import asyncio
-import logging
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -232,7 +231,6 @@ def test_clear_history_resets_tool_call_dedupe_state():
 def test_arun_stops_after_user_rejects_command(monkeypatch):
     # Given: 图执行期间终端工具收到用户拒绝信号。
     from agent.agent_core import AgentCore
-
     from tools.terminal_tools import run_shell
 
     monkeypatch.setattr("tools.terminal_tools.confirm", lambda prompt: False)

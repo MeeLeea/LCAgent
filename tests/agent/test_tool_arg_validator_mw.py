@@ -23,7 +23,7 @@ if ROOT not in sys.path:
 
 from langchain.messages import ToolMessage
 
-from agent.tool_arg_validator_mw import ArgRule, MutexRule, ToolArgValidatorMW
+from agent.tool_arg_validator_mw import MutexRule, ToolArgValidatorMW
 
 
 def _make_request(tool_name: str, args: dict) -> SimpleNamespace:
@@ -119,7 +119,7 @@ def test_sync_allows_tail_only():
     mw = ToolArgValidatorMW()
     request = _make_request("read_file", {"tail": 100, "path": "x.py"})
     called: list = []
-    result = mw.wrap_tool_call(request, _make_handler(called))
+    mw.wrap_tool_call(request, _make_handler(called))
 
     assert len(called) == 1
 
@@ -129,7 +129,7 @@ def test_sync_allows_neither():
     mw = ToolArgValidatorMW()
     request = _make_request("read_file", {"path": "x.py"})
     called: list = []
-    result = mw.wrap_tool_call(request, _make_handler(called))
+    mw.wrap_tool_call(request, _make_handler(called))
 
     assert len(called) == 1
 
@@ -139,7 +139,7 @@ def test_sync_allows_none_values():
     mw = ToolArgValidatorMW()
     request = _make_request("read_file", {"head": None, "tail": None, "path": "x.py"})
     called: list = []
-    result = mw.wrap_tool_call(request, _make_handler(called))
+    mw.wrap_tool_call(request, _make_handler(called))
 
     assert len(called) == 1
 
@@ -149,7 +149,7 @@ def test_sync_allows_non_target_tool():
     mw = ToolArgValidatorMW()
     request = _make_request("write_file", {"head": 50, "tail": 100, "path": "x.py"})
     called: list = []
-    result = mw.wrap_tool_call(request, _make_handler(called))
+    mw.wrap_tool_call(request, _make_handler(called))
 
     assert len(called) == 1
 
@@ -194,7 +194,7 @@ def test_async_allows_head_only():
         called.append(req)
         return ToolMessage(content="ok", tool_call_id="call-1", name="read_file")
 
-    result = asyncio.run(mw.awrap_tool_call(request, handler))
+    asyncio.run(mw.awrap_tool_call(request, handler))
 
     assert len(called) == 1
 
@@ -244,7 +244,7 @@ def test_custom_rule_does_not_affect_default():
     # read_file 不在自定义规则列表中 → 不拦截
     request = _make_request("read_file", {"head": 50, "tail": 100})
     called: list = []
-    result = mw.wrap_tool_call(request, _make_handler(called))
+    mw.wrap_tool_call(request, _make_handler(called))
 
     # 自定义规则不包含 read_file → 放行
     assert len(called) == 1

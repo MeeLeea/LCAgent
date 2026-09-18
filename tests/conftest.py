@@ -20,7 +20,7 @@ def pytest_addoption(parser):
 @pytest.fixture(autouse=True)
 def _reset_safety_cache():
     """每个测试前重置 safety 配置缓存,保证用例间隔离"""
-    import tools.safety as safety
+    from tools import safety
     safety._config_cache = None
     yield
     safety._config_cache = None
