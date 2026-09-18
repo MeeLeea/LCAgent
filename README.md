@@ -259,6 +259,7 @@ LangChainAgent/
 │   ├── turn_runners.py      # TurnRunners Mixin：结构化执行入口（arun/achat/aresume_structured）
 │   ├── turn_types.py        # AgentTurnResult（结构化执行结果类型）
 │   ├── terminal_retry_cap_mw.py  # TerminalRetryCapMW：终端命令超时重试上限中间件（达3次超时则拦截）
+│   ├── tool_retry_cap_mw.py  # ToolRetryCapMW：重复调用熔断中间件（同一工具+同一参数失败达2次则拦截）
 │   ├── tool_arg_validator_mw.py  # ToolArgValidatorMW：工具参数语义校验中间件（互斥参数拦截）
 │   ├── tool_error_mw.py     # ToolExecutionErrorMW：工具错误反思纠错中间件
 │   ├── workspace_mw.py      # WorkspaceSecurityMW：工作空间安全中间件
@@ -310,7 +311,7 @@ LangChainAgent/
 ├── tools/
 │   ├── __init__.py          # 本地工具注册
 │   ├── search.py            # 联网搜索工具(Tavily API)
-│   ├── file_tool.py         # 文件读写工具
+│   ├── search_file_content.py # 文件内容检索工具（正则匹配 + 上下文 + 文件类型过滤）
 │   ├── calculator.py        # 数学计算工具
 │   ├── terminal_tools.py    # 终端命令工具（shell/python/bat/ps1,含安全护栏+ctrl+c超时分类）
 │   ├── get_local_time.py    # 获取本地时间工具
@@ -322,6 +323,7 @@ LangChainAgent/
 │   ├── mcp_loader.py        # MCP 配置管理与工具加载器（含按工具名筛选加载 aload_mcp_tools_by_name / load_mcp_tools_by_name_sync）
 │   ├── mcp_pool.py          # MCP 连接池（per-server 隔离 + 健康探测 + 自动重连）
 │   ├── tool_wrapper.py      # 工具超时包装器（统一超时保护，超时返回 JSON 错误）
+│   ├── human_confirmation.py # request_user_confirmation：多问题批量确认（interrupt kind="user_confirmation"）
 │   └── scheduler_tool.py    # 定时任务工具（schedule_task/list/cancel/delete/cleanup）
 ├── cli/
 │   ├── __init__.py
@@ -369,7 +371,7 @@ LangChainAgent/
 | [utils/metrics.py](utils/metrics.py)                                     | `MetricsCollector`：线程安全的运行时指标收集（LLM 调用 / 工具执行 / 压缩统计）                                                                                                                                                                                                                                                                                                                   |
 | [utils/logging_config.py](utils/logging_config.py)                       | 结构化日志：`contextvars` 实现 trace_id / thread_id 异步安全注入                                                                                                                                                                                                                                                                                                                                 |
 | [utils/exceptions.py](utils/exceptions.py)                               | 统一异常层次：`LCAgentError` 基类及 MCP/超时/压缩/中断/状态等子类                                                                                                                                                                                                                                                                                                                                |
-| [agent/](agent/)                                                         | Agent 核心按职责拆分：`agent_core.py`（主类，构造/生命周期/共享工具方法）+ 6 个 Mixin（`session_mgmt`/`mcp_tools`/`graph_builder`/`streaming`/`interrupts`/`turn_runners`）+ `turn_types.py`（`AgentTurnResult`）+ 3 个中间件（`tool_arg_validator_mw`/`tool_error_mw`/`workspace_mw`）+ `role_sw.py`（团队角色切换唯一实现）；技能相关 Mixin/中间件已迁入 `skmng/` 包 |
+| [agent/](agent/)                                                         | Agent 核心按职责拆分：`agent_core.py`（主类，构造/生命周期/共享工具方法）+ 6 个 Mixin（`session_mgmt`/`mcp_tools`/`graph_builder`/`streaming`/`interrupts`/`turn_runners`）+ `turn_types.py`（`AgentTurnResult`）+ 5 个中间件（`terminal_retry_cap_mw`/`tool_retry_cap_mw`/`tool_arg_validator_mw`/`tool_error_mw`/`workspace_mw`）+ `role_sw.py`（团队角色切换唯一实现）；技能相关 Mixin/中间件已迁入 `skmng/` 包 |
 | [agent/session_config_middleware.py](agent/session_config_middleware.py) | `SessionConfigMW` 按请求覆盖会话模型与角色 system prompt，`SessionModelFactory` 对模型配置做有界 LRU 缓存                                                                                                                                                                                                                                                                                      |
 | [session/](session/)                                                     | 三层架构 Session 层：`SessionConfig`（会话基础配置）/ `SessionContext`（单会话运行时上下文）/ `SessionStore`（per-session 瞬态状态）/ `SessionRegistry`（生命周期管理）/ `WorkspaceStore`（工作空间映射）/ `SessionManager`（对外门面 & 会话调度）                                                                                                                                     |
 | [team/](team/)                                                           | 多 Agent 团队协作：ManagerAgent（拆解）/ WorkerAgent（执行）/ TerminatorAgent（汇总）+ 工厂函数                                                                                                                                                                                                                                                                                                    |
@@ -1210,13 +1212,12 @@ Agent 的工具分为两类：
 
 ### 1. 本地工具（Local Tools）
 
-使用 LangChain `@tool` 装饰器定义，启动时直接加载：
+使用 LangChain `@tool` 装饰器定义，启动时直接加载（下表为**本地**工具；`read_file` / `write_file` 等文件读写工具来自 MCP filesystem server，仅在启用该 server 时可用——默认 `config/mcp_servers.json` 为 `{"servers": {}}`，此时不存在任何文件读写工具）：
 
 | 工具               | 文件                                              | 功能                                                                                                                                                                                                                                                                                                                                                     | 参数                                                                                         |
 | ------------------ | ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | `search`         | [tools/search.py](tools/search.py)                 | 联网搜索(Tavily API)                                                                                                                                                                                                                                                                                                                                     | `query`, `num_results`, `search_depth`                                                 |
-| `read_file`      | [tools/file_tool.py](tools/file_tool.py)           | 读取文件                                                                                                                                                                                                                                                                                                                                                 | `file_path`                                                                                |
-| `write_file`     | [tools/file_tool.py](tools/file_tool.py)           | 写入文件                                                                                                                                                                                                                                                                                                                                                 | `file_path`, `content`, `mode`                                                         |
+| `search_file_content` | [tools/search_file_content.py](tools/search_file_content.py) | 在目录/文件中按正则检索内容（支持文件类型过滤、上下文行数、结果上限、是否递归） | `search_dir`, `pattern`, `file_pattern`, `case_sensitive`, `show_context`, `max_results`, `recursive` |
 | `calculate`      | [tools/calculator.py](tools/calculator.py)         | 数学计算                                                                                                                                                                                                                                                                                                                                                 | `expression`                                                                               |
 | `run_shell`      | [tools/terminal_tools.py](tools/terminal_tools.py) | 执行 shell 命令                                                                                                                                                                                                                                                                                                                                          | `command`, `cwd`, `timeout`                                                            |
 | `run_python`     | [tools/terminal_tools.py](tools/terminal_tools.py) | 执行 Python 脚本文件                                                                                                                                                                                                                                                                                                                                     | `file_path`, `script_args`, `cwd`, `timeout`                                         |
@@ -1227,6 +1228,7 @@ Agent 的工具分为两类：
 | `read_skill`     | [skmng/tool.py](skmng/tool.py)                     | 读取本地技能(SKILL.md)的指引正文                                                                                                                                                                                                                                                                                                                         | `skill_name`(可空)                                                                         |
 | `create_tool`    | [tools/create_tools.py](tools/create_tools.py)     | 动态生成工具代码并保存为 .py 文件（默认保存到 tools/ 目录、自动注册到 tools/__init__.py，并顺带生成单元测试到 tests/tools/test_<tool>.py；tool_logic 支持含 f-string/多行字符串的代码，内容行不会被误缩进）。安全边界：工具名须为合法 Python 标识符、工具路径限制在 tools/ 内且测试路径限制在 tests/tools/ 内禁止逃逸、默认禁止覆盖已有文件（`force=True` 可覆盖）、生成源码经 AST 校验禁止导入 os/subprocess/socket 等高风险模块 | `tool_name`, `tool_description`, `args_spec`, `tool_logic`, `tool_path`, `force`, `with_test` |
 | `ask_human`      | [cli/human_input.py](cli/human_input.py)           | 暂停 LangGraph 图并请求人工结构化选择                                                                                                                                                                                                                                                                                                                    | `prompt`, `choices`                                                                      |
+| `request_user_confirmation` | [tools/human_confirmation.py](tools/human_confirmation.py) | 多问题批量人工确认（LangGraph interrupt，`kind="user_confirmation"`），与单选语义的 `ask_human` 区分 | `items`（问题+选项清单） |
 
 > `open_sqlite` 会自动查找 DB Browser for SQLite 路径（环境变量 `SQLITE_BROWSER_PATH` → 常见安装位置 → `shutil.which`），找不到则返回下载链接。Linux 下安装 `sqlitebrowser` 包即可使用。
 
@@ -1541,20 +1543,14 @@ LLM 决定是否调用工具
 
 ### 6. System Prompt 强化
 
-为确保 LLM 主动调用工具而非拒绝，system prompt 中明确要求：
+`agent/AGENT.md`（由 `agent_prompt_file` 指定）是 Agent 的核心系统提示词，含两个二级小节；它既作为主对话 Agent 的 system prompt，也被工作流节点按角色能力继承（见「工作流节点的提示词继承」）。
 
-```
-1. 当用户要求创建文件、读写文件、创建目录等操作时，你【必须】调用相应工具
-2. 绝对不要回复'我无法访问你的文件系统'、'请你自己保存'之类的话
-3. 你确实拥有这些工具的能力，工具会在用户本地执行
-4. 创建文件、脚本、文件夹默认位置是 ./tests/
-5. 如果用户要保存内容到文件，直接调用 write_file 工具
-6. 如果用户要创建目录，直接调用终端工具
-7. 测试/运行脚本时直接调用终端工具
-8. 危险命令会被安全策略拦截或要求确认
-9. 专业任务应优先用 read_skill 读取相关技能指引
-10. 需要人工确认、选择或补充信息时，应调用 ask_human 并提供结构化 choices
-```
+- `## 重要规则`：通用行为规则（技能读取、路径语义与 workspace 边界、中文回答）——**所有角色**继承
+- `## 工具规则`：依赖具体工具的规则（必须调用工具、默认目录约定、`create_tool`、危险命令、`ask_human`、定时任务登记流程、终端命令超时处理、重复失败即停手、不臆造结果、MCP 工具传参）——**仅持有工具的角色**继承
+
+主对话 Agent（`AgentCore`）读取**完整**文件（两个小节都生效）。文件缺失或为空时回退到 `llm/config.py` 的 `_DEFAULT_AGENT_CORE_PROMPT`，该常量与 `agent/AGENT.md` 内容**逐字符相同**（含同名小节标题），因此回退时行为规则与主 Agent 一致，工作流节点也仍能提取到规则小节。
+
+修改规则只需编辑 `agent/AGENT.md`；如需兜底保持一致，请同步更新 `_DEFAULT_AGENT_CORE_PROMPT`。
 
 ### 7. 扩展工具
 
@@ -1879,7 +1875,11 @@ with TraceContext(trace_id="req-123", thread_id="thread-abc"):
 - **超时原因分类**（`_classify_timeout`）：启发式识别交互式命令 / 网络阻塞 / IO 阻塞 / 命令错误 / 死循环，写入返回结果的 `timeout_reason` 字段，供主模型判断如何修改命令重试。
 - **富结果返回**：超时返回 `{error_type: "timeout", timeout_reason, partial_stdout, partial_stderr, ...}`，主模型读到后自行反思修改命令重试（方案 B，每次重试是模型新发的 tool_call，事件干净）。
 - **软超时由硬超时派生**（[`tools/config.py`](tools/config.py) 的 `soft_timeout_for()`）：三个终端工具函数级 `timeout` 默认值不再是固定的 `DEFAULT_TIMEOUT`，而是 `hard - SOFT_TIMEOUT_MARGIN(10s)`，实测值 `run_shell` **590s**（硬 600s）、`run_python` / `run_cmd` **50s**（硬 60s）。此前 `run_shell` 内层默认 60s 会把 vivado/xsim 长批处理提前掐断（与文档宣称的 600s 矛盾），而 `run_python` / `run_cmd` 内外层同为 60s 则让外层抢先触发，模型只能拿到无信息的裸错误。
-- **重试上限中间件**（[`agent/terminal_retry_cap_mw.py`](agent/terminal_retry_cap_mw.py) `TerminalRetryCapMW`）：无状态中间件，读 `request.state["messages"]` 统计当前会话内 exec 工具（`run_shell`/`run_python`/`run_cmd`）的超时累计次数，达 `MAX_TIMEOUT_RETRIES`（3 次）则拦截返回失败 `ToolMessage(status="error")`，阻止主模型无限重试。注册在 `create_agent` middleware 链最外层（最先拦截）。
+- **重试上限中间件**（[`agent/terminal_retry_cap_mw.py`](agent/terminal_retry_cap_mw.py) `TerminalRetryCapMW`）：无状态中间件，读 `request.state["messages"]` 统计**同一工具**（`run_shell`/`run_python`/`run_cmd`）的**连续**超时次数（streak）：被该工具任意非超时结果重置为 0，且按工具分别计数（`run_shell` 的超时不影响 `run_python`/`run_cmd`），达 `MAX_TIMEOUT_RETRIES`（3 次）则拦截返回失败 `ToolMessage(status="error")`，阻止主模型无限重试。⚠️ 早期实现统计的是**会话生命周期累计**次数，导致长会话中 3 次互不相关的超时永久封禁全部 exec 工具，现已修正为连续语义。注册在 `create_agent` middleware 链最外层（最先拦截）。
+- **重复调用熔断中间件**（[`agent/tool_retry_cap_mw.py`](agent/tool_retry_cap_mw.py) `ToolRetryCapMW`）：`TerminalRetryCapMW` 的通用互补——后者只管终端超时，本中间件**面向所有工具**。读 `request.state["messages"]`，用 `AIMessage.tool_calls` 建立 `tool_call_id → (工具名, 参数指纹)` 关联，统计「同一工具 + 同一参数」的失败 ToolMessage 数；达 `MAX_IDENTICAL_FAILURES`（2 次）则拦截第三次相同调用，返回 `ToolMessage(status="error")`（内容以 `[重复调用熔断]` 开头，提示更换参数/改方案/`ask_human`）。设计为 **fail-open**：state 缺失、无法关联 `tool_calls` 时一律放行，`ask_human` 永不拦截。作用域覆盖主 Agent 与团队角色（`graph_builder.py` 与 `team/base.py` 的中间件链均已接入）。
+  - **与 prompt 的分工**：`agent/AGENT.md` 与 `ToolExecutionErrorMW` 的反思文案提供"同类失败 ≥2 次即停手"的软约束；本中间件是**确定性硬兜底**，模型不遵守时仍能终止循环。
+  - **失败识别口径**（三选一）：① `ToolMessage.status == "error"`；② 内容含标记 `[工具执行失败]` / `[重复调用熔断]` / `[超时重试已达上限]` / `[参数冲突]` / `操作被拒绝`（最后一项对应 `WorkspaceSecurityMW` 的拒绝消息——它不带 `status`，若不登记则路径逃逸这一最高频场景不会被计数）；③ **内容是 JSON 对象且 `success` 为 `false`** —— 终端工具的非超时失败（`run_python`/`run_cmd` 退出码非 0、`run_shell` 非零退出）、`create_tool`、`search` 等都以 dict 形式返回失败而非抛异常，LangGraph 经 `json.dumps` 序列化为 `ToolMessage.content`（如 `{"success": false, "returncode": 1, ...}`），前两条均无法识别。
+  - **已知边界**：压缩中间件执行 `REMOVE_ALL_MESSAGES` 后历史被清空，计数随之重置（视为新上下文，属预期行为）。
 - **前端超时展示**：工具卡片（`web/src/components/ToolCallCard.tsx`）识别 `error_type:"timeout"` / `"error":"tool_timeout"` / "执行超时" 等标记，显示橙色边框 + Clock 图标 + "超时"文字，区别于红色"异常"和绿色"已完成"。
 
 ### 统一异常层次
@@ -2899,7 +2899,7 @@ asyncio.run(main())
 | 键                        | 类型  | 默认值                      | 说明                                                                                                   |
 | ------------------------- | ----- | --------------------------- | ------------------------------------------------------------------------------------------------------ |
 | `name`                  | str   | `LCAgent`                 | Agent 名称（可通过`agent.name` 访问）                                                                |
-| `max_iterations`        | int   | 15                          | 单次`invoke` 最大推理步数（即 `recursion_limit`）                                                  |
+| `max_iterations`        | int   | 15                          | 单次`invoke` 最大推理步数（即 `recursion_limit`）。`llm/config.py` 的 `DEFAULTS` 为 15，键缺失时回退该值；实际生效值以 `agent/agent_config.json` 为准（当前为 50，作为 ReAct 循环的硬上限兜底）                                                  |
 | `skills_dir`            | str   | `.agents/skills`          | 技能目录（相对项目根或绝对路径）                                                                       |
 | `auto_match_skills`     | bool  | true                        | 任务自动匹配并注入相关技能                                                                             |
 | `enable_mcp`            | bool  | true                        | 是否加载 MCP 工具                                                                                      |
@@ -2940,7 +2940,7 @@ Agent 的核心系统提示词（行为规则）已从 `agent_config.json` 中�
 
 自定义 Agent 行为规则时，直接编辑 `agent/AGENT.md` 即可，无需修改代码或 JSON 配置。
 
-> **注意**：`agent_prompt_file` 指定的 AGENT.md 同时也承载工作流提示词模板（`## workflow:*` 小节）。构建 TeamAgent 时（`team/factory.py`）只需传 `prompt_file`，`TeamAgent.__init__` 会自动经 `parse_prompt_sections` 剥离这些小节并解析出 system prompt，避免模板内容混入（详见「工作流提示词外置」）。
+> **注意**：`agent/AGENT.md` 只承载主 Agent 的行为规则小节，**不含** `## workflow:*` 工作流模板；那些小节位于各角色自己的 `team/<角色>/AGENT.md`。构建 TeamAgent 时（`team/factory.py`）只需传该角色的 `prompt_file`，`TeamAgent.__init__` 会自动经 `parse_prompt_sections` 剥离 `## workflow:*` 小节并解析出 system prompt，避免模板内容混入（详见「工作流提示词外置」）。
 
 > **工作流节点的提示词继承**：`agent/AGENT.md` 中的规则按**角色是否持有工具**分为两个小节，由 `llm.config.load_agent_rules` 按需提取，`graph/common/node_factory.py` 的 `create_llm_node` 生成的节点会把它前置到节点模板之前（在技能注入之前）：
 >
@@ -3140,7 +3140,8 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 | `tests/cli/test_cli_commands.py`                | CLI 命令分发：路由优先级、状态变更和各领域处理器                                                                                                                                            |
 | `tests/agent/test_human_input.py`               | LangGraph HITL：interrupt、恢复、并行选择和线程隔离                                                                                                                                         |
 | `tests/tools/test_terminal.py`                  | 终端工具：输出截断、护栏拒绝、安全执行、超时分类、ctrl+c 软中断(mock Popen)                                                                                                                 |
-| `tests/agent/test_terminal_retry_cap_mw.py`     | TerminalRetryCapMW：超时计数 cap、达上限拦截、非 exec 工具放行、state 容错                                                                                                                  |
+| `tests/agent/test_terminal_retry_cap_mw.py`     | TerminalRetryCapMW：同一工具连续超时计数、成功即重置、按工具隔离、达上限拦截、非 exec 工具放行、state 容错                                                                                                                  |
+| `tests/agent/test_tool_retry_cap_mw.py`         | ToolRetryCapMW：同一工具+同参数失败达2次拦截、结构化 `success:false` 识别、不同参数/不同工具放行、成功不计入、ask_human 豁免、state 容错与 fail-open                                                                      |
 | `tests/agent/test_streaming_heartbeat.py`       | streaming 心跳：工具执行期间发 tool_running、静默期（无活跃工具）发 heartbeat、on_tool_end 后不再发 tool_running、heartbeat 不携带工具信息                                                                                                               |
 | `tests/tools/test_calculator.py`                | 计算器工具：表达式求值、错误处理                                                                                                                                                            |
 | `tests/memory/test_memory.py`                   | memory/ 包`AgentMemory`：checkpointer + Store 基础设施的初始化、SQLite/acreate/aclose                                                                                                     |
