@@ -16,6 +16,7 @@
 - 安全护栏（危险终端命令拦截/确认、路径保护）
 - **全套异步 Public API**（`arun` / `achat` / `aresume` / `arun_structured` / `achat_structured` 等）
 - **生成停止即时生效**（`POST /api/stop` 显式取消信号，per-thread 隔离；前端点击停止后即使后端正阻塞在 LLM 调用或 SDK 内部 429/5xx 自动重试期间也能立即中断；同时取消该会话待处理的记忆沉淀，防止停止后后台仍发起 LLM fact 抽取）
+- **断流重连（attach）**（SSE 生成期间刷新页面不丢内容：客户端断开后执行转后台继续完成并写入 checkpoint，前端刷新后经 `GET /api/threads/{id}/stream-status` 探测进行中流、经 `GET /api/chat/attach/{id}` 重放错过的事件并续传实时输出）
 - **运行时指标收集**（LLM 调用 / 工具执行 / 压缩统计，`metrics` 命令查询）
 - **结构化日志**（trace_id / thread_id 上下文注入，asyncio 安全）
 - **工具超时保护**与**统一异常层次**（`LCAgentError` 及其子类）
@@ -1158,6 +1159,7 @@ HTTP API（[api/server.py](api/server.py)）同样暴露三个 RESTful 端点，
 `AgentCore.session_manager`（懒初始化）是上层流量的统一入口，封装 Agent + Memory：
 
 - **流式接口**：`achat_stream` / `aresume_stream` / `arun_stream`，产出 SSE 事件（`token` / `tool_call` / `tool_result` / `interrupt` / `cancelled` / `error` / `done` / `workflow_node` / `workflow_status`）。其中 `workflow_node`（NODE_START/END/ERROR → status `running`/`done`/`error`）在 `done` 时携带该节点产出 `content`，前端在会话窗口渲染节点结果块
+  - **HTTP 层断流重连**：`/api/chat`（普通对话路径）与 `/api/chat/resume` 注册 per-thread `_ActiveStream`（事件日志 + 多订阅者）。客户端断开（Starlette 检测 `http.disconnect` 取消响应任务，由 `_forward_stream_with_cancel` 捕获 `CancelledError`/`GeneratorExit` 识别）后执行转移 `_detached_stream_cleanup` 后台任务继续持有会话锁直到完成，checkpoint 保存完整消息；`GET /api/threads/{thread_id}/stream-status` 查询进行中流，`GET /api/chat/attach/{thread_id}` 先重放事件日志再实时续传（无活跃流时返回 `attach_expired`，前端回退历史加载）
   - **`tool_call` / `tool_result` id 一致性**：LangChain 的 `on_tool_start` / `on_tool_end` 事件 data 不含 `tool_call_id`，`agent_core._arun_graph_events` 借助 `on_chat_model_end` 的 `AIMessage.tool_calls` 与事件 `run_id` 建立桥接，保证两个事件的 `id` 一致（兜底回退到事件 `name`），前端按 `id` 关联工具卡片与其结果
 - **非流式接口**：`achat` / `aresume` / `arun`，收集全部 token 为最终文本
 - **会话管理委托**：`new_session` / `new_workflow_session` / `set_current_session` / `current_session_id` / `alist_sessions` / `aswitch_session` / `adelete_session` / `aget_messages` / `aexport_session` / `asummarize`
