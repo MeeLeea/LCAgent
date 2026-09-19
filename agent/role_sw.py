@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import TYPE_CHECKING
@@ -35,16 +36,30 @@ def get_available_team_roles() -> list[str]:
         return []
 
     available: list[str] = ["default"]
+    
+    # 从统一配置获取定义的角色
+    unified_config_path = os.path.join(_BASE_DIR, "team", "team_agents.json")
+    unified_roles: set[str] = set()
+    if os.path.exists(unified_config_path):
+        try:
+            with open(unified_config_path, "r", encoding="utf-8") as f:
+                team_config = json.load(f)
+            unified_roles = set(team_config.keys()) - {"default"}
+        except (OSError, json.JSONDecodeError):
+            pass
+    
     for entry in sorted(os.listdir(_TEAM_DIR)):
         if entry in _NON_ROLE_DIRS:
             continue
         sub_dir = os.path.join(_TEAM_DIR, entry)
         if not os.path.isdir(sub_dir):
             continue
-        # 仅将同时具备 agent_config.json + AGENT.md 的目录视为合法角色
-        has_config = os.path.isfile(os.path.join(sub_dir, "agent_config.json"))
+        # 合法角色：在统一配置中定义，且有 AGENT.md
+        has_unified = entry in unified_roles
         has_prompt = os.path.isfile(os.path.join(sub_dir, "AGENT.md"))
-        if has_config and has_prompt:
+        # 兼容：过渡期保留 agent_config.json 检查
+        has_config = os.path.isfile(os.path.join(sub_dir, "agent_config.json"))
+        if (has_unified or has_config) and has_prompt:
             available.append(entry)
 
     return available
@@ -107,14 +122,13 @@ async def arebuild_agent_from_team_dir(
 
     # 1. 扫描 team/ 定位目标角色目录
     role_dir = _locate_team_agent_dir(agent_name)
-    config_path = os.path.join(role_dir, "agent_config.json")
     prompt_path = os.path.join(role_dir, "AGENT.md")
 
     # 2. 读取角色配置与提示词(复用现有能力)
-    from llm.config import load_agent_config
+    from llm.config import load_team_agent_config
     from team.base import TeamAgent
 
-    config = load_agent_config(config_path)
+    config = load_team_agent_config(agent_name, _BASE_DIR)
     content = TeamAgent._read_prompt_file(prompt_path)
     if content is None:
         raise FileNotFoundError(f"角色提示词文件为空或无法读取: {prompt_path}")

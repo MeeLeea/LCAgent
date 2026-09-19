@@ -56,12 +56,12 @@ async def _choose_role(context: CommandContext) -> CommandOutcome:
 async def _switch_role(context: CommandContext, role_name: str, task_text: str) -> CommandOutcome:
     """更新当前会话角色，可选地在切换后立即执行任务。"""
     try:
-        from agent.role_sw import _locate_team_agent_dir
-        from llm.config import load_agent_config
+        from agent.role_sw import _BASE_DIR, _locate_team_agent_dir
+        from llm.config import load_team_agent_config
         from team.base import TeamAgent
 
         role_dir = _locate_team_agent_dir(role_name)
-        config = load_agent_config(f"{role_dir}/agent_config.json")
+        config = load_team_agent_config(role_name, _BASE_DIR)
         content = TeamAgent._read_prompt_file(f"{role_dir}/AGENT.md")
         if content is None:
             raise FileNotFoundError(f"角色提示词为空: {role_name}")

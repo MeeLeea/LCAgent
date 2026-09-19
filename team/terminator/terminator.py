@@ -8,7 +8,7 @@ from graph.common import register_agent
 from team.base import PromptInjector, TeamAgent
 
 
-@register_agent("terminator", "team/terminator/agent_config.json", tools=None)
+@register_agent("terminator", tools=None)
 class TerminatorAgent(TeamAgent):
     """
     终结者 Agent,负责汇总工作结果并返回最终答案给用户

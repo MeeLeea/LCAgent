@@ -385,7 +385,7 @@ def test_register_agent_decorator():
     from graph.common import AGENT_REGISTRY, register_agent
     from team.base import TeamAgent
     
-    @register_agent("fake_role", "team/fake/agent_config.json", tools=None)
+    @register_agent("fake_role", tools=None)
     class FakeRoleAgent(TeamAgent):
         pass
     
@@ -393,7 +393,6 @@ def test_register_agent_decorator():
         assert "fake_role" in AGENT_REGISTRY
         spec = AGENT_REGISTRY["fake_role"]
         assert spec["agent_class"] is FakeRoleAgent
-        assert spec["config_file"] == "team/fake/agent_config.json"
         assert spec["tools"] is None
         # 装饰器应原样返回被装饰的类
         assert FakeRoleAgent.__name__ == "FakeRoleAgent"
@@ -409,7 +408,7 @@ def test_register_agent_tools_passthrough():
     
     fake_tools = ["tool_a", "tool_b"]
     
-    @register_agent("fake_worker", "team/fake_worker/agent_config.json", tools=fake_tools)
+    @register_agent("fake_worker", tools=fake_tools)
     class FakeWorkerAgent(TeamAgent):
         pass
     
@@ -427,7 +426,6 @@ def test_register_agent_mcp_tools_passthrough():
     # 显式声明 mcp_tools
     @register_agent(
         "fake_mcp_role",
-        "team/fake_mcp/agent_config.json",
         tools=None,
         mcp_tools=["write_file"],
     )
@@ -442,7 +440,7 @@ def test_register_agent_mcp_tools_passthrough():
         AGENT_REGISTRY.pop("fake_mcp_role", None)
 
     # 不传 mcp_tools 时默认 None
-    @register_agent("fake_no_mcp", "team/fake_no_mcp/agent_config.json")
+    @register_agent("fake_no_mcp")
     class FakeNoMcpAgent(TeamAgent):
         pass
 
@@ -462,7 +460,6 @@ def test_builtin_agents_registered():
         assert role in AGENT_REGISTRY
         spec = AGENT_REGISTRY[role]
         assert issubclass(spec["agent_class"], TeamAgent)
-        assert spec["config_file"].startswith(f"team/{role}/")
     
     # Worker 注入全部本地工具,Manager/Terminator 纯文本模式
     assert AGENT_REGISTRY["worker"]["tools"] is not None
@@ -517,7 +514,6 @@ def test_build_workflow_mcp_tools_injection():
     # 用 fake role 测试,避免污染真实 architect 注册项
     @register_agent(
         "fake_mcp_inject_role",
-        "team/architect/agent_config.json",  # 复用 architect 配置避免新建文件
         tools=None,
         mcp_tools=["write_file"],
     )
@@ -527,7 +523,6 @@ def test_build_workflow_mcp_tools_injection():
     # 另注册一个无 mcp_tools 的角色作对照
     @register_agent(
         "fake_no_mcp_inject_role",
-        "team/manager/agent_config.json",
         tools=None,
     )
     class FakeNoMcpInjectAgent(TeamAgent):
@@ -541,7 +536,7 @@ def test_build_workflow_mcp_tools_injection():
 
         original_build = team_mod.build_team_agent
 
-        def _spy_build(agent_class, config_file, base_dir, tools=None, **kwargs):
+        def _spy_build(agent_class, agent_name, base_dir, tools=None, **kwargs):
             captured[agent_class.__name__] = tools
             # 返回一个最小实例,避免真实 LLM/MCP 初始化
             inst = object.__new__(agent_class)

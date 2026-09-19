@@ -11,7 +11,6 @@ from tools import all_tools
 
 @register_agent(
     "worker",
-    "team/worker/agent_config.json",
     tools=all_tools,
     mcp_all=True,
 )

@@ -8,13 +8,13 @@ from typing import Any
 
 from langchain_core.tools import BaseTool
 
-from llm.config import load_agent_config, resolve_path
+from llm.config import load_agent_config, load_team_agent_config, resolve_path
 from team.base import TeamAgent
 
 
 def build_team_agent(
     agent_class: type[TeamAgent],
-    config_file: str,
+    agent_name: str,
     base_dir: str,
     tools: list[BaseTool] | None = None,
     checkpointer: Any | None = None,
@@ -25,7 +25,7 @@ def build_team_agent(
 
     Args:
         agent_class: Agent 类(ManagerAgent/WorkerAgent/TerminatorAgent)
-        config_file: agent_config.json 路径(相对项目根)
+        agent_name: 角色名称(如 "architect", "worker")，对应 team/team_agents.json 中的键
         base_dir: 项目根目录
         tools: 可选工具列表(Worker 需要,Manager/Terminator 不需要)
         checkpointer: LangGraph checkpointer 实例。传入时由 TeamAgent 持有，
@@ -35,14 +35,18 @@ def build_team_agent(
     Returns:
         初始化好的 Agent 实例
     """
-    config_path = os.path.join(base_dir, config_file)
-    config = load_agent_config(config_path)
+    # 优先从统一配置加载
+    config = load_team_agent_config(agent_name, base_dir)
+    
+    # 兼容回退：统一配置无该角色时，读取旧 agent_config.json
+    if not config:
+        config_path = os.path.join(base_dir, "team", agent_name, "agent_config.json")
+        config = load_agent_config(config_path)
     
     # 应用覆盖参数
     config.update(overrides)
     
-    # 采样参数来源：角色级 agent_config.json（load_agent_config 已合并 DEFAULTS，
-    # 未显式配置时自动落到 DEFAULTS 默认值），overrides 经 config.update 已优先覆盖
+    # 采样参数来源：角色级配置（已合并 DEFAULTS），overrides 经 config.update 已优先覆盖
     temperature = config.get("temperature")
     max_tokens = config.get("max_tokens")
     stream_chunk_timeout = config.get("stream_chunk_timeout")

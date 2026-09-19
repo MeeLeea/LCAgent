@@ -2,7 +2,7 @@
 
 两个注册表:
   - WORKFLOWS:       工作流名称 → 规格字典(由 register_workflow 写入)
-  - AGENT_REGISTRY:  角色名 → {agent_class, config_file, tools}(由 @register_agent 装饰器填充)
+  - AGENT_REGISTRY:  角色名 → {agent_class, tools}(由 @register_agent 装饰器填充)
 
 工作流注册方式(唯一入口 register_workflow):
   - 内置工作流: 模块 import 时自注册(见 graph/simple.py 与 graph/rtl_graph.py 末尾)
@@ -43,17 +43,22 @@ T = TypeVar("T")
 
 def register_agent(
     name: str,
-    config_file: str,
     tools: list[BaseTool] | None = None,
     mcp_tools: list[str] | None = None,
     mcp_all: bool = False,
 ) -> Callable[[type[T]], type[T]]:
-    """将 Agent 类注册到全局 AGENT_REGISTRY,供 build_workflow 统一构建。"""
+    """将 Agent 类注册到全局 AGENT_REGISTRY,供 build_workflow 统一构建。
+
+    Args:
+        name: 角色名称(如 "architect", "worker")，对应 team/team_agents.json 中的键
+        tools: 可选工具列表
+        mcp_tools: 可选 MCP 工具名称列表
+        mcp_all: 是否加载所有 MCP 工具
+    """
 
     def decorator(cls: type[T]) -> type[T]:
         AGENT_REGISTRY[name] = {
             "agent_class": cls,
-            "config_file": config_file,
             "tools": tools,
             "mcp_tools": mcp_tools,
             "mcp_all": mcp_all,
@@ -173,7 +178,7 @@ def build_workflow(name: str, checkpointer=None) -> tuple[object, dict[str, obje
                 )
         return build_team_agent(
             role_spec["agent_class"],
-            role_spec["config_file"],
+            role,
             BASE_DIR,
             tools=tools or None,
             checkpointer=checkpointer,

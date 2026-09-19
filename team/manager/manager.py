@@ -8,7 +8,7 @@ from graph.common import register_agent
 from team.base import PromptInjector, TeamAgent
 
 
-@register_agent("manager", "team/manager/agent_config.json", tools=None)
+@register_agent("manager", tools=None)
 class ManagerAgent(TeamAgent):
     """
     管理者 Agent,负责任务拆解与规划

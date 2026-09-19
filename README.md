@@ -1072,9 +1072,9 @@ session/
 
 会话配置的读写使用现有的 `SessionManager._thread_locks[thread_id]` 串行化，同一会话的配置更新与执行互斥，不同会话无需全局锁即可并行。模型由 `SessionModelFactory` 通过既有 `LLMClient` 构造，并按 `(provider, model, temperature, max_tokens)` 使用有界 LRU 缓存，默认上限为 16 个不同模型配置，而不是为每个会话复制模型对象。
 
-配置优先级为：显式请求字段 > 角色目录 `team/<role>/agent_config.json` 中的字段 > 保持原值。设置角色时，会在写入时读取该角色的 `agent_config.json` 和 `AGENT.md`，将解析后的 system prompt 保存到 `system_prompt`；之后即使 `AGENT.md` 被修改，已有会话仍使用原快照。每轮开始时捕获一份不可变配置快照，轮中修改只影响下一轮。
+配置优先级为：显式请求字段 > 角色目录 `team/team_agents.json` 中 `default` 与角色配置合并后的字段 > 保持原值。设置角色时，会在写入时读取该角色的统一配置和 `AGENT.md`，将解析后的 system prompt 保存到 `system_prompt`；之后即使 `AGENT.md` 被修改，已有会话仍使用原快照。每轮开始时捕获一份不可变配置快照，轮中修改只影响下一轮。
 
-**provider 变更时 model 的重解析**：`provider` 与 `model` 是耦合取值——旧 provider 的模型通常不在新 provider 的 `models` 白名单内（如 `zhipu` 的 `glm-4.7-flash` 切到 `yunlan`）。因此当一次更新**实际改变了 provider 且未显式给出 `model`** 时，服务端会把 model 重解析为该 provider 的可用模型：优先取 `llm_config.json` 中该 provider 的默认 `model`，若该默认值未列入自身 `models`（配置不一致）则退回 `models[0]`。该规则覆盖两条路径：前端顶栏只发 `{"provider": "..."}`，以及角色目录 `agent_config.json` 只配置 `provider`、`model` 为 `null`（如 `team/worker`、`team/terminator`）。显式传入的 `model` 始终以请求为准（非法值照常 400）；provider 未实际变化时不重置 model，避免覆盖用户已选模型。
+**provider 变更时 model 的重解析**：`provider` 与 `model` 是耦合取值——旧 provider 的模型通常不在新 provider 的 `models` 白名单内（如 `zhipu` 的 `glm-4.7-flash` 切到 `yunlan`）。因此当一次更新**实际改变了 provider 且未显式给出 `model`** 时，服务端会把 model 重解析为该 provider 的可用模型：优先取 `llm_config.json` 中该 provider 的默认 `model`，若该默认值未列入自身 `models`（配置不一致）则退回 `models[0]`。该规则覆盖两条路径：前端顶栏只发 `{"provider": "..."}`，以及角色配置只配置 `provider`、`model` 为 `null`（如 `team/worker`、`team/terminator` 在 `team/team_agents.json` 中）。显式传入的 `model` 始终以请求为准（非法值照常 400）；provider 未实际变化时不重置 model，避免覆盖用户已选模型。
 
 **运行时注入通道（重要）**：`config["configurable"]` 只喂给 checkpointer，**不会**自动映射到 `request.runtime.context`——`ModelRequest.runtime` 是 LangGraph `Runtime`，它没有 `config` 属性，`context` 仅由调用方的 `context=` 参数填充。因此图调用处必须写 `ainvoke(..., config=config, context=config)`（见 `agent/turn_runners.py` 的 `arun_structured` / `achat_structured` / `aresume_structured` 与 `agent/streaming.py` 的 `_arun_graph_events`），把同一份 `{"configurable": {...}}` 同时经两条通道传入：`config=` 供 checkpointer 解析 `thread_id`，`context=` 供 `SessionConfigMW` 读取 `session_config`。遗漏 `context=` 时中间件会静默直通、回落构建期默认模型（前端仍提示切换成功，但本轮实际未生效）。注意工具侧不同：`ToolCallRequest.runtime` 是 `ToolRuntime`，**有** `.config`，所以 `WorkspaceSecurityMW` / `ToolExecutionErrorMW` 读 `runtime.config` 一直正常。回归守护见 `tests/agent/test_session_config_e2e.py`。
 
@@ -1723,11 +1723,11 @@ create_tool(
 
 ```python
 # 按名声明（推荐，工具数可控）
-@register_agent("architect", "team/architect/agent_config.json",
+@register_agent("architect",
     mcp_tools=["write_file"])
 
 # 全量声明
-@register_agent("architect", "team/architect/agent_config.json",
+@register_agent("architect",
     mcp_all=True)
 ```
 
@@ -2350,15 +2350,15 @@ Verification (spec_design_task:验证计划)
 - **类型化执行结果**:`arun_structured` 返回 `AgentTurnResult`(completed / cancelled,复用 `agent/turn_types.py`),调用方可区分"正常完成"与"LLM 失败",工作流节点可据此重试/降级;`ainvoke`/`astream` 保持返回字符串契约不变
 - **运行时指标**:`metrics` 惰性收集器(与 `AgentCore.metrics` 同构)——LLM 调用 token 用量(流式事件与纯文本通道自动提取)、工具执行计数/失败/超时、turn 计数,经 `get_summary()` 汇总
 - **能力边界清晰**:规划/汇总角色不暴露危险工具(如 `run_shell`),Worker 才拥有工具执行能力
-- **自带 LLM 配置**:每个 agent 的 `agent_config.json` 里配置 `provider` + `model`,TeamAgent 内部创建 LLMClient
-- **可定制 LLM 采样参数**:`temperature`/`max_tokens` 采用**分层隔离**配置——非团队场景（主对话/调度器/API）默认值统一在 `llm/config.py` 的 `DEFAULTS` 管理，`LLMClient` 内部自动读取全局 `agent/agent_config.json`（含 DEFAULTS 兜底），外部无需传参；团队角色在其自身 `team/<角色>/agent_config.json` 中配置（如 WorkerAgent 用 `temperature=0.3` 提升执行确定性、`max_tokens=4096` 放宽输出上限），角色未配置时回退 DEFAULTS，**不读取全局自定义值**；子类也可通过类属性或 `__init__` 参数覆盖
+- **自带 LLM 配置**:团队角色在 `team/team_agents.json` 中统一配置 `provider` + `model`，`TeamAgent` 内部创建 LLMClient
+- **可定制 LLM 采样参数**:`temperature`/`max_tokens` 采用**分层隔离**配置——非团队场景（主对话/调度器/API）默认值统一在 `llm/config.py` 的 `DEFAULTS` 管理，`LLMClient` 内部自动读取全局 `agent/agent_config.json`（含 DEFAULTS 兜底），外部无需传参；团队角色在 `team/team_agents.json` 的 `default` 与角色配置中配置（如 Worker 用 `temperature=0.3` 提升执行确定性、`max_tokens=4096` 放宽输出上限），角色未配置时回退 default，**不读取全局自定义值**；子类也可通过类属性或 `__init__` 参数覆盖
 
 ### 异步化与跨轮次压缩
 
 工作流节点已全面异步化,`TeamAgent` 提供 `ainvoke`/`astream` 异步能力,节点直接 `await` 角色类 async 业务方法并透传 LangGraph `config`(callbacks 通道)实现 TOKEN 级流式;同时具备技能注入与跨轮次记忆压缩能力:
 
 - **异步节点执行 + TOKEN 流式**:`simple.py` / `rtl_graph.py` 的业务节点(`summarize`/`manager_plan`/`worker_exec`/`terminator_final` 及 RTL 各节点)全部为 `async`,直接 `await` 角色类 async 业务方法(`asummarize_context`/`aplan_task`/`aexecute_task`/`afinalize` 等)并透传 LangGraph 注入的 `config: Optional[RunnableConfig]`。`TeamAgent`(`team/base.py`)提供 `ainvoke`(`astream` 聚合)/`astream` 异步能力:`_astream_with_tools` 经 `agent_executor.astream_events(version="v2")` 过滤 `on_chat_model_stream`;`_astream_pure_text` 经 chat model `astream`。因同事件循环执行,callbacks 自然透传——`NodeTrackingHandler.on_chat_model_stream` 捕获 LLM token 增量转发为 `AgentEvent.token`,`WorkflowAdapter._on_token` 闭包补 `thread_id`/`role="assistant"`/`trace_id` 后注入事件流,实现节点执行期间的 TOKEN 级流式(空块自动过滤)。同步业务方法与 `ainvoke_team_agent()` 兼容辅助已移除,统一走 async 链路。
-- **技能注入(SkillInjector)**:`build_simple_workflow` 接受 `skills_dir` / `auto_match_skills` 参数,构建时创建 `skmng.injector.SkillInjector`(改调 `skmng.core.build_skill_block` 三来源合并:角色级 `fixed_skills` + 运行时 `active_names` + 自动匹配)。节点渲染 prompt 后调用 `inject_into_prompt()` 把命中技能(`match_skills(task)`)的指引块追加到 prompt 末尾,已含技能块时跳过(防重复)。`TeamAgent` 亦内建同等能力(`build_skill_block` / `inject_into_prompt` 转发 `skmng.core`,满足 `PromptInjector` 协议)——节点可直接以角色实例为注入器,无需外部构造;`team/factory.py` 会把角色 `agent_config.json` 的 `skills_dir` / `auto_match_skills` / `tool_timeout` 透传给 TeamAgent。
+- **技能注入(SkillInjector)**:`build_simple_workflow` 接受 `skills_dir` / `auto_match_skills` 参数,构建时创建 `skmng.injector.SkillInjector`(改调 `skmng.core.build_skill_block` 三来源合并:角色级 `fixed_skills` + 运行时 `active_names` + 自动匹配)。节点渲染 prompt 后调用 `inject_into_prompt()` 把命中技能(`match_skills(task)`)的指引块追加到 prompt 末尾,已含技能块时跳过(防重复)。`TeamAgent` 亦内建同等能力(`build_skill_block` / `inject_into_prompt` 转发 `skmng.core`,满足 `PromptInjector` 协议)——节点可直接以角色实例为注入器,无需外部构造;`team/factory.py` 会把角色 `team/team_agents.json` 的 `skills_dir` / `auto_match_skills` / `tool_timeout` 透传给 TeamAgent。
 - **消息通道压缩(compaction)**:`simple.py` / `rtl_graph.py` / `pipline.py` 的 `WorkflowState` / `RTLGraphState` 新增 `messages`(LangGraph `add_messages` 通道)与 `summary` 字段,每个业务节点产出追加一条 `AIMessage`。`build_*_workflow` 接受 `compaction_config` 参数,经 `graph/common.py` 的 `_build_compaction_middleware` 构造中间件,再由 `register_nodes` 工厂统一包装节点(`wrap_node_with_compaction`):消息累计超过阈值(默认 50)时调用 `arun_compaction(force=True)` 把历史消息压缩为增量摘要并入 `summary`,防止长会话撑爆上下文。`compaction_config=None` 且 agent 无 LLM 时静默禁用。
 - **跨轮次上下文延续**:统一入口(CLI/API)经 `WorkflowAdapter`(`session/workflow_adapter.py`)执行——运行前从 workflow 专属会话的 checkpoint `messages` 通道读取历史节点产出(预览最多 5 条、每条截断 200 字符,拼为 `【历史执行记录】` 块),叠加 `MemoryManager.recall_text` 的长期记忆,合并注入 `raw_context`,实现多轮运行间的上下文延续。直接调用 `arun_simple_workflow` + `thread_id` 时,旧的 `_aget_previous_workflow_summary()`(checkpoint 摘要)仍可用(已标记 deprecated,待消息通道完全接管后移除)。
 
@@ -2492,26 +2492,29 @@ from graph.registry import register_agent
 from team.base import TeamAgent
 from tools import all_tools
 
-@register_agent("my_agent", "team/my_agent/agent_config.json", tools=all_tools)
+@register_agent("my_agent", tools=all_tools)
 class MyAgent(TeamAgent):
     default_templates = {"my_node": "模板..."}
 ```
 
 ```
+# ```
 # team/my_agent/AGENT.md        — 角色系统提示词 + ## workflow:小节
-# team/my_agent/agent_config.json — LLM 配置(provider/model/temperature/max_tokens/prompt_file 等)
-# 采样参数建议配置在 agent_config.json(角色级,缺省回退 DEFAULTS),无需改代码类属性
+# team/team_agents.json          — 统一 LLM 配置(default + 角色覆盖)
+# 采样参数建议配置在 team_agents.json(角色级,缺省回退 default),无需改代码类属性
 ```
 
-```
-// team/my_agent/agent_config.json
+```json
+// team/team_agents.json (新增/修改条目)
 {
+  "my_agent": {
     "name": "my_agent",
     "provider": "zhipu",
     "model": "glm-4-flash",
     "temperature": 0.3,
     "max_tokens": 4096,
     "agent_prompt_file": "team/my_agent/AGENT.md"
+  }
 }
 ```
 
@@ -2910,12 +2913,12 @@ asyncio.run(main())
 | `max_context_messages`  | int   | 0                           | 长上下文裁剪阈值（0 = 关闭）                                                                           |
 | `context_trim_keep`     | int   | 12                          | 裁剪时保留的最近消息条数                                                                               |
 | `tool_timeout`          | int   | 120                         | 工具调用超时（秒）                                                                                     |
-| `temperature`           | float | 0.7                         | LLM 采样温度（主对话/调度器/API 默认；团队角色分层配置于自身`agent_config.json`，缺省回退 DEFAULTS） |
+| `temperature`           | float | 0.7                         | LLM 采样温度（主对话/调度器/API 默认；团队角色分层配置于 `team/team_agents.json`，缺省回退 default） |
 | `max_tokens`            | int   | 8192                        | LLM 最大生成 token 数（覆盖来源同`temperature`）                                                     |
 | `stream_chunk_timeout`  | float | 300.0                       | LLM 流式响应 chunk 间隔超时（秒；覆盖来源同`temperature`）。显式替代 `langchain-openai` 默认 120s，避免思考型模型网关长时间零字节时误触发告警（详见「LLM 流式 chunk 超时」） |
 | `latest_msg_cnt`        | int   | 10                          | 短期上下文窗口消息条数：取最近 N 条消息（传递给`SessionRegistry.aget_short_term`）                   |
 
-> **采样参数分层隔离**：团队场景只用 `team/<角色>/agent_config.json`（`temperature`/`max_tokens` 经 `build_team_agent` 解析后作为显式参数传入，未配置时回退 `llm/config.py` 的 `DEFAULTS`，**不读取全局自定义值**）；非团队场景（主对话/调度器/API/飞书）由 `LLMClient` 内部自动读取全局 `agent/agent_config.json`（含 DEFAULTS 兜底），外部无需传参。显式构造参数（`LLMClient(..., temperature=...)` / `build_team_agent(..., temperature=...)`）始终优先。
+> **采样参数分层隔离**：团队场景只用 `team/team_agents.json`（`default` + 角色覆盖），`temperature`/`max_tokens` 经 `build_team_agent` 解析后作为显式参数传入，未配置时回退 `llm/config.py` 的 `DEFAULTS`，**不读取全局自定义值**；非团队场景（主对话/调度器/API/飞书）由 `LLMClient` 内部自动读取全局 `agent/agent_config.json`（含 DEFAULTS 兜底），外部无需传参。显式构造参数（`LLMClient(..., temperature=...)` / `build_team_agent(..., temperature=...)`）始终优先。
 
 **Memory 层配置**（由 [memory/config.py](memory/config.py) 统一管理，**不写入** `agent_config.json`，修改后重启 `main.py` 生效）：
 

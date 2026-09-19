@@ -214,6 +214,33 @@ def load_agent_rules(
     return "\n\n".join(section for section in sections if section)
 
 
+def load_team_agent_config(agent_name: str, base_dir: str) -> dict[str, Any]:
+    """
+    从 team/team_agents.json 加载团队角色配置(default + 角色覆盖)
+
+    Args:
+        agent_name: 角色名称(如 "architect", "worker")
+        base_dir: 项目根目录
+
+    Returns:
+        合并后的配置字典;文件不存在或角色不存在时返回空字典
+    """
+    team_config_path = os.path.join(base_dir, "team", "team_agents.json")
+    if not os.path.exists(team_config_path):
+        return {}
+
+    try:
+        with open(team_config_path, "r", encoding="utf-8") as f:
+            team_config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    result = dict(team_config.get("default", {}))
+    if agent_name in team_config:
+        result.update(team_config[agent_name])
+    return result
+
+
 def resolve_path(path: str, base_dir: str) -> str:
     """将配置中的相对路径解析为基于项目根的绝对路径(并规范化分隔符)"""
     if not path:

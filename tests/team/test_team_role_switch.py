@@ -7,7 +7,7 @@
    旧的仅更新提示词路径已移除，两条路径统一走 _arebuild_agent_executor）。
 3. arebuild_agent_from_team_dir 在 provider/model 变化时重建 LLMClient + executor。
 
-断言约定：LLM 相关的预期值从 team/<角色>/agent_config.json 动态读取，
+断言约定：LLM 相关的预期值从 team/team_agents.json 统一配置动态读取，
 不硬编码具体 provider/model 名——验证的是"切换后 LLM 与角色配置一致"
 这一行为，而非绑定某个模型（避免默认 provider 调整导致测试失配）。
 """
@@ -22,22 +22,22 @@ from agent import role_sw
 from agent.agent_core import AgentCore
 from agent.role_sw import _locate_team_agent_dir
 
-# 项目根目录（tests/team/ 上两级）
-_ROOT = Path(__file__).resolve().parents[2]
-
-# ============ 辅助：最小化 AgentCore 与 FakeLLM ============
-
 
 def _read_role_llm_config(role: str) -> dict:
-    """读取 team/<role>/agent_config.json 声明的 LLM 配置（provider/model/采样参数，可缺省）"""
-    config_path = _ROOT / "team" / role / "agent_config.json"
+    """从 team/team_agents.json 读取角色的 LLM 配置"""
+    # 项目根目录
+    _ROOT = Path(__file__).resolve().parents[2]
+    config_path = _ROOT / "team" / "team_agents.json"
     with open(config_path, encoding="utf-8") as f:
         data = json.load(f)
+    default = data.get("default", {})
+    role_cfg = data.get(role, {})
+    merged = {**default, **role_cfg}
     return {
-        "provider": data.get("provider"),
-        "model": data.get("model"),
-        "temperature": data.get("temperature"),
-        "max_tokens": data.get("max_tokens"),
+        "provider": merged.get("provider"),
+        "model": merged.get("model"),
+        "temperature": merged.get("temperature"),
+        "max_tokens": merged.get("max_tokens"),
     }
 
 
@@ -80,8 +80,8 @@ def test_locate_team_agent_dir_finds_manager():
 
     assert os.path.isdir(path)
     assert path.endswith("manager")
-    assert os.path.isfile(os.path.join(path, "agent_config.json"))
     assert os.path.isfile(os.path.join(path, "AGENT.md"))
+    # 不再检查 agent_config.json，改检查统一配置
 
 
 def test_locate_team_agent_dir_raises_on_missing():
@@ -89,6 +89,17 @@ def test_locate_team_agent_dir_raises_on_missing():
     with pytest.raises(KeyError) as exc:
         _locate_team_agent_dir("nonexistent_role_xyz")
     assert "nonexistent_role_xyz" in str(exc.value)
+
+
+def test_get_available_team_roles_includes_builtin():
+    """get_available_team_roles 返回内置角色"""
+    roles = role_sw.get_available_team_roles()
+    assert "manager" in roles
+    assert "worker" in roles
+    assert "terminator" in roles
+    assert "architect" in roles
+    assert "rtl_designer" in roles
+    assert "rtl_verification" in roles
 
 
 # ============ 测试：_arebuild_agent_executor 在两种场景下都被调用 ============
@@ -231,7 +242,7 @@ def test_rebuild_uses_target_provider_default_model_when_role_model_null(monkeyp
 
 
 def test_rebuild_applies_role_sampling_params(monkeypatch):
-    """角色切换重建 LLM 时，应用角色级 agent_config.json 的 temperature/max_tokens
+    """角色切换重建 LLM 时，应用角色级统一配置的 temperature/max_tokens
 
     验证:切换后 LLMClient 以角色配置的采样参数构造(而非保留当前 LLM 的值)。
     """

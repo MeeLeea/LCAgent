@@ -580,14 +580,14 @@ async def _resolve_role_patch(
     if patch.role is None:
         return patch
     from agent.role_sw import _locate_team_agent_dir
-    from llm.config import load_agent_config
+    from llm.config import load_team_agent_config
     from team.base import TeamAgent
 
     try:
         role_dir = _locate_team_agent_dir(patch.role)
     except KeyError as error:
         raise HTTPException(status_code=400, detail=f"角色不存在: {patch.role}") from error
-    config = load_agent_config(os.path.join(role_dir, "agent_config.json"))
+    config = load_team_agent_config(patch.role, BASE_DIR)
     prompt_path = os.path.join(role_dir, "AGENT.md")
     content = TeamAgent._read_prompt_file(prompt_path)
     if content is None:
