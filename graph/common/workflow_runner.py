@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 async def arun_compiled_workflow(
     graph: StateGraph,
     task: str,
-    state_fields: dict[str, str] | None = None,
+    state_fields: dict[str, Any] | None = None,
     raw_context: str = "",
     thread_id: str | None = None,
     workspace_path: str | None = None,
@@ -70,7 +70,7 @@ async def arun_compiled_workflow(
 async def _arun_with_trace(
     graph: StateGraph,
     task: str,
-    state_fields: dict[str, str] | None,
+    state_fields: dict[str, Any] | None,
     raw_context: str,
     tid: str,
     workspace_path: str | None,
@@ -105,7 +105,7 @@ async def _arun_with_trace(
                 f"{raw_context}\n\n{recalled}".strip() if raw_context else recalled
             )
 
-    initial_state: dict[str, str] = {
+    initial_state: dict[str, Any] = {
         "task": task,
         "raw_context": raw_context,
         "context_summary": "",
