@@ -39,6 +39,7 @@ from graph.common import (
     NodeSpec,
     _build_compaction_middleware,
     arun_compiled_workflow,
+    create_llm_node,
     register_nodes,
     register_workflow,
     run_team_turn_with_interrupt,
@@ -90,85 +91,31 @@ async def summarize_context(
     return {"context_summary": result, "messages": [AIMessage(content=result)]}
 
 
-async def manager_plan_node(
-    state: WorkflowState,
-    agent: TeamAgent,
-    injector=None,
-    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 见 worker_exec_node 注释
-) -> WorkflowState:
-    """Manager 拆解任务,生成执行计划(结合记忆上下文摘要)
-
-    节点内渲染 ``manager_plan`` 模板 + 注入技能块,然后调
-    ``run_team_turn_with_interrupt`` 流式执行;技能注入 match 文本为
-    ``task``(对照原 ManagerAgent.aplan_task)。
-    """
-    task = state["task"]
-    summary = state.get("context_summary", "")
-    prompt = agent.render_template(
-        agent.get_template("manager_plan"), task=task, context_summary=summary
-    )
-    if injector is not None:
-        prompt = injector.inject_into_prompt(prompt, task)
-    result = await run_team_turn_with_interrupt(agent, prompt, config)
-    return {"plan": result, "messages": [AIMessage(content=result)]}
+manager_plan_node = create_llm_node(
+    template_name="manager_plan",
+    output_field="plan",
+    template_vars_fn=lambda s: {"task": s["task"], "context_summary": s.get("context_summary", "")},
+    match_text_fn=lambda s: s["task"],
+    base_prompts="",
+)
 
 
-async def worker_exec_node(
-    state: WorkflowState,
-    agent: TeamAgent,
-    injector=None,
-    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 见下文:须用 Optional 写法,LangGraph 注解判定仅接受该字符串形态
-) -> WorkflowState:
-    """Worker 执行计划中的子任务。
-
-    节点内渲染 ``worker_exec`` 模板 + 注入技能块,然后调
-    ``run_team_turn_with_interrupt`` 流式执行;技能注入 match 文本为
-    ``plan``(对照原 WorkerAgent.aexecute_task,worker 的"任务文本"即计划)。
-
-    config 由 LangGraph 按节点签名以关键字注入（含 configurable.workspace_path）,
-    透传给 helper → arun_structured → astream,使工具调用受 workspace 隔离约束、
-    LLM token 增量经 callbacks 流出到外层事件流。
-
-    注:必须用 Optional[RunnableConfig] 而非 RunnableConfig | None——模块启用
-    ``from __future__ import annotations`` 后注解为字符串,仅
-    'Optional[RunnableConfig]'/'RunnableConfig' 在 LangGraph 判定中被接受,
-    'RunnableConfig | None' 字符串不匹配会导致 config 静默不注入。
-    """
-    plan = state["plan"]
-    prompt = agent.render_template(agent.get_template("worker_exec"), plan=plan)
-    if injector is not None:
-        prompt = injector.inject_into_prompt(prompt, plan)
-    result = await run_team_turn_with_interrupt(agent, prompt, config)
-    return {"worker_result": result, "messages": [AIMessage(content=result)]}
+worker_exec_node = create_llm_node(
+    template_name="worker_exec",
+    output_field="worker_result",
+    template_vars_fn=lambda s: {"plan": s["plan"]},
+    match_text_fn=lambda s: s["plan"],
+    base_prompts="",
+)
 
 
-async def terminator_final_node(
-    state: WorkflowState,
-    agent: TeamAgent,
-    injector=None,
-    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 见 worker_exec_node 注释
-) -> WorkflowState:
-    """Terminator 汇总结果并返回最终答案(结合记忆上下文摘要)
-
-    节点内渲染 ``terminator_final`` 模板 + 注入技能块,然后调
-    ``run_team_turn_with_interrupt`` 流式执行;技能注入 match 文本为
-    ``task``(对照原 TerminatorAgent.afinalize)。
-    """
-    task = state["task"]
-    plan = state["plan"]
-    worker_result = state["worker_result"]
-    summary = state.get("context_summary", "")
-    prompt = agent.render_template(
-        agent.get_template("terminator_final"),
-        task=task,
-        plan=plan,
-        worker_result=worker_result,
-        context_summary=summary,
-    )
-    if injector is not None:
-        prompt = injector.inject_into_prompt(prompt, task)
-    result = await run_team_turn_with_interrupt(agent, prompt, config)
-    return {"final_answer": result, "messages": [AIMessage(content=result)]}
+terminator_final_node = create_llm_node(
+    template_name="terminator_final",
+    output_field="final_answer",
+    template_vars_fn=lambda s: {"task": s["task"], "plan": s["plan"], "worker_result": s["worker_result"], "context_summary": s.get("context_summary", "")},
+    match_text_fn=lambda s: s["task"],
+    base_prompts="",
+)
 
 
 # 3. 构建工作流图
