@@ -303,11 +303,17 @@ LangChainAgent/
 │       ├── agent_config.json
 │       └── AGENT.md
 ├── graph/                   # LangGraph 工作流编排
-│   ├── common.py            # 工作流通用能力：异步执行辅助 + 跨轮次记忆压缩 + workspace 透传
+│   ├── common/              # 工作流共享组件包：节点跟踪 + 中断转发 + 节点工厂 + 运行器 + 压缩 + 声明式注册 + 注册表
+│   │   ├── node_tracking.py     # NodeTrackingHandler 节点级进度回调（含 TOKEN 级流式）
+│   │   ├── interrupt_forward.py # run_team_turn_with_interrupt 中断转发
+│   │   ├── node_factory.py      # create_llm_node 节点工厂
+│   │   ├── workflow_runner.py   # arun_compiled_workflow 通用运行器（跨轮次记忆压缩 + workspace_path 透传）
+│   │   ├── compaction_utils.py  # _build_compaction_middleware 压缩中间件构造
+│   │   ├── node_spec.py         # NodeSpec / register_nodes 声明式注册（可选 compaction_mw 节点级压缩）
+│   │   └── registry.py          # WORKFLOWS / AGENT_REGISTRY / build_workflow 注册表与构建入口（runner 支持 workspace_path 参数）
 │   ├── simple.py            # 监督者模式工作流（Manager→Worker→Terminator，异步节点，worker_exec 接收 config 注入 workspace）
 │   ├── pipline.py           # 流水线模式工作流（异步节点，与 simple 同构，worker_exec 接收 config 注入 workspace）
-│   ├── rtl_graph.py         # RTL 芯片设计流水线（Manager 提炼→Architect 架构→Designer 设计↔Verification 多轮验证→验证通过/达上限即终止(END)）
-│   └── registry.py          # 工作流/Agent 注册表与构建入口（runner 支持 workspace_path 参数）
+│   └── rtl_graph.py         # RTL 芯片设计流水线（Manager 提炼→Architect 架构→Designer 设计↔Verification 多轮验证→验证通过/达上限即经 designer_output 交付后终止(END)）
 ├── tools/
 │   ├── __init__.py          # 本地工具注册
 │   ├── search.py            # 联网搜索工具(Tavily API)
@@ -376,11 +382,11 @@ LangChainAgent/
 | [session/](session/)                                                     | 三层架构 Session 层：`SessionConfig`（会话基础配置）/ `SessionContext`（单会话运行时上下文）/ `SessionStore`（per-session 瞬态状态）/ `SessionRegistry`（生命周期管理）/ `WorkspaceStore`（工作空间映射）/ `SessionManager`（对外门面 & 会话调度）                                                                                                                                     |
 | [team/](team/)                                                           | 多 Agent 团队协作：ManagerAgent（拆解）/ WorkerAgent（执行）/ TerminatorAgent（汇总）+ 工厂函数                                                                                                                                                                                                                                                                                                    |
 | [skmng/](skmng/)                                                         | 技能管理统一包：`SkillManager`（扫描/匹配/渲染）+ `SkillInjector`（工作流节点注入器）+ `SkillInjectionMW`（agent 层中间件）+ `SkillOps`（Mixin）+ `core.py`（三来源合并核心）+ `protocols.py`（PromptInjector 协议）+ `read_skill` 工具                                                                                                                                              |
-| [graph/common.py](graph/common.py)                                       | 工作流通用能力：`NodeTrackingHandler` 节点级进度回调(含 TOKEN 级流式)、`arun_compiled_workflow` 跨轮次记忆压缩 + `workspace_path` 注入 `config.configurable`（SkillInjector 已迁往 `skmng/injector.py`）                                                                                                                                                                                 |
+| [graph/common/](graph/common/)                                           | 工作流共享组件包（子模块 `node_tracking` / `interrupt_forward` / `node_factory` / `workflow_runner` / `compaction_utils` / `node_spec` / `registry`）：`NodeTrackingHandler` 节点级进度回调(含 TOKEN 级流式)、`arun_compiled_workflow` 跨轮次记忆压缩 + `workspace_path` 注入 `config.configurable`、`register_nodes` 声明式节点注册（可选 `compaction_mw` 节点级压缩）（SkillInjector 已迁往 `skmng/injector.py`）                                                                                                                                                                                 |
 | [graph/simple.py](graph/simple.py)                                       | LangGraph 监督者模式工作流编排（Manager→Worker→Terminator，异步节点）；`worker_exec` 节点接收 LangGraph 注入的 config（含 `workspace_path`）透传 Worker                                                                                                                                                                                                                                      |
 | [graph/pipline.py](graph/pipline.py)                                     | LangGraph 流水线模式工作流编排（异步节点，与 simple 同构）；`worker_exec` 节点同样透传 workspace config                                                                                                                                                                                                                                                                                          |
-| [graph/rtl_graph.py](graph/rtl_graph.py)                                 | RTL 芯片设计流水线：Manager 提炼上下文→Architect 计划/设计/分析/评审/规格→Designer 规格+编码↔Verification 验证多轮交互（条件路由 + max_rounds 限轮）→验证通过/达上限即终止(END)                                                                                                                                                                                                                |
-| [graph/registry.py](graph/registry.py)                                   | 工作流/Agent 注册表：`register_workflow` / `register_agent` / `build_workflow`；runner 统一支持 `workspace_path` 透传                                                                                                                                                                                                                                                                      |
+| [graph/rtl_graph.py](graph/rtl_graph.py)                                 | RTL 芯片设计流水线：Manager 提炼上下文→Architect 计划/设计/分析/评审/规格→Designer 规格+编码↔Verification 验证多轮交互（条件路由 + max_rounds 限轮）→验证通过/达上限即经 designer_output 交付后终止(END)                                                                                                                                                                                                                |
+| [graph/common/registry.py](graph/common/registry.py)                     | 工作流/Agent 注册表：`register_workflow` / `register_agent` / `build_workflow`；runner 统一支持 `workspace_path` 透传                                                                                                                                                                                                                                                                      |
 | [tools/skills.py](tools/skills.py)                                       | re-export`skmng.manager.SkillManager`（向后兼容，待删）                                                                                                                                                                                                                                                                                                                                          |
 | [tools/skill_tool.py](tools/skill_tool.py)                               | re-export`skmng.tool.read_skill`（向后兼容，待删）                                                                                                                                                                                                                                                                                                                                               |
 | [tools/mcp_pool.py](tools/mcp_pool.py)                                   | `MCPPool`：per-server 连接管理 + 健康探测 + 自动重连，替代全量重载                                                                                                                                                                                                                                                                                                                               |
@@ -2298,7 +2304,7 @@ Terminator (汇总结果,返回最终答案)
 
 ### 架构(rtl_graph)
 
-RTL 芯片设计流水线：`Manager` 提炼上下文 → `Architect` 五阶段架构（计划/设计/分析/评审/规格）→ `Designer` 规格+编码 ↔ `Verification` 多轮验证 → 验证通过/达上限即终止（END）：
+RTL 芯片设计流水线：`Manager` 提炼上下文 → `Architect` 五阶段架构（计划/设计/分析/评审/规格）→ `Designer` 规格+编码 ↔ `Verification` 多轮验证 → 验证通过/达上限即经 `designer_output` 交付后终止（END）：
 
 ```
 用户任务
@@ -2317,12 +2323,13 @@ Verification (spec_design_task:验证计划)
 │  Verification (verilog_design_task:验证) │──┘
 └──────────────────────────────────────────┘
     ↓ 验证通过 / 达 max_rounds 上限
-   END（终止,不再经 Designer 交付节点）
+Designer (designer_output:整理最终交付物) → END（终止）
 ```
 
-- **多轮交互**：`designer_verilog` → `designer_file_check` → `verification_check` → `sim_exec_check` 构成迭代环，由 `route_after_file_check` / `route_after_sim_check` 条件路由判定。`designer_file_check` 校验本轮产出 RTL 文件存在且非空；`sim_exec_check` 实际执行 Vivado 仿真并检查覆盖率（`scripts/syn_filelist.f` 全部 src 被 `scripts/sim_filelist.f` 包含且报告已生成），仿真+覆盖率通过即终止（END）；失败且轮次未达 `max_rounds`（默认 3）时携带验证反馈回到 Designer 重新编码；达上限强制终止（END），防止死循环。
+- **多轮交互**：`designer_verilog` → `designer_file_check` → `verification_check` → `sim_exec_check` 构成迭代环，由 `route_after_file_check` / `route_after_sim_check` 条件路由判定。`designer_file_check` 校验本轮产出 RTL 文件存在且非空；`sim_exec_check` 实际执行 Vivado 仿真并检查覆盖率（`scripts/syn_filelist.f` 全部 src 被 `scripts/sim_filelist.f` 包含且报告已生成），仿真+覆盖率通过即经 `designer_output` 交付后终止（END）；失败且轮次未达 `max_rounds`（默认 3）时携带验证反馈回到 Designer 重新编码；达上限强制经 `designer_output` 交付后终止（END），防止死循环。
+- **交付节点（零 LLM）**：`designer_output` 是**确定性机械拼装**节点，**不调用任何 LLM、不渲染模板、不做网络/磁盘 IO**——仅把 `task` / `design_spec` / `rtl_code` / `verification_report` / `output_files` 等 state 字段按固定小节拼装成 `final_answer`（空字段整段省略，全空时至少回退 `state["task"]`）。两条终态路径（`sim_exec_check` 通过、达 `max_rounds` 上限）以及 `designer_file_check` 达上限，均先经 `designer_output` 交付再 `→ END`，保证 `final_answer` 非空、跨轮次记忆沉淀与 DONE 事件内容可用。
 - **上下文衔接**：Architect 各阶段任务文本逐级拼接上游产物（计划→设计→分析→评审→规格），Designer/Verification 基于架构规格分工，多轮迭代时第二轮起注入上一轮验证报告反馈。
-- **角色注册**：`team/__init__.py` 未导入 `rtl_designer`/`rtl_verification`，由 `rtl_graph.py` 顶部显式导入触发 `@register_agent` 注册，与 `graph.registry` 无循环导入。
+- **角色注册**：`team/__init__.py` 未导入 `rtl_designer`/`rtl_verification`，由 `rtl_graph.py` 顶部显式导入触发 `@register_agent` 注册，与 `graph.common` 无循环导入。
 
 ### 团队角色
 
@@ -2359,7 +2366,7 @@ Verification (spec_design_task:验证计划)
 
 - **异步节点执行 + TOKEN 流式**:`simple.py` / `rtl_graph.py` 的业务节点(`summarize`/`manager_plan`/`worker_exec`/`terminator_final` 及 RTL 各节点)全部为 `async`,直接 `await` 角色类 async 业务方法(`asummarize_context`/`aplan_task`/`aexecute_task`/`afinalize` 等)并透传 LangGraph 注入的 `config: Optional[RunnableConfig]`。`TeamAgent`(`team/base.py`)提供 `ainvoke`(`astream` 聚合)/`astream` 异步能力:`_astream_with_tools` 经 `agent_executor.astream_events(version="v2")` 过滤 `on_chat_model_stream`;`_astream_pure_text` 经 chat model `astream`。因同事件循环执行,callbacks 自然透传——`NodeTrackingHandler.on_chat_model_stream` 捕获 LLM token 增量转发为 `AgentEvent.token`,`WorkflowAdapter._on_token` 闭包补 `thread_id`/`role="assistant"`/`trace_id` 后注入事件流,实现节点执行期间的 TOKEN 级流式(空块自动过滤)。同步业务方法与 `ainvoke_team_agent()` 兼容辅助已移除,统一走 async 链路。
 - **技能注入(SkillInjector)**:`build_simple_workflow` 接受 `skills_dir` / `auto_match_skills` 参数,构建时创建 `skmng.injector.SkillInjector`(改调 `skmng.core.build_skill_block` 三来源合并:角色级 `fixed_skills` + 运行时 `active_names` + 自动匹配)。节点渲染 prompt 后调用 `inject_into_prompt()` 把命中技能(`match_skills(task)`)的指引块追加到 prompt 末尾,已含技能块时跳过(防重复)。`TeamAgent` 亦内建同等能力(`build_skill_block` / `inject_into_prompt` 转发 `skmng.core`,满足 `PromptInjector` 协议)——节点可直接以角色实例为注入器,无需外部构造;`team/factory.py` 会把角色 `team/team_agents.json` 的 `skills_dir` / `auto_match_skills` / `tool_timeout` 透传给 TeamAgent。
-- **消息通道压缩(compaction)**:`simple.py` / `rtl_graph.py` / `pipline.py` 的 `WorkflowState` / `RTLGraphState` 新增 `messages`(LangGraph `add_messages` 通道)与 `summary` 字段,每个业务节点产出追加一条 `AIMessage`。`build_*_workflow` 接受 `compaction_config` 参数,经 `graph/common.py` 的 `_build_compaction_middleware` 构造中间件,再由 `register_nodes` 工厂统一包装节点(`wrap_node_with_compaction`):消息累计超过阈值(默认 50)时调用 `arun_compaction(force=True)` 把历史消息压缩为增量摘要并入 `summary`,防止长会话撑爆上下文。`compaction_config=None` 且 agent 无 LLM 时静默禁用。
+- **消息通道压缩(compaction)**:`simple.py` / `rtl_graph.py` / `pipline.py` 的 `WorkflowState` / `RTLGraphState` 新增 `messages`(LangGraph `add_messages` 通道)与 `summary` 字段,每个业务节点产出追加一条 `AIMessage`。`build_*_workflow` 接受 `compaction_config` 参数,经 `graph/common/` 的 `_build_compaction_middleware` 构造中间件,再由 `register_nodes` 以可选 `compaction_mw` 形参对节点统一包装:节点返回后调用 `arun_compaction`(**非 force**,仅消息数 > `max_messages`(默认 50)时触发)把历史消息压缩为增量摘要并入 `summary`,防止长会话撑爆上下文。`compaction_config=None` 且 agent 无 LLM 时静默禁用。
 - **跨轮次上下文延续**:统一入口(CLI/API)经 `WorkflowAdapter`(`session/workflow_adapter.py`)执行——运行前从 workflow 专属会话的 checkpoint `messages` 通道读取历史节点产出(预览最多 5 条、每条截断 200 字符,拼为 `【历史执行记录】` 块),叠加 `MemoryManager.recall_text` 的长期记忆,合并注入 `raw_context`,实现多轮运行间的上下文延续。直接调用 `arun_simple_workflow` + `thread_id` 时,旧的 `_aget_previous_workflow_summary()`(checkpoint 摘要)仍可用(已标记 deprecated,待消息通道完全接管后移除)。
 
 ### 状态隔离机制
@@ -2370,7 +2377,7 @@ Verification (spec_design_task:验证计划)
 
 工作流运行期间可实时感知节点执行进度（CLI 打印 + Web 前端节点高亮）：
 
-- **节点级回调**：`arun_simple_workflow` 接受可选 `on_node_start` / `on_node_end` / `on_node_error` 回调（接收 `AgentEvent`，其中 NODE_START / NODE_END / NODE_ERROR 事件携带 `node` 节点名；NODE_END 额外携带 `content` —— 该节点的产出文本，从节点返回值的 `messages` 通道提取，供前端渲染节点结果块）。内部通过 LangGraph 的 `config["callbacks"]` 注入 `NodeTrackingHandler`（位于 `graph/common.py`），利用节点执行时 `metadata["langgraph_node"]` 字段识别业务节点（哨兵节点与内部 agent 子图会被过滤），在节点开始/结束/异常时构造 `AgentEvent` 并触发回调。不传回调时零额外开销。
+- **节点级回调**：`arun_simple_workflow` 接受可选 `on_node_start` / `on_node_end` / `on_node_error` 回调（接收 `AgentEvent`，其中 NODE_START / NODE_END / NODE_ERROR 事件携带 `node` 节点名；NODE_END 额外携带 `content` —— 该节点的产出文本，从节点返回值的 `messages` 通道提取，供前端渲染节点结果块）。内部通过 LangGraph 的 `config["callbacks"]` 注入 `NodeTrackingHandler`（位于 `graph/common/node_tracking.py`），利用节点执行时 `metadata["langgraph_node"]` 字段识别业务节点（哨兵节点与内部 agent 子图会被过滤），在节点开始/结束/异常时构造 `AgentEvent` 并触发回调。不传回调时零额外开销。
 - **CLI 场景**：`run_workflow` 把节点状态打印到终端（`▸ 节点开始: manager_plan` / `✓ 节点完成: manager_plan`）。
 - **Web 场景**：`CommandContext.workflow_event_cb` 把结构化事件（`workflow_node` / `workflow_status`）经 `/api/chat` 的 SSE 流实时推送；服务端将管理型命令的 `dispatch_command` 放到后台线程执行、输出经 `asyncio.Queue` 实时转发，前端 `WorkflowView` 据此高亮节点卡片与流程图。`workflow_node` 的 `done` 状态携带该节点产出（`content` 字段）时，前端在**会话窗口**追加一条带节点名标签的可折叠节点结果块（`web/src/components/Message.tsx` 的 `nodeName` 分支），使节点间的 message/result 可见；节点内 LLM 增量仍经 `token` 事件实时流式展示。
 
@@ -2441,7 +2448,7 @@ Verification (spec_design_task:验证计划)
 
 ```python
 import asyncio
-from graph.registry import build_workflow
+from graph.common import build_workflow
 from graph.simple import arun_simple_workflow
 
 # 方式1: 构建并运行(异步接口)
@@ -2488,7 +2495,7 @@ result = asyncio.run(run_workflow(context, "simple", "帮我分析项目结构")
 
 ```python
 # team/my_agent/my_agent.py
-from graph.registry import register_agent
+from graph.common import register_agent
 from team.base import TeamAgent
 from tools import all_tools
 
@@ -2522,7 +2529,7 @@ class MyAgent(TeamAgent):
 
 #### 2. 添加新工作流（register_workflow 注册）
 
-所有工作流统一通过 `graph.registry.register_workflow` 注册（唯一入口）,仅调用时机不同:
+所有工作流统一通过 `graph.common.register_workflow` 注册（唯一入口）,仅调用时机不同:
 
 **方式 A — 模块自注册（推荐,内置工作流采用）:**
 
@@ -2530,8 +2537,12 @@ class MyAgent(TeamAgent):
 
 ```python
 # graph/my_workflow.py
-from graph.common import NodeSpec, register_nodes, _build_compaction_middleware
-from graph.registry import register_workflow
+from graph.common import (
+    NodeSpec,
+    _build_compaction_middleware,
+    register_nodes,
+    register_workflow,
+)
 
 def build_my_workflow(agents: dict) -> StateGraph:
     my_agent = agents["my_agent"]
@@ -2560,12 +2571,14 @@ register_workflow(
 
 > ⚠️ **必须用 `register_nodes`/`functools.partial` 而非 `lambda` 绑定 agent 实例**:`partial` 保留 async 函数的 coroutine 特征(LangGraph 据此判定节点为异步并 `await`),`lambda` 会返回未 await 的 coroutine 导致 `InvalidUpdateError`。
 
-`graph/registry.py` 底部 `_load_builtin_workflows()` 在 registry 首次 import 时加载 `graph.simple` / `graph.pipline`,触发其自注册;新增内置工作流时在该函数中补充 import 即可。
+> **`register_nodes` 签名**：`register_nodes(builder, agents, injector, compaction_mw=None, specs=None)`。`compaction_mw` 为 `None` 时行为与未接线一致（仅对 `specs` 中每个节点做 `partial` 绑定后 `builder.add_node`）；非 `None` 时节点返回后由包装器调用 `arun_compaction(messages, existing_summary=...)` 做**节点级增量压缩**——**非 force**：仅当消息数 > `max_messages`（默认 50）时触发，并把压缩产生的 `messages`/`summary` 合并进节点返回值（`{**result, **update}`，`update["messages"]` 取代节点原 `messages`，不丢不重）。
+
+`graph/common/registry.py` 底部 `_load_builtin_workflows()` 在 registry 首次 import 时加载 `graph.simple` / `graph.pipline`,触发其自注册;新增内置工作流时在该函数中补充 import 即可。
 
 **方式 B — 动态注册（运行时添加,无需改源码,适合插件式/条件式工作流）:**
 
 ```python
-from graph.registry import register_workflow
+from graph.common import register_workflow
 
 register_workflow(
     name="my_flow",
