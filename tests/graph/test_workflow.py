@@ -53,6 +53,7 @@ class FakeAgent:
     prompt_file: str | None = None
     default_templates: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_TEMPLATES))
     calls: list[tuple[str, str]] = field(default_factory=list)
+    last_prompt: str = ""
 
     async def ainvoke(self, task: str, config=None) -> str:
         """异步版 invoke:记录调用并返回模拟结果(兼容 TeamAgent.ainvoke 既有调用方)"""
@@ -91,6 +92,7 @@ class FakeAgent:
         记录 (arun_structured, prompt) 并返回 completed(self._next(prompt))
         """
         self.calls.append(("arun_structured", prompt))
+        self.last_prompt = prompt
         return AgentTurnResult.completed(self._next(prompt))
 
 
@@ -202,6 +204,31 @@ def test_terminator_final_node_no_summary():
     prompt = terminator.calls[0][1]
     assert "记忆上下文摘要:" in prompt
     assert "用户偏好" not in prompt
+
+
+def test_factory_nodes_do_not_inject_agent_rules():
+    """工厂化节点传 base_prompts=""，prompt 不含 load_agent_rules 产物（「重要规则」）
+
+    证明 create_llm_node 的 base_prompts="" 生效：三个标准节点的 prompt 与恢复文件的
+    手写节点逐字一致，不注入 agent/AGENT.md 的「重要规则」/「工具规则」前缀。
+    """
+    manager = FakeAgent(name="manager", response="计划")
+    worker = FakeAgent(name="worker", response="结果")
+    terminator = FakeAgent(name="terminator", response="答案")
+
+    asyncio.run(manager_plan_node({"task": "任务", "context_summary": ""}, manager))
+    asyncio.run(worker_exec_node({"plan": "计划"}, worker))
+    asyncio.run(
+        terminator_final_node(
+            {"task": "任务", "plan": "计划", "worker_result": "结果"}, terminator
+        )
+    )
+
+    for agent in (manager, worker, terminator):
+        # 节点确有 prompt 产出（排除"prompt 为空所以不含规则"的假通过）
+        assert agent.last_prompt
+        assert "重要规则" not in agent.last_prompt
+        assert "工具规则" not in agent.last_prompt
 
 
 # ==================== 测试 AGENT.md 提示词模板 ====================
