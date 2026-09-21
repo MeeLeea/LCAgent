@@ -13,8 +13,8 @@ RTL 芯片设计流水线工作流 - Manager 提炼 → Architect 架构 → Des
     由条件路由 route_after_file_check / route_after_sim_check 判定:
       designer_file_check 校验本轮产出 RTL 文件存在且非空,缺失则回 designer_verilog 重做;
       sim_exec_check 实际执行 Vivado 仿真并检查覆盖率(syn_filelist ⊆ sim_filelist 且报告已生成),
-      仿真+覆盖率通过 → 直接终止(END);失败且轮次未达 max_rounds → 携带上轮验证报告反馈回到
-      designer_verilog 重新设计;轮次达 max_rounds 上限 → 强制终止(END,防止死循环)。
+      仿真+覆盖率通过 → 经 designer_output 交付后终止(END);失败且轮次未达 max_rounds → 携带上轮验证报告反馈回到
+      designer_verilog 重新设计;轮次达 max_rounds 上限 → 强制经 designer_output 交付后终止(END,防止死循环)。
 
 节点执行链路说明：
     节点函数在自身渲染 prompt(get_template + render_template + 技能注入)后,
@@ -521,21 +521,21 @@ def verification_passed(report: str) -> bool:
 
 def route_after_file_check(state: RTLGraphState) -> str:
     """designer_file_check 后的条件路由:文件校验通过 → verification_check;
-    失败且未达轮次上限 → 回 designer_verilog 重做;达上限 → END(防死循环)。"""
+    失败且未达轮次上限 → 回 designer_verilog 重做;达上限 → designer_output 交付。"""
     if state.get("file_check_passed"):
         return "verification_check"
     if state.get("round", 0) >= state.get("max_rounds", 3):
-        return END
+        return "designer_output"
     return "designer_verilog"
 
 
 def route_after_sim_check(state: RTLGraphState) -> str:
-    """sim_exec_check 后的条件路由:仿真+覆盖率通过 → END;
-    失败且未达轮次上限 → 回 designer_verilog 重做;达上限 → END(防死循环)。"""
+    """sim_exec_check 后的条件路由:仿真+覆盖率通过 → designer_output 交付;
+    失败且未达轮次上限 → 回 designer_verilog 重做;达上限 → designer_output 交付。"""
     if state.get("sim_check_passed"):
-        return END
+        return "designer_output"
     if state.get("round", 0) >= state.get("max_rounds", 3):
-        return END
+        return "designer_output"
     return "designer_verilog"
 
 
@@ -600,11 +600,13 @@ def build_rtl_graph_workflow(
             NodeSpec("verification_check", verification_check_node, role="rtl_verification"),
             NodeSpec("designer_file_check", designer_file_check_node, role="rtl_designer"),
             NodeSpec("sim_exec_check", sim_exec_check_node, role="rtl_verification"),
+            NodeSpec("designer_output", designer_output_node, role="rtl_designer"),
         ],
     )
 
     # 添加边: START → summarize → architect 五阶段 → designer_spec → verification_plan
-    #        → designer_verilog → verification_check →(条件) END 或回 designer_verilog
+    #        → designer_verilog → verification_check →(条件) designer_output 交付 或回 designer_verilog
+    #        designer_output → END(两条终态路径均经交付节点后终止)
     builder.add_edge(START, "summarize")
     builder.add_edge("summarize", "architect_plan")
     builder.add_edge("architect_plan", "architect_design")
@@ -620,6 +622,7 @@ def build_rtl_graph_workflow(
         route_after_file_check,
         {
             "verification_check": "verification_check",
+            "designer_output": "designer_output",
             "designer_verilog": "designer_verilog",
         },
     )
@@ -628,10 +631,11 @@ def build_rtl_graph_workflow(
         "sim_exec_check",
         route_after_sim_check,
         {
-            END: END,
+            "designer_output": "designer_output",
             "designer_verilog": "designer_verilog",
         },
     )
+    builder.add_edge("designer_output", END)
 
     return builder.compile(checkpointer=checkpointer)
 
