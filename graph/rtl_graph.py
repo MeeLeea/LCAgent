@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import Sequence
 from typing import Annotated, Any, Optional, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage
@@ -86,6 +87,9 @@ class RTLGraphState(TypedDict, total=False):
     sim_check_passed: bool    # sim_exec_check 仿真+覆盖率校验结果
     sim_status: str           # sim_exec_check 结论(PASS/FAIL/ERROR)
     sim_log_path: str         # sim_exec_check 写出的完整 Vivado 日志路径
+    # 本 workflow 线程手动加载的技能名列表(经 skill:<name> 写入,随 checkpoint
+    # per-thread 持久化);节点经 create_llm_node 读取并注入 prompt
+    active_skills: list[str]
 
 
 # 2. 节点函数(提示词模板由各角色 TeamAgent 懒加载,节点需要时调用 get_template)
@@ -658,6 +662,7 @@ async def arun_rtl_graph_workflow(
     memory=None,
     memory_thread_id: str | None = None,
     is_run_mode: bool = False,
+    active_skills: Sequence[str] = (),
 ) -> dict:
     """
     运行 RTL 芯片设计流水线工作流(异步)
@@ -677,6 +682,8 @@ async def arun_rtl_graph_workflow(
         memory: MemoryManager 实例（长期记忆召回与结果沉淀）；None 禁用
         memory_thread_id: 长期记忆使用的会话线程 ID
         is_run_mode: 是否运行模式（决定 DONE 事件是否标记为重要记忆）
+        active_skills: 显式注入的手动加载技能名(仅非空时写入初始状态,
+            不覆盖 checkpoint 已持久化的值)
 
     Returns:
         包含 final_answer 的结果字典
@@ -711,6 +718,7 @@ async def arun_rtl_graph_workflow(
         memory=memory,
         memory_thread_id=memory_thread_id,
         is_run_mode=is_run_mode,
+        active_skills=active_skills,
     )
 
 

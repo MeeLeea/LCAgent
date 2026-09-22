@@ -81,9 +81,12 @@ def create_llm_node(
 
         if inject_skill and injector is not None:
             match_text = match_text_fn(state) if match_text_fn else state.get("task", "")
+            # 手动加载的技能名从 state["active_skills"] 读取（per-thread，随 checkpoint 持久化）；
+            # 与角色级 fixed_skills、自动匹配在注入器内三来源合并
             prompt = injector.inject_into_prompt(
                 prompt,
                 match_text,
+                active_names=tuple(state.get("active_skills") or ()),
                 exclude_skills=exclude_skills,
                 fixed_skills=tuple(getattr(agent, "fixed_skills", ()) or ()),
             )
