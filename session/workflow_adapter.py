@@ -51,6 +51,7 @@ from graph.common import NodeTrackingHandler, _build_compaction_middleware
 from llm.message_utils import build_interrupt_event
 from memory.manager import MemoryManager
 from session.registry import SessionRegistry
+from skmng.manager import SkillManager, default_skills_dir
 from utils.events import AgentEvent
 from utils.logging_config import TraceContext, generate_trace_id
 
@@ -87,6 +88,8 @@ class WorkflowAdapter:
         self._checkpointer = checkpointer if checkpointer is not None else registry.checkpointer
         self._compaction_config = compaction_config
         self._closed = False
+        # 技能管理器惰性创建（首次 list_skills/aload_skill 时扫描默认技能目录）
+        self._skills: SkillManager | None = None
 
     # ============ SessionAgent 协议：属性 ============
 
@@ -207,6 +210,76 @@ class WorkflowAdapter:
         store = getattr(self._registry, "_store", None)
         if store is not None:
             await store.aclear_history(sid)
+
+    # ============ 技能（对齐 AgentCore.SkillOps） ============
+
+    def _get_skill_manager(self) -> SkillManager:
+        """惰性创建技能管理器（扫描默认技能目录 .agents/skills）。"""
+        if self._skills is None:
+            self._skills = SkillManager(default_skills_dir())
+        return self._skills
+
+    def list_skills(self) -> list[dict[str, str]]:
+        """列出所有本地可用技能（与 AgentCore.list_skills 同构）。"""
+        return self._get_skill_manager().list_skills()
+
+    @property
+    def auto_match_skills(self) -> bool:
+        """workflow 图构建时是否启用技能自动匹配（默认 True）。"""
+        return True
+
+    async def aload_skill(self, name: str, thread_id: str | None = None) -> bool:
+        """加载技能到指定 workflow 会话（写入 state.active_skills）。
+
+        技能名存入 workflow 会话的 per-thread checkpoint state，由节点经
+        ``create_llm_node`` 读取 ``state["active_skills"]`` 后注入提示词。
+        与 ``SkillOps.aload_skill`` 语义一致，仅图来源不同。
+
+        Args:
+            name: 技能名（目录名或 frontmatter name）
+            thread_id: 目标 workflow 会话 ID（为 None 时使用当前会话）
+
+        Returns:
+            True=成功加载；False=技能不存在或目标会话非 workflow 会话
+        """
+        if self._get_skill_manager().get_skill(name) is None:
+            return False
+        tid = self._current_sid(thread_id)
+        workflow_name = self._registry.workflow_name_of(tid)
+        if not workflow_name:
+            return False
+
+        from graph.common import build_workflow
+
+        graph, _agents = build_workflow(workflow_name, checkpointer=self._checkpointer)
+        config = {"configurable": {"thread_id": tid}}
+        state = await graph.aget_state(config)
+        current: set[str] = set(
+            (state.values if state and state.values else {}).get("active_skills") or []
+        )
+        current.add(name)
+        await graph.aupdate_state(config, {"active_skills": sorted(current)})
+        return True
+
+    async def aclear_skills(self, thread_id: str | None = None) -> None:
+        """清空指定 workflow 会话的手动加载技能（写入空列表）。
+
+        注：只清 state.active_skills，不影响 TeamAgent.fixed_skills 类属性
+        （角色级固定依赖由 build_skill_block 独立合并，不经 state 通道）。
+
+        Args:
+            thread_id: 目标 workflow 会话 ID（为 None 时使用当前会话）
+        """
+        tid = self._current_sid(thread_id)
+        workflow_name = self._registry.workflow_name_of(tid)
+        if not workflow_name:
+            return
+
+        from graph.common import build_workflow
+
+        graph, _agents = build_workflow(workflow_name, checkpointer=self._checkpointer)
+        config = {"configurable": {"thread_id": tid}}
+        await graph.aupdate_state(config, {"active_skills": []})
 
     # ============ SessionAgent 协议：压缩 ============
 
