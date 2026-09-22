@@ -82,7 +82,10 @@ def create_llm_node(
         if inject_skill and injector is not None:
             match_text = match_text_fn(state) if match_text_fn else state.get("task", "")
             prompt = injector.inject_into_prompt(
-                prompt, match_text, exclude_skills=exclude_skills
+                prompt,
+                match_text,
+                exclude_skills=exclude_skills,
+                fixed_skills=tuple(getattr(agent, "fixed_skills", ()) or ()),
             )
 
         result = await run_team_turn_with_interrupt(agent, prompt, config)

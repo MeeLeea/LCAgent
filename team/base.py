@@ -253,17 +253,22 @@ class TeamAgent:
         self,
         task: str,
         active_names: Sequence[str] = (),
+        exclude_skills: Sequence[str] = (),
+        fixed_skills: Sequence[str] | None = None,
     ) -> str:
         """根据任务匹配技能并渲染指引块(内建技能注入能力)
 
         转发 skmng.core.build_skill_block 实现三来源合并:
-        - fixed_skills(self 类属性,角色级固定依赖)
+        - fixed_skills(self 类属性,角色级固定依赖;显式传入时以传入值为准)
         - active_names(由节点函数从 state["active_skills"] 取值传入)
         - match_skills(auto_match_skills 开启时按任务文本自动匹配)
 
         Args:
             task: 用户任务描述(用于技能匹配)
             active_names: 手动加载的技能名(由节点函数从 state 取值传入)
+            exclude_skills: 需排除的技能名(在三来源合并后统一剔除)
+            fixed_skills: 角色级固定依赖技能名;None 时回退 self.fixed_skills
+                (保持类属性默认来源),显式传入时以传入值为准
 
         Returns:
             技能指引块文本;未命中任何技能或未开启自动匹配时返回空串
@@ -272,8 +277,11 @@ class TeamAgent:
             self.skill_manager,
             task,
             active_names=tuple(active_names),
-            fixed_skills=tuple(self.fixed_skills),
+            fixed_skills=(
+                tuple(self.fixed_skills) if fixed_skills is None else tuple(fixed_skills)
+            ),
             auto_match=self.auto_match_skills,
+            exclude_skills=tuple(exclude_skills),
         )
 
     def inject_into_prompt(
@@ -281,6 +289,8 @@ class TeamAgent:
         prompt: str,
         task: str,
         active_names: Sequence[str] = (),
+        exclude_skills: Sequence[str] = (),
+        fixed_skills: Sequence[str] | None = None,
     ) -> str:
         """将技能指引块追加到 prompt 末尾(已含 skill 块时跳过)
 
@@ -291,11 +301,13 @@ class TeamAgent:
             prompt: 渲染后的节点提示词
             task: 用户任务描述
             active_names: 手动加载的技能名(由节点函数从 state 取值传入)
+            exclude_skills: 需排除的技能名(在三来源合并后统一剔除)
+            fixed_skills: 角色级固定依赖技能名;None 时回退 self.fixed_skills
 
         Returns:
             注入技能指引块后的提示词
         """
-        block = self.build_skill_block(task, active_names)
+        block = self.build_skill_block(task, active_names, exclude_skills, fixed_skills)
         return _inject_into_prompt(prompt, block)
     
     @property
