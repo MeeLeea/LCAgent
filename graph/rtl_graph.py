@@ -142,19 +142,18 @@ async def summarize_context(
 ) -> RTLGraphState:
     """Manager 提炼记忆上下文,生成分发给下游节点的上下文摘要
 
-    raw_context 为空时短路返回空串,跳过 LLM 调用(对照原
-    ManagerAgent.asummarize_context 的短路语义)。非空时把
-    ``summarize_context`` 模板内容拼到 prompt 前部作为指令(原实现经
+    raw_context 为空时短路返回空串,跳过 LLM 调用。非空时把
+    ``summarize_context`` 模板内容拼到 prompt 前部作为指令(经
     _astream_messages 的 system 消息语义,helper 单 prompt 通道下合并为用户消息),
     调 ``run_team_turn_with_interrupt`` 流式执行。
 
     config 透传(含 callbacks):使 summarize 的 LLM token 增量可流出到外层事件流。
     """
     raw = state.get("raw_context", "")
-    # 与原 asummarize_context 一致:raw 为空时短路返回空串(不调 helper)
+    # raw 为空时短路返回空串(不调 helper)
     if not raw:
         return {"context_summary": "", "messages": [AIMessage(content="")]}
-    # summarize 节点不注入技能块(原 asummarize_context 也不调 injector)
+    # summarize 节点不注入技能块(不调 injector)
     prompt = f"{agent.get_template('summarize_context')}\n\n{raw}"
     result = await run_team_turn_with_interrupt(agent, prompt, config)
     return {"context_summary": result, "messages": [AIMessage(content=result)]}

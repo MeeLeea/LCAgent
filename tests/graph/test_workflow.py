@@ -21,7 +21,7 @@ from graph.simple import (
 )
 from team.base import TeamAgent
 
-# 默认模板(与各角色类的 default_templates 一致,供 FakeAgent 兜底)
+# 默认模板(与各角色 AGENT.md 的 ## workflow:* 小节一致,供 FakeAgent 兜底)
 DEFAULT_TEMPLATES: dict[str, str] = {
     "manager_plan": "请为以下任务制定详细的执行计划:\n\n{task}\n\n记忆上下文摘要:\n{context_summary}",
     "summarize_context": "你是一个工作流上下文提炼助手。",
@@ -40,8 +40,7 @@ class FakeAgent:
 
     summarize 节点(summarize_context 节点)的 prompt 含 ``summarize_context``
     模板前缀(节点把模板拼到 raw 前部),据此识别后返回 ``summary_response``,
-    与原 ``asummarize_context`` 返回 summary_response 的语义对齐;其余节点
-    回退 ``response``。
+    其余节点回退 ``response``。
     """
 
     # summarize_context 节点 prompt 的特征字符串(节点模板固定,稳定可识别)

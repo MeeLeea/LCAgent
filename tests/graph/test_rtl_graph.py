@@ -38,7 +38,7 @@ from graph.rtl_graph import (
 )
 from team.base import TeamAgent
 
-# 默认模板(与各角色类的 default_templates 一致,供 FakeRTLAgent.get_template 兜底)
+# 默认模板(与各角色 AGENT.md 的 ## workflow:* 小节一致,供 FakeRTLAgent.get_template 兜底)
 DEFAULT_TEMPLATES: dict[str, str] = {
     "summarize_context": "你是一个工作流上下文提炼助手。",
     "architect_plan": "请为以下芯片架构设计任务制定详细的执行计划:\n\n{task}\n\n",
