@@ -26,7 +26,7 @@ def create_llm_node(
     match_text_fn: Callable[[dict[str, Any]], str] | None = None,
     exclude_skills: tuple[str, ...] = (),
     inject_skill: bool = True,
-    extra_return_fn: Callable[[dict[str, Any], str], dict[str, Any]] | None = None,
+    extra_return_fn: Callable[[dict[str, Any], str, Optional[RunnableConfig]], dict[str, Any]] | None = None,  # noqa: UP045
     base_prompts: str | None = None,
 ) -> Callable[..., dict[str, Any]]:
     """通用 LLM 节点工厂 — 消除重复的样板代码。
@@ -42,8 +42,9 @@ def create_llm_node(
             为 None 时默认返回 state.get("task", "")
         exclude_skills: 注入时排除的技能名列表
         inject_skill: 是否注入技能块（False 用于摘要节点等不需技能的场景）
-        extra_return_fn: 额外的 state 返回字段函数 ``(state, result) -> dict``;
-            用于需要返回 round/output_files 等额外字段的节点
+        extra_return_fn: 额外的 state 返回字段函数 ``(state, result, config) -> dict``;
+            用于需要返回 round/output_files 等额外字段的节点（config 供读取
+            ``configurable.workspace_path`` 等运行时上下文）
         base_prompts: 基础提示词;默认 None 表示按角色能力**运行时**解析
             （见 ``llm.config.load_agent_rules``）：持有工具的 Agent 注入
             「重要规则」+「工具规则」，纯文本角色的 Agent 仅注入「重要规则」。
@@ -91,7 +92,7 @@ def create_llm_node(
             "messages": [AIMessage(content=result)],
         }
         if extra_return_fn is not None:
-            ret.update(extra_return_fn(state, result))
+            ret.update(extra_return_fn(state, result, config))
         return ret
 
     return node_fn
