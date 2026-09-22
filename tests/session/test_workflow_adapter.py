@@ -696,3 +696,148 @@ def test_close_idempotent():
         assert "已关闭" in str(error)
     else:
         raise AssertionError("关闭后应拒绝执行")
+
+
+# ────────────── 技能：list_skills / aload_skill / aclear_skills ──────────────
+
+
+def _make_skill_dir(tmp_path, name: str = "git-helper") -> str:
+    """在 tmp_path 下造一个技能目录（含带 frontmatter 的 SKILL.md）。"""
+    skill_md = tmp_path / "skills" / name / "SKILL.md"
+    skill_md.parent.mkdir(parents=True, exist_ok=True)
+    skill_md.write_text(
+        f"---\nname: {name}\ndescription: 测试技能\n---\n# {name} 指引正文\n",
+        encoding="utf-8",
+    )
+    return str(tmp_path / "skills")
+
+
+class FakeGraphWithState(FakeGraph):
+    """记录 aupdate_state，并可返回既有 state（供 aload_skill 读 active_skills）。"""
+
+    def __init__(self, existing: dict | None = None) -> None:
+        super().__init__()
+        self.existing = existing
+        self.state_reads: list = []
+
+    async def aget_state(self, config):
+        self.state_reads.append(config)
+        if self.existing is None:
+            return None
+        return types.SimpleNamespace(values=self.existing)
+
+
+def test_list_skills_scans_default_dir(tmp_path, monkeypatch):
+    """list_skills 扫描默认技能目录（惰性创建 SkillManager）。"""
+    skills_dir = _make_skill_dir(tmp_path)
+    monkeypatch.setattr(
+        "session.workflow_adapter.default_skills_dir", lambda: skills_dir
+    )
+    adapter = _make_adapter()
+
+    skills = adapter.list_skills()
+
+    assert [s["name"] for s in skills] == ["git-helper"]
+
+
+def test_auto_match_skills_defaults_true():
+    """auto_match_skills 属性默认 True（与 AgentCore 默认一致）。"""
+    assert _make_adapter().auto_match_skills is True
+
+
+def test_aload_skill_unknown_returns_false(tmp_path, monkeypatch):
+    """技能不存在时返回 False（不触碰图/checkpoint）。"""
+    skills_dir = _make_skill_dir(tmp_path)
+    monkeypatch.setattr(
+        "session.workflow_adapter.default_skills_dir", lambda: skills_dir
+    )
+    adapter = _make_adapter()
+
+    assert asyncio.run(adapter.aload_skill("no-such-skill")) is False
+
+
+def test_aload_skill_non_workflow_session_returns_false(tmp_path, monkeypatch):
+    """目标会话非 workflow 会话时返回 False。"""
+    skills_dir = _make_skill_dir(tmp_path)
+    monkeypatch.setattr(
+        "session.workflow_adapter.default_skills_dir", lambda: skills_dir
+    )
+    reg = _make_registry(workflow_name=None)
+    adapter = _make_adapter(reg)
+
+    assert asyncio.run(adapter.aload_skill("git-helper")) is False
+
+
+def test_aload_skill_writes_sorted_union(tmp_path, monkeypatch):
+    """加载技能：读取既有 active_skills 并写入排序去重后的并集。"""
+    skills_dir = _make_skill_dir(tmp_path, name="a-skill")
+    # 再补一个技能，验证不相关的技能名不受影响
+    _make_skill_dir(tmp_path, name="b-skill")
+    monkeypatch.setattr(
+        "session.workflow_adapter.default_skills_dir", lambda: skills_dir
+    )
+    fake_graph = FakeGraphWithState(existing={"active_skills": ["b-skill"]})
+    monkeypatch.setattr(
+        "graph.common.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
+    adapter = _make_adapter()
+
+    result = asyncio.run(adapter.aload_skill("a-skill"))
+
+    assert result is True
+    assert len(fake_graph.update_calls) == 1
+    config, update = fake_graph.update_calls[0]
+    assert config == {"configurable": {"thread_id": "workflow-simple-thread-1"}}
+    assert update == {"active_skills": ["a-skill", "b-skill"]}
+
+
+def test_aload_skill_no_existing_state_writes_single(tmp_path, monkeypatch):
+    """无既有 state（aget_state 返回 None）时写入单元素列表。"""
+    skills_dir = _make_skill_dir(tmp_path)
+    monkeypatch.setattr(
+        "session.workflow_adapter.default_skills_dir", lambda: skills_dir
+    )
+    fake_graph = FakeGraphWithState(existing=None)
+    monkeypatch.setattr(
+        "graph.common.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
+    adapter = _make_adapter()
+
+    result = asyncio.run(adapter.aload_skill("git-helper"))
+
+    assert result is True
+    assert fake_graph.update_calls[0][1] == {"active_skills": ["git-helper"]}
+
+
+def test_aclear_skills_writes_empty_list(monkeypatch):
+    """清空技能：向 state 写入空列表。"""
+    fake_graph = FakeGraphWithState()
+    monkeypatch.setattr(
+        "graph.common.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
+    adapter = _make_adapter()
+
+    asyncio.run(adapter.aclear_skills())
+
+    assert len(fake_graph.update_calls) == 1
+    config, update = fake_graph.update_calls[0]
+    assert config == {"configurable": {"thread_id": "workflow-simple-thread-1"}}
+    assert update == {"active_skills": []}
+
+
+def test_aclear_skills_non_workflow_session_noop(monkeypatch):
+    """非 workflow 会话清空技能为无操作（不写 checkpoint）。"""
+    built: list = []
+    monkeypatch.setattr(
+        "graph.common.build_workflow",
+        lambda name, checkpointer=None: built.append(name) or (FakeGraph(), {}),
+    )
+    reg = _make_registry(workflow_name=None)
+    adapter = _make_adapter(reg)
+
+    asyncio.run(adapter.aclear_skills())
+
+    assert built == []

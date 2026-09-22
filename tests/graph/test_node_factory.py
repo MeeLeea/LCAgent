@@ -45,11 +45,15 @@ class _FakeInjector:
         self.received_kwargs: list[dict] = []
 
     def inject_into_prompt(
-        self, prompt: str, task: str, exclude_skills=(), fixed_skills=()
+        self, prompt: str, task: str, active_names=(), exclude_skills=(), fixed_skills=()
     ) -> str:
         self.received.append(prompt)
         self.received_kwargs.append(
-            {"exclude_skills": exclude_skills, "fixed_skills": fixed_skills}
+            {
+                "active_names": active_names,
+                "exclude_skills": exclude_skills,
+                "fixed_skills": fixed_skills,
+            }
         )
         return f"{prompt}\n\n【技能块】"
 
@@ -206,7 +210,11 @@ def test_node_passes_agent_fixed_skills_to_injector(monkeypatch):
     asyncio.run(node_fn({"task": "任务"}, _FakeAgentWithFixedSkills(), injector))
 
     assert injector.received_kwargs == [
-        {"exclude_skills": (), "fixed_skills": ("vivado-2025.2",)}
+        {
+            "active_names": (),
+            "exclude_skills": (),
+            "fixed_skills": ("vivado-2025.2",),
+        }
     ]
 
 
@@ -223,6 +231,63 @@ def test_node_passes_empty_fixed_skills_when_agent_lacks_attribute(monkeypatch):
     asyncio.run(node_fn({"task": "任务"}, _FakeAgent(), injector))
 
     assert injector.received_kwargs[0]["fixed_skills"] == ()
+
+
+# ──────────────────────────────────────────────
+# create_llm_node: state.active_skills → injector 透传
+# ──────────────────────────────────────────────
+
+
+def test_node_passes_state_active_skills_to_injector(monkeypatch):
+    """节点把 state["active_skills"] 透传给 injector(手动加载技能注入路径)。
+
+    回归保护:修复前节点不传 active_names,手动加载的技能永远到不了工作流节点。
+    """
+    injector = _FakeInjector()
+
+    async def _fake_run(agent, prompt, config=None) -> str:
+        return "节点结果"
+
+    monkeypatch.setattr(node_factory, "run_team_turn_with_interrupt", _fake_run)
+
+    node_fn = node_factory.create_llm_node("tpl", "output")
+    asyncio.run(
+        node_fn({"task": "任务", "active_skills": ["git-helper"]}, _FakeAgent(), injector)
+    )
+
+    assert injector.received_kwargs[0]["active_names"] == ("git-helper",)
+
+
+def test_node_active_skills_empty_when_state_lacks_key(monkeypatch):
+    """state 无 active_skills 键时透传空元组(无手动加载技能)。"""
+    injector = _FakeInjector()
+
+    async def _fake_run(agent, prompt, config=None) -> str:
+        return "节点结果"
+
+    monkeypatch.setattr(node_factory, "run_team_turn_with_interrupt", _fake_run)
+
+    node_fn = node_factory.create_llm_node("tpl", "output")
+    asyncio.run(node_fn({"task": "任务"}, _FakeAgent(), injector))
+
+    assert injector.received_kwargs[0]["active_names"] == ()
+
+
+def test_node_active_skills_none_value_yields_empty_tuple(monkeypatch):
+    """state["active_skills"] 为 None(显式置空)时透传空元组而非报错。"""
+    injector = _FakeInjector()
+
+    async def _fake_run(agent, prompt, config=None) -> str:
+        return "节点结果"
+
+    monkeypatch.setattr(node_factory, "run_team_turn_with_interrupt", _fake_run)
+
+    node_fn = node_factory.create_llm_node("tpl", "output")
+    asyncio.run(
+        node_fn({"task": "任务", "active_skills": None}, _FakeAgent(), injector)
+    )
+
+    assert injector.received_kwargs[0]["active_names"] == ()
 
 
 if __name__ == "__main__":
