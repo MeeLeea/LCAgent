@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Annotated, Optional, TypedDict
+from typing import Annotated, Any, Optional, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage
 from langchain_core.runnables import RunnableConfig
@@ -234,6 +234,46 @@ def _verification_check_task(s: RTLGraphState) -> str:
     return "\n\n".join(parts)
 
 
+def _designer_verilog_task(s: RTLGraphState) -> str:
+    """Designer RTL 编码节点的任务文本:task + 设计规格 + 验证计划 + 上轮验证反馈。
+
+    与手写节点逐字一致(拼装逻辑承载原 parts 逻辑,供模板变量与技能匹配文本复用):
+    仅当 ``round > 0`` 且存在 ``verification_report`` 时追加反馈小节。
+    """
+    task = s["task"]
+    design_spec = s.get("design_spec", "")
+    vplan = s.get("verification_plan", "")
+    report = s.get("verification_report", "")
+    round_n = s.get("round", 0)
+    parts = [task]
+    if design_spec:
+        parts.append(f"【设计规格与Filelist】\n{design_spec}")
+    if vplan:
+        parts.append(f"【验证计划】\n{vplan}")
+    if round_n > 0 and report:
+        parts.append(f"【第 {round_n} 轮验证报告反馈(请据此修正 RTL)】\n{report}")
+    return "\n\n".join(parts)
+
+
+def _designer_verilog_extra(
+    state: RTLGraphState,
+    result: str,
+    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 node_fn 注解形态一致
+) -> dict[str, Any]:
+    """Designer RTL 编码节点的额外返回字段:round 递增 + output_files 解析。
+
+    解析 designer 产出的 ``scripts/syn_filelist.f``,得到本轮待交付 RTL 文件
+    清单(相对路径),供下游 designer_file_check 校验存在/非空,以及
+    sim_exec_check 做覆盖率包含检查。workspace 取自
+    ``config.configurable.workspace_path``,缺失时优雅降级为空列表。
+    """
+    workspace = ((config or {}).get("configurable", {}) or {}).get("workspace_path")
+    return {
+        "round": state.get("round", 0) + 1,
+        "output_files": _parse_filelist(workspace, "scripts/syn_filelist.f"),
+    }
+
+
 # Architect 五阶段 + Designer/Verification 规格与验证节点:统一走 create_llm_node 工厂。
 # base_prompts="" 使 prompt 与手写版逐字一致(不注入 load_agent_rules)。
 architect_plan_node = create_llm_node(
@@ -293,50 +333,14 @@ verification_plan_node = create_llm_node(
 )
 
 
-async def designer_verilog_node(
-    state: RTLGraphState,
-    agent: TeamAgent,
-    injector=None,
-    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 simple.py 一致:LangGraph 注解判定要求该字符串形态
-) -> RTLGraphState:
-    """Designer 输出可综合 RTL 源码(多轮迭代时携带上轮验证反馈)。
-
-    节点内拼装 task + 设计规格 + 验证计划 + 上轮反馈为 ``prompt_task``,
-    渲染 ``verilog_design`` 模板 + 注入技能块,然后调
-    ``run_team_turn_with_interrupt`` 流式执行;技能注入 match 文本为
-    ``prompt_task``(对照原 DesignerAgent.averilog_design_task)。
-
-    round 计数:每次进入本节点轮次 +1,供条件路由判断是否达 max_rounds 上限。
-    config 透传(含 callbacks):使 Designer LLM token 增量可流出到外层事件流。
-    """
-    task = state["task"]
-    design_spec = state.get("design_spec", "")
-    vplan = state.get("verification_plan", "")
-    report = state.get("verification_report", "")
-    round_n = state.get("round", 0)
-    parts = [task]
-    if design_spec:
-        parts.append(f"【设计规格与Filelist】\n{design_spec}")
-    if vplan:
-        parts.append(f"【验证计划】\n{vplan}")
-    if round_n > 0 and report:
-        parts.append(f"【第 {round_n} 轮验证报告反馈(请据此修正 RTL)】\n{report}")
-    prompt_task = "\n\n".join(parts)
-    prompt = agent.render_template(agent.get_template("verilog_design"), task=prompt_task)
-    if injector is not None:
-        prompt = injector.inject_into_prompt(prompt, prompt_task)
-    result = await run_team_turn_with_interrupt(agent, prompt, config)
-    # 解析 designer 产出的 syn_filelist.f,得到本轮待交付 RTL 文件清单(相对路径),
-    # 供下游 designer_file_check 校验存在/非空,以及 sim_exec_check 做覆盖率包含检查。
-    configurable = ((config or {}).get("configurable", {}) if config else {})
-    workspace = configurable.get("workspace_path")
-    output_files = _parse_filelist(workspace, "scripts/syn_filelist.f")
-    return {
-        "rtl_code": result,
-        "round": round_n + 1,
-        "output_files": output_files,
-        "messages": [AIMessage(content=result)],
-    }
+designer_verilog_node = create_llm_node(
+    template_name="verilog_design",
+    output_field="rtl_code",
+    template_vars_fn=lambda s: {"task": _designer_verilog_task(s)},
+    match_text_fn=_designer_verilog_task,
+    extra_return_fn=_designer_verilog_extra,
+    base_prompts="",
+)
 
 
 verification_check_node = create_llm_node(
