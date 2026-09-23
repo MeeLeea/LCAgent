@@ -7,8 +7,11 @@ if ROOT not in sys.path:
 
 from llm.config import (
     _DEFAULT_AGENT_CORE_PROMPT,
+    AGENT_RULES_HEADING,
+    AGENT_TOOL_RULES_HEADING,
     DEFAULTS,
     _load_agent_prompt,
+    compose_role_system_prompt,
     load_agent_config,
     resolve_path,
 )
@@ -117,3 +120,58 @@ def test_prompt_file_empty(tmp_path):
 
     result = _load_agent_prompt(str(prompt_file))
     assert result == _DEFAULT_AGENT_CORE_PROMPT
+
+
+# ──────────────────────────────────────────────
+# compose_role_system_prompt: 角色提示词拼接基础规则
+# ──────────────────────────────────────────────
+
+ROLE_PROMPT = "# Agent 核心提示词\n你是一个芯片架构工程师（Architect）。"
+
+
+def test_compose_role_prompt_with_tools_keeps_both_rule_sections():
+    """持有工具的角色：基础规则两节 + 角色提示词都保留（修复"切角色丢通用规则"缺陷）。"""
+    composed = compose_role_system_prompt(ROLE_PROMPT, role="architect", has_tools=True)
+    headings = [ln for ln in composed.splitlines() if ln.startswith("## ")]
+
+    assert headings == [AGENT_RULES_HEADING, AGENT_TOOL_RULES_HEADING]
+    assert "请用中文回答。" in composed
+    assert "schedule_task" in composed  # 工具规则专属条款
+    assert "芯片架构工程师" in composed  # 角色提示词未被丢弃
+
+
+def test_compose_role_prompt_without_tools_omits_tool_section():
+    """无工具角色：仅注入「重要规则」，不注入「工具规则」（避免误导模型调用不存在的工具）。"""
+    composed = compose_role_system_prompt(ROLE_PROMPT, role="manager", has_tools=False)
+    headings = [ln for ln in composed.splitlines() if ln.startswith("## ")]
+
+    assert headings == [AGENT_RULES_HEADING]
+    assert AGENT_TOOL_RULES_HEADING not in composed
+    assert "请用中文回答。" in composed
+    assert "芯片架构工程师" in composed
+
+
+def test_compose_role_prompt_puts_base_rules_before_role_prompt():
+    """顺序固定为基础规则 → 角色提示词（缓存前缀稳定，避免逐轮抖动）。"""
+    composed = compose_role_system_prompt(ROLE_PROMPT, role="architect")
+
+    assert composed.index(AGENT_RULES_HEADING) < composed.index("芯片架构工程师")
+
+
+def test_compose_role_prompt_default_role_is_not_concatenated():
+    """role="default" 的提示词来源就是 agent/AGENT.md，拼接会导致规则小节重复。"""
+    agent_md_like = f"{AGENT_RULES_HEADING}\n1. 规则\n\n{AGENT_TOOL_RULES_HEADING}\n1. 工具"
+    composed = compose_role_system_prompt(agent_md_like, role="default")
+
+    assert composed == agent_md_like
+    assert composed.count(AGENT_RULES_HEADING) == 1
+    assert composed.count(AGENT_TOOL_RULES_HEADING) == 1
+
+
+def test_compose_role_prompt_empty_role_prompt_falls_back_to_rules():
+    """角色提示词为空时回退为纯基础规则，不产生多余空白。"""
+    composed = compose_role_system_prompt("", role="architect", has_tools=True)
+
+    assert composed.startswith(AGENT_RULES_HEADING)
+    assert composed == composed.strip()
+
