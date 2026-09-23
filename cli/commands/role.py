@@ -57,7 +57,7 @@ async def _switch_role(context: CommandContext, role_name: str, task_text: str) 
     """更新当前会话角色，可选地在切换后立即执行任务。"""
     try:
         from agent.role_sw import _BASE_DIR, _locate_team_agent_dir
-        from llm.config import load_team_agent_config
+        from llm.config import compose_role_system_prompt, load_team_agent_config
         from team.base import TeamAgent
 
         role_dir = _locate_team_agent_dir(role_name)
@@ -66,6 +66,9 @@ async def _switch_role(context: CommandContext, role_name: str, task_text: str) 
         if content is None:
             raise FileNotFoundError(f"角色提示词为空: {role_name}")
         prompt, _ = TeamAgent.parse_prompt_sections(content)
+        # 角色提示词拼接基础规则（主对话 Agent 持有工具，故附带「工具规则」）；
+        # role="default" 时内部特判不拼接，避免 agent/AGENT.md 规则重复
+        prompt = compose_role_system_prompt(prompt, role=role_name)
         patch_values = {"role": role_name, "system_prompt": prompt}
         for field in ("provider", "model", "temperature", "max_tokens", "max_iterations"):
             if field in config:

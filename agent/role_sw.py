@@ -125,7 +125,7 @@ async def arebuild_agent_from_team_dir(
     prompt_path = os.path.join(role_dir, "AGENT.md")
 
     # 2. 读取角色配置与提示词(复用现有能力)
-    from llm.config import load_team_agent_config
+    from llm.config import compose_role_system_prompt, load_team_agent_config
     from team.base import TeamAgent
 
     config = load_team_agent_config(agent_name, _BASE_DIR)
@@ -135,6 +135,9 @@ async def arebuild_agent_from_team_dir(
 
     # 剥离 ## workflow:* 小节,只取角色系统提示词
     role_prompt, _templates = TeamAgent.parse_prompt_sections(content)
+    # 拼接基础规则(主对话 Agent 持有工具,故附带「工具规则」);
+    # role="default" 时内部特判不拼接,避免 agent/AGENT.md 规则重复
+    role_prompt = compose_role_system_prompt(role_prompt, role=agent_name)
 
     # provider/model 经 load_agent_config 的 cfg.update(data) 透传(cfg 不过滤键)，
     # 直接读取即可。

@@ -580,7 +580,7 @@ async def _resolve_role_patch(
     if patch.role is None:
         return patch
     from agent.role_sw import _locate_team_agent_dir
-    from llm.config import load_team_agent_config
+    from llm.config import compose_role_system_prompt, load_team_agent_config
     from team.base import TeamAgent
 
     try:
@@ -593,7 +593,13 @@ async def _resolve_role_patch(
     if content is None:
         raise HTTPException(status_code=400, detail=f"角色提示词为空或无法读取: {patch.role}")
     role_prompt, _ = TeamAgent.parse_prompt_sections(content)
-    values: dict[str, Any] = {"role": patch.role, "system_prompt": patch.system_prompt or role_prompt}
+    # 角色提示词拼接基础规则（主对话 Agent 持有工具，故附带「工具规则」）；
+    # role="default" 时内部特判不拼接，避免 agent/AGENT.md 规则重复
+    composed_prompt = (
+        patch.system_prompt
+        or compose_role_system_prompt(role_prompt, role=patch.role)
+    )
+    values: dict[str, Any] = {"role": patch.role, "system_prompt": composed_prompt}
     for field in ("provider", "model", "temperature", "max_tokens", "max_iterations"):
         explicit = getattr(patch, field)
         if explicit is not None:

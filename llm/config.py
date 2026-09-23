@@ -214,6 +214,43 @@ def load_agent_rules(
     return "\n\n".join(section for section in sections if section)
 
 
+def compose_role_system_prompt(
+    role_prompt: str,
+    *,
+    role: str | None = None,
+    has_tools: bool = True,
+) -> str:
+    """把基础 Agent 规则与角色提示词合成为该会话的完整系统提示词
+
+    角色切换不应丢弃 ``agent/AGENT.md`` 的通用规则（历史缺陷：``SessionConfigMW``
+    以角色提示词整体替换 system prompt，导致「优先用 read_skill」「路径以最新
+    用户消息为准」「请用中文回答」等条款在切角色后全部失效）。
+
+    规则按角色能力条件化继承（复用 ``load_agent_rules``）：
+
+    - ``has_tools=True``  → 「重要规则」+「工具规则」
+    - ``has_tools=False`` → 仅「重要规则」（避免无工具角色被"必须调用工具"误导）
+
+    ``role == "default"`` 时**不拼接**：默认角色的提示词来源就是 ``agent/AGENT.md``
+    自身（``_locate_team_agent_dir("default")`` 返回 ``agent/`` 目录），拼接会导致
+    规则小节重复。此时原样返回 ``role_prompt``。
+
+    Args:
+        role_prompt: 经 ``parse_prompt_sections`` 剥离 ``## workflow:*`` 后的角色提示词
+        role: 角色名（``team/<role>/`` 目录名）；为 ``None`` 时一律拼接
+        has_tools: 该角色是否持有工具，决定是否附带「工具规则」小节
+
+    Returns:
+        合成后的系统提示词；``role_prompt`` 为空时回退为纯基础规则
+    """
+    role_prompt = (role_prompt or "").strip()
+    # 默认角色的提示词即 agent/AGENT.md 全文，再接基础规则会重复
+    if role == "default":
+        return role_prompt
+    rules = load_agent_rules(include_tool_rules=has_tools)
+    return f"{rules}\n\n{role_prompt}".strip() if role_prompt else rules
+
+
 def load_team_agent_config(agent_name: str, base_dir: str) -> dict[str, Any]:
     """
     从 team/team_agents.json 加载团队角色配置(default + 角色覆盖)
