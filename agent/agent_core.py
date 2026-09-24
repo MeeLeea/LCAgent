@@ -14,7 +14,7 @@ Agent核心调度模块 - 基于LangChain 1.x + LangGraph
 - turn_types.py      AgentTurnResult（避免 mixin 反向导入 agent_core）
 - tool_error_mw.py   工具错误纠错中间件 ToolExecutionErrorMW
 - workspace_mw.py    工作空间安全中间件 WorkspaceSecurityMW
-- role_sw.py         团队角色切换
+- role_sw.py         团队角色目录发现（可用角色扫描 / 角色目录定位）
 """
 from __future__ import annotations
 

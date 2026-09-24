@@ -1,25 +1,26 @@
-"""团队角色切换 - 从 team/<角色>/ 目录重建主对话 Agent 的角色
+"""团队角色目录发现 - 扫描 team/<角色>/ 定位可用角色与角色目录
 
-对外提供两个能力(供 AgentCore 委托调用):
+对外提供两个能力(供 CLI / API 委托调用):
+    - get_available_team_roles: 扫描 team/ 列出可用角色
     - _locate_team_agent_dir: 扫描 team/ 精确定位角色目录
-    - arebuild_agent_from_team_dir: 读取角色 agent_config.json + AGENT.md,
-      就地把传入的 AgentCore 切换为该角色的提示词/LLM
 
 从 agent_core.py 抽离,避免核心调度模块承载角色目录扫描逻辑。
+
+**角色切换不在此模块**:会话级角色切换由会话配置实现(写入
+``SessionConfig.role`` / ``SessionConfig.system_prompt``,经
+``agent/session_config_middleware.py::SessionConfigMW`` 在每次 model 调用时生效),
+因此不同会话可同时使用不同角色。写入口只有两处:
+    - CLI:  ``cli/commands/role.py::_switch_role``
+    - HTTP: ``api/server.py::_resolve_role_patch``
+
+历史遗留的 ``arebuild_agent_from_team_dir`` 已删除:它就地改写**共享** AgentCore
+实例(``agent_core_prompt`` / ``llm`` + 重建共享图),会篡改**所有**会话,与
+per-session 隔离模型冲突。
 """
 from __future__ import annotations
 
 import json
-import logging
 import os
-from typing import TYPE_CHECKING
-
-from llm.llm_client import LLMClient
-
-if TYPE_CHECKING:
-    from agent.agent_core import AgentCore
-
-logger = logging.getLogger(__name__)
 
 # 项目根目录(基于本文件位置计算: agent/role_sw.py -> 上两级)
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -94,95 +95,3 @@ def _locate_team_agent_dir(agent_name: str) -> str:
     # 直接拼接路径，不用再次扫描磁盘
     agent_dir = os.path.join(_TEAM_DIR, agent_name)
     return agent_dir
-
-
-async def arebuild_agent_from_team_dir(
-    agent: AgentCore, agent_name: str, *, task: str = ""
-) -> None:
-    """按 team/ 角色文件夹名重建主对话 Agent 的角色(唯一对外入口)
-
-    扫描 team/ 定位目标角色目录,读取其 agent_config.json 与 AGENT.md,
-    复用现有构建链把主 AgentCore 切换为该角色的提示词/LLM:
-
-    - 仅提示词变化 → 重建 executor（system_prompt 已改为静态字符串）
-    - provider/model 变化 → 重建 LLMClient 并重建 executor
-
-    整个过程就地修改传入的 AgentCore 实例,不返回新对象。
-
-    Args:
-        agent: 待切换角色的 AgentCore 实例(就地修改)
-        agent_name: team/ 下的角色文件夹名(如 "manager"/"worker")
-        task: 可选任务描述,用于切换后自动匹配注入技能
-
-    Raises:
-        KeyError: 角色文件夹不存在或缺少必需文件
-        FileNotFoundError: AGENT.md 读取失败(内容为空)
-    """
-    agent._ensure_not_closed()
-
-    # 1. 扫描 team/ 定位目标角色目录
-    role_dir = _locate_team_agent_dir(agent_name)
-    prompt_path = os.path.join(role_dir, "AGENT.md")
-
-    # 2. 读取角色配置与提示词(复用现有能力)
-    from llm.config import compose_role_system_prompt, load_team_agent_config
-    from team.base import TeamAgent
-
-    config = load_team_agent_config(agent_name, _BASE_DIR)
-    content = TeamAgent._read_prompt_file(prompt_path)
-    if content is None:
-        raise FileNotFoundError(f"角色提示词文件为空或无法读取: {prompt_path}")
-
-    # 剥离 ## workflow:* 小节,只取角色系统提示词
-    role_prompt, _templates = TeamAgent.parse_prompt_sections(content)
-    # 拼接基础规则(主对话 Agent 持有工具,故附带「工具规则」);
-    # role="default" 时内部特判不拼接,避免 agent/AGENT.md 规则重复
-    role_prompt = compose_role_system_prompt(role_prompt, role=agent_name)
-
-    # provider/model 经 load_agent_config 的 cfg.update(data) 透传(cfg 不过滤键)，
-    # 直接读取即可。
-    # 3. 判断是否需要切换 LLM(provider/model 变化)
-    #    目标 provider：角色显式配置优先，否则沿用当前 LLM 的 provider。
-    target_provider = (config.get("provider") or agent.llm.provider).lower()
-    configured_model = config.get("model")
-    if configured_model:
-        target_model = configured_model
-    else:
-        from llm.llm_client import load_providers
-
-        _providers = load_providers(agent.llm.config_file)
-        target_model = _providers.get(target_provider, {}).get("model")
-    llm_changed = (
-        target_provider != agent.llm.provider or target_model != agent.llm.model
-    )
-
-    async with agent._state_lock:
-        # 更新角色核心提示词
-        agent.agent_core_prompt = role_prompt
-        agent.name = config.get("name", agent.name)
-        agent.max_iterations = config.get("max_iterations", agent.max_iterations)
-
-        if llm_changed:
-            # LLM 变化:重建 LLMClient + 重建 executor
-            # 采样参数来源：角色级 agent_config.json（load_agent_config 已合并 DEFAULTS，
-            # 未显式配置时自动落到 DEFAULTS 默认值）
-            temperature = config.get("temperature")
-            max_tokens = config.get("max_tokens")
-            agent.llm = LLMClient(
-                provider=target_provider,
-                model=target_model,
-                config_file=agent.llm.config_file,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            await agent._arebuild_agent_executor()
-        else:
-            # 仅提示词变化:重建 executor 以使用新的 system_prompt
-            await agent._arebuild_agent_executor()
-
-    if agent.verbose:
-        logger.info(
-            "已切换到 team 角色: %s (LLM %s)",
-            agent_name,
-            "已重建" if llm_changed else "未变",
-        )
