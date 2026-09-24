@@ -25,7 +25,7 @@ from langchain.agents.middleware import AgentMiddleware, AgentState
 from langchain.agents.middleware.types import OmitFromInput
 from langchain_core.messages import (
     AnyMessage,
-    SystemMessage,
+    HumanMessage,
     ToolMessage,
 )
 from langchain_core.messages.utils import get_buffer_string
@@ -245,7 +245,7 @@ class LCAgentCompactionMiddleware(AgentMiddleware):
                     # REMOVE_ALL_MESSAGES 先清空，再写入压缩后的消息
                     # 这样 checkpoint 中旧消息被彻底移除，不再占用存储
                     _make_remove_all(),
-                    SystemMessage(content=self.SUMMARY_HEADER + new_summary),
+                    HumanMessage(content=self.SUMMARY_HEADER + new_summary),
                     *pruned_keep,
                 ],
                 "summary": new_summary,
