@@ -307,8 +307,8 @@ def test_safe_cutoff_returns_zero_when_too_few():
 # ============ 消息重建 ============
 
 
-def test_compaction_produces_summary_system_message():
-    """压缩后消息列表头部是 SystemMessage（摘要）"""
+def test_compaction_produces_summary_human_message():
+    """压缩后消息列表头部是 HumanMessage（摘要；不用 system 角色，避免多条 system 消息）"""
     model = FakeModel(response="压缩摘要")
     mw = LCAgentCompactionMiddleware(model, CompactionConfig(max_messages=5, keep_recent=2))
     msgs = _build_messages(8)
@@ -319,10 +319,11 @@ def test_compaction_produces_summary_system_message():
     assert result is not None
     new_messages = result["messages"]
     # 第一条是 RemoveMessage(REMOVE_ALL_MESSAGES)
-    from langchain_core.messages import RemoveMessage
+    from langchain_core.messages import HumanMessage, RemoveMessage
     assert isinstance(new_messages[0], RemoveMessage)
-    # 第二条是 SystemMessage（摘要）
-    assert isinstance(new_messages[1], SystemMessage)
+    # 第二条是 HumanMessage（摘要），避免 payload 出现第二条 system 消息
+    assert isinstance(new_messages[1], HumanMessage)
+    assert not isinstance(new_messages[1], SystemMessage)
     assert "压缩摘要" in new_messages[1].content
     assert "【历史对话摘要" in new_messages[1].content
 

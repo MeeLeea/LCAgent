@@ -495,7 +495,7 @@ Agent 有三种执行模式，对应三种不同的交互入口：
      → 并行 query_agent_facts() + query_facts(thread_id)
      → 合并 + content 精确去重（agent 优先，保留 agent 级版本）
      → 按 create_time 升序，截取 recall_limit（默认 20）条
-     → 格式化为文本追加到 SystemMessage（【长期记忆】块）
+     → 格式化为文本，追加为 request.messages 末尾的 user 消息（【长期记忆】块）
      → 非阻塞 touch 更新 last_used_at（按 scope 分发到两级 namespace）
 ```
 
@@ -508,7 +508,7 @@ Agent 有三种执行模式，对应三种不同的交互入口：
 | `AgentMemory`                 | [memory/agent_memory.py](memory/agent_memory.py) | checkpointer（`AsyncSqliteSaver`）+ 长期记忆 Store（`AsyncSqliteStore`）基础设施；`process_type` 仅用于 thread_id 前缀（会话可见性），agent 级 namespace 由 `agent_key` 决定（默认跨进程共享）                                                                                                       |
 | `ThreadMemoryStore`           | [memory/store.py](memory/store.py)               | Store 业务封装：thread 级 facts 增/查/批量写/LRU 淘汰/摘要替换/会话级清空；新增 agent 级方法族（`query_agent_facts` / `save_agent_facts_batch` / `count_agent_facts` / `clear_agent_facts` / `prune_agent_facts` / `touch_agent_fact` / `replace_agent_facts_with_summary`），构造参数含 `max_agent_facts` / `agent_key` |
 | `ThreadMemoryWriteMiddleware` | [memory/middleware.py](memory/middleware.py)     | 写服务：事件接收 + 防抖 buffer + Fact 抽取流水线（非 AgentMiddleware）；按`category` 路由到 agent / thread 两级作用域                                                                                                                                                                                |
-| `ThreadMemoryReadMiddleware`  | [memory/middleware.py](memory/middleware.py)     | 读中间件（AgentMiddleware）：`awrap_model_call` 并行读取两级 facts，合并去重（agent 优先）后注入 SystemMessage                                                                                                                                                                                       |
+| `ThreadMemoryReadMiddleware`  | [memory/middleware.py](memory/middleware.py)     | 读中间件（AgentMiddleware）：`awrap_model_call` 并行读取两级 facts，合并去重（agent 优先）后注入为尾随 user 消息（不动 system message）                                                                                                                                                                                       |
 | `ThreadMemoryLockPool`        | [memory/lock_pool.py](memory/lock_pool.py)       | per-thread`asyncio.Lock` 池：串行化同一 thread 的写入，不同 thread 并行                                                                                                                                                                                                                              |
 | `models.py`                   | [memory/models.py](memory/models.py)             | `MemoryCategory` / `ThreadFactItem`（含 `scope` 字段：`thread` / `agent`）/ `MemoryInputEvent` / `judge_long_term_memory` 分类判定                                                                                                                                                       |
 | `config.py`                   | [memory/config.py](memory/config.py)             | 运行时参数默认值（buffer 延迟 / 上限 / thread 级 fact 上限 / agent 级 fact 上限 / 召回条数）                                                                                                                                                                                                           |
@@ -533,7 +533,7 @@ awrap_model_call
    ↓ asyncio.gather(query_agent_facts(), query_facts(thread_id))
    ↓ 合并 + content 精确去重（agent 级优先，保留 agent 级版本）
    ↓ 按 create_time 升序，截取 recall_limit（默认 20）条
-   ↓ 注入 SystemMessage（【长期记忆】块）
+   ↓ 注入为尾随 user 消息（【长期记忆】块；system message 保持静态）
    ↓ 非阻塞 touch：agent 级调 touch_agent_fact，thread 级调 touch_fact
 ```
 
@@ -574,13 +574,13 @@ async for ev in self._arun_graph_events({"messages": [HumanMessage(content=messa
 ```
 
 - **历史消息**：LangGraph 从 checkpoint 自动恢复（按 thread_id 取出该会话所有历史消息，拼到新消息前面）
-- **长期记忆**：`ThreadMemoryReadMiddleware` 在每个 model 调用前（`awrap_model_call`）并行读取 **agent 级 + thread 级** facts，合并去重（agent 优先）后格式化为文本追加到 SystemMessage，随请求一起发给 LLM
+- **长期记忆**：`ThreadMemoryReadMiddleware` 在每个 model 调用前（`awrap_model_call`）并行读取 **agent 级 + thread 级** facts，合并去重（agent 优先）后格式化为文本，追加为 `request.messages` 末尾的 user 消息，随请求一起发给 LLM
 - **写入路径**：SessionManager 在事件流消费时调用 `submit_user_message()` / `consume_event()` 非阻塞投递，经防抖 + LLM 抽取后按 `category` 路由到 agent / thread 两级 Store namespace
 
 ```
 invoke(新消息, thread_id)
    ↓
-[历史消息1, ..., 新消息] + SystemMessage(【长期记忆】块) → 传给 LLM
+[System(静态，逐轮不变)] + [历史消息1, ..., 新消息] + [尾随 user 消息(【长期记忆】块)] → 传给 LLM
    ↓
 LLM 回复 → 写回 checkpoint
    ↓
@@ -606,22 +606,22 @@ response = self.llm.chat_with_history(
 
 #### 技能指引与长上下文摘要的注入
 
-`react:` 和 `chat()` 在每次执行前会根据任务重建 Agent：
+`react:` / `chat()` 的 system message 是**静态的**（`agent/AGENT.md` 全文；切角色后为
+`compose_role_system_prompt` 合成的「base 规则 + 角色提示词」），每次 model 调用时由中间件
+把动态内容作为**尾随 user 消息**追加到 `request.messages` 末尾（只改本次请求副本，不写 state）：
 
-```python
-self.agent_executor = self._create_agent_executor(
-    self._compute_skill_block(task)
-)
-```
-
-因此除了 checkpoint 历史外，system prompt 还可能包含：
-
-| 来源         | 触发方式                                              | 说明                                                                                                                |
+| 来源         | 触发方式                                              | 注入位置与说明                                                                                                      |
 | ------------ | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| 长期记忆     | 事件驱动自动沉淀，model 调用前注入                    | ReadMiddleware 注入 Store facts（`【长期记忆】` 块）                                                              |
-| 手动技能     | `skill:<name>`                                      | 后续对话都会注入该技能指引，直到`skill:clear`                                                                     |
+| 长期记忆     | 事件驱动自动沉淀，model 调用前注入                    | `ThreadMemoryReadMiddleware` 注入 Store facts（`【长期记忆】` 块）→ 尾随 user 消息                              |
+| 手动技能     | `skill:<name>`                                      | 后续对话都会注入该技能指引，直到`skill:clear`；`SkillInjectionMW` → 尾随 user 消息                              |
 | 自动匹配技能 | `auto_match_skills=true`                            | 根据任务与技能描述的关键词重叠度自动注入相关技能                                                                    |
-| 长上下文压缩 | 消息数超`max_messages` 时 `before_model` 自动触发 | 由 Compaction 中间件增量摘要旧消息，写入`state.summary`（随 checkpoint 持久化、per-thread 隔离），无需新开 thread |
+| 长上下文压缩 | 消息数超`max_messages` 时 `before_model` 自动触发 | 由 Compaction 中间件增量摘要旧消息，写入`state.summary`（随 checkpoint 持久化、per-thread 隔离）；摘要以 **HumanMessage**（非 system 角色）置于 messages 头部 |
+
+> **单条 system message 约束（重要）**：payload 中只保留一条 system 消息（`agent/AGENT.md` 全文，
+> 或切角色后合成的 base 规则 + 角色提示词），动态块（技能 / 长期记忆 / 历史摘要）一律**不使用
+> `system` 角色** —— 这既是 OpenAI 的规范格式（一条 system 开头 + 交替 user/assistant），也避免
+> 兼容网关对多条 system 消息的处理差异。静态 system 位于 payload 首位且逐轮不变，跨轮次前缀缓存
+> （KV cache）可复用；动态块集中在尾部，其变化不会使前面的 system 与历史消息失效。
 
 #### 对比表
 
@@ -1072,7 +1072,7 @@ session/
 | `max_tokens`     | 最大生成 token 数                                       |
 | `max_iterations` | 单轮最大推理步数，同时决定 LangGraph`recursion_limit` |
 | `version`        | 配置版本号                                              |
-| `system_prompt`  | 写入时解析得到的 system prompt 快照                     |
+| `system_prompt`  | 写入时解析得到的 system prompt 快照（= 基础规则 + 角色提示词；`role="default"` 时为空，回落静态 `agent/AGENT.md`） |
 
 配置保存在同一 SQLite 文件 `data/checkpoints_async.sqlite` 的 LangGraph **`store` 表**中，namespace 为 `("lcagent", "sessions", <session_id>, "session_config")`、键为 `"current"`（在表中 namespace 以点号拼接为 `prefix` 列，即 `lcagent.sessions.<session_id>.session_config`）。`Store` 是唯一事实源：会话配置不写入 checkpoint，`LCAgentState` 中也没有配置字段，因此读取配置不需要跑图、也不受 `aupdate_state` 与 interrupt 影响。旧会话首次读取时，会将当时的进程级默认配置懒迁移并持久化，之后不再重新读取默认值，因此默认值改变不会使旧会话漂移。进程级默认配置保存在 `SessionRegistry.default_session_config`，由启动时 Agent 的 `llm.provider`、`llm.model` 和 `max_iterations` 推导，也可通过 `set_default_session_config()` 更新。
 
@@ -1080,7 +1080,9 @@ session/
 
 配置优先级为：显式请求字段 > 角色目录 `team/team_agents.json` 中 `default` 与角色配置合并后的字段 > 保持原值。设置角色时，会在写入时读取该角色的统一配置和 `AGENT.md`，将解析后的 system prompt 保存到 `system_prompt`；之后即使 `AGENT.md` 被修改，已有会话仍使用原快照。每轮开始时捕获一份不可变配置快照，轮中修改只影响下一轮。
 
-**角色提示词拼接基础规则（重要）**：写 `system_prompt` 时不是直接使用 `team/<role>/AGENT.md` 的正文，而是经 `llm.config.compose_role_system_prompt(role_prompt, role=..., has_tools=...)` 合成——**基础规则在前、角色提示词在后**（顺序固定，便于复用同一份稳定 system 前缀）。基础规则来自 `agent/AGENT.md`，按角色能力条件化继承（复用 `load_agent_rules`）：持有工具时包含 `## 重要规则` + `## 工具规则`，无工具角色仅 `## 重要规则`，避免把"必须调用工具"这类条款落到无工具角色上。`role="default"` 时**不拼接**——默认角色的提示词来源就是 `agent/AGENT.md` 自身（`_locate_team_agent_dir("default")` 返回 `agent/` 目录），拼接会使规则小节重复。三条角色切换路径（CLI `cli/commands/role.py`、HTTP `api/server.py::_resolve_role_patch`、legacy `agent/role_sw.py::arebuild_agent_from_team_dir`）共用同一合成函数，确保行为一致。
+**角色提示词拼接基础规则（重要）**：写 `system_prompt` 时不是直接使用 `team/<role>/AGENT.md` 的正文，而是经 `llm.config.compose_role_system_prompt(role_prompt, role=..., has_tools=...)` 合成——**基础规则在前、角色提示词在后**（顺序固定，便于复用同一份稳定 system 前缀）。基础规则来自 `agent/AGENT.md`，按角色能力条件化继承（复用 `load_agent_rules`）：持有工具时包含 `## 重要规则` + `## 工具规则`，无工具角色仅 `## 重要规则`，避免把"必须调用工具"这类条款落到无工具角色上。`role="default"` 时**不拼接**——默认角色的提示词来源就是 `agent/AGENT.md` 自身（`_locate_team_agent_dir("default")` 返回 `agent/` 目录），拼接会使规则小节重复。
+
+`SessionConfigMW` 用该快照**替换** `system_message`。这是刻意的：**system message 只承载「会话内静态」内容**——基础规则 + 角色提示词在一次会话内逐轮不变（角色切换才变），因此可以安全地作为稳定前缀被 KV 缓存复用，且角色约束保有 system 级权威。真正**逐轮变化**的内容（技能指引 / 长期记忆 / 历史摘要）一律**不写 system**，改由中间件作为尾随 user 消息注入（详见[技能指引与长上下文摘要的注入](#技能指引与长上下文摘要的注入)）。三条角色切换路径（CLI `cli/commands/role.py`、HTTP `api/server.py::_resolve_role_patch`、legacy `agent/role_sw.py::arebuild_agent_from_team_dir`）共用同一合成函数，确保行为一致。
 
 > 历史缺陷：早期实现直接以角色提示词**整体替换** system prompt，而 `team/*/AGENT.md` 都不含 `## 重要规则`/`## 工具规则`，导致切角色后「优先用 `read_skill`」「路径以最新用户消息为准」「请用中文回答」「必须调用工具」「危险命令拦截」「定时任务三步流程」等通用规则全部失效。现由 `compose_role_system_prompt` 统一拼接修复。
 
@@ -1781,7 +1783,7 @@ create_tool(
 - 摘要存入 LangGraph `state.summary` 字段，随 **checkpoint 自动持久化**，天然实现 **per-thread 隔离**（每个 thread 拥有独立 summary），彻底消除跨会话污染。
 - **摘要模型按会话动态解析**：中间件除静态 `model=` 外还接受 `model_resolver`，每次压缩从 runtime context 解析当前会话的模型（解析失败回退静态模型）。这修复了「主模型已按会话切换、摘要却仍用启动时 provider」的静默缺陷。手动路径 `arun_compaction()` 亦可显式传入 `model`。
 - **安全切割**：不会拆开 `AIMessage(tool_calls)` + `ToolMessage` 配对（切割点落在 `ToolMessage` 上时向前回退到对应的 `AIMessage`）。
-- 压缩后用 `RemoveMessage(REMOVE_ALL_MESSAGES)` 先清空 checkpoint 旧消息，再写入 `SystemMessage(摘要) + Pruned 近期消息`，旧消息彻底移除不再占用存储。
+- 压缩后用 `RemoveMessage(REMOVE_ALL_MESSAGES)` 先清空 checkpoint 旧消息，再写入 `HumanMessage(摘要) + Pruned 近期消息`（摘要**不用 system 角色**，以保证 payload 只有一条 system 消息），旧消息彻底移除不再占用存储。
 
 触发方式：
 

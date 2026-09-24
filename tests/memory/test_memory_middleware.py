@@ -286,25 +286,40 @@ class _FakeRuntime:
 
 
 class _FakeModelRequest:
-    """最小化 ModelRequest 替身：override() 返回携带真实 SystemMessage 的新实例。"""
+    """最小化 ModelRequest 替身：override() 返回携带新字段的新实例。
 
-    def __init__(self, context, system_message=None):
+    记忆/技能块现注入到 ``messages`` 末尾（尾随 user 消息），不再改
+    ``system_message``，故 override 需同时支持两个字段。
+    """
+
+    def __init__(self, context, system_message=None, messages=None):
         self.runtime = _FakeRuntime(context)
         self.system_message = system_message
+        self.messages = list(messages) if messages is not None else []
 
-    def override(self, system_message=None):
-        return _FakeModelRequest(self.runtime.context, system_message=system_message)
+    def override(self, system_message=None, messages=None):
+        return _FakeModelRequest(
+            self.runtime.context,
+            system_message=system_message,
+            messages=messages,
+        )
 
 
-def _sys_content_text(system_message) -> str:
-    """从 SystemMessage 提取纯文本（content 可能为 text block 列表）。"""
-    content = system_message.content
+def _sys_content_text(message) -> str:
+    """从消息提取纯文本（content 可能为 text block 列表）。"""
+    content = message.content
     if isinstance(content, list):
         return "".join(
             str(block.get("text", "")) if isinstance(block, dict) else str(block)
             for block in content
         )
     return str(content)
+
+
+def _last_message_text(request) -> str:
+    """取 ``request.messages`` 末尾消息的文本（记忆块注入目标）。"""
+    assert request.messages, "request.messages 为空：记忆块未注入"
+    return _sys_content_text(request.messages[-1])
 
 
 class TestReadMiddleware:
@@ -336,17 +351,13 @@ class TestReadMiddleware:
         assert "unknown" in text
 
     def test_awrap_model_call_injects_facts(self):
-        """验证 awrap_model_call 将 facts 注入 SystemMessage。"""
+        """验证 awrap_model_call 把 facts 注入为尾随 user 消息。"""
         async def run():
             store = ThreadMemoryStore()
             await store.save_fact("t1", ThreadFactItem(content="injected fact", category="user_fact"))
             mw = ThreadMemoryReadMiddleware(store)
 
-            # 构建最小化 ModelRequest mock
-            request = MagicMock()
-            request.runtime.context = {"configurable": {"thread_id": "t1"}}
-            request.system_message = None  # 无 system message
-
+            request = _FakeModelRequest(context={"configurable": {"thread_id": "t1"}})
             captured_request = []
 
             async def handler(req):
@@ -356,8 +367,9 @@ class TestReadMiddleware:
             result = await mw.awrap_model_call(request, handler)
             assert result == "result"
             assert len(captured_request) == 1
-            # 验证 new_request 有 system_message
-            assert captured_request[0].system_message is not None
+            # system_message 未被改动；facts 作为尾随 user 消息注入
+            assert captured_request[0].system_message is None
+            assert "injected fact" in _last_message_text(captured_request[0])
 
         asyncio.run(run())
 
@@ -420,7 +432,7 @@ class TestReadMiddleware:
             result = await mw.awrap_model_call(request, handler)
             assert result == "ok"
             assert len(captured) == 1
-            text = _sys_content_text(captured[0].system_message)
+            text = _last_message_text(captured[0])
             assert "fact-1" in text and "fact-2" in text
             assert "fact-0" not in text
 
@@ -450,7 +462,7 @@ class TestReadMiddleware:
                 return "ok"
 
             await mw.awrap_model_call(request, handler)
-            text = _sys_content_text(captured[0].system_message)
+            text = _last_message_text(captured[0])
             assert "fact-0" in text and "fact-1" in text and "fact-2" in text
 
         asyncio.run(run())
@@ -631,7 +643,7 @@ class TestAgentScopeRouting:
                 return "ok"
 
             await mw.awrap_model_call(request, handler)
-            text = _sys_content_text(captured[0].system_message)
+            text = _last_message_text(captured[0])
             assert "agent-fact-shared" in text
             assert "thread-fact-local" in text
 
@@ -660,7 +672,7 @@ class TestAgentScopeRouting:
                 return "ok"
 
             await mw.awrap_model_call(request, handler)
-            text = _sys_content_text(captured[0].system_message)
+            text = _last_message_text(captured[0])
             # 注入文本只应出现一次（去重后保留 agent 版本）
             assert text.count(same_content) == 1
             # agent 版本 category 为 user_fact → "用户事实" 标签
@@ -701,7 +713,7 @@ class TestAgentScopeRouting:
                 return "ok"
 
             await mw.awrap_model_call(request, handler)
-            text = _sys_content_text(captured[0].system_message)
+            text = _last_message_text(captured[0])
             # 合并 8 条按 create_time 升序，取最近 5 条 → 应为 thread-0..thread-4
             # （create_time 较晚的 5 条 thread facts）
             for i in range(5):

@@ -15,7 +15,7 @@ import asyncio
 from typing import Annotated, Any, Optional, TypedDict
 
 import pytest
-from langchain_core.messages import AIMessage, AnyMessage, SystemMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -116,7 +116,10 @@ def test_above_threshold_compacts_and_keeps_node_output():
     out = _run_graph(_make_mw(max_messages=2, keep_recent=1), _node, state_in)
 
     assert out.get("summary"), "压缩后 summary 必须非空"
-    assert any(isinstance(m, SystemMessage) for m in out["messages"]), "缺少摘要 SystemMessage"
+    assert any(isinstance(m, HumanMessage) for m in out["messages"]), "缺少摘要 HumanMessage"
+    assert not any(isinstance(m, SystemMessage) for m in out["messages"]), (
+        "摘要不得使用 system 角色（避免 payload 出现多条 system 消息）"
+    )
     assert out["messages"][-1].content == "node-out", "节点自身产出被压缩吞掉"
 
 
