@@ -1082,7 +1082,7 @@ session/
 
 **角色提示词拼接基础规则（重要）**：写 `system_prompt` 时不是直接使用 `team/<role>/AGENT.md` 的正文，而是经 `llm.config.compose_role_system_prompt(role_prompt, role=..., has_tools=...)` 合成——**基础规则在前、角色提示词在后**（顺序固定，便于复用同一份稳定 system 前缀）。基础规则来自 `agent/AGENT.md`，按角色能力条件化继承（复用 `load_agent_rules`）：持有工具时包含 `## 重要规则` + `## 工具规则`，无工具角色仅 `## 重要规则`，避免把"必须调用工具"这类条款落到无工具角色上。`role="default"` 时**不拼接**——默认角色的提示词来源就是 `agent/AGENT.md` 自身（`_locate_team_agent_dir("default")` 返回 `agent/` 目录），拼接会使规则小节重复。
 
-`SessionConfigMW` 用该快照**替换** `system_message`。这是刻意的：**system message 只承载「会话内静态」内容**——基础规则 + 角色提示词在一次会话内逐轮不变（角色切换才变），因此可以安全地作为稳定前缀被 KV 缓存复用，且角色约束保有 system 级权威。真正**逐轮变化**的内容（技能指引 / 长期记忆 / 历史摘要）一律**不写 system**，改由中间件作为尾随 user 消息注入（详见[技能指引与长上下文摘要的注入](#技能指引与长上下文摘要的注入)）。三条角色切换路径（CLI `cli/commands/role.py`、HTTP `api/server.py::_resolve_role_patch`、legacy `agent/role_sw.py::arebuild_agent_from_team_dir`）共用同一合成函数，确保行为一致。
+`SessionConfigMW` 用该快照**替换** `system_message`。这是刻意的：**system message 只承载「会话内静态」内容**——基础规则 + 角色提示词在一次会话内逐轮不变（角色切换才变），因此可以安全地作为稳定前缀被 KV 缓存复用，且角色约束保有 system 级权威。真正**逐轮变化**的内容（技能指引 / 长期记忆 / 历史摘要）一律**不写 system**，改由中间件作为尾随 user 消息注入（详见[技能指引与长上下文摘要的注入](#技能指引与长上下文摘要的注入)）。角色切换的写入口只有两处（CLI `cli/commands/role.py::_switch_role`、HTTP `api/server.py::_resolve_role_patch`），二者共用同一合成函数确保行为一致。
 
 > 历史缺陷：早期实现直接以角色提示词**整体替换** system prompt，而 `team/*/AGENT.md` 都不含 `## 重要规则`/`## 工具规则`，导致切角色后「优先用 `read_skill`」「路径以最新用户消息为准」「请用中文回答」「必须调用工具」「危险命令拦截」「定时任务三步流程」等通用规则全部失效。现由 `compose_role_system_prompt` 统一拼接修复。
 
@@ -1166,7 +1166,7 @@ HTTP API（[api/server.py](api/server.py)）同样暴露三个 RESTful 端点，
 | `POST` | `/api/models/switch`    | 同上                                                                                                                                                    |
 | `POST` | `/api/roles/switch`     | 同上；`task` 字段仍接受以兼容旧客户端，但不再在此端点触发任务执行                                                                                     |
 
-> ⚠️ 这些端点**不再**调用 `agent.aswitch_llm()` 或 `arebuild_agent_from_team_dir()`，也**不会**把一个会话的改动广播到其他会话。新代码请使用 `PATCH /api/sessions/{thread_id}/config`。
+> ⚠️ 这些端点**不再**调用 `agent.aswitch_llm()`，也**不会**把一个会话的改动广播到其他会话。新代码请使用 `PATCH /api/sessions/{thread_id}/config`。
 
 ### SessionManager 门面
 
@@ -1924,7 +1924,6 @@ LCAgentError                    ← 所有 LCAgent 异常的基类（含 detail 
 | `await aresume(payload)`                                                                            | 恢复被`ask_human` 中断的会话（`Command(resume=...)`）                                                                                                                                               |
 | `await arun_structured(task, thread_id=None)` / `await achat_structured(message, thread_id=None)` | 返回`AgentTurnResult`（含 HITL 结构化中断信息）；`thread_id` 显式指定目标会话                                                                                                                       |
 | `await aswitch_llm(llm_client)`                                                                     | **仅 legacy 全局切换**：替换共享 LLM 并重建图，同时刷新进程级默认会话配置；只影响**新会话**，不再用于会话级切换（会话级请用 `PATCH /api/sessions/{thread_id}/config`）                    |
-| `await role_sw.arebuild_agent_from_team_dir(agent, agent_name, *, task="")`                         | **仅 legacy 全局路径**：按`team/<角色>/` 文件夹名切换主对话 Agent 的角色（读取该目录的 `agent_config.json` + `AGENT.md`）；会话级角色切换已改为写入会话配置，见「会话管理 → 会话基础配置」 |
 | `await areload_mcp_tools()`                                                                         | 通过 MCP 连接池重载工具并按需重建 Graph                                                                                                                                                                 |
 | `await manually_compact(force=False, thread_id=None)`                                               | 手动触发上下文压缩，返回状态更新字典或`None`；`thread_id` 指定目标会话                                                                                                                              |
 | `await aclose()`                                                                                    | 释放资源（MCP 连接、checkpoint 等）的生命周期收尾                                                                                                                                                       |
