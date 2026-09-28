@@ -57,3 +57,54 @@ def test_get_available_team_roles_includes_builtin():
     assert "architect" in roles
     assert "rtl_designer" in roles
     assert "rtl_verification" in roles
+
+
+# ============ 测试：共享角色配置解析（CLI / API 唯一实现） ============
+
+
+def test_resolve_role_config_patch_builds_role_and_prompt():
+    # When: 解析内置 manager 角色
+    patch = role_sw.resolve_role_config_patch("manager")
+
+    # Then: 产出含 role 与非空 system_prompt 的补丁
+    assert patch.role == "manager"
+    assert patch.system_prompt
+    # 基础规则应已拼接进角色提示词（manager 无工具，仅「重要规则」）
+    assert "重要规则" in patch.system_prompt
+
+
+def test_resolve_role_config_patch_default_role_keeps_prompt_unconcatenated():
+    # When: 解析 default 角色（提示词来源即 agent/AGENT.md，不应重复拼接）
+    patch = role_sw.resolve_role_config_patch("default")
+
+    # Then: role 为 default，system_prompt 非空
+    assert patch.role == "default"
+    assert patch.system_prompt
+
+
+def test_resolve_role_config_patch_raises_for_unknown_role():
+    with pytest.raises(KeyError):
+        role_sw.resolve_role_config_patch("nonexistent_role_xyz")
+
+
+def test_resolve_role_config_patch_explicit_fields_take_precedence():
+    """显式字段（如 temperature/system_prompt）优先于角色配置。"""
+    from session.config import SessionConfigPatch
+
+    patch = role_sw.resolve_role_config_patch(
+        "manager",
+        explicit=SessionConfigPatch(system_prompt="自定义提示词", temperature=0.123),
+    )
+    assert patch.role == "manager"
+    assert patch.system_prompt == "自定义提示词"
+    assert patch.temperature == 0.123
+
+
+def test_resolve_role_config_patch_same_across_cli_and_api_entry():
+    """CLI 与 API 对同一角色解析出的补丁必须一致（防两入口漂移）。"""
+    from session.config import SessionConfigPatch
+
+    # API 路径（带显式补丁）与 CLI 路径（无显式补丁）对纯角色切换应等价
+    from_api = role_sw.resolve_role_config_patch("worker", explicit=SessionConfigPatch(role="worker"))
+    from_cli = role_sw.resolve_role_config_patch("worker")
+    assert from_api == from_cli

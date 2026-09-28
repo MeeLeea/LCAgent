@@ -915,7 +915,7 @@ ThreadMemoryStore.replace_agent_facts_with_summary(summary)
 
 `MemoryManager.compress_agent()` 返回与 `compress()` 相同的 `{"success", "original_count", "original_chars", "compressed_chars", "summary"}` 结构。
 
-> **HTTP API 限制**：目前没有 agent 级压缩/清空端点。`POST /api/compress` 只压缩 thread 级；`DELETE /api/memory?scope=long|short|all` 也只清 thread 级（`all` 仅额外开启新会话，不含 agent 级，且 `scope=agent` 会返回 400）。agent 级压缩/清空目前仅 CLI 提供。
+> **HTTP API 说明**：`POST /api/compress` 只压缩 thread 级（与 CLI `compress` 共用同一实现，无记忆时短路返回 `skipped`）；`DELETE /api/memory?scope=long|short|agent|all` 与 CLI `clear` 语义一致——`agent` 清 agent 级跨会话记忆，`all` 同时清 thread 级 + agent 级并开启新会话。agent 级**压缩**目前仅 CLI `compress agent` 提供（API 无 agent 级压缩端点）。
 
 #### 特点与注意事项
 
@@ -1070,9 +1070,9 @@ session/
 
 **角色提示词拼接基础规则（重要）**：写 `system_prompt` 时不是直接使用 `team/<role>/AGENT.md` 的正文，而是经 `llm.config.compose_role_system_prompt(role_prompt, role=..., has_tools=...)` 合成——**基础规则在前、角色提示词在后**（顺序固定，便于复用同一份稳定 system 前缀）。基础规则来自 `agent/AGENT.md`，按角色能力条件化继承（复用 `load_agent_rules`）：持有工具时包含 `## 重要规则` + `## 工具规则`，无工具角色仅 `## 重要规则`，避免把"必须调用工具"这类条款落到无工具角色上。`role="default"` 时**不拼接**——默认角色的提示词来源就是 `agent/AGENT.md` 自身（`_locate_team_agent_dir("default")` 返回 `agent/` 目录），拼接会使规则小节重复。
 
-`SessionConfigMW` 用该快照**替换** `system_message`。这是刻意的：**system message 只承载「会话内静态」内容**——基础规则 + 角色提示词在一次会话内逐轮不变（角色切换才变），因此可以安全地作为稳定前缀被 KV 缓存复用，且角色约束保有 system 级权威。真正**逐轮变化**的内容（技能指引 / 长期记忆 / 历史摘要）一律**不写 system**，改由中间件作为尾随 user 消息注入（详见[技能指引与长上下文摘要的注入](#技能指引与长上下文摘要的注入)）。角色切换的写入口只有两处（CLI `cli/commands/role.py::_switch_role`、HTTP `api/server.py::_resolve_role_patch`），二者共用同一合成函数确保行为一致。
+`SessionConfigMW` 用该快照**替换** `system_message`。这是刻意的：**system message 只承载「会话内静态」内容**——基础规则 + 角色提示词在一次会话内逐轮不变（角色切换才变），因此可以安全地作为稳定前缀被 KV 缓存复用，且角色约束保有 system 级权威。真正**逐轮变化**的内容（技能指引 / 长期记忆 / 历史摘要）一律**不写 system**，改由中间件作为尾随 user 消息注入（详见[技能指引与长上下文摘要的注入](#技能指引与长上下文摘要的注入)）。角色切换的写入口只有两处（CLI `cli/commands/role.py::_switch_role`、HTTP `api/server.py::_resolve_role_patch`），二者**统一委托** `agent/role_sw.py::resolve_role_config_patch` 做解析——该函数是角色→`SessionConfigPatch`（定位目录 / 读配置 / 读 `AGENT.md` / 剥离 workflow 小节 / 拼接基础规则 / 合并采样参数）的**唯一实现**，杜绝两入口对同一角色解析结果漂移。
 
-**provider 变更时 model 的重解析**：`provider` 与 `model` 是耦合取值——旧 provider 的模型通常不在新 provider 的 `models` 白名单内（如 `zhipu` 的 `glm-4.7-flash` 切到 `yunlan`）。因此当一次更新**实际改变了 provider 且未显式给出 `model`** 时，服务端会把 model 重解析为该 provider 的可用模型：优先取 `llm_config.json` 中该 provider 的默认 `model`，若该默认值未列入自身 `models`（配置不一致）则退回 `models[0]`。该规则覆盖两条路径：前端顶栏只发 `{"provider": "..."}`，以及角色配置只配置 `provider`、`model` 为 `null`（如 `team/worker`、`team/terminator` 在 `team/team_agents.json` 中）。显式传入的 `model` 始终以请求为准（非法值照常 400）；provider 未实际变化时不重置 model，避免覆盖用户已选模型。
+**provider 变更时 model 的重解析**：`provider` 与 `model` 是耦合取值——旧 provider 的模型通常不在新 provider 的 `models` 白名单内（如 `zhipu` 的 `glm-4.7-flash` 切到 `yunlan`）。因此当一次更新**实际改变了 provider 且未显式给出 `model`** 时，会把 model 重解析为该 provider 的可用模型：优先取 `llm_config.json` 中该 provider 的默认 `model`，若该默认值未列入自身 `models`（配置不一致）则退回 `models[0]`。该规则由 `session/config.py::resolve_session_config_update`（配合 `preferred_model_for_provider`）作为**唯一实现**，供 `PATCH /api/sessions/{id}/config`、CLI `switch:` 命令、legacy `/api/providers/switch` 共用。显式传入的 `model` 始终以请求为准（非法值照常 400）；provider 未实际变化时不重置 model，避免覆盖用户已选模型。
 
 **运行时注入通道（重要）**：`config["configurable"]` 只喂给 checkpointer，**不会**自动映射到 `request.runtime.context`——`ModelRequest.runtime` 是 LangGraph `Runtime`，它没有 `config` 属性，`context` 仅由调用方的 `context=` 参数填充。因此图调用处必须写 `ainvoke(..., config=config, context=config)`（见 `agent/turn_runners.py` 的 `arun_structured` / `achat_structured` / `aresume_structured` 与 `agent/streaming.py` 的 `_arun_graph_events`），把同一份 `{"configurable": {...}}` 同时经两条通道传入：`config=` 供 checkpointer 解析 `thread_id`，`context=` 供 `SessionConfigMW` 读取 `session_config`。遗漏 `context=` 时中间件会静默直通、回落构建期默认模型（前端仍提示切换成功，但本轮实际未生效）。注意工具侧不同：`ToolCallRequest.runtime` 是 `ToolRuntime`，**有** `.config`，所以 `WorkspaceSecurityMW` / `ToolExecutionErrorMW` 读 `runtime.config` 一直正常。回归守护见 `tests/agent/test_session_config_e2e.py`。
 
