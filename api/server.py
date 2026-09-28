@@ -26,7 +26,6 @@ import os
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
-from dataclasses import replace
 from functools import lru_cache
 from typing import Any
 
@@ -56,7 +55,6 @@ from session.config import (
     SessionConfig,
     SessionConfigError,
     SessionConfigPatch,
-    validate_session_config,
 )
 from tools import safety as safety_module
 
@@ -577,36 +575,24 @@ async def _resolve_role_patch(
     patch: SessionConfigPatch,
     current: SessionConfig,
 ) -> SessionConfigPatch:
+    """把含 role 的补丁解析为可写入的配置补丁（唯一实现见 agent/role_sw.py）。
+
+    与 CLI 路径共用 ``resolve_role_config_patch``，避免两入口对同一角色
+    产生不同的 system_prompt / 采样参数。解析失败统一映射为 HTTP 400。
+    """
     if patch.role is None:
         return patch
-    from agent.role_sw import _locate_team_agent_dir
-    from llm.config import compose_role_system_prompt, load_team_agent_config
-    from team.base import TeamAgent
+    from agent.role_sw import resolve_role_config_patch
 
     try:
-        role_dir = _locate_team_agent_dir(patch.role)
+        # 显式请求字段（如 system_prompt / provider / temperature）优先于角色配置
+        return resolve_role_config_patch(patch.role, base_dir=BASE_DIR, explicit=patch)
     except KeyError as error:
         raise HTTPException(status_code=400, detail=f"角色不存在: {patch.role}") from error
-    config = load_team_agent_config(patch.role, BASE_DIR)
-    prompt_path = os.path.join(role_dir, "AGENT.md")
-    content = TeamAgent._read_prompt_file(prompt_path)
-    if content is None:
-        raise HTTPException(status_code=400, detail=f"角色提示词为空或无法读取: {patch.role}")
-    role_prompt, _ = TeamAgent.parse_prompt_sections(content)
-    # 角色提示词拼接基础规则（主对话 Agent 持有工具，故附带「工具规则」）；
-    # role="default" 时内部特判不拼接，避免 agent/AGENT.md 规则重复
-    composed_prompt = (
-        patch.system_prompt
-        or compose_role_system_prompt(role_prompt, role=patch.role)
-    )
-    values: dict[str, Any] = {"role": patch.role, "system_prompt": composed_prompt}
-    for field in ("provider", "model", "temperature", "max_tokens", "max_iterations"):
-        explicit = getattr(patch, field)
-        if explicit is not None:
-            values[field] = explicit
-        elif field in config and config[field] is not None:
-            values[field] = config[field]
-    return SessionConfigPatch(**values)
+    except FileNotFoundError as error:
+        raise HTTPException(
+            status_code=400, detail=f"角色提示词为空或无法读取: {patch.role}"
+        ) from error
 
 
 async def _ensure_session_config(thread_id: str) -> SessionConfig:
@@ -622,51 +608,28 @@ async def _ensure_session_config(thread_id: str) -> SessionConfig:
     return default
 
 
-def _preferred_model_for_provider(
-    providers: dict[str, dict[str, Any]], provider: str
-) -> str | None:
-    """取 provider 的默认模型；默认模型未列入其 ``models`` 白名单时回落首个可用模型。
-
-    配置不一致（如 ``yunlan-gpt`` 的默认 ``model`` 不在自身 ``models`` 中）不应让
-    前端「切换供应商」永久 400 —— 候选必须出自 ``models`` 才能通过显式校验。
-    """
-    conf = providers.get(provider, {})
-    default_model = conf.get("model")
-    models = conf.get("models", [])
-    if default_model is not None and (not models or default_model in models):
-        return default_model
-    return models[0] if models else None
-
-
 async def _update_session_config(thread_id: str, patch: SessionConfigPatch) -> SessionConfig:
-    """应用一次会话配置更新；非法配置统一转为 HTTP 400。"""
+    """应用一次会话配置更新；非法配置统一转为 HTTP 400。
+
+    provider/model 重解析与校验统一委托 ``session.config.resolve_session_config_update``
+    （与 CLI ``switch:`` 命令共用唯一实现），避免两入口行为分叉。
+    """
     current = await _ensure_session_config(thread_id)
     patch = await _resolve_role_patch(patch, current)
     providers = load_providers(LLM_FILE)
     provider = patch.provider or current.provider
     models = providers.get(provider, {}).get("models", [])
-    # provider 实际发生变化时才需要重解析 model；
-    # 重复选中同一 provider 不得覆盖用户已选的 model。
-    provider_switched = patch.provider is not None and patch.provider != current.provider
     # 延迟导入避免与 agent 包形成循环依赖（与本文件其他 role_sw 用法一致）
     from agent.role_sw import get_available_team_roles
+    from session.config import resolve_session_config_update
 
     try:
-        # SessionConfig.apply() 内部会做一次结构校验（如 temperature 越界），
-        # 必须与显式校验同处 try 内，否则会逃逸成 500 而非 400。
-        result = current.apply(patch)
-        if provider_switched and patch.model is None:
-            # 旧 provider 的 model 在新 provider 下通常不在其 models 白名单内
-            # （如 zhipu/glm-4.7-flash 切到 yunlan），沿用会让显式校验判为「未知模型」
-            # 并返回 400，前端只 console.error → 表现为「无法切换供应商」。
-            # 未显式指定 model 时重解析为新 provider 的可用模型，与 CLI `switch:`
-            # 命令、legacy `/api/providers/switch` 行为一致。
-            # 这里替换 SessionConfig 而非 patch：patch 的 None 语义是「不修改」，
-            # 无法表达「把 model 重置为新 provider 的默认值」。
-            result = replace(result, model=_preferred_model_for_provider(providers, provider))
-        validate_session_config(
-            result,
-            providers=providers.keys(),
+        # 结构校验 + provider 切换时 model 重解析 + 候选存在性校验，均在
+        # resolve_session_config_update 内部完成；任一失败转为 400（否则逃逸成 500）。
+        result = resolve_session_config_update(
+            current,
+            patch,
+            providers=providers,
             roles=get_available_team_roles(),
             models=models,
         )
@@ -696,7 +659,11 @@ async def switch_provider(req: SwitchProviderRequest):
             )
         return {"scope": "session", "thread_id": req.thread_id, "session_config": conf.to_dict(), "provider": conf.provider, "model": conf.model}
     current = agent.session.default_session_config or SessionConfig(provider=req.provider)
-    conf = current.apply(SessionConfigPatch(provider=req.provider, model=providers[req.provider].get("model")))
+    from session.config import resolve_session_config_update
+
+    conf = resolve_session_config_update(
+        current, SessionConfigPatch(provider=req.provider), providers=providers
+    )
     agent.session.set_default_session_config(conf)
     return {"scope": "default", "thread_id": None, "session_config": conf.to_dict(), "provider": conf.provider, "model": conf.model, "deprecated": True, "message": "未指定 thread_id，已更新进程默认配置（仅影响新会话）；请改用 PATCH /api/sessions/{thread_id}/config"}
 
@@ -1584,15 +1551,18 @@ async def reset_metrics():
 # --------------------------------------------------------------------------- #
 @app.post("/api/compact")
 async def compact_context(thread_id: str | None = None):
-    """手动触发指定会话的上下文压缩（增量摘要 + 工具输出 Prune）
+    """手动触发指定会话的上下文压缩（增量摘要 + 工具输出 Prune）。
 
-    与 before_model 中间件使用相同的压缩逻辑，适用于对话过长时主动释放 token。
+    与 CLI ``compact`` 命令共用 ``cli.commands.memory.compact_context_apply``，
+    手动触发一律 ``force=True``（跳过阈值，用户主动压缩应生效）。
     """
+    from cli.commands.memory import compact_context_apply
+
     tid = thread_id or agent.session.current_session_id
     logger.info("手动压缩上下文 [%s]", tid)
     async with _thread_lock(tid):
         try:
-            result = await agent.session_manager.manually_compact(thread_id=tid)
+            result = await compact_context_apply(agent, thread_id=tid)
         except Exception as e:
             logger.error("压缩失败 [%s]: %s", tid, e)
             raise HTTPException(status_code=500, detail=f"压缩失败: {e}")
@@ -1615,14 +1585,18 @@ async def get_memory_summary():
 
 @app.post("/api/compress")
 async def compress_long_term_memory():
-    """压缩长期记忆（用 LLM 生成摘要并替换原始记忆条目）
+    """压缩长期记忆（用 LLM 生成摘要并替换原始记忆条目）。
 
-    acompress_memory 内部将同步 LLM 调用放入线程池，避免阻塞事件循环。
+    与 CLI ``compress`` 命令共用 ``cli.commands.memory.compress_memory_apply``，
+    因此同样具备「无长期记忆时短路跳过」语义。``acompress_memory`` 内部将同步
+    LLM 调用放入线程池，避免阻塞事件循环。
     """
+    from cli.commands.memory import compress_memory_apply
+
     async with chat_lock:
         logger.info("压缩长期记忆")
         try:
-            result = await agent.session_manager.acompress_memory()
+            result = await compress_memory_apply(agent, scope="thread")
         except Exception as e:
             logger.error("长期记忆压缩失败: %s", e)
             raise HTTPException(status_code=500, detail=f"压缩失败: {e}")
@@ -1633,28 +1607,30 @@ async def compress_long_term_memory():
 
 @app.delete("/api/memory")
 async def clear_memory(scope: str = "long"):
-    """清空记忆
+    """清空记忆。
+
+    与 CLI ``clear`` 命令共用 ``cli.commands.memory.clear_memory_apply``，
+    语义完全一致（含 ``agent`` 作用域；``all`` 同时清 agent 级记忆）。
 
     Args:
-        scope: long=仅长期记忆, short=仅短期记忆(当前会话), all=全部
+        scope: long=仅长期记忆, short=仅短期记忆(当前会话),
+               agent=agent 级跨会话记忆, all=全部
+
+    Returns:
+        ``{"cleared": True, "scope": <规范化作用域>, ...统计字段}``
     """
+    from cli.commands.memory import clear_memory_apply
+
     async with chat_lock:
-        if scope in ("long", "长期"):
-            cleared = await agent.session_manager.aclear_long_term_memory()
-            logger.info("已清空长期记忆 (%d 条 facts)", cleared)
-        elif scope in ("short", "短期"):
-            # 短期记忆 = 当前会话 checkpoint；开启新会话替代删除
-            tid = agent.session.new_session()
-            agent.set_current_session(tid)
-            logger.info("已清空短期记忆（新会话: %s）", tid)
-        elif scope in ("all", "全部"):
-            cleared = await agent.session_manager.aclear_long_term_memory()
-            tid = agent.session.new_session()
-            agent.set_current_session(tid)
-            logger.info("已清空全部记忆 (长期 %d 条 facts + 短期，新会话: %s)", cleared, tid)
-        else:
-            raise HTTPException(status_code=400, detail="scope 必须为 long|short|all")
-        return {"cleared": True, "scope": scope}
+        try:
+            result = await clear_memory_apply(agent, scope)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        logger.info(
+            "已清空记忆: scope=%s long=%s agent=%s new_thread=%s",
+            result["scope"], result["long_cleared"], result["agent_cleared"], result["new_thread_id"],
+        )
+        return {"cleared": True, **result}
 
 
 # --------------------------------------------------------------------------- #

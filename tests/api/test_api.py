@@ -82,6 +82,7 @@ def mock_agent():
     # execute_command 端点用 set_current_session 切换当前会话
     agent.set_current_session = MagicMock()
     agent.session_manager.aclear_long_term_memory = AsyncMock(return_value=2)
+    agent.session_manager.aclear_agent_memory = AsyncMock(return_value=3)
     agent.get_available_tools = MagicMock(return_value=["calculator", "web_search", "ask_human"])
     agent.switch_llm = MagicMock()
     agent.aswitch_llm = AsyncMock(side_effect=agent.switch_llm)
@@ -1568,14 +1569,27 @@ def test_clear_memory_short(client, mock_agent):
 
 
 def test_clear_memory_all(client, mock_agent):
-    """测试清空全部记忆"""
+    """测试清空全部记忆（含 agent 级跨会话记忆，与 CLI clear all 语义一致）"""
     response = client.delete("/api/memory?scope=all")
     assert response.status_code == 200
 
     data = response.json()
     assert data["scope"] == "all"
     mock_agent.session_manager.aclear_long_term_memory.assert_awaited_once()
+    mock_agent.session_manager.aclear_agent_memory.assert_awaited_once()
     mock_agent.session.new_session.assert_called_once()
+
+
+def test_clear_memory_agent_scope(client, mock_agent):
+    """测试 agent scope 清空 agent 级跨会话记忆（补齐 CLI clear agent 语义）"""
+    response = client.delete("/api/memory?scope=agent")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["scope"] == "agent"
+    mock_agent.session_manager.aclear_agent_memory.assert_awaited_once()
+    mock_agent.session_manager.aclear_long_term_memory.assert_not_called()
+    mock_agent.session.new_session.assert_not_called()
 
 
 def test_clear_memory_invalid_scope(client, mock_agent):
