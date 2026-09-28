@@ -172,6 +172,81 @@ def validate_session_config(
         raise SessionConfigError(f"未知模型: {config.model!r}")
 
 
+def preferred_model_for_provider(
+    providers: Mapping[str, Mapping[str, Any]], provider: str
+) -> str | None:
+    """取 provider 的默认模型；默认模型未列入其 ``models`` 白名单时回落首个可用模型。
+
+    配置不一致（如 ``yunlan-gpt`` 的默认 ``model`` 不在自身 ``models`` 中）不应让
+    「切换供应商」永久失败——候选必须出自 ``models`` 才能通过显式校验。
+    ``providers`` 无该 provider 或无默认/白名单模型时返回 ``None``。
+
+    Args:
+        providers: ``load_providers()`` 返回的 provider 配置字典。
+        provider: 目标提供商标识。
+
+    Returns:
+        目标 provider 的可用模型名；无可用模型时返回 ``None``。
+    """
+    conf = providers.get(provider, {})
+    default_model = conf.get("model")
+    models = conf.get("models", [])
+    if default_model is not None and (not models or default_model in models):
+        return default_model
+    return models[0] if models else None
+
+
+def resolve_session_config_update(
+    current: SessionConfig,
+    patch: SessionConfigPatch,
+    *,
+    providers: Mapping[str, Mapping[str, Any]] | None = None,
+    roles: Iterable[str] | None = None,
+    models: Iterable[str] | None = None,
+) -> SessionConfig:
+    """应用一次会话配置更新，并在 provider 实际变化时重解析 model。
+
+    这是 provider/model 更新语义的**唯一实现**（PATCH 端点、CLI ``switch:``、
+    旧版 ``/api/providers/switch`` 共用），避免「切 provider 后 model 漂移」
+    在各入口表现不一致（历史缺陷：CLI 与 API 各自实现，行为分叉）。
+
+    流程：
+        1. ``current.apply(patch)``（结构校验 + version 自增）
+        2. provider 实际变化且未显式给出 model 时，把 model 重解析为该 provider
+           的可用模型（默认模型不在白名单时回落 ``models[0]``）。显式传入的
+           model 始终以请求为准；provider 未实际变化时不重置 model，避免覆盖
+           用户已选模型。
+        3. 按调用方注入的候选集合做存在性校验。
+
+    Args:
+        current: 当前会话配置快照。
+        patch: 部分更新请求（``None`` 字段表示不修改）。
+        providers: provider 配置字典；提供时校验 provider 存在并支持 model 重解析。
+        roles: 可用角色候选；提供时校验 role 存在。
+        models: 目标 provider 的可用模型候选；提供时校验 model 存在。
+
+    Returns:
+        更新后的 ``SessionConfig``（未持久化，由调用方负责写回）。
+
+    Raises:
+        SessionConfigError: 任一校验失败（越界 / 候选不存在）。
+    """
+    provider = patch.provider or current.provider
+    provider_switched = patch.provider is not None and patch.provider != current.provider
+    result = current.apply(patch)
+    if provider_switched and patch.model is None and providers is not None:
+        result = replace(
+            result, model=preferred_model_for_provider(providers, provider)
+        )
+    validate_session_config(
+        result,
+        providers=providers.keys() if providers is not None else None,
+        roles=roles,
+        models=models,
+    )
+    return result
+
+
 def session_config_to_configurable(config: SessionConfig) -> dict[str, Any]:
     """构造注入 ``config["configurable"]`` 的会话配置片段。
 
@@ -242,6 +317,8 @@ __all__ = [
     "SessionConfig",
     "SessionConfigError",
     "SessionConfigPatch",
+    "preferred_model_for_provider",
+    "resolve_session_config_update",
     "session_config_from_runtime_context",
     "session_config_to_configurable",
     "validate_session_config",

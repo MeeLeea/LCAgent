@@ -13,6 +13,10 @@ from session import (
     SessionRegistry,
     SessionStore,
 )
+from session.config import (
+    preferred_model_for_provider,
+    resolve_session_config_update,
+)
 
 
 def _config(**overrides: object) -> SessionConfig:
@@ -48,6 +52,67 @@ def test_apply_bumps_version_and_keeps_unset_fields():
 def test_apply_rejects_invalid_values():
     with pytest.raises(SessionConfigError):
         _config().apply(SessionConfigPatch(temperature=3.0))
+
+
+# --------------------------------------------------------------------------- #
+# provider 切换的 model 重解析（CLI / API 唯一实现）
+# --------------------------------------------------------------------------- #
+_PROVIDERS = {
+    "zhipu": {"model": "glm-4-flash", "models": ["glm-4-flash", "glm-4-plus"]},
+    "deepseek": {"model": "deepseek-chat", "models": ["deepseek-chat"]},
+    # 默认 model 不在自身 models 白名单（配置不一致场景）
+    "inconsistent": {"model": "not-listed", "models": ["ok-1", "ok-2"]},
+}
+
+
+def test_preferred_model_for_provider_uses_default_when_listed():
+    assert preferred_model_for_provider(_PROVIDERS, "deepseek") == "deepseek-chat"
+
+
+def test_preferred_model_for_provider_falls_back_to_first_when_default_invalid():
+    assert preferred_model_for_provider(_PROVIDERS, "inconsistent") == "ok-1"
+
+
+def test_preferred_model_for_provider_returns_none_for_unknown():
+    assert preferred_model_for_provider(_PROVIDERS, "ghost") is None
+
+
+def test_resolve_session_config_update_resets_stale_model_on_provider_switch():
+    current = SessionConfig(provider="zhipu", model="glm-4-flash")
+    updated = resolve_session_config_update(
+        current, SessionConfigPatch(provider="deepseek"), providers=_PROVIDERS
+    )
+    assert updated.provider == "deepseek"
+    assert updated.model == "deepseek-chat"
+
+
+def test_resolve_session_config_update_keeps_model_when_same_provider():
+    current = SessionConfig(provider="zhipu", model="glm-4-plus")
+    updated = resolve_session_config_update(
+        current, SessionConfigPatch(provider="zhipu"), providers=_PROVIDERS
+    )
+    assert updated.model == "glm-4-plus"
+
+
+def test_resolve_session_config_update_honours_explicit_model():
+    current = SessionConfig(provider="zhipu", model="glm-4-flash")
+    updated = resolve_session_config_update(
+        current,
+        SessionConfigPatch(provider="zhipu", model="glm-4-plus"),
+        providers=_PROVIDERS,
+    )
+    assert updated.model == "glm-4-plus"
+
+
+def test_resolve_session_config_update_validates_candidates():
+    current = SessionConfig(provider="zhipu", model="glm-4-flash")
+    with pytest.raises(SessionConfigError, match="未知模型"):
+        resolve_session_config_update(
+            current,
+            SessionConfigPatch(model="ghost-model"),
+            providers=_PROVIDERS,
+            models=_PROVIDERS["zhipu"]["models"],
+        )
 
 
 def test_store_set_get_and_update_absent():
