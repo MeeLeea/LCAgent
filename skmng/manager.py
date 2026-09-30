@@ -11,11 +11,37 @@
 - 列出所有技能(名称 + 描述)
 - 读取指定技能的完整内容
 - 根据任务描述自动匹配相关技能(确定性关键词打分,不调用 LLM)
+  - 中文按 2-gram(bigram)分词,避免单字分词让无关中文文本因共用汉字而误命中
+  - 中英停用词在打分前剔除,消除泛化词造成的噪声命中
+  - 重叠系数打分 + 命中阈值(0.25)过滤噪声
+  - 技能名显著 token 豁免:任务直接点名技能时无视阈值注入
 - 将若干技能内容渲染为可注入 system prompt 的指引块
 """
 import os
 import re
 from typing import ClassVar
+
+# 中文停用词: 高频泛化 bigram(语义噪声的主要来源),在打分前剔除
+_STOPWORDS_ZH: frozenset[str] = frozenset({
+    "技能", "文件", "运行", "流程", "使用", "如何", "帮我", "一下", "可以", "需要",
+    "项目", "目录", "功能", "实现", "方法", "工具", "查看", "报告", "内容", "支持",
+    "提供", "包含", "包括", "以及", "相关", "进行", "通过", "这个", "那个", "什么",
+    "怎么", "哪些", "一个", "我们", "就是", "还是", "因为", "所以", "但是", "如果",
+    "然后", "现在", "已经", "应该", "可能", "主要", "重要", "基本", "具体", "一般",
+    "通常", "生成", "创建", "的", "了", "是", "在", "和", "与", "或", "上", "下", "里",
+})
+
+# 英文停用词: 仅剔除功能词,保留 pptx/skill/file/presentation 等有信息量的词
+_STOPWORDS_EN: frozenset[str] = frozenset({
+    "the", "a", "an", "and", "or", "of", "to", "in", "for", "on", "with", "is",
+    "are", "this", "that", "it", "use", "using", "used", "any", "time", "when",
+    "how", "what", "you", "your", "can", "will", "be", "by", "from", "as", "at",
+    "do", "does", "not", "no", "all", "has", "have",
+})
+
+# 命中阈值: 重叠系数低于此值视为噪声命中(0.25 经真实技能目录标定:
+# 正样本最低 0.25/0.286,负样本最高 0.2)
+_MIN_MATCH_SCORE: float = 0.25
 
 
 def default_skills_dir() -> str:
@@ -87,17 +113,20 @@ class SkillManager:
         """
         根据任务描述匹配相关技能(确定性打分,不调用 LLM)
 
-        算法: 对任务文本与每个技能的 name + description 做关键词重叠度打分,
-        取分数 > 0 的前 top_k 个技能(按分数降序)。
-        任务中的中文关键词会先扩展为对应英文词(如 提交→commit/git),
-        以解决技能描述多为英文导致的中文任务无法命中问题。
+        算法:
+        - 任务文本先经中文关键词→英文扩展(如 提交→commit/git),再与技能
+          name + description 一并按 2-gram/词 分词并剔除中英停用词
+        - 用重叠系数 |A∩B| / min(|A|,|B|) 打分,分数 >= _MIN_MATCH_SCORE(0.25)
+          才视为命中,过滤泛化词造成的噪声
+        - 技能名豁免:任务直接点名技能名中的显著 token(如 vivado/pptx)时,
+          即使分数低于阈值也命中,保证用户点名技能必被注入
 
         Args:
             task: 用户任务描述
             top_k: 最多返回的技能数
 
         Returns:
-            命中的技能名列表(降序)
+            命中的技能名列表(按分数降序)
         """
         if not task or not task.strip():
             return []
@@ -115,7 +144,9 @@ class SkillManager:
             if not skill_tokens:
                 continue
             score = self._overlap_score(task_tokens, skill_tokens)
-            if score > 0:
+            # 命中条件: 分数达阈值,或任务直接点名了技能名中的显著 token
+            name_hit = bool(self._name_tokens(skill["name"]) & task_tokens)
+            if score >= _MIN_MATCH_SCORE or name_hit:
                 scored.append((score, skill["name"]))
 
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -208,13 +239,40 @@ class SkillManager:
 
     @staticmethod
     def _tokenize(text: str) -> set:
-        """简单分词: 中文按字/词粗分,英文按单词;统一小写去标点"""
+        """分词: 英文/数字按词,中文按 2-gram(bigram),并剔除停用词
+
+        中文按单字分词会让"科技/技能"这类无关词因共用汉字而误命中
+        (见模块 docstring 的 bug 记录),故改用 2-gram:
+        - 连续中文串切为相邻两字组合(如"提交代码" → 提交/交代/代码)
+        - 长度为 1 的中文串保留单字(避免短词丢失)
+        - 英文/数字仍按词切分
+        - 中英停用词在返回前剔除,消除泛化词造成的噪声命中
+        """
         text = text.lower()
-        # 提取英文/数字词
-        en = set(re.findall(r"[a-z0-9]+", text))
-        # 提取中文字符(按单字,够用即可)
-        zh = set(re.findall(r"[\u4e00-\u9fff]", text))
-        return en | zh
+        tokens = set(re.findall(r"[a-z0-9]+", text))
+        for run in re.findall(r"[\u4e00-\u9fff]+", text):
+            if len(run) == 1:
+                tokens.add(run)
+                continue
+            for i in range(len(run) - 1):
+                tokens.add(run[i : i + 2])
+        return {
+            t for t in tokens
+            if t not in _STOPWORDS_ZH and t not in _STOPWORDS_EN
+        }
+
+    @staticmethod
+    def _name_tokens(name: str) -> set:
+        """提取技能名的"显著"token: 仅英文/数字词,长度≥3 且非纯数字
+
+        技能名是最强的意图信号(用户直接点名 vivado/pptx/gitmcp 时应注入),
+        故 match_skills 用它做阈值豁免。过滤掉 vivado-2025-2 里的 2025/2
+        这类版本号噪声,避免"2分钟后提醒我"之类的任务误命中。
+        """
+        return {
+            w for w in re.findall(r"[a-z0-9]+", name.lower())
+            if len(w) >= 3 and not w.isdigit()
+        }
 
     # 中文关键词 → 英文扩展词(仅用于匹配打分,不改变原任务)
     _ALIASES: ClassVar[dict[str, list[str]]] = {
@@ -240,13 +298,14 @@ class SkillManager:
 
     @staticmethod
     def _overlap_score(a: set, b: set) -> float:
-        """重叠度打分: 基于 Jaccard 相似度 + 命中词数"""
+        """重叠系数打分: |A∩B| / min(|A|,|B|)
+
+        用 min 归一化而非并集(Jaccard):技能描述通常远长于任务文本,
+        Jaccard 会被长描述稀释,导致真实命中得分过低。
+        """
         if not a or not b:
             return 0.0
         inter = a & b
         if not inter:
             return 0.0
-        union = a | b
-        jaccard = len(inter) / len(union)
-        # 命中词数加权,避免长描述天然占优
-        return jaccard * (1 + len(inter) * 0.1)
+        return len(inter) / min(len(a), len(b))
