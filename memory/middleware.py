@@ -43,6 +43,17 @@ from .store import ThreadMemoryStore
 
 logger = logging.getLogger(__name__)
 
+# 记忆链路 LLM 解析器：thread_id 可为 None（agent 级操作）；返回 LLMClient
+ThreadLLMResolver = Callable[[str | None], Awaitable[Any]]
+
+
+def default_thread_llm_resolver(getter: Callable[[], Any]) -> ThreadLLMResolver:
+    """把 zero-arg getter 适配为 thread-aware async resolver（占位/测试用）。"""
+    async def _resolve(thread_id: str | None) -> Any:
+        return getter()
+    return _resolve
+
+
 # 控制流 / HITL 确认内容标记：TOOL_RESULT 含这些标记说明是 interrupt
 # （危险命令确认 / ask_human）在事件流层的映射残留，不是真实工具失败，
 # 不得计入失败计数、不得沉淀为 lesson（历史 bug：安全确认被逐字记成
@@ -121,7 +132,8 @@ class ThreadMemoryWriteMiddleware:
     Args:
         memory_store: ThreadMemoryStore 实例（Store 业务封装）
         lock_pool: ThreadMemoryLockPool 实例（per-thread 并发锁）
-        llm_getter: 返回当前 LLMClient 的 callable（支持 LLM 热切换）
+        llm_getter: 返回当前 LLMClient 的 thread-aware async resolver（支持
+            按会话解析 provider/model，失败回落默认 LLM）
         buffer_delay_seconds: 防抖缓冲窗口（秒），默认 MEMORY_BUFFER_DELAY_SECONDS
         max_buffer_messages: 单 thread 缓冲区上限，默认 MEMORY_MAX_BUFFER_MESSAGES
         agent_lock: agent 级跨进程互斥锁（保护 agent namespace 的批量写入与
@@ -133,7 +145,7 @@ class ThreadMemoryWriteMiddleware:
         self,
         memory_store: ThreadMemoryStore,
         lock_pool: ThreadMemoryLockPool,
-        llm_getter: Callable[[], Any],
+        llm_getter: ThreadLLMResolver,
         buffer_delay_seconds: int | None = None,
         max_buffer_messages: int | None = None,
         agent_lock: AgentMemoryLock | None = None,
@@ -156,14 +168,15 @@ class ThreadMemoryWriteMiddleware:
         # 供 judge_long_term_memory 确定性判定经验教训（失败 ≥2 次）
         self._failure_counts: dict[tuple[str, str], int] = {}
 
-    def bind_llm(self, llm_getter: Callable[[], Any]) -> None:
-        """运行时替换 LLM 获取器（支持 provider 热切换后即时生效）。
+    def bind_llm(self, llm_getter: ThreadLLMResolver) -> None:
+        """运行时替换 LLM 解析器（支持 provider 热切换后即时生效）。
 
-        入口创建 Agent 后调用，将记忆抽取的 LLM 来源动态绑定到
-        ``agent.llm``，保证主对话与记忆抽取始终使用同一当前 LLM。
+        入口创建 Agent 后调用，把记忆抽取的 LLM 来源替换为 thread-aware
+        resolver：按 thread_id 解析该会话的 provider/model，无会话配置或
+        解析失败时回落默认 LLM（``agent.llm``），避免跨 provider 误发请求。
 
         Args:
-            llm_getter: 返回当前 LLMClient 的 callable
+            llm_getter: 返回当前 LLMClient 的 thread-aware async resolver
         """
         self._llm_getter = llm_getter
 
@@ -441,7 +454,7 @@ class ThreadMemoryWriteMiddleware:
             "只输出教训文本本身，不要其他内容。"
         )
         try:
-            llm = self._llm_getter()
+            llm = await self._llm_getter(thread_id)
             response = await asyncio.to_thread(
                 llm.chat,
                 [
@@ -506,7 +519,7 @@ class ThreadMemoryWriteMiddleware:
         )
 
         try:
-            llm = self._llm_getter()
+            llm = await self._llm_getter(thread_id)
             response = await asyncio.to_thread(
                 llm.chat,
                 [
@@ -793,6 +806,8 @@ class ThreadMemoryReadMiddleware(AgentMiddleware):
 
 
 __all__ = [
+    "ThreadLLMResolver",
     "ThreadMemoryReadMiddleware",
     "ThreadMemoryWriteMiddleware",
+    "default_thread_llm_resolver",
 ]

@@ -45,6 +45,7 @@ if BASE_DIR not in sys.path:
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from agent import AgentCore
+from agent.memory_llm import build_memory_llm_resolver
 from cli.commands import CommandContext, dispatch_command
 from cli.commands.provider import create_llm
 from llm.config import load_agent_config, resolve_path
@@ -334,9 +335,10 @@ async def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
     # 注入 MemoryManager → SessionManager 懒初始化时会自动接收
     new_agent.set_memory_manager(memory_ctx.memory_manager)
     new_agent._memory_context = memory_ctx  # 供 aclose 时关闭 SQLite 连接
-    # 动态绑定：记忆组件直接读取 agent 当前 LLM，切换 provider 后自动同步
+    # 动态绑定：记忆组件按会话解析 LLM（回落 agent 当前 LLM），切换 provider
+    # 后自动同步，且会话级 provider/model 正确生效
     # （修复 /api/providers/switch 后记忆抽取仍用启动时旧 LLMClient 的问题）
-    memory_ctx.bind_llm(lambda: new_agent.llm)
+    memory_ctx.bind_llm(build_memory_llm_resolver(new_agent.session, lambda: new_agent.llm))
     new_agent.session.set_default_session_config(
         SessionConfig(provider=new_llm.provider, model=new_llm.model, max_iterations=cfg["max_iterations"])
     )

@@ -27,6 +27,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from agent import AgentCore
+from agent.memory_llm import build_memory_llm_resolver
 from llm.config import load_agent_config, resolve_path
 from llm.llm_client import LLMClient, load_providers
 from memory import MemoryContext
@@ -134,8 +135,9 @@ def make_agent_factory(provider: str):
         # 注入 MemoryManager → SessionManager 懒初始化时会自动接收
         agent.set_memory_manager(memory_ctx.memory_manager)
         agent._memory_context = memory_ctx  # 供 executor aclose 时关闭 SQLite 连接
-        # 动态绑定：记忆组件直接读取 agent 当前 LLM，保持与主对话一致
-        memory_ctx.bind_llm(lambda: agent.llm)
+        # 动态绑定：记忆组件按会话解析 LLM（回落 agent 当前 LLM），
+        # 切换 provider 后自动同步，且会话级 provider/model 正确生效
+        memory_ctx.bind_llm(build_memory_llm_resolver(agent.session, lambda: agent.llm))
         return agent
 
     return factory

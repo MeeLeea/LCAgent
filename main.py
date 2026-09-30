@@ -13,6 +13,7 @@ except ImportError:
     pass
 
 from agent import AgentCore
+from agent.memory_llm import build_memory_llm_resolver
 from cli.cli_menu import select_menu
 from cli.commands import CommandContext, dispatch_command
 from cli.commands.core import show_ready
@@ -89,8 +90,9 @@ async def build_agent(provider: str, process_type: str | None = None) -> tuple[A
     # 注入 MemoryManager → SessionManager 懒初始化时会自动接收
     agent.set_memory_manager(memory_ctx.memory_manager)
     agent._memory_context = memory_ctx  # 供 aclose 时关闭 SQLite 连接
-    # 动态绑定：记忆组件直接读取 agent 当前 LLM，切换 provider 后自动同步
-    memory_ctx.bind_llm(lambda: agent.llm)
+    # 动态绑定：记忆组件按会话解析 LLM（回落 agent 当前 LLM），
+    # 切换 provider 后自动同步，且会话级 provider/model 正确生效
+    memory_ctx.bind_llm(build_memory_llm_resolver(agent.session, lambda: agent.llm))
     return agent, llm
 
 
