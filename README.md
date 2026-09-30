@@ -668,10 +668,21 @@ agent.set_memory_manager(memory_ctx.memory_manager)  # ← 注入 MemoryManager
 创建 `AgentCore` 后，还需把记忆组件的 LLM 来源动态绑定到当前 Agent（三个入口 `main.py` / `api/server.py` / `scheduler/run.py` 均已内置）：
 
 ```python
-memory_ctx.bind_llm(lambda: agent.llm)  # 记忆组件直接读取 agent 当前 LLM
+# thread-aware 解析器：按会话（thread_id）解析各自的 provider/model，
+# 无会话配置时回退到进程默认 agent.llm
+memory_ctx.bind_llm(build_memory_llm_resolver(agent.session, lambda: agent.llm))
 ```
 
-这样**运行时切换提供商/模型**（API `/api/providers/switch`、CLI `switch` 命令、team 角色切换）后，记忆链路（事实抽取 / 召回 / 压缩）会跟随 `agent.llm` 同步切换，避免记忆抽取仍使用启动时的旧 `LLMClient` 向旧提供商发请求。
+`build_memory_llm_resolver(session, default_getter)`（`agent/memory_llm.py`）返回一个
+**thread-aware 异步解析器**：记忆链路（事实抽取 / 蒸馏 / 压缩）每次处理时按当前
+`thread_id` 调用 `session.apeek_session_config(thread_id)` 读取该会话的 provider/model，
+命中则按 `(provider, model, temperature, max_tokens)` 构造并缓存 `LLMClient`；thread 为空、
+无会话配置、读取失败或构造失败时统一回退到默认 getter（进程启动时的 `agent.llm`）。
+
+这样**全局切换提供商/模型**（API `/api/providers/switch`、CLI `switch` 命令、team 角色切换）
+仍会作用于没有显式会话配置的会话；而通过 `PATCH /api/sessions/{id}/config` 设置的
+**会话级 provider/model** 会在下一次记忆 flush（事实抽取 / 蒸馏 / 压缩）时被采纳，避免记忆
+链路永远只用启动时的旧 `LLMClient` 向旧提供商发请求。
 
 调用时传 thread_id，LangGraph 自动恢复该会话历史（`_invoke_config` 构造 `{"configurable": {"thread_id": ...}}`）。
 
@@ -941,7 +952,7 @@ ThreadMemoryStore.replace_agent_facts_with_summary(summary)
 
 | 成员                                 | 说明                                                                             |
 | ------------------------------------ | -------------------------------------------------------------------------------- |
-| `await MemoryContext.acreate(...)` | 异步创建全部记忆组件（checkpointer + Store + 锁池 + 读写中间件 + MemoryManager）；关键参数：`process_type`（仅 thread_id 前缀）/ `agent_key`（agent 级 namespace，默认 `"global"` 跨进程共享）/ `max_facts_per_thread` / `max_agent_facts` / `recall_limit` |
+| `await MemoryContext.acreate(...)` | 异步创建全部记忆组件（checkpointer + Store + 锁池 + 读写中间件 + MemoryManager）；关键参数：`process_type`（仅 thread_id 前缀）/ `agent_key`（agent 级 namespace，默认 `"global"` 跨进程共享）/ `max_facts_per_thread` / `max_agent_facts` / `recall_limit` / `llm_getter`（创建 Agent 前的**默认 getter**，返回进程启动时的 `LLMClient`；`acreate` 内部用 `default_thread_llm_resolver` 包装为 thread-aware 解析器，创建 Agent 后再由 `bind_llm(build_memory_llm_resolver(...))` 覆盖） |
 | `ctx.checkpointer`                 | LangGraph checkpointer（传给`AgentCore` / `SessionRegistry`）                |
 | `ctx.store`                        | LangGraph`BaseStore`（传给 `create_agent(store=...)`）                       |
 | `ctx.read_middleware`              | `ThreadMemoryReadMiddleware`（传给 `extra_middleware`）                      |
@@ -2799,7 +2810,7 @@ async def main() -> None:
     # 三层架构：先创建 MemoryContext（记忆基础设施），再创建 AgentCore（纯执行内核）
     memory_ctx = await MemoryContext.acreate(
         checkpoint_file="data/checkpoints_async.sqlite",  # Checkpoint + 长期记忆 Store（同一 SQLite 文件）
-        llm_getter=lambda: llm,                            # 供 LLM 抽取/压缩记忆使用（支持热切换）
+        llm_getter=lambda: llm,                            # 创建 Agent 前的默认 getter（内部包装为 thread-aware 解析器，创建后由 bind_llm 覆盖）
         buffer_delay_seconds=30,                           # 记忆防抖窗口（秒）
         max_buffer_messages=40,                            # 单 thread 防抖 buffer 上限
         max_facts_per_thread=60,                           # 单 thread 最大 fact 条数（thread 级 LRU 淘汰）
