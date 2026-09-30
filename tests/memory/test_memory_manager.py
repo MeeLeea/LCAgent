@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 
 from memory.lock_pool import ThreadMemoryLockPool
 from memory.manager import MemoryManager
+from memory.middleware import default_thread_llm_resolver
 from memory.models import ThreadFactItem
 from memory.store import ThreadMemoryStore
 
@@ -33,6 +34,9 @@ def _make_manager(
     lock_pool = ThreadMemoryLockPool()
     if llm_getter is None:
         llm_getter = lambda: None
+    # 新契约：MemoryManager 接收 thread-aware 异步解析器，helper 统一把零参
+    # getter 适配为 ThreadLLMResolver，保持既有 `llm_getter=lambda: llm` 调用点不变。
+    llm_getter = default_thread_llm_resolver(llm_getter)
     mgr = MemoryManager(
         memory_store=store,
         lock_pool=lock_pool,
@@ -502,17 +506,21 @@ class TestBindLlm:
 
     def test_bind_llm_replaces_manager_and_write_middleware_getter(self):
         """bind_llm 后 MemoryManager 与写中间件的 llm_getter 应返回新 LLM。"""
-        old_llm = _FakeLLM()
-        new_llm = _FakeLLM()
-        mgr, _ = _make_manager(llm_getter=lambda: old_llm)
 
-        assert mgr._llm_getter() is old_llm
-        assert mgr.write_middleware._llm_getter() is old_llm
+        async def run():
+            old_llm = _FakeLLM()
+            new_llm = _FakeLLM()
+            mgr, _ = _make_manager(llm_getter=lambda: old_llm)
 
-        mgr.bind_llm(lambda: new_llm)
+            assert await mgr._llm_getter(None) is old_llm
+            assert await mgr.write_middleware._llm_getter(None) is old_llm
 
-        assert mgr._llm_getter() is new_llm
-        assert mgr.write_middleware._llm_getter() is new_llm
+            mgr.bind_llm(default_thread_llm_resolver(lambda: new_llm))
+
+            assert await mgr._llm_getter(None) is new_llm
+            assert await mgr.write_middleware._llm_getter(None) is new_llm
+
+        asyncio.run(run())
 
     def test_fact_extraction_uses_bound_llm_after_provider_switch(self):
         """模拟切换 provider：bind 新 LLM 后 flush 抽取应使用新 LLM 请求。"""
@@ -523,8 +531,8 @@ class TestBindLlm:
         mgr, store = _make_manager(llm_getter=lambda: old_llm, buffer_delay_seconds=999)
 
         async def run():
-            # 切换 provider：替换为读取 agent.llm 的 getter（模拟入口 bind 调用）
-            mgr.bind_llm(lambda: new_llm)
+            # 切换 provider：替换为读取 agent.llm 的 resolver（模拟入口 bind 调用）
+            mgr.bind_llm(default_thread_llm_resolver(lambda: new_llm))
             await mgr.submit_user_message("t1", "用户偏好信息")
             await mgr.flush_all()
 
@@ -544,21 +552,24 @@ class TestBindLlm:
         """MemoryContext.bind_llm 应透传到内部 MemoryManager。"""
         from memory.context import MemoryContext
 
-        old_llm = _FakeLLM()
-        new_llm = _FakeLLM()
-        mgr, _ = _make_manager(llm_getter=lambda: old_llm)
-        ctx = MemoryContext(
-            agent_memory=MagicMock(),
-            read_middleware=MagicMock(),
-            memory_manager=mgr,
-        )
+        async def run():
+            old_llm = _FakeLLM()
+            new_llm = _FakeLLM()
+            mgr, _ = _make_manager(llm_getter=lambda: old_llm)
+            ctx = MemoryContext(
+                agent_memory=MagicMock(),
+                read_middleware=MagicMock(),
+                memory_manager=mgr,
+            )
 
-        assert ctx.memory_manager._llm_getter() is old_llm
+            assert await ctx.memory_manager._llm_getter(None) is old_llm
 
-        ctx.bind_llm(lambda: new_llm)
+            ctx.bind_llm(default_thread_llm_resolver(lambda: new_llm))
 
-        assert ctx.memory_manager._llm_getter() is new_llm
-        assert ctx.memory_manager.write_middleware._llm_getter() is new_llm
+            assert await ctx.memory_manager._llm_getter(None) is new_llm
+            assert await ctx.memory_manager.write_middleware._llm_getter(None) is new_llm
+
+        asyncio.run(run())
 
 
 # ════════════════════════════════════════════════════════════════════════

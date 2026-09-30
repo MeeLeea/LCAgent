@@ -230,3 +230,36 @@ def test_session_config_survives_real_sqlite_reopen(tmp_path):
     expected, actual = asyncio.run(run())
     assert actual == expected
 
+
+# --------------------------------------------------------------------------- #
+# apeek_session_config：纯读，不触发默认配置迁移写
+# --------------------------------------------------------------------------- #
+
+
+def test_registry_apeek_returns_stored_config_without_migration():
+    store = SessionStore()
+    registry = SessionRegistry(MemorySaver(), store)
+
+    async def run():
+        await registry.aset_session_config("s1", _config())
+        return await registry.apeek_session_config("s1")
+
+    assert asyncio.run(run()) == _config()
+
+
+def test_registry_apeek_is_read_only_when_store_empty():
+    """store 为空但设有默认配置时，apeek 返回 None 且不持久化默认配置。"""
+    store = SessionStore()
+    registry = SessionRegistry(
+        MemorySaver(), store, default_session_config=_config(provider="default")
+    )
+
+    async def run():
+        peeked = await registry.apeek_session_config("missing")
+        stored_after = await store.aget_session_config("missing")
+        return peeked, stored_after
+
+    peeked, stored_after = asyncio.run(run())
+    assert peeked is None
+    assert stored_after is None  # 未触发 aget_session_config 的默认配置迁移写
+
