@@ -10,8 +10,8 @@
     latest_msg_cnt             int    短期上下文窗口消息条数（最近 N 条消息，传递给 SessionRegistry.aget_short_term）
     verbose                    bool   是否打印详细过程
     mcp_config_file            str    MCP 配置文件(相对项目根或绝对路径)
-    max_context_messages       int    长上下文裁剪阈值(0=关闭)
-    context_trim_keep          int    裁剪时保留的最近消息条数
+    max_context_tokens         int    长上下文压缩触发 token 阈值(0=关闭自动触发；缺省回退 100000)
+    context_trim_keep          int    压缩时保留的最近消息条数
     max_execution_history      int    执行历史最大条数
     tool_timeout               int    工具调用超时(秒)
     temperature                float  LLM 采样温度(全局默认，非团队场景生效；
@@ -87,7 +87,7 @@ DEFAULTS: dict[str, Any] = {
     "latest_msg_cnt": 10,
     "verbose": True,
     "mcp_config_file": "config/mcp_servers.json",
-    "max_context_messages": 0,
+    "max_context_tokens": 100000,
     "context_trim_keep": 12,
     "max_execution_history": 100,
     "agent_prompt_file": "agent/AGENT.md",
@@ -276,6 +276,23 @@ def load_team_agent_config(agent_name: str, base_dir: str) -> dict[str, Any]:
     if agent_name in team_config:
         result.update(team_config[agent_name])
     return result
+
+
+def load_team_agent_role_entry(agent_name: str, base_dir: str) -> dict[str, Any]:
+    """只取 team_agents.json 中 agent_name 自身的条目（不合并 default）。
+    兼容旧格式：角色无统一配置条目时回退到 team/<role>/agent_config.json。"""
+    team_config_path = os.path.join(base_dir, "team", "team_agents.json")
+    if os.path.exists(team_config_path):
+        try:
+            with open(team_config_path, "r", encoding="utf-8") as f:
+                team_config = json.load(f)
+            if agent_name in team_config:
+                return dict(team_config[agent_name])
+        except (OSError, json.JSONDecodeError):
+            pass
+    # Legacy fallback
+    old_path = os.path.join(base_dir, "team", agent_name, "agent_config.json")
+    return load_agent_config(old_path) if os.path.exists(old_path) else {}
 
 
 def resolve_path(path: str, base_dir: str) -> str:

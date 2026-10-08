@@ -117,8 +117,8 @@ async def compact_context_apply(
 ) -> dict[str, Any] | None:
     """手动触发上下文压缩（CLI / API 共用唯一实现）。
 
-    手动触发一律 ``force=True``：跳过 ``max_messages`` 阈值检查，允许用户在
-    消息数未超阈值时主动压缩（仍需消息数 > ``keep_recent`` 才能安全切割）。
+    手动触发一律 ``force=True``：跳过 ``max_context_tokens`` 阈值检查，允许用户在
+    预估 token 未超阈值时主动压缩（仍需消息数 > ``keep_recent`` 才能安全切割）。
 
     Returns:
         压缩结果字典；消息过少无法安全切割时返回 ``None``。

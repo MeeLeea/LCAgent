@@ -108,3 +108,35 @@ def test_resolve_role_config_patch_same_across_cli_and_api_entry():
     from_api = role_sw.resolve_role_config_patch("worker", explicit=SessionConfigPatch(role="worker"))
     from_cli = role_sw.resolve_role_config_patch("worker")
     assert from_api == from_cli
+
+
+def test_resolve_role_config_patch_worker_keeps_own_temperature():
+    """worker 角色自身声明 temperature=0.3，解析结果保留该采样值。
+
+    角色解析读取的是角色**自身**条目（不再与 default 合并），worker 声明的
+    temperature 必须出现在补丁中。
+    """
+    patch = role_sw.resolve_role_config_patch("worker")
+
+    assert patch.temperature == 0.3
+
+
+def test_resolve_role_config_patch_role_without_sampling_leaves_temperature_none():
+    """角色自身未声明采样参数时不得从 default 合并（architect 无 temperature）。
+
+    default 条目声明了 temperature=0.7，但 architect 自身条目未声明；
+    若解析误做 default 合并，这里会得到 0.7 而非 None。
+    """
+    patch = role_sw.resolve_role_config_patch("architect")
+
+    assert patch.role == "architect"
+    assert patch.temperature is None
+
+
+def test_resolve_role_config_patch_default_role_has_no_overrides():
+    """role="default" 不携带 provider/model/temperature 覆盖，回落 agent_config.json。"""
+    patch = role_sw.resolve_role_config_patch("default")
+
+    assert patch.role == "default"
+    assert patch.provider is None
+    assert patch.temperature is None

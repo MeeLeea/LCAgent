@@ -9,6 +9,12 @@
 
 从 agent_core.py 抽离,避免核心调度模块承载角色目录扫描逻辑。
 
+**配置优先级**（``resolve_role_config_patch``）：只取角色在 ``team_agents.json`` 中的
+**自身条目**，不再与 ``default`` 合并。角色未声明 ``temperature`` / ``max_tokens`` /
+``max_iterations`` 时保持未设置，由会话模型工厂回退到 ``agent/agent_config.json`` 的全局
+默认采样；``team_agents.json`` 仅声明角色级差异。``role:default`` 不覆盖 provider/model/采样，
+保留会话现有值。
+
 **角色切换的写入口**仍只有两处(会话级角色切换由会话配置实现,写入
 ``SessionConfig.role`` / ``SessionConfig.system_prompt``,经
 ``agent/session_config_middleware.py::SessionConfigMW`` 在每次 model 调用时生效):
@@ -117,12 +123,18 @@ def resolve_role_config_patch(
 ) -> SessionConfigPatch:
     """解析角色并合成为该会话的配置补丁（CLI / API 共用唯一实现）。
 
-    完整流程：定位角色目录 → 加载 ``team/team_agents.json`` 角色配置 →
-    读取 ``AGENT.md`` → 剥离 ``## workflow:*`` 小节 → 拼接基础规则得到 system prompt
+    完整流程：定位角色目录 → 加载 ``team/team_agents.json`` 中该角色**自身**的条目
+    → 读取 ``AGENT.md`` → 剥离 ``## workflow:*`` 小节 → 拼接基础规则得到 system prompt
     → 合并 provider/model/采样参数，产出 ``SessionConfigPatch``。
 
-    字段优先级（``explicit`` 非 None 时）：显式请求字段 > 角色配置字段 > 不修改。
-    ``explicit=None``（CLI 路径）时：角色配置中存在的字段一律覆盖。
+    字段优先级（``explicit`` 非 None 时）：显式请求字段 > 角色自身配置字段 > 不修改。
+    ``explicit=None``（CLI 路径）时：角色自身配置中存在的字段一律覆盖。
+
+    **采样参数回退**：只读取角色自身条目，**不合并** ``team_agents.json`` 的 ``default``。
+    角色未显式声明 ``temperature`` / ``max_tokens`` / ``max_iterations`` 时，这些字段保持
+    未设置，由 ``SessionModelFactory`` 回退到 ``agent/agent_config.json`` 的全局默认采样。
+    ``team_agents.json`` 只声明角色级差异（delta）。``role_name="default"`` 一律不产生任何
+    覆盖（不覆盖 provider/model/采样），保留会话现有值。
 
     Args:
         role_name: 角色名（``team/<role>/`` 目录名，或 ``"default"``）。
@@ -137,11 +149,14 @@ def resolve_role_config_patch(
         FileNotFoundError: 角色提示词为空或无法读取。
     """
     # 延迟导入：避免 agent 包与 llm/team 在模块加载期形成循环依赖
-    from llm.config import compose_role_system_prompt, load_team_agent_config
+    from llm.config import compose_role_system_prompt, load_team_agent_role_entry
     from team.base import TeamAgent
 
     role_dir = _locate_team_agent_dir(role_name)
-    config = load_team_agent_config(role_name, base_dir)
+    # 只取角色自身条目（不合并 default）：default 不再作为采样兜底来源。
+    # role:default 不覆盖 provider/model/采样，保留会话现有值 →
+    # 经 SessionModelFactory 回退到 agent_config.json 的全局默认。
+    config = {} if role_name == "default" else load_team_agent_role_entry(role_name, base_dir)
     content = TeamAgent._read_prompt_file(os.path.join(role_dir, "AGENT.md"))
     if content is None:
         raise FileNotFoundError(f"角色提示词为空: {role_name}")

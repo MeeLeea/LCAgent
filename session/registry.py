@@ -316,6 +316,14 @@ class SessionRegistry:
         await self._store.aset_session_config(session_id, migrated)
         return migrated
 
+    async def apeek_session_config(self, session_id: str) -> SessionConfig | None:
+        """只读读取会话配置，不触发默认配置迁移写入（供后台任务使用）。
+
+        与 ``aget_session_config`` 不同，本方法不写入 Store，避免后台记忆
+        flush 产生写副作用或与并发 PATCH 竞态。
+        """
+        return await self._store.aget_session_config(session_id)
+
     async def aget_session_configs(
         self, session_ids: Sequence[str]
     ) -> dict[str, SessionConfig]:

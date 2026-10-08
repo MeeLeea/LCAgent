@@ -19,7 +19,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 from langgraph.errors import GraphBubbleUp
 
 from llm.llm_client import RETRY_ATTEMPTS, RETRY_MAX_DELAY, should_retry
-from llm.message_utils import extract_llm_error, stringify_content
+from llm.message_utils import extract_llm_error, final_answer_is_empty, stringify_content
 from tools.terminal_tools import UserRejectedCommandError
 from utils.events import AgentEvent
 from utils.logging_config import TraceContext, generate_trace_id
@@ -44,6 +44,7 @@ class Streaming:
         thread_id: str,
         trace_id: str,
         collected_output: list[str] | None = None,
+        final_ai: list[AIMessage] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """内部方法：直接消费 LangGraph astream_events，映射为 AgentEvent。
 
@@ -56,6 +57,8 @@ class Streaming:
             thread_id: 会话线程 ID（写入事件）
             trace_id: 追踪 ID
             collected_output: 可选列表，收集 TOKEN 文本用于最终 DONE 事件
+            final_ai: 可选列表（长度 1），记录最后一次 on_chat_model_end 的
+                      AIMessage，供调用方检测最终回答是否为空
         """
         graph = self.agent_executor
         recorded_msg_ids: set[str] = set()
@@ -283,6 +286,12 @@ class Streaming:
                                     provider=getattr(llm, "provider", ""),
                                     model=getattr(llm, "model", "") or "",
                                 )
+                            # 记录最终 AIMessage：调用方在流结束后据此检测
+                            # 空回答（reasoning token 耗尽 / finish_reason=length）
+                            if final_ai is not None:
+                                # 覆写为最新（也是最终）AIMessage；用切片赋值兼容空/已占位列表，
+                                # 杜绝 `list assignment index out of range`（历史回归，见 test_empty_response_guard）
+                                final_ai[:] = [output]
                             # 提前发出 TOOL_CALL：LLM 回复完成时 tool_calls 已确定，
                             # 无需等待 LangGraph 路由到工具节点（on_tool_start），
                             # 前端可更早显示工具名 + "执行中"
@@ -393,6 +402,7 @@ class Streaming:
             config = await self._ainvoke_config(thread_id)
             input_msg = HumanMessage(content=message)
             collected_output: list[str] = []
+            _ai_holder: list[AIMessage] = []
 
             with self._temp_verbose(False):
                 async for ev in self._arun_graph_events(
@@ -401,6 +411,7 @@ class Streaming:
                     tid,
                     trace_id,
                     collected_output,
+                    final_ai=_ai_holder,
                 ):
                     if ev.is_terminal:
                         # ERROR / CANCELLED → 记录 interrupt 状态后返回
@@ -415,6 +426,14 @@ class Streaming:
             if interrupt_ev is not None:
                 await self._acapture_pending_interrupt(config, "chat" if not is_run_mode else "run")
                 yield interrupt_ev
+                return
+
+            # 空最终回答检测：reasoning token 耗尽 / finish_reason=length 时
+            # 模型可能返回空 AIMessage，静默 yield 空 DONE 会让前端显示空白。
+            # 发 ERROR 事件明确提示原因，而非静默空白（interrupt/cancelled 优先）。
+            _reason = final_answer_is_empty(_ai_holder[0]) if _ai_holder else None
+            if _reason:
+                yield AgentEvent.error(_reason, thread_id=tid, trace_id=trace_id)
                 return
 
             # 正常完成：清理中断状态，yield DONE
@@ -460,6 +479,7 @@ class Streaming:
                 mode = "chat"
 
             collected_output: list[str] = []
+            _ai_holder: list[AIMessage] = []
 
             resume_command = await self._abuild_resume_command(config, payload)
 
@@ -470,6 +490,7 @@ class Streaming:
                     tid,
                     trace_id,
                     collected_output,
+                    final_ai=_ai_holder,
                 ):
                     if ev.is_terminal:
                         if ev.event_type.value == "cancelled":
@@ -483,6 +504,14 @@ class Streaming:
             if interrupt_ev is not None:
                 await self._acapture_pending_interrupt(config, mode)
                 yield interrupt_ev
+                return
+
+            # 空最终回答检测：reasoning token 耗尽 / finish_reason=length 时
+            # 模型可能返回空 AIMessage，发 ERROR 明确提示而非静默空白
+            # （interrupt/cancelled 优先）。
+            _reason = final_answer_is_empty(_ai_holder[0]) if _ai_holder else None
+            if _reason:
+                yield AgentEvent.error(_reason, thread_id=tid, trace_id=trace_id)
                 return
 
             # 正常完成

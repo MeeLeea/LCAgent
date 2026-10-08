@@ -2,8 +2,8 @@
 
 覆盖 5 个用例:
 1. ``compaction_mw=None`` → 节点返回值不含 RemoveMessage, 其它字段原样透传
-2. 消息数 <= max_messages(arun_compaction 返回 None) → 与未包装时逐字相同
-3. 消息数 > max_messages 且摘要模型可用 → summary 非空、messages 含 SystemMessage、
+2. 估算 token <= max_context_tokens(arun_compaction 返回 None) → 与未包装时逐字相同
+3. 估算 token > max_context_tokens 且摘要模型可用 → summary 非空、messages 含摘要 HumanMessage、
    且 messages[-1] 仍是节点自身产出
 4. 节点返回的其它字段(out)在压缩后仍保留(守护 ``{**result, **update}``)
 5. config 注入回归: 包装后的节点仍收到 LangGraph 注入的 config(workspace_path 可达)
@@ -44,11 +44,11 @@ class _StubModel:
         return _Resp(self._text)
 
 
-def _make_mw(max_messages: int, keep_recent: int = 1) -> LCAgentCompactionMiddleware:
-    """构造带 stub 摘要模型的 compaction 中间件(非 force, 仅超阈值时触发)。"""
+def _make_mw(max_context_tokens: int, keep_recent: int = 1) -> LCAgentCompactionMiddleware:
+    """构造带 stub 摘要模型的 compaction 中间件(非 force, 仅估算 token 超阈值时触发)。"""
     return LCAgentCompactionMiddleware(
         model=_StubModel(),
-        config=CompactionConfig(max_messages=max_messages, keep_recent=keep_recent),
+        config=CompactionConfig(max_context_tokens=max_context_tokens, keep_recent=keep_recent),
     )
 
 
@@ -98,10 +98,10 @@ def test_no_compaction_mw_passes_through():
 
 
 def test_below_threshold_is_identical_to_unwrapped():
-    """用例 2: 消息数 <= max_messages(arun_compaction 返回 None) → 与未包装逐字相同。"""
+    """用例 2: 估算 token <= max_context_tokens(arun_compaction 返回 None) → 与未包装逐字相同。"""
     state_in = {"messages": [AIMessage(content="m0", id="m0")]}
 
-    wrapped = _run_graph(_make_mw(max_messages=10, keep_recent=5), _node, dict(state_in))
+    wrapped = _run_graph(_make_mw(max_context_tokens=10, keep_recent=5), _node, dict(state_in))
     plain = _run_graph(None, _node, dict(state_in))
 
     assert wrapped["out"] == plain["out"]
@@ -113,7 +113,7 @@ def test_above_threshold_compacts_and_keeps_node_output():
     """用例 3: 超阈值压缩后 summary 非空、含 SystemMessage、末条仍是节点产出。"""
     state_in = {"messages": [AIMessage(content=f"m{i}", id=f"m{i}") for i in range(4)]}
 
-    out = _run_graph(_make_mw(max_messages=2, keep_recent=1), _node, state_in)
+    out = _run_graph(_make_mw(max_context_tokens=2, keep_recent=1), _node, state_in)
 
     assert out.get("summary"), "压缩后 summary 必须非空"
     assert any(isinstance(m, HumanMessage) for m in out["messages"]), "缺少摘要 HumanMessage"
@@ -127,7 +127,7 @@ def test_other_node_fields_survive_compaction():
     """用例 4: 压缩后节点返回的其它字段(out)仍保留(守护 ``{**result, **update}``)。"""
     state_in = {"messages": [AIMessage(content=f"m{i}", id=f"m{i}") for i in range(4)]}
 
-    out = _run_graph(_make_mw(max_messages=2, keep_recent=1), _node, state_in)
+    out = _run_graph(_make_mw(max_context_tokens=2, keep_recent=1), _node, state_in)
 
     assert out.get("summary"), "前置条件: 本用例必须触发压缩"
     assert out["out"] == "x", "节点返回的 out 字段在压缩后丢失(合并语义被改坏)"
@@ -151,7 +151,7 @@ def test_wrapped_node_still_receives_injected_config():
         builder,
         {"r": None},
         None,
-        compaction_mw=_make_mw(max_messages=50, keep_recent=20),
+        compaction_mw=_make_mw(max_context_tokens=100_000, keep_recent=20),
         specs=[NodeSpec("n", config_node, role="r")],
     )
     builder.add_edge(START, "n")
