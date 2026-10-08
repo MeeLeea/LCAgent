@@ -1,72 +1,23 @@
-"""测试团队角色切换：role_sw.arebuild_agent_from_team_dir 单一入口。
+"""测试团队角色目录发现：role_sw 的可用角色扫描与目录定位。
 
-覆盖三件事：
-1. _locate_team_agent_dir 扫描 team/ 精确定位角色目录，未命中抛 KeyError。
-2. arebuild_agent_from_team_dir 在仅提示词变化与 provider/model 变化两种场景下，
-   都调用 _arebuild_agent_executor 重建 executor（system_prompt 已改为静态字符串，
-   旧的仅更新提示词路径已移除，两条路径统一走 _arebuild_agent_executor）。
-3. arebuild_agent_from_team_dir 在 provider/model 变化时重建 LLMClient + executor。
+覆盖两件事：
+1. ``_locate_team_agent_dir`` 扫描 team/ 精确定位角色目录，未命中抛 KeyError。
+2. ``get_available_team_roles`` 返回统一配置中定义的内置角色。
 
-断言约定：LLM 相关的预期值从 team/team_agents.json 统一配置动态读取，
-不硬编码具体 provider/model 名——验证的是"切换后 LLM 与角色配置一致"
-这一行为，而非绑定某个模型（避免默认 provider 调整导致测试失配）。
+注：会话级角色切换已改由会话配置实现（CLI ``cli/commands/role.py`` /
+HTTP ``api/server.py::_resolve_role_patch``），历史遗留的
+``arebuild_agent_from_team_dir``（就地改写共享 AgentCore 的全局路径）已删除，
+故本文件不再覆盖切换行为。
+
+断言约定：不硬编码具体 provider/model 名——验证的是"角色目录可被正确定位"
+这一行为，而非绑定某个模型（避免默认配置调整导致测试失配）。
 """
-import asyncio
-import json
-from pathlib import Path
+import os
 
 import pytest
-from langchain_core.messages import SystemMessage
 
 from agent import role_sw
-from agent.agent_core import AgentCore
 from agent.role_sw import _locate_team_agent_dir
-
-
-def _read_role_llm_config(role: str) -> dict:
-    """从 team/team_agents.json 读取角色的 LLM 配置"""
-    # 项目根目录
-    _ROOT = Path(__file__).resolve().parents[2]
-    config_path = _ROOT / "team" / "team_agents.json"
-    with open(config_path, encoding="utf-8") as f:
-        data = json.load(f)
-    default = data.get("default", {})
-    role_cfg = data.get(role, {})
-    merged = {**default, **role_cfg}
-    return {
-        "provider": merged.get("provider"),
-        "model": merged.get("model"),
-        "temperature": merged.get("temperature"),
-        "max_tokens": merged.get("max_tokens"),
-    }
-
-
-class FakeLLM:
-    """最小化 LLM mock，提供切换判断所需属性"""
-
-    def __init__(self, provider="zhipu", model="glm-4-flash"):
-        self.provider = provider
-        self.model = model
-        self.config_file = "config/llm_config.json"
-        self.temperature = 0.7
-        self.max_tokens = 2048
-
-
-def _make_minimal_core(llm=None):
-    """创建一个最小化的 AgentCore 实例（绕过 __init__）"""
-    core = object.__new__(AgentCore)
-    core.name = "test"
-    core.verbose = False
-    core.max_iterations = 25
-    core.agent_core_prompt = "base prompt"
-    core.active_skills = set()
-    core.auto_match_skills = False
-    core._state_lock = asyncio.Lock()
-    core._system_message = SystemMessage(content="base prompt")
-    core.llm = llm or FakeLLM()
-    core._closed = False
-    return core
-
 
 # ============ 测试：目录定位 ============
 
@@ -76,8 +27,6 @@ def test_locate_team_agent_dir_finds_manager():
     path = _locate_team_agent_dir("manager")
 
     # Then: 返回的目录包含必需文件
-    import os
-
     assert os.path.isdir(path)
     assert path.endswith("manager")
     assert os.path.isfile(os.path.join(path, "AGENT.md"))
@@ -91,6 +40,14 @@ def test_locate_team_agent_dir_raises_on_missing():
     assert "nonexistent_role_xyz" in str(exc.value)
 
 
+def test_locate_team_agent_dir_returns_agent_dir_for_default():
+    """default 角色不在 team/ 下，返回 agent/ 目录。"""
+    path = _locate_team_agent_dir("default")
+
+    assert os.path.isdir(path)
+    assert os.path.basename(path) == "agent"
+
+
 def test_get_available_team_roles_includes_builtin():
     """get_available_team_roles 返回内置角色"""
     roles = role_sw.get_available_team_roles()
@@ -102,171 +59,84 @@ def test_get_available_team_roles_includes_builtin():
     assert "rtl_verification" in roles
 
 
-# ============ 测试：_arebuild_agent_executor 在两种场景下都被调用 ============
+# ============ 测试：共享角色配置解析（CLI / API 唯一实现） ============
 
 
-def test_rebuild_calls_agent_executor_for_prompt_only_and_llm_change(monkeypatch):
-    """仅提示词变化与 LLM 变化两种场景都应调用 _arebuild_agent_executor。
+def test_resolve_role_config_patch_builds_role_and_prompt():
+    # When: 解析内置 manager 角色
+    patch = role_sw.resolve_role_config_patch("manager")
 
-    新架构下 system_prompt 已改为静态字符串，prompt-only 变化也需重建 executor；
-    旧的仅更新提示词路径已移除，两条路径统一走 _arebuild_agent_executor。
-    断言只关心切换行为（executor 重建次数 + 角色 name），不绑定具体 LLM。
-    """
-    # --- 场景 1：仅提示词变化（provider/model 不变）---
-    # Given: 主 agent 当前 provider/model 与 manager 角色配置一致（保证走 prompt-only 分支）
-    manager_llm = _read_role_llm_config("manager")
-    core = _make_minimal_core(
-        FakeLLM(provider=manager_llm["provider"], model=manager_llm["model"])
+    # Then: 产出含 role 与非空 system_prompt 的补丁
+    assert patch.role == "manager"
+    assert patch.system_prompt
+    # 基础规则应已拼接进角色提示词（manager 无工具，仅「重要规则」）
+    assert "重要规则" in patch.system_prompt
+
+
+def test_resolve_role_config_patch_default_role_keeps_prompt_unconcatenated():
+    # When: 解析 default 角色（提示词来源即 agent/AGENT.md，不应重复拼接）
+    patch = role_sw.resolve_role_config_patch("default")
+
+    # Then: role 为 default，system_prompt 非空
+    assert patch.role == "default"
+    assert patch.system_prompt
+
+
+def test_resolve_role_config_patch_raises_for_unknown_role():
+    with pytest.raises(KeyError):
+        role_sw.resolve_role_config_patch("nonexistent_role_xyz")
+
+
+def test_resolve_role_config_patch_explicit_fields_take_precedence():
+    """显式字段（如 temperature/system_prompt）优先于角色配置。"""
+    from session.config import SessionConfigPatch
+
+    patch = role_sw.resolve_role_config_patch(
+        "manager",
+        explicit=SessionConfigPatch(system_prompt="自定义提示词", temperature=0.123),
     )
-
-    rebuild_calls_prompt_only = 0
-
-    async def counting_rebuild_prompt_only(task=""):
-        nonlocal rebuild_calls_prompt_only
-        rebuild_calls_prompt_only += 1
-
-    core._arebuild_agent_executor = counting_rebuild_prompt_only
-
-    # When: 切换到 manager 角色（provider/model 与当前一致 → 仅重建 executor）
-    asyncio.run(role_sw.arebuild_agent_from_team_dir(core, "manager"))
-
-    # Then: 仅提示词变化也重建了 executor
-    assert rebuild_calls_prompt_only == 1
-    # 角色已切换：name 与提示词对应 manager
-    assert core.name == "manager"
-    assert "任务规划者" in core.agent_core_prompt
-
-    # --- 场景 2：LLM 变化（provider 不同）---
-    # Given: 主 agent 当前 provider=qwen，与 manager 角色配置不同
-    core2 = _make_minimal_core(FakeLLM(provider="qwen", model="qwen-max"))
-
-    rebuild_calls_llm_change = 0
-    constructed_llm_change = {}
-
-    async def counting_rebuild_llm_change(task=""):
-        nonlocal rebuild_calls_llm_change
-        rebuild_calls_llm_change += 1
-
-    def fake_llm_ctor_change(**kwargs):
-        constructed_llm_change.update(kwargs)
-        return FakeLLM(provider=kwargs["provider"], model=kwargs.get("model"))
-
-    core2._arebuild_agent_executor = counting_rebuild_llm_change
-    # 拦截 LLMClient 构造，避免真实 API key 依赖
-    monkeypatch.setattr(role_sw, "LLMClient", fake_llm_ctor_change)
-
-    # When: 切换到 manager（provider 与当前不同 → 触发 LLM 重建）
-    asyncio.run(role_sw.arebuild_agent_from_team_dir(core2, "manager"))
-
-    # Then: LLM 变化也重建了 executor，且 LLMClient 被按角色配置重建
-    assert rebuild_calls_llm_change == 1
-    assert core2.name == "manager"
-    # LLM 确实被重建（LLMClient 以角色配置参数被构造），不绑定具体值
-    assert constructed_llm_change["provider"] == manager_llm["provider"]
-    assert core2.llm.provider == constructed_llm_change["provider"]
+    assert patch.role == "manager"
+    assert patch.system_prompt == "自定义提示词"
+    assert patch.temperature == 0.123
 
 
-# ============ 测试：provider 变化触发重建 ============
+def test_resolve_role_config_patch_same_across_cli_and_api_entry():
+    """CLI 与 API 对同一角色解析出的补丁必须一致（防两入口漂移）。"""
+    from session.config import SessionConfigPatch
+
+    # API 路径（带显式补丁）与 CLI 路径（无显式补丁）对纯角色切换应等价
+    from_api = role_sw.resolve_role_config_patch("worker", explicit=SessionConfigPatch(role="worker"))
+    from_cli = role_sw.resolve_role_config_patch("worker")
+    assert from_api == from_cli
 
 
-def test_rebuild_switches_llm_when_provider_changes(monkeypatch):
-    # Given: 主 agent 当前 provider=qwen，与 manager 角色配置不同
-    manager_llm = _read_role_llm_config("manager")
-    core = _make_minimal_core(FakeLLM(provider="qwen", model="qwen-max"))
+def test_resolve_role_config_patch_worker_keeps_own_temperature():
+    """worker 角色自身声明 temperature=0.3，解析结果保留该采样值。
 
-    rebuild_calls = 0
-    constructed = {}
-
-    async def counting_rebuild(task=""):
-        nonlocal rebuild_calls
-        rebuild_calls += 1
-
-    def fake_llm_ctor(**kwargs):
-        constructed.update(kwargs)
-        return FakeLLM(provider=kwargs["provider"], model=kwargs.get("model"))
-
-    core._arebuild_agent_executor = counting_rebuild
-    # 拦截 LLMClient 构造，避免真实 API key 依赖(现由 role_sw 模块调用)
-    monkeypatch.setattr(role_sw, "LLMClient", fake_llm_ctor)
-
-    # When: 切换到 manager（provider 与当前不同 → 触发 LLM 重建）
-    asyncio.run(role_sw.arebuild_agent_from_team_dir(core, "manager"))
-
-    # Then: 重建了 executor，LLMClient 按角色配置重建（不绑定具体 provider 名）
-    assert rebuild_calls == 1
-    assert core.name == "manager"
-    assert constructed["provider"] == manager_llm["provider"]
-    assert core.llm.provider == constructed["provider"]
-
-
-def test_rebuild_uses_target_provider_default_model_when_role_model_null(monkeypatch):
-    """角色 model 为 null 且 provider 与当前不同时，回退到目标 provider 的默认 model。
-
-    回归测试：修复前 target_model = config.get("model") or agent.llm.model，
-    会从 yunlan(qwen3.8-max) 切到 zhipu(model=null) 时把旧 provider 的 model 误带过去，
-    触发网关 400「modelCode：不存在」。
-
-    Given: 当前 LLM 为 yunlan / qwen3.8-max，切到 worker(zhipu, model=null)
-    Then: 重建的 LLMClient 的 model 应为 zhipu 在 llm_config.json 的默认模型(glm-4.7-flash)，
-          而非沿用当前的 qwen3.8-max。
+    角色解析读取的是角色**自身**条目（不再与 default 合并），worker 声明的
+    temperature 必须出现在补丁中。
     """
-    from llm.llm_client import load_providers
+    patch = role_sw.resolve_role_config_patch("worker")
 
-    # 目标 provider(zhipu) 的默认 model，从真实配置读取，不硬编码
-    zhipu_default = load_providers("config/llm_config.json")["zhipu"]["model"]
-    assert zhipu_default, "llm_config.json 中 zhipu 应声明默认 model"
-
-    # Given: 当前处于 yunlan / qwen3.8-max
-    core = _make_minimal_core(FakeLLM(provider="yunlan", model="qwen3.8-max"))
-    constructed = {}
-
-    async def noop_rebuild(task=""):
-        pass
-
-    def fake_llm_ctor(**kwargs):
-        constructed.update(kwargs)
-        # 复用 FakeLLM，但真实解析 model 以便断言
-        m = FakeLLM(provider=kwargs["provider"], model=kwargs.get("model"))
-        return m
-
-    core._arebuild_agent_executor = noop_rebuild
-    monkeypatch.setattr(role_sw, "LLMClient", fake_llm_ctor)
-
-    # When: 切换到 worker（provider=zhipu, model=null）
-    asyncio.run(role_sw.arebuild_agent_from_team_dir(core, "worker"))
-
-    # Then: model 回退到 zhipu 默认模型，而非误带 yunwu 的 qwen3.7-max
-    assert constructed["model"] == zhipu_default
-    assert constructed["model"] != "qwen3.7-max"
-    assert core.llm.model == zhipu_default
+    assert patch.temperature == 0.3
 
 
-def test_rebuild_applies_role_sampling_params(monkeypatch):
-    """角色切换重建 LLM 时，应用角色级统一配置的 temperature/max_tokens
+def test_resolve_role_config_patch_role_without_sampling_leaves_temperature_none():
+    """角色自身未声明采样参数时不得从 default 合并（architect 无 temperature）。
 
-    验证:切换后 LLMClient 以角色配置的采样参数构造(而非保留当前 LLM 的值)。
+    default 条目声明了 temperature=0.7，但 architect 自身条目未声明；
+    若解析误做 default 合并，这里会得到 0.7 而非 None。
     """
-    worker_llm = _read_role_llm_config("worker")
-    assert worker_llm["temperature"] is not None, "worker 角色应配置采样参数"
+    patch = role_sw.resolve_role_config_patch("architect")
 
-    # Given: 主 agent 当前 provider 与 worker 角色不同 → 触发 LLM 重建
-    core = _make_minimal_core(FakeLLM(provider="qwen", model="qwen-max"))
-    constructed = {}
+    assert patch.role == "architect"
+    assert patch.temperature is None
 
-    async def noop_rebuild(task=""):
-        pass
 
-    def fake_llm_ctor(**kwargs):
-        constructed.update(kwargs)
-        return FakeLLM(provider=kwargs["provider"], model=kwargs.get("model"))
+def test_resolve_role_config_patch_default_role_has_no_overrides():
+    """role="default" 不携带 provider/model/temperature 覆盖，回落 agent_config.json。"""
+    patch = role_sw.resolve_role_config_patch("default")
 
-    core._arebuild_agent_executor = noop_rebuild
-    monkeypatch.setattr(role_sw, "LLMClient", fake_llm_ctor)
-
-    # When: 切换到 worker 角色
-    asyncio.run(role_sw.arebuild_agent_from_team_dir(core, "worker"))
-
-    # Then: 重建的 LLMClient 携带角色级采样参数
-    assert constructed["provider"] == worker_llm["provider"]
-    assert constructed["temperature"] == worker_llm["temperature"]
-    assert constructed["max_tokens"] == worker_llm["max_tokens"]
+    assert patch.role == "default"
+    assert patch.provider is None
+    assert patch.temperature is None

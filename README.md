@@ -123,7 +123,7 @@
   - [代码使用示例](#代码使用示例)
   - [运行时配置](#运行时配置)
     - [1. `agent_config.json` — Agent 运行时参数](#1-agent_configjson--agent-运行时参数)
-      - [长上下文裁剪（Long-Context Trimming）](#长上下文裁剪long-context-trimming)
+      - [长上下文压缩（Long-Context Compaction）](#长上下文压缩long-context-compaction)
     - [2. `llm_config.json` — LLM 服务商配置](#2-llm_configjson--llm-服务商配置)
     - [3. `mcp_servers.json` — MCP 服务器配置](#3-mcp_serversjson--mcp-服务器配置)
     - [4. `safety.json` — 安全护栏](#4-safetyjson--安全护栏)
@@ -265,15 +265,15 @@ LangChainAgent/
 │   ├── workspace_mw.py      # WorkspaceSecurityMW：工作空间安全中间件
 │   ├── compaction.py        # LangGraph 上下文压缩中间件（增量摘要 + 工具输出 Prune + 保留近期消息）
 │   └── role_sw.py           # 团队角色切换（唯一实现/入口）
-├── skmng/                    # 技能管理统一包（收敛原 tools/skills+skill_tool+graph/common:SkillInjector+agent/skill_mw+skill_ops+team/base:PromptInjector）
+├── skmng/                    # 技能管理统一包（技能扫描/匹配/渲染 + 注入 + read_skill 工具）
 │   ├── __init__.py          # 聚合导出 SkillManager/SkillInjector/SkillInjectionMW/SkillOps/read_skill/PromptInjector/build_skill_block/inject_into_prompt
-│   ├── manager.py           # SkillManager：扫描/匹配/渲染本地技能（原 tools/skills.py）
-│   ├── tool.py              # read_skill 工具：LLM 自助读取技能指引（原 tools/skill_tool.py）
+│   ├── manager.py           # SkillManager：扫描/匹配/渲染本地技能
+│   ├── tool.py              # read_skill 工具：LLM 自助读取技能指引
 │   ├── core.py              # 统一注入核心：build_skill_block 三来源合并（fixed_skills+active_names+auto_match）+ inject_into_prompt 防重复
 │   ├── protocols.py         # PromptInjector 协议（独立放置，防 team→graph 循环依赖）
-│   ├── injector.py          # SkillInjector：工作流节点 prompt 层注入器（改调 core 三来源合并）
-│   ├── middleware.py        # SkillInjectionMW：agent 层 model 调用前注入中间件（改调 core）
-│   └── ops.py               # SkillOps Mixin：技能加载/清理 + 手动压缩（原 agent/skill_ops.py，供 AgentCore 多继承）
+│   ├── injector.py          # SkillInjector：工作流节点 prompt 层注入器
+│   ├── middleware.py        # SkillInjectionMW：agent 层 model 调用前注入中间件
+│   └── ops.py               # SkillOps Mixin：技能加载/清理 + 手动压缩（供 AgentCore 多继承）
 ├── utils/                   # 通用工具（与业务解耦，供 agent/graph/session 等共用）
 │   ├── events.py            # 标准化执行事件模型（AgentEvent / EventType，含节点进度事件）
 │   ├── exceptions.py        # 统一异常层次（LCAgentError 及其子类）
@@ -303,11 +303,17 @@ LangChainAgent/
 │       ├── agent_config.json
 │       └── AGENT.md
 ├── graph/                   # LangGraph 工作流编排
-│   ├── common.py            # 工作流通用能力：异步执行辅助 + 跨轮次记忆压缩 + workspace 透传
+│   ├── common/              # 工作流共享组件包：节点跟踪 + 中断转发 + 节点工厂 + 运行器 + 压缩 + 声明式注册 + 注册表
+│   │   ├── node_tracking.py     # NodeTrackingHandler 节点级进度回调（含 TOKEN 级流式）
+│   │   ├── interrupt_forward.py # run_team_turn_with_interrupt 中断转发
+│   │   ├── node_factory.py      # create_llm_node 节点工厂
+│   │   ├── workflow_runner.py   # arun_compiled_workflow 通用运行器（跨轮次记忆压缩 + workspace_path 透传）
+│   │   ├── compaction_utils.py  # _build_compaction_middleware 压缩中间件构造
+│   │   ├── node_spec.py         # NodeSpec / register_nodes 声明式注册（可选 compaction_mw 节点级压缩）
+│   │   └── registry.py          # WORKFLOWS / AGENT_REGISTRY / build_workflow 注册表与构建入口（runner 支持 workspace_path 参数）
 │   ├── simple.py            # 监督者模式工作流（Manager→Worker→Terminator，异步节点，worker_exec 接收 config 注入 workspace）
 │   ├── pipline.py           # 流水线模式工作流（异步节点，与 simple 同构，worker_exec 接收 config 注入 workspace）
-│   ├── rtl_graph.py         # RTL 芯片设计流水线（Manager 提炼→Architect 架构→Designer 设计↔Verification 多轮验证→验证通过/达上限即终止(END)）
-│   └── registry.py          # 工作流/Agent 注册表与构建入口（runner 支持 workspace_path 参数）
+│   └── rtl_graph.py         # RTL 芯片设计流水线（Manager 提炼→Architect 架构→Designer 设计↔Verification 多轮验证→验证通过/达上限即经 designer_output 交付后终止(END)）
 ├── tools/
 │   ├── __init__.py          # 本地工具注册
 │   ├── search.py            # 联网搜索工具(Tavily API)
@@ -316,8 +322,6 @@ LangChainAgent/
 │   ├── terminal_tools.py    # 终端命令工具（shell/python/bat/ps1,含安全护栏+ctrl+c超时分类）
 │   ├── get_local_time.py    # 获取本地时间工具
 │   ├── open_file.py         # 文件打开工具（系统默认程序/DB Browser）
-│   ├── skills.py            # re-export skmng.manager（向后兼容，待删）
-│   ├── skill_tool.py        # re-export skmng.tool（向后兼容，待删）
 │   ├── create_tools.py      # 动态生成工具代码，保存为 .py 并自动注册到 __init__.py（顺带生成单元测试到 tests/tools/）
 │   ├── safety.py            # 安全护栏(黑名单/白名单/交互确认/路径保护)
 │   ├── mcp_loader.py        # MCP 配置管理与工具加载器（含按工具名筛选加载 aload_mcp_tools_by_name / load_mcp_tools_by_name_sync）
@@ -371,18 +375,16 @@ LangChainAgent/
 | [utils/metrics.py](utils/metrics.py)                                     | `MetricsCollector`：线程安全的运行时指标收集（LLM 调用 / 工具执行 / 压缩统计）                                                                                                                                                                                                                                                                                                                   |
 | [utils/logging_config.py](utils/logging_config.py)                       | 结构化日志：`contextvars` 实现 trace_id / thread_id 异步安全注入                                                                                                                                                                                                                                                                                                                                 |
 | [utils/exceptions.py](utils/exceptions.py)                               | 统一异常层次：`LCAgentError` 基类及 MCP/超时/压缩/中断/状态等子类                                                                                                                                                                                                                                                                                                                                |
-| [agent/](agent/)                                                         | Agent 核心按职责拆分：`agent_core.py`（主类，构造/生命周期/共享工具方法）+ 6 个 Mixin（`session_mgmt`/`mcp_tools`/`graph_builder`/`streaming`/`interrupts`/`turn_runners`）+ `turn_types.py`（`AgentTurnResult`）+ 5 个中间件（`terminal_retry_cap_mw`/`tool_retry_cap_mw`/`tool_arg_validator_mw`/`tool_error_mw`/`workspace_mw`）+ `role_sw.py`（团队角色切换唯一实现）；技能相关 Mixin/中间件已迁入 `skmng/` 包 |
+| [agent/](agent/)                                                         | Agent 核心按职责拆分：`agent_core.py`（主类，构造/生命周期/共享工具方法）+ 6 个 Mixin（`session_mgmt`/`mcp_tools`/`graph_builder`/`streaming`/`interrupts`/`turn_runners`）+ `turn_types.py`（`AgentTurnResult`）+ 5 个中间件（`terminal_retry_cap_mw`/`tool_retry_cap_mw`/`tool_arg_validator_mw`/`tool_error_mw`/`workspace_mw`）+ `role_sw.py`（团队角色切换唯一实现） |
 | [agent/session_config_middleware.py](agent/session_config_middleware.py) | `SessionConfigMW` 按请求覆盖会话模型与角色 system prompt，`SessionModelFactory` 对模型配置做有界 LRU 缓存                                                                                                                                                                                                                                                                                      |
 | [session/](session/)                                                     | 三层架构 Session 层：`SessionConfig`（会话基础配置）/ `SessionContext`（单会话运行时上下文）/ `SessionStore`（per-session 瞬态状态）/ `SessionRegistry`（生命周期管理）/ `WorkspaceStore`（工作空间映射）/ `SessionManager`（对外门面 & 会话调度）                                                                                                                                     |
 | [team/](team/)                                                           | 多 Agent 团队协作：ManagerAgent（拆解）/ WorkerAgent（执行）/ TerminatorAgent（汇总）+ 工厂函数                                                                                                                                                                                                                                                                                                    |
 | [skmng/](skmng/)                                                         | 技能管理统一包：`SkillManager`（扫描/匹配/渲染）+ `SkillInjector`（工作流节点注入器）+ `SkillInjectionMW`（agent 层中间件）+ `SkillOps`（Mixin）+ `core.py`（三来源合并核心）+ `protocols.py`（PromptInjector 协议）+ `read_skill` 工具                                                                                                                                              |
-| [graph/common.py](graph/common.py)                                       | 工作流通用能力：`NodeTrackingHandler` 节点级进度回调(含 TOKEN 级流式)、`arun_compiled_workflow` 跨轮次记忆压缩 + `workspace_path` 注入 `config.configurable`（SkillInjector 已迁往 `skmng/injector.py`）                                                                                                                                                                                 |
+| [graph/common/](graph/common/)                                           | 工作流共享组件包（子模块 `node_tracking` / `interrupt_forward` / `node_factory` / `workflow_runner` / `compaction_utils` / `node_spec` / `registry`）：`NodeTrackingHandler` 节点级进度回调(含 TOKEN 级流式)、`arun_compiled_workflow` 跨轮次记忆压缩 + `workspace_path` 注入 `config.configurable`、`register_nodes` 声明式节点注册（可选 `compaction_mw` 节点级压缩）                                                                                                                                                                                 |
 | [graph/simple.py](graph/simple.py)                                       | LangGraph 监督者模式工作流编排（Manager→Worker→Terminator，异步节点）；`worker_exec` 节点接收 LangGraph 注入的 config（含 `workspace_path`）透传 Worker                                                                                                                                                                                                                                      |
 | [graph/pipline.py](graph/pipline.py)                                     | LangGraph 流水线模式工作流编排（异步节点，与 simple 同构）；`worker_exec` 节点同样透传 workspace config                                                                                                                                                                                                                                                                                          |
-| [graph/rtl_graph.py](graph/rtl_graph.py)                                 | RTL 芯片设计流水线：Manager 提炼上下文→Architect 计划/设计/分析/评审/规格→Designer 规格+编码↔Verification 验证多轮交互（条件路由 + max_rounds 限轮）→验证通过/达上限即终止(END)                                                                                                                                                                                                                |
-| [graph/registry.py](graph/registry.py)                                   | 工作流/Agent 注册表：`register_workflow` / `register_agent` / `build_workflow`；runner 统一支持 `workspace_path` 透传                                                                                                                                                                                                                                                                      |
-| [tools/skills.py](tools/skills.py)                                       | re-export`skmng.manager.SkillManager`（向后兼容，待删）                                                                                                                                                                                                                                                                                                                                          |
-| [tools/skill_tool.py](tools/skill_tool.py)                               | re-export`skmng.tool.read_skill`（向后兼容，待删）                                                                                                                                                                                                                                                                                                                                               |
+| [graph/rtl_graph.py](graph/rtl_graph.py)                                 | RTL 芯片设计流水线：Manager 提炼上下文→Architect 计划/设计/分析/评审/规格→Designer 规格+编码↔Verification 验证多轮交互（条件路由 + max_rounds 限轮）→验证通过/达上限即经 designer_output 交付后终止(END)                                                                                                                                                                                                                |
+| [graph/common/registry.py](graph/common/registry.py)                     | 工作流/Agent 注册表：`register_workflow` / `register_agent` / `build_workflow`；runner 统一支持 `workspace_path` 透传                                                                                                                                                                                                                                                                      |
 | [tools/mcp_pool.py](tools/mcp_pool.py)                                   | `MCPPool`：per-server 连接管理 + 健康探测 + 自动重连，替代全量重载                                                                                                                                                                                                                                                                                                                               |
 | [tools/tool_wrapper.py](tools/tool_wrapper.py)                           | 工具超时包装：统一超时保护，超时返回 JSON 错误而非抛异常                                                                                                                                                                                                                                                                                                                                           |
 | [tools/](tools/)                                                         | 本地工具 + MCP 工具加载 + 技能管理                                                                                                                                                                                                                                                                                                                                                                 |
@@ -409,7 +411,7 @@ LangChainAgent/
 
 **支持的提供商：**
 
-提供商不再硬编码在代码中，全部来自 [config/llm_config.json](config/llm_config.json) 的 `providers` 字段。当前配置包含（实际内容以文件为准）：
+提供商全部来自 [config/llm_config.json](config/llm_config.json) 的 `providers` 字段。当前配置包含（实际内容以文件为准）：
 
 | 提供商       | 名称            | 环境变量              | 默认模型                |
 | ------------ | --------------- | --------------------- | ----------------------- |
@@ -469,7 +471,7 @@ Agent 有三种执行模式，对应三种不同的交互入口：
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-> **agent_key**：由 `MemoryContext.acreate(..., agent_key=...)` 经 `ThreadMemoryStore(agent_key=...)` 透传的显式参数，默认 `"global"`（`memory/config.py` 的 `MEMORY_AGENT_KEY`），**跨进程共享**——CLI / API / 调度器 / 飞书 共用同一 `("global", "global_facts")`。`process_type` 不再参与 agent 级 namespace，仅用于 thread_id 前缀（会话可见性）。
+> **agent_key**：由 `MemoryContext.acreate(..., agent_key=...)` 经 `ThreadMemoryStore(agent_key=...)` 透传的显式参数，默认 `"global"`（`memory/config.py` 的 `MEMORY_AGENT_KEY`），**跨进程共享**——CLI / API / 调度器 / 飞书 共用同一 `("global", "global_facts")`。`process_type` 仅用于 thread_id 前缀（会话可见性），不参与 agent 级 namespace。
 
 **数据流**（读写分离，两级作用域）：
 
@@ -489,7 +491,7 @@ Agent 有三种执行模式，对应三种不同的交互入口：
      → 并行 query_agent_facts() + query_facts(thread_id)
      → 合并 + content 精确去重（agent 优先，保留 agent 级版本）
      → 按 create_time 升序，截取 recall_limit（默认 20）条
-     → 格式化为文本追加到 SystemMessage（【长期记忆】块）
+     → 格式化为文本，追加为 request.messages 末尾的 user 消息（【长期记忆】块）
      → 非阻塞 touch 更新 last_used_at（按 scope 分发到两级 namespace）
 ```
 
@@ -500,14 +502,14 @@ Agent 有三种执行模式，对应三种不同的交互入口：
 | `MemoryManager`               | [memory/manager.py](memory/manager.py)           | 统一门面：`recall` / `recall_text`（thread 级）+ `recall_agent` / `recall_agent_text` / `count_agent_facts` / `clear_agent_facts` / `compress_agent`（agent 级）+ `submit_user_message` / `consume_event` / `compress` / `clear` / `flush_all`                                                      |
 | `MemoryContext`               | [memory/context.py](memory/context.py)           | 统一工厂：入口程序（main/api/scheduler）调用`acreate()` 组装全部组件，透传 `process_type` / `agent_key` / `max_agent_facts`，暴露 checkpointer / store / read_middleware / memory_manager                                                                                                                      |
 | `AgentMemory`                 | [memory/agent_memory.py](memory/agent_memory.py) | checkpointer（`AsyncSqliteSaver`）+ 长期记忆 Store（`AsyncSqliteStore`）基础设施；`process_type` 仅用于 thread_id 前缀（会话可见性），agent 级 namespace 由 `agent_key` 决定（默认跨进程共享）                                                                                                       |
-| `ThreadMemoryStore`           | [memory/store.py](memory/store.py)               | Store 业务封装：thread 级 facts 增/查/批量写/LRU 淘汰/摘要替换/会话级清空；新增 agent 级方法族（`query_agent_facts` / `save_agent_facts_batch` / `count_agent_facts` / `clear_agent_facts` / `prune_agent_facts` / `touch_agent_fact` / `replace_agent_facts_with_summary`），构造参数含 `max_agent_facts` / `agent_key` |
+| `ThreadMemoryStore`           | [memory/store.py](memory/store.py)               | Store 业务封装：thread 级 facts 增/查/批量写/LRU 淘汰/摘要替换/会话级清空；agent 级方法族（`query_agent_facts` / `save_agent_facts_batch` / `count_agent_facts` / `clear_agent_facts` / `prune_agent_facts` / `touch_agent_fact` / `replace_agent_facts_with_summary`），构造参数含 `max_agent_facts` / `agent_key` |
 | `ThreadMemoryWriteMiddleware` | [memory/middleware.py](memory/middleware.py)     | 写服务：事件接收 + 防抖 buffer + Fact 抽取流水线（非 AgentMiddleware）；按`category` 路由到 agent / thread 两级作用域                                                                                                                                                                                |
-| `ThreadMemoryReadMiddleware`  | [memory/middleware.py](memory/middleware.py)     | 读中间件（AgentMiddleware）：`awrap_model_call` 并行读取两级 facts，合并去重（agent 优先）后注入 SystemMessage                                                                                                                                                                                       |
+| `ThreadMemoryReadMiddleware`  | [memory/middleware.py](memory/middleware.py)     | 读中间件（AgentMiddleware）：`awrap_model_call` 并行读取两级 facts，合并去重（agent 优先）后注入为尾随 user 消息（不动 system message）                                                                                                                                                                                       |
 | `ThreadMemoryLockPool`        | [memory/lock_pool.py](memory/lock_pool.py)       | per-thread`asyncio.Lock` 池：串行化同一 thread 的写入，不同 thread 并行                                                                                                                                                                                                                              |
 | `models.py`                   | [memory/models.py](memory/models.py)             | `MemoryCategory` / `ThreadFactItem`（含 `scope` 字段：`thread` / `agent`）/ `MemoryInputEvent` / `judge_long_term_memory` 分类判定                                                                                                                                                       |
 | `config.py`                   | [memory/config.py](memory/config.py)             | 运行时参数默认值（buffer 延迟 / 上限 / thread 级 fact 上限 / agent 级 fact 上限 / 召回条数）                                                                                                                                                                                                           |
 
-> 除此之外还有一层 **Compaction 压缩中间件**（[agent/compaction.py](agent/compaction.py)）负责控制**单会话内的上下文长度**：当 checkpoint 恢复的消息数超过阈值时，`before_model` 自动把旧消息增量摘要成 `state.summary`（随 checkpoint 持久化、per-thread 隔离），并 Prune 过长的历史工具输出，无需新开 thread。注意这与记忆系统的 `compress` 命令是两回事（前者压缩会话上下文，后者压缩长期记忆 facts）。详见[可观测性与可靠性 → 长上下文压缩中间件](#长上下文压缩中间件compaction)。
+> 除此之外还有一层 **Compaction 压缩中间件**（[agent/compaction.py](agent/compaction.py)）负责控制**单会话内的上下文长度**：每次 model 调用前按**预估 token**（字符数 /4 粗估）判断，超过 `max_context_tokens` 时 `before_model` 自动把旧消息增量摘要成 `state.summary`（随 checkpoint 持久化、per-thread 隔离）；同时**独立**于压缩触发条件地 Prune 过长的历史工具输出（保护最近 `keep_recent` 条消息），无需新开 thread。注意这与记忆系统的 `compress` 命令是两回事（前者压缩会话上下文，后者压缩长期记忆 facts）。详见[可观测性与可靠性 → 长上下文压缩中间件](#长上下文压缩中间件compaction)。
 
 ### 两级作用域（agent 级 / thread 级）
 
@@ -518,7 +520,7 @@ Agent 有三种执行模式，对应三种不同的交互入口：
 | **agent 级**  | `(agent_key, "global_facts")` | `user_fact` / `lesson`     | 跨进程共享（CLI / API / 调度器 / 飞书 共用 `("global", "global_facts")`） | `memory_max_agent_facts`（默认 200）     |
 | **thread 级** | `(thread_id, "thread_facts")` | `conv` / `business` / 兜底 | 仅当前`thread_id` 可见           | `memory_max_facts_per_thread`（默认 60） |
 
-**`agent_key` 来源**：`agent_key` 是 `MemoryContext.acreate(..., agent_key=...)` 的显式参数，默认 `"global"`（`memory/config.py` 的 `MEMORY_AGENT_KEY`），经 `ThreadMemoryStore(agent_key=...)` 透传，决定 agent 级 namespace。**默认跨进程共享**：CLI / API / 调度器 / 飞书 共用 `("global", "global_facts")`，agent 级记忆可跨进程沉淀；如需隔离可显式覆盖 `agent_key`。`process_type` 仍由 `MemoryContext.acreate(..., process_type=...)` 透传，但只用于 thread_id 前缀（会话可见性），不再参与 agent 级 namespace。
+**`agent_key` 来源**：`agent_key` 是 `MemoryContext.acreate(..., agent_key=...)` 的显式参数，默认 `"global"`（`memory/config.py` 的 `MEMORY_AGENT_KEY`），经 `ThreadMemoryStore(agent_key=...)` 透传，决定 agent 级 namespace。**默认跨进程共享**：CLI / API / 调度器 / 飞书 共用 `("global", "global_facts")`，agent 级记忆可跨进程沉淀；如需隔离可显式覆盖 `agent_key`。`process_type` 仍由 `MemoryContext.acreate(..., process_type=...)` 透传，但只用于 thread_id 前缀（会话可见性），不参与 agent 级 namespace。
 
 **读取侧聚合**（每次 LLM 调用前）：
 
@@ -527,7 +529,7 @@ awrap_model_call
    ↓ asyncio.gather(query_agent_facts(), query_facts(thread_id))
    ↓ 合并 + content 精确去重（agent 级优先，保留 agent 级版本）
    ↓ 按 create_time 升序，截取 recall_limit（默认 20）条
-   ↓ 注入 SystemMessage（【长期记忆】块）
+   ↓ 注入为尾随 user 消息（【长期记忆】块；system message 保持静态）
    ↓ 非阻塞 touch：agent 级调 touch_agent_fact，thread 级调 touch_fact
 ```
 
@@ -537,15 +539,7 @@ awrap_model_call
 - 抽取结果中 `category ∈ {conv, business}` 或非法回退为 `conv` → 组装 `scope="thread"` 的 `ThreadFactItem`，写入 thread namespace，触发 `prune_facts(thread_id)`；
 - 去重基准同时读取两级 existing，按 `content` 精确比对，agent 级优先（避免同一条 fact 跨作用域重复）。
 
-> **写入路径**：事件筛选（`is_memory_worthy`：DONE / TOOL_RESULT 且 content 非空）→ 防抖 → `judge_long_term_memory` 确定性预判定（SKIP 丢弃 / 失败≥2 锁定 lesson 分类、内容走 LLM 蒸馏 / 其余交 LLM）→ LLM 抽取 → 按 `category` 路由到 agent / thread 作用域 → 去重 → 写入 → LRU 淘汰。本次分层只改变了"写到哪一级 namespace"和"读时如何聚合"。
-
-> **历史数据迁移（旧 `server` namespace）**：`agent_key` 与 `process_type` 解耦前，agent 级记忆写在 `("server", "global_facts")`。升级后请用一次性脚本把旧数据复制到共享 namespace `("global", "global_facts")`（默认 dry-run，确认后再 `--apply`）：
->
-> - 预演（只读，不写库）：`uv run python scripts/migrate_agent_memory_namespace.py --dry-run`
-> - 真正复制：`uv run python scripts/migrate_agent_memory_namespace.py --apply`
-> - （可选）校验通过后删除旧数据：`uv run python scripts/migrate_agent_memory_namespace.py --apply --delete-source`
->
-> 脚本复用项目自身的 `AsyncSqliteStore`，按 `fact_id` 幂等、可安全重跑；详见 [scripts/README.md](scripts/README.md)。
+> **写入路径**：事件筛选（`is_memory_worthy`：DONE / TOOL_RESULT 且 content 非空）→ 防抖 → `judge_long_term_memory` 确定性预判定（SKIP 丢弃 / 失败≥2 锁定 lesson 分类、内容走 LLM 蒸馏 / 其余交 LLM）→ LLM 抽取 → 按 `category` 路由到 agent / thread 作用域 → 去重 → 写入 → LRU 淘汰。
 
 > **跨进程共享的已知取舍**：agent 级 namespace 默认跨进程共享，带来以下代价：
 >
@@ -568,13 +562,13 @@ async for ev in self._arun_graph_events({"messages": [HumanMessage(content=messa
 ```
 
 - **历史消息**：LangGraph 从 checkpoint 自动恢复（按 thread_id 取出该会话所有历史消息，拼到新消息前面）
-- **长期记忆**：`ThreadMemoryReadMiddleware` 在每个 model 调用前（`awrap_model_call`）并行读取 **agent 级 + thread 级** facts，合并去重（agent 优先）后格式化为文本追加到 SystemMessage，随请求一起发给 LLM
+- **长期记忆**：`ThreadMemoryReadMiddleware` 在每个 model 调用前（`awrap_model_call`）并行读取 **agent 级 + thread 级** facts，合并去重（agent 优先）后格式化为文本，追加为 `request.messages` 末尾的 user 消息，随请求一起发给 LLM
 - **写入路径**：SessionManager 在事件流消费时调用 `submit_user_message()` / `consume_event()` 非阻塞投递，经防抖 + LLM 抽取后按 `category` 路由到 agent / thread 两级 Store namespace
 
 ```
 invoke(新消息, thread_id)
    ↓
-[历史消息1, ..., 新消息] + SystemMessage(【长期记忆】块) → 传给 LLM
+[System(静态，逐轮不变)] + [历史消息1, ..., 新消息] + [尾随 user 消息(【长期记忆】块)] → 传给 LLM
    ↓
 LLM 回复 → 写回 checkpoint
    ↓
@@ -600,22 +594,22 @@ response = self.llm.chat_with_history(
 
 #### 技能指引与长上下文摘要的注入
 
-`react:` 和 `chat()` 在每次执行前会根据任务重建 Agent：
+`react:` / `chat()` 的 system message 是**静态的**（`agent/AGENT.md` 全文；切角色后为
+`compose_role_system_prompt` 合成的「base 规则 + 角色提示词」），每次 model 调用时由中间件
+把动态内容作为**尾随 user 消息**追加到 `request.messages` 末尾（只改本次请求副本，不写 state）：
 
-```python
-self.agent_executor = self._create_agent_executor(
-    self._compute_skill_block(task)
-)
-```
-
-因此除了 checkpoint 历史外，system prompt 还可能包含：
-
-| 来源         | 触发方式                                              | 说明                                                                                                                |
+| 来源         | 触发方式                                              | 注入位置与说明                                                                                                      |
 | ------------ | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| 长期记忆     | 事件驱动自动沉淀，model 调用前注入                    | ReadMiddleware 注入 Store facts（`【长期记忆】` 块）                                                              |
-| 手动技能     | `skill:<name>`                                      | 后续对话都会注入该技能指引，直到`skill:clear`                                                                     |
+| 长期记忆     | 事件驱动自动沉淀，model 调用前注入                    | `ThreadMemoryReadMiddleware` 注入 Store facts（`【长期记忆】` 块）→ 尾随 user 消息                              |
+| 手动技能     | `skill:<name>`                                      | 后续对话都会注入该技能指引，直到`skill:clear`；`SkillInjectionMW` → 尾随 user 消息                              |
 | 自动匹配技能 | `auto_match_skills=true`                            | 根据任务与技能描述的关键词重叠度自动注入相关技能                                                                    |
-| 长上下文压缩 | 消息数超`max_messages` 时 `before_model` 自动触发 | 由 Compaction 中间件增量摘要旧消息，写入`state.summary`（随 checkpoint 持久化、per-thread 隔离），无需新开 thread |
+| 长上下文压缩 | 预估 token 超`max_context_tokens` 时 `before_model` 自动触发 | 由 Compaction 中间件增量摘要旧消息，写入`state.summary`（随 checkpoint 持久化、per-thread 隔离）；摘要以 **HumanMessage**（非 system 角色）置于 messages 头部 |
+
+> **单条 system message 约束（重要）**：payload 中只保留一条 system 消息（`agent/AGENT.md` 全文，
+> 或切角色后合成的 base 规则 + 角色提示词），动态块（技能 / 长期记忆 / 历史摘要）一律**不使用
+> `system` 角色** —— 这既是 OpenAI 的规范格式（一条 system 开头 + 交替 user/assistant），也避免
+> 兼容网关对多条 system 消息的处理差异。静态 system 位于 payload 首位且逐轮不变，跨轮次前缀缓存
+> （KV cache）可复用；动态块集中在尾部，其变化不会使前面的 system 与历史消息失效。
 
 #### 对比表
 
@@ -647,7 +641,7 @@ self.agent_executor = self._create_agent_executor(
 | `cot:任务`   | `acot()`                        | ❌ 不写         | ❌ 不写                               | CoT 绕过 Agent，纯 LLM 推理，无事件流      |
 | 普通输入       | `achat_stream()`                | ✅ 自动         | ✅ 事件驱动（不标记 important）       | 对话同样参与记忆抽取，只是不强调重要       |
 
-> **关键区别**：Checkpoint 由 LangGraph 自动管理，无需手动干预；长期记忆由**事件驱动流水线**自动沉淀（确定性预判定 + LLM 抽取 + 两级去重 + 按 `category` 路由到 agent / thread 作用域），`important` 标记提高"值得评估"的优先级（在 LLM 抽取时加「用户明确要求记住」标注），不再决定是否写入。
+> **关键区别**：Checkpoint 由 LangGraph 自动管理，无需手动干预；长期记忆由**事件驱动流水线**自动沉淀（确定性预判定 + LLM 抽取 + 两级去重 + 按 `category` 路由到 agent / thread 作用域），`important` 标记只提高"值得评估"的优先级（在 LLM 抽取时加「用户明确要求记住」标注），不决定是否写入。
 
 ### Checkpoint 持久化原理
 
@@ -674,10 +668,21 @@ agent.set_memory_manager(memory_ctx.memory_manager)  # ← 注入 MemoryManager
 创建 `AgentCore` 后，还需把记忆组件的 LLM 来源动态绑定到当前 Agent（三个入口 `main.py` / `api/server.py` / `scheduler/run.py` 均已内置）：
 
 ```python
-memory_ctx.bind_llm(lambda: agent.llm)  # 记忆组件直接读取 agent 当前 LLM
+# thread-aware 解析器：按会话（thread_id）解析各自的 provider/model，
+# 无会话配置时回退到进程默认 agent.llm
+memory_ctx.bind_llm(build_memory_llm_resolver(agent.session, lambda: agent.llm))
 ```
 
-这样**运行时切换提供商/模型**（API `/api/providers/switch`、CLI `switch` 命令、team 角色切换）后，记忆链路（事实抽取 / 召回 / 压缩）会跟随 `agent.llm` 同步切换，避免记忆抽取仍使用启动时的旧 `LLMClient` 向旧提供商发请求。
+`build_memory_llm_resolver(session, default_getter)`（`agent/memory_llm.py`）返回一个
+**thread-aware 异步解析器**：记忆链路（事实抽取 / 蒸馏 / 压缩）每次处理时按当前
+`thread_id` 调用 `session.apeek_session_config(thread_id)` 读取该会话的 provider/model，
+命中则按 `(provider, model, temperature, max_tokens)` 构造并缓存 `LLMClient`；thread 为空、
+无会话配置、读取失败或构造失败时统一回退到默认 getter（进程启动时的 `agent.llm`）。
+
+这样**全局切换提供商/模型**（API `/api/providers/switch`、CLI `switch` 命令、team 角色切换）
+仍会作用于没有显式会话配置的会话；而通过 `PATCH /api/sessions/{id}/config` 设置的
+**会话级 provider/model** 会在下一次记忆 flush（事实抽取 / 蒸馏 / 压缩）时被采纳，避免记忆
+链路永远只用启动时的旧 `LLMClient` 向旧提供商发请求。
 
 调用时传 thread_id，LangGraph 自动恢复该会话历史（`_invoke_config` 构造 `{"configurable": {"thread_id": ...}}`）。
 
@@ -693,7 +698,7 @@ memory_ctx.bind_llm(lambda: agent.llm)  # 记忆组件直接读取 agent 当前 
 
 ### 长期记忆写入流水线
 
-长期记忆不再是"手动标记 important"的简单追加，而是**事件驱动 + LLM 抽取**的完整流水线。写入在 [memory/middleware.py](memory/middleware.py) 的 `ThreadMemoryWriteMiddleware` 中实现：
+长期记忆由**事件驱动 + LLM 抽取**的完整流水线沉淀。写入在 [memory/middleware.py](memory/middleware.py) 的 `ThreadMemoryWriteMiddleware` 中实现：
 
 ```
 submit_event(thread_id, role, content, important, event_type, tool_name)   # SessionManager 非阻塞调用
@@ -741,7 +746,7 @@ if self._memory is not None:
 
 **确定性预判定**（[memory/models.py](memory/models.py) 的 `judge_long_term_memory`）：
 
-`judge_long_term_memory` 只做**可确定性判定**的信号（失败次数 / 用户显式记住），语义字段（是否猜想、是否临时、是否技术决策等）不再以规则硬编码，统一交由 LLM 抽取阶段依据对话内容自行分类。返回值语义：
+`judge_long_term_memory` 只做**可确定性判定**的信号（失败次数 / 用户显式记住），语义字段（是否猜想、是否临时、是否技术决策等）统一交由 LLM 抽取阶段依据对话内容自行分类。返回值语义：
 
 | 返回值                     | 取值       | 作用域/行为                                                                             |
 | -------------------------- | ---------- | --------------------------------------------------------------------------------------- |
@@ -776,7 +781,7 @@ CHECKPOINT_FILE = os.path.join(BASE_DIR, "data", "checkpoints_async.sqlite")
 | 表 / 数据                    | 管理者               | 内容                                                                                                                                                             |
 | ---------------------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `checkpoints` / `writes` | `AsyncSqliteSaver` | Agent 执行状态（消息 + 工具调用链，按`thread_id` 隔离）                                                                                                        |
-| LangGraph Store 表           | `AsyncSqliteStore` | 长期记忆 facts（两级 namespace：agent 级`(agent_key, "global_facts")` 跨会话共享 + thread 级 `(thread_id, "thread_facts")` 会话隔离，替代旧`memory.json`） |
+| LangGraph Store 表           | `AsyncSqliteStore` | 长期记忆 facts（两级 namespace：agent 级`(agent_key, "global_facts")` 跨会话共享 + thread 级 `(thread_id, "thread_facts")` 会话隔离） |
 | `session_workspaces`       | `WorkspaceStore`   | `session_id ↔ workspace_path` 映射（多会话工作目录隔离）                                                                                                      |
 
 > **长期记忆存储**：长期记忆由 LangGraph `BaseStore`（`AsyncSqliteStore`，见 [memory/store.py](memory/store.py) 的 `ThreadMemoryStore`）管理，与 checkpoint 复用同一 SQLite 文件，按**两级 namespace**天然实现分层隔离：
@@ -921,7 +926,7 @@ ThreadMemoryStore.replace_agent_facts_with_summary(summary)
 
 `MemoryManager.compress_agent()` 返回与 `compress()` 相同的 `{"success", "original_count", "original_chars", "compressed_chars", "summary"}` 结构。
 
-> **HTTP API 限制**：目前没有 agent 级压缩/清空端点。`POST /api/compress` 只压缩 thread 级；`DELETE /api/memory?scope=long|short|all` 也只清 thread 级（`all` 仅额外开启新会话，不含 agent 级，且 `scope=agent` 会返回 400）。agent 级压缩/清空目前仅 CLI 提供。
+> **HTTP API 说明**：`POST /api/compress` 只压缩 thread 级（与 CLI `compress` 共用同一实现，无记忆时短路返回 `skipped`）；`DELETE /api/memory?scope=long|short|agent|all` 与 CLI `clear` 语义一致——`agent` 清 agent 级跨会话记忆，`all` 同时清 thread 级 + agent 级并开启新会话。agent 级**压缩**目前仅 CLI `compress agent` 提供（API 无 agent 级压缩端点）。
 
 #### 特点与注意事项
 
@@ -947,7 +952,7 @@ ThreadMemoryStore.replace_agent_facts_with_summary(summary)
 
 | 成员                                 | 说明                                                                             |
 | ------------------------------------ | -------------------------------------------------------------------------------- |
-| `await MemoryContext.acreate(...)` | 异步创建全部记忆组件（checkpointer + Store + 锁池 + 读写中间件 + MemoryManager）；关键参数：`process_type`（仅 thread_id 前缀）/ `agent_key`（agent 级 namespace，默认 `"global"` 跨进程共享）/ `max_facts_per_thread` / `max_agent_facts` / `recall_limit` |
+| `await MemoryContext.acreate(...)` | 异步创建全部记忆组件（checkpointer + Store + 锁池 + 读写中间件 + MemoryManager）；关键参数：`process_type`（仅 thread_id 前缀）/ `agent_key`（agent 级 namespace，默认 `"global"` 跨进程共享）/ `max_facts_per_thread` / `max_agent_facts` / `recall_limit` / `llm_getter`（创建 Agent 前的**默认 getter**，返回进程启动时的 `LLMClient`；`acreate` 内部用 `default_thread_llm_resolver` 包装为 thread-aware 解析器，创建 Agent 后再由 `bind_llm(build_memory_llm_resolver(...))` 覆盖） |
 | `ctx.checkpointer`                 | LangGraph checkpointer（传给`AgentCore` / `SessionRegistry`）                |
 | `ctx.store`                        | LangGraph`BaseStore`（传给 `create_agent(store=...)`）                       |
 | `ctx.read_middleware`              | `ThreadMemoryReadMiddleware`（传给 `extra_middleware`）                      |
@@ -1029,7 +1034,7 @@ ThreadMemoryStore.replace_agent_facts_with_summary(summary)
 
 ## 会话管理（Session）
 
-会话（Session / Thread）是对话隔离的基本单元，每个会话对应一个 `thread_id`（即 session_id），历史消息、工具调用链、执行历史、挂起中断和基础模型配置等状态按会话隔离并持久化。早期会话管理内嵌在 `AgentMemory` 中，现已抽离为独立的 `session/` 模块（三层架构）：`SessionRegistry` 负责生命周期、`SessionStore` 负责瞬态状态、`SessionManager` 作为对外门面。
+会话（Session / Thread）是对话隔离的基本单元，每个会话对应一个 `thread_id`（即 session_id），历史消息、工具调用链、执行历史、挂起中断和基础模型配置等状态按会话隔离并持久化。会话管理由独立的 `session/` 模块（三层架构）承担：`SessionRegistry` 负责生命周期、`SessionStore` 负责瞬态状态、`SessionManager` 作为对外门面。
 
 ### 架构总览
 
@@ -1066,15 +1071,19 @@ session/
 | `max_tokens`     | 最大生成 token 数                                       |
 | `max_iterations` | 单轮最大推理步数，同时决定 LangGraph`recursion_limit` |
 | `version`        | 配置版本号                                              |
-| `system_prompt`  | 写入时解析得到的 system prompt 快照                     |
+| `system_prompt`  | 写入时解析得到的 system prompt 快照（= 基础规则 + 角色提示词；`role="default"` 时为空，回落静态 `agent/AGENT.md`） |
 
-配置保存在同一 SQLite 文件 `data/checkpoints_async.sqlite` 的 LangGraph **`store` 表**中，namespace 为 `("lcagent", "sessions", <session_id>, "session_config")`、键为 `"current"`（在表中 namespace 以点号拼接为 `prefix` 列，即 `lcagent.sessions.<session_id>.session_config`）。`Store` 是唯一事实源：会话配置不写入 checkpoint，`LCAgentState` 中也没有配置字段，因此读取配置不需要跑图、也不受 `aupdate_state` 与 interrupt 影响。旧会话首次读取时，会将当时的进程级默认配置懒迁移并持久化，之后不再重新读取默认值，因此默认值改变不会使旧会话漂移。进程级默认配置保存在 `SessionRegistry.default_session_config`，由启动时 Agent 的 `llm.provider`、`llm.model` 和 `max_iterations` 推导，也可通过 `set_default_session_config()` 更新。
+配置保存在同一 SQLite 文件 `data/checkpoints_async.sqlite` 的 LangGraph **`store` 表**中，namespace 为 `("lcagent", "sessions", <session_id>, "session_config")`、键为 `"current"`（在表中 namespace 以点号拼接为 `prefix` 列，即 `lcagent.sessions.<session_id>.session_config`）。`Store` 是唯一事实源：会话配置不写入 checkpoint，`LCAgentState` 中也没有配置字段，因此读取配置不需要跑图、也不受 `aupdate_state` 与 interrupt 影响。会话首次读取配置时，会将当时的进程级默认配置持久化，之后不再重新读取默认值，因此默认值改变不会使已有会话漂移。进程级默认配置保存在 `SessionRegistry.default_session_config`，由启动时 Agent 的 `llm.provider`、`llm.model` 和 `max_iterations` 推导，也可通过 `set_default_session_config()` 更新。
 
 会话配置的读写使用现有的 `SessionManager._thread_locks[thread_id]` 串行化，同一会话的配置更新与执行互斥，不同会话无需全局锁即可并行。模型由 `SessionModelFactory` 通过既有 `LLMClient` 构造，并按 `(provider, model, temperature, max_tokens)` 使用有界 LRU 缓存，默认上限为 16 个不同模型配置，而不是为每个会话复制模型对象。
 
-配置优先级为：显式请求字段 > 角色目录 `team/team_agents.json` 中 `default` 与角色配置合并后的字段 > 保持原值。设置角色时，会在写入时读取该角色的统一配置和 `AGENT.md`，将解析后的 system prompt 保存到 `system_prompt`；之后即使 `AGENT.md` 被修改，已有会话仍使用原快照。每轮开始时捕获一份不可变配置快照，轮中修改只影响下一轮。
+配置优先级为：显式请求字段 > 角色在 `team/team_agents.json` 中的**自身条目** > 保持原值。角色未显式声明 `temperature` / `max_tokens` / `max_iterations` 时，这些字段保持未设置，由 `SessionModelFactory` 回退到 `agent/agent_config.json` 的全局默认采样；`team_agents.json` 只声明角色级差异（delta），不再提供 `default` 采样兜底。`role:default` 不覆盖 provider/model/采样，保留会话现有值。设置角色时，会在写入时读取该角色的自身配置和 `AGENT.md`，将解析后的 system prompt 保存到 `system_prompt`；之后即使 `AGENT.md` 被修改，已有会话仍使用原快照。每轮开始时捕获一份不可变配置快照，轮中修改只影响下一轮。
 
-**provider 变更时 model 的重解析**：`provider` 与 `model` 是耦合取值——旧 provider 的模型通常不在新 provider 的 `models` 白名单内（如 `zhipu` 的 `glm-4.7-flash` 切到 `yunlan`）。因此当一次更新**实际改变了 provider 且未显式给出 `model`** 时，服务端会把 model 重解析为该 provider 的可用模型：优先取 `llm_config.json` 中该 provider 的默认 `model`，若该默认值未列入自身 `models`（配置不一致）则退回 `models[0]`。该规则覆盖两条路径：前端顶栏只发 `{"provider": "..."}`，以及角色配置只配置 `provider`、`model` 为 `null`（如 `team/worker`、`team/terminator` 在 `team/team_agents.json` 中）。显式传入的 `model` 始终以请求为准（非法值照常 400）；provider 未实际变化时不重置 model，避免覆盖用户已选模型。
+**角色提示词拼接基础规则（重要）**：写 `system_prompt` 时不是直接使用 `team/<role>/AGENT.md` 的正文，而是经 `llm.config.compose_role_system_prompt(role_prompt, role=..., has_tools=...)` 合成——**基础规则在前、角色提示词在后**（顺序固定，便于复用同一份稳定 system 前缀）。基础规则来自 `agent/AGENT.md`，按角色能力条件化继承（复用 `load_agent_rules`）：持有工具时包含 `## 重要规则` + `## 工具规则`，无工具角色仅 `## 重要规则`，避免把"必须调用工具"这类条款落到无工具角色上。`role="default"` 时**不拼接**——默认角色的提示词来源就是 `agent/AGENT.md` 自身（`_locate_team_agent_dir("default")` 返回 `agent/` 目录），拼接会使规则小节重复。
+
+`SessionConfigMW` 用该快照**替换** `system_message`。这是刻意的：**system message 只承载「会话内静态」内容**——基础规则 + 角色提示词在一次会话内逐轮不变（角色切换才变），因此可以安全地作为稳定前缀被 KV 缓存复用，且角色约束保有 system 级权威。真正**逐轮变化**的内容（技能指引 / 长期记忆 / 历史摘要）一律**不写 system**，改由中间件作为尾随 user 消息注入（详见[技能指引与长上下文摘要的注入](#技能指引与长上下文摘要的注入)）。角色切换的写入口只有两处（CLI `cli/commands/role.py::_switch_role`、HTTP `api/server.py::_resolve_role_patch`），二者**统一委托** `agent/role_sw.py::resolve_role_config_patch` 做解析——该函数是角色→`SessionConfigPatch`（定位目录 / 读配置 / 读 `AGENT.md` / 剥离 workflow 小节 / 拼接基础规则 / 合并采样参数）的**唯一实现**，杜绝两入口对同一角色解析结果漂移。
+
+**provider 变更时 model 的重解析**：`provider` 与 `model` 是耦合取值——旧 provider 的模型通常不在新 provider 的 `models` 白名单内（如 `zhipu` 的 `glm-4.7-flash` 切到 `yunlan`）。因此当一次更新**实际改变了 provider 且未显式给出 `model`** 时，会把 model 重解析为该 provider 的可用模型：优先取 `llm_config.json` 中该 provider 的默认 `model`，若该默认值未列入自身 `models`（配置不一致）则退回 `models[0]`。该规则由 `session/config.py::resolve_session_config_update`（配合 `preferred_model_for_provider`）作为**唯一实现**，供 `PATCH /api/sessions/{id}/config`、CLI `switch:` 命令、legacy `/api/providers/switch` 共用。显式传入的 `model` 始终以请求为准（非法值照常 400）；provider 未实际变化时不重置 model，避免覆盖用户已选模型。
 
 **运行时注入通道（重要）**：`config["configurable"]` 只喂给 checkpointer，**不会**自动映射到 `request.runtime.context`——`ModelRequest.runtime` 是 LangGraph `Runtime`，它没有 `config` 属性，`context` 仅由调用方的 `context=` 参数填充。因此图调用处必须写 `ainvoke(..., config=config, context=config)`（见 `agent/turn_runners.py` 的 `arun_structured` / `achat_structured` / `aresume_structured` 与 `agent/streaming.py` 的 `_arun_graph_events`），把同一份 `{"configurable": {...}}` 同时经两条通道传入：`config=` 供 checkpointer 解析 `thread_id`，`context=` 供 `SessionConfigMW` 读取 `session_config`。遗漏 `context=` 时中间件会静默直通、回落构建期默认模型（前端仍提示切换成功，但本轮实际未生效）。注意工具侧不同：`ToolCallRequest.runtime` 是 `ToolRuntime`，**有** `.config`，所以 `WorkspaceSecurityMW` / `ToolExecutionErrorMW` 读 `runtime.config` 一直正常。回归守护见 `tests/agent/test_session_config_e2e.py`。
 
@@ -1106,7 +1115,7 @@ session/
 | `alist_sessions(all_types=False)`     | 列出所有可见会话（checkpoint 存量 ∪ 当前会话）                                                                                                                                                                |
 | `asummarize(session_id)`              | 返回会话统计（session_id / 消息数 / 总会话数）                                                                                                                                                                 |
 | `aget_messages(session_id)`           | 从 checkpoint 获取该会话所有消息                                                                                                                                                                               |
-| `aget_short_term(session_id, limit)`  | 取最近 N 条消息转 dict 格式（兼容旧 API）                                                                                                                                                                      |
+| `aget_short_term(session_id, limit)`  | 取最近 N 条消息转 dict 格式                                                                                                                                                                                    |
 | `aexport_session(session_id, fmt)`    | 导出会话为可读文本（`text`）或 Markdown（`markdown`）                                                                                                                                                      |
 | `aclose()`                            | 关闭 checkpointer 持有的 SQLite 连接                                                                                                                                                                           |
 
@@ -1146,15 +1155,15 @@ HTTP API（[api/server.py](api/server.py)）同样暴露三个 RESTful 端点，
 | `GET`   | `/api/threads`                     | `thread`                           | 每个会话条目附带`session_config`，由一次批量 `aget_session_configs()` 读取（非逐会话查询）                                                                                                                                                             |
 | `GET`   | `/api/roles?thread_id=<id>`        | `role` / `roles`                 | 返回可用角色列表与`current`（该会话的角色）                                                                                                                                                                                                              |
 
-兼容端点（保留原路径与请求体，新增可选 `thread_id`）：
+其他端点（可选传 `thread_id`）：
 
 | 方法     | 路径                      | 说明                                                                                                                                                    |
 | -------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `POST` | `/api/providers/switch` | 带`thread_id` → `{"scope": "session", ...}`，只改该会话；不带 → `{"scope": "default", "deprecated": true, ...}`，只改进程默认值（仅影响新会话） |
+| `POST` | `/api/providers/switch` | 带`thread_id` → `{"scope": "session", ...}`，只改该会话；不带 → `{"scope": "default", ...}`，只改进程默认值（仅影响新会话） |
 | `POST` | `/api/models/switch`    | 同上                                                                                                                                                    |
-| `POST` | `/api/roles/switch`     | 同上；`task` 字段仍接受以兼容旧客户端，但不再在此端点触发任务执行                                                                                     |
+| `POST` | `/api/roles/switch`     | 同上                                                                                                                                                    |
 
-> ⚠️ 这些端点**不再**调用 `agent.aswitch_llm()` 或 `arebuild_agent_from_team_dir()`，也**不会**把一个会话的改动广播到其他会话。新代码请使用 `PATCH /api/sessions/{thread_id}/config`。
+> 这些端点不会把一个会话的改动广播到其他会话。推荐使用 `PATCH /api/sessions/{thread_id}/config`。
 
 ### SessionManager 门面
 
@@ -1165,7 +1174,7 @@ HTTP API（[api/server.py](api/server.py)）同样暴露三个 RESTful 端点，
   - **`tool_call` / `tool_result` id 一致性**：LangChain 的 `on_tool_start` / `on_tool_end` 事件 data 不含 `tool_call_id`，`agent_core._arun_graph_events` 借助 `on_chat_model_end` 的 `AIMessage.tool_calls` 与事件 `run_id` 建立桥接，保证两个事件的 `id` 一致（兜底回退到事件 `name`），前端按 `id` 关联工具卡片与其结果
 - **非流式接口**：`achat` / `aresume` / `arun`，收集全部 token 为最终文本
 - **会话管理委托**：`new_session` / `new_workflow_session` / `set_current_session` / `current_session_id` / `alist_sessions` / `aswitch_session` / `adelete_session` / `aget_messages` / `aexport_session` / `asummarize`
-- **会话基础配置**：`aget_session_config(thread_id)` / `aupdate_session_config(patch, thread_id)`（均在 per-thread 锁内执行，转发 `SessionRegistry`；后者在会话尚无配置时先懒迁移再更新）
+- **会话基础配置**：`aget_session_config(thread_id)` / `aupdate_session_config(patch, thread_id)`（均在 per-thread 锁内执行，转发 `SessionRegistry`）
 - **记忆管理委托**：`aget_memory_summary` / `acompress_memory` / `aclear_long_term_memory` / `aclear_agent_memory` / `arecall_agent_memory`
 - **执行历史**：`aget_execution_history` / `aclear_history`
 - **上下文压缩**：`manually_compact(force, thread_id)`
@@ -1300,7 +1309,7 @@ Agent 可以在任务中**阅读并使用这些技能指引**，支持三种方�
 | `pptx`          | 创建/读取/编辑`.pptx` 演示文稿                                                    |
 | `vivado-2025.2` | Vivado 2025.2 FPGA 工程自动化构建（综合→实现→比特流，`run_skill.tcl` 一键流程） |
 
-> 中文任务通过内置中→英关键词扩展（如 提交→commit/git、演示→ppt/slides）实现与英文描述的匹配。
+> 中文任务通过内置中→英关键词扩展（如 提交→commit/git、搜索→find/search、安装→install/add、技能→skill）实现与英文描述的匹配。
 
 #### 交互命令
 
@@ -1324,13 +1333,21 @@ LLM 在任务中可调用：
     ↓
 SkillManager.match_skills(task)
   • 中文关键词扩展为英文(提交→commit/git ...)
-  • 与每个技能的 name+description 做重叠度(Jaccard)打分
-  • 取分数>0 的前 N 个技能
+  • 分词: 英文/数字按词, 中文按 2-gram(bigram), 剔除中英停用词
+  • 与每个技能的 name+description 做重叠系数打分 |A∩B| / min(|A|,|B|)
+  • 命中条件: 分数 >= 0.25, 或任务直接点名技能名中的显著 token(如 vivado/pptx)
+  • 取命中技能的前 N 个(按分数降序)
     ↓
 将命中技能正文拼接为「技能指引」块
     ↓
 注入本次任务的 system prompt(手动加载的技能也会合并进去)
 ```
+
+> **为什么用 2-gram 而不是单字**：单字分词会让语义无关的中文文本因共用汉字而误命中
+> （例如「并行科技」的`技`与「构建技能」的`技`）。2-gram + 停用词 + 阈值共同把
+> 噪声命中降到 0，同时保留真实命中（如「运行 FPGA 综合流程」仍命中 `vivado-2025.2`）。
+> 已知边界：2-gram 会跨越词边界产生组合词（如「生成文件」产生`成文`），
+> 该类 token 不在任何技能描述中，仅轻微稀释分母，不影响命中判定。
 
 > 关闭自动匹配：`agent.set_auto_match(False)`；手动加载的技能不受此开关影响。
 
@@ -1342,6 +1359,10 @@ SkillManager.match_skills(task)
 | `agent.load_skill(name)`           | 手动加载技能到当前会话（注入 system prompt + 重建 Agent） |
 | `agent.clear_skills()`             | 清空手动加载的技能                                        |
 | `agent.set_auto_match(enabled)`    | 开关自动匹配（默认开）                                    |
+| `WorkflowAdapter.list_skills()`    | 列出所有本地技能（workflow 会话，惰性创建 SkillManager）  |
+| `WorkflowAdapter.aload_skill(name, thread_id)` | 把技能写入 workflow 会话 state.active_skills（随 checkpoint per-thread 持久化，节点读取后注入 prompt） |
+| `WorkflowAdapter.aclear_skills(thread_id)` | 清空 workflow 会话的手动加载技能（写入空列表）     |
+| `WorkflowAdapter.auto_match_skills` | workflow 图构建时是否自动匹配技能（默认 `True`）        |
 | `SkillManager.match_skills(task)`  | 根据任务匹配相关技能（确定性打分）                        |
 | `SkillManager.render_block(names)` | 把若干技能渲染为可注入的指引块                            |
 
@@ -1355,8 +1376,6 @@ Agent 可自动执行终端命令与文件操作，为防止破坏性操作，�
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------ |
 | **BLOCKLIST（始终拒绝）** | `format`、`mkfs`、`dd if=`、`shutdown`、`fork bomb`、`:(){`、``curl\|sh``/``wget\|sh``、编码执行的 PowerShell 等灾难性命令 | 直接拦截，返回拒绝错误（不论路径）                     |
 | **CONFIRM（需确认）**     | `rm`、`rm -rf`、`sudo`、`chmod`、`mv`、`kill`、`Remove-Item`、脚本执行等危险但可能需要的命令                           | 根据**路径分类**决定：保护级→拒绝，询问级→确认 |
-
-> **重要变更**：`rm -rf`、`Remove-Item -Recurse -Force` 等递归删除命令已从 BLOCKLIST 移至 CONFIRM，通过**路径分类系统**实现精细化保护。
 
 #### 两级路径保护
 
@@ -1522,7 +1541,7 @@ LLM 决定是否调用工具
 `AgentCore._arun_graph_events` 的事件循环处理 `on_tool_error` 事件（LangGraph 在工具异常时不发射 `on_tool_end`，改发射 `on_tool_error`）：
 
 - **单工具异常**：`on_tool_error` → 映射为 `TOOL_RESULT` 事件（content 以 `[工具执行失败]` 前缀标记，含异常类型名 + 修正提示），前端工具卡片显示失败状态；异常逃逸到 `except Exception` → 发 `ERROR` 事件终止流
-- **控制流信号排除**：`on_tool_error` 的 error 若是 `GraphBubbleUp`（含 `GraphInterrupt`——危险命令确认、`ask_human` 等工具内 `interrupt()` 的正常暂停），**不映射为 `[工具执行失败]` TOOL_RESULT**，只清理 run_id 映射。历史 bug：HITL 确认曾被误记为工具失败，同类累积 ≥2 次后把巨型命令原文沉淀为跨会话"经验教训"（记忆层另有独立防线：`memory/middleware.py` 的 `_CONTROL_FLOW_MARKERS` 使这类内容不计入失败）
+- **控制流信号排除**：`on_tool_error` 的 error 若是 `GraphBubbleUp`（含 `GraphInterrupt`——危险命令确认、`ask_human` 等工具内 `interrupt()` 的正常暂停），**不映射为 `[工具执行失败]` TOOL_RESULT**，只清理 run_id 映射
 - **并行工具异常**：第一个工具崩后 Pregel 立即 `raise`，其余已 `on_tool_start` 但未 `on_tool_end`/`on_tool_error` 的 tool_call（孤儿）在 `except` 块中补发失败 `TOOL_RESULT`，避免前端工具卡片永远卡在"执行中"
 
 设计决策：工具失败发 `TOOL_RESULT`（携带错误信息）而非 `ERROR`——`ERROR` 是终止事件会中断整个流，而工具失败应让 LLM 看到错误并调整策略（ReAct 模式标准行为）。异常最终仍会逃逸到 `except Exception` 发 `ERROR` 终止流（因 Pregel 的 `_panic_or_proceed` 在第一个工具崩后立即 raise，无法继续执行后续节点）。
@@ -1767,29 +1786,30 @@ create_tool(
 - 摘要存入 LangGraph `state.summary` 字段，随 **checkpoint 自动持久化**，天然实现 **per-thread 隔离**（每个 thread 拥有独立 summary），彻底消除跨会话污染。
 - **摘要模型按会话动态解析**：中间件除静态 `model=` 外还接受 `model_resolver`，每次压缩从 runtime context 解析当前会话的模型（解析失败回退静态模型）。这修复了「主模型已按会话切换、摘要却仍用启动时 provider」的静默缺陷。手动路径 `arun_compaction()` 亦可显式传入 `model`。
 - **安全切割**：不会拆开 `AIMessage(tool_calls)` + `ToolMessage` 配对（切割点落在 `ToolMessage` 上时向前回退到对应的 `AIMessage`）。
-- 压缩后用 `RemoveMessage(REMOVE_ALL_MESSAGES)` 先清空 checkpoint 旧消息，再写入 `SystemMessage(摘要) + Pruned 近期消息`，旧消息彻底移除不再占用存储。
+- **独立工具输出 Prune**：Prune 不再只是压缩的附赠动作——每次 model 调用前只要历史工具输出的可裁剪收益足够（超过 `max_tool_output_chars * 10` 字符），就独立裁剪保留区之外的历史工具输出，即使预估 token 未达压缩阈值也会执行（保护最后 `keep_recent` 条消息不受影响）。
+- 压缩后用 `RemoveMessage(REMOVE_ALL_MESSAGES)` 先清空 checkpoint 旧消息，再写入 `HumanMessage(摘要) + Pruned 近期消息`（摘要**不用 system 角色**，以保证 payload 只有一条 system 消息），旧消息彻底移除不再占用存储。
 
 触发方式：
 
 | 触发方式 | 入口                                                | 阈值行为                                              |
 | -------- | --------------------------------------------------- | ----------------------------------------------------- |
-| 自动     | `before_model` / `abefore_model` 中间件         | 消息数 >`max_messages`（默认 50）时触发             |
-| 手动     | `AgentCore.manually_compact()` / `compact` 命令 | `force=True` 跳过阈值，仍需消息数 > `keep_recent` |
+| 自动     | `before_model` / `abefore_model` 中间件         | 预估 token（字符数 /4）≥ `max_context_tokens`（默认 100000）时触发；工具输出 Prune 独立执行 |
+| 手动     | `AgentCore.manually_compact()` / `compact` 命令 | `force=True` 跳过 token 阈值，仍需消息数 > `keep_recent` |
 
 `CompactionConfig` 关键参数（`agent/compaction.py`）：
 
 | 参数                      | 默认 | 说明                           |
 | ------------------------- | ---- | ------------------------------ |
-| `max_messages`          | 50   | 触发压缩的消息数阈值           |
-| `keep_recent`           | 20   | 保留最近 N 条消息（原样保留）  |
+| `max_context_tokens`    | 100000 | 触发压缩的预估 token 阈值（0 = 关闭自动触发） |
+| `keep_recent`           | 20   | 保留最近 N 条消息（不参与摘要）  |
 | `max_tool_output_chars` | 200  | 工具输出超过此长度则触发 Prune |
 | `tool_prune_preview`    | 100  | Prune 后保留的预览字符数       |
 
-> 可用 `CompactionConfig.from_kwargs(max_context_messages, context_trim_keep)` 从 AgentCore 现有配置参数构建。
+> 可用 `CompactionConfig.from_kwargs(max_context_tokens, context_trim_keep)` 从 AgentCore 现有配置参数构建。历史键 `max_context_messages`（按消息条数触发）已移除，替换为 `agent_config.json` 的 `max_context_tokens`。
 
 ### MCP 连接池（MCPPool）
 
-[`tools/mcp_pool.py`](tools/mcp_pool.py) 提供 `MCPPool`，替代旧的 `load_mcp_tools` 全量重载模式：
+[`tools/mcp_pool.py`](tools/mcp_pool.py) 提供 `MCPPool`，以 per-server 隔离方式管理 MCP 连接：
 
 - **per-server 隔离**：`server-A` 断连不影响 `server-B/C`
 - **健康探测**：感知连接状态（`ServerStatus`：`disconnected` / `connecting` / `connected` / `error`）
@@ -1867,6 +1887,15 @@ with TraceContext(trace_id="req-123", thread_id="thread-abc"):
 - **作用域**：仅 `provider ∈ {yunlan, yunlan-gpt}` 的 `CloudmistChatOpenAI` 具备此重启能力；其他 provider 走 `init_chat_model`，暂无流层重试（症状集中于云雾网关，属有意收敛的作用域限制）。
 - **已知边界**：若停滞发生在**已有可见内容之后**，任何重试方案都会重复文本，故此时直接上抛。若产品要求「内容已开始后仍零错误重试」，唯一无重复路径是牺牲实时流式（改非流式缓冲整段再合成 token），属产品级取舍。
 
+#### 空最终回答检测（Empty Final Answer）
+
+思考型模型（如 `deepseek-v4.1-flash`）的 **reasoning token 计入 `max_tokens`**。当输出预算被推理 token 耗尽时，网关返回 `finish_reason=length` 且 `content` 为空的 `AIMessage`。若流式层静默产出空的 `DONE`，Web UI 会显示一片空白且无任何提示。
+
+[`agent/streaming.py`](agent/streaming.py) 的 `arun_events` / `aresume_events` 现在会记录最后一次 `on_chat_model_end` 的 `AIMessage`，在流结束且未被 interrupt / cancelled 接管时调用 [`llm/message_utils.py`](llm/message_utils.py) 的 `final_answer_is_empty()` 检测：
+
+- 终态 `AIMessage` 既无内容、也无 `tool_calls`（不在工具循环中）→ 发 `ERROR` 事件（携带 `finish_reason`），前端明确提示「输出预算可能被推理 token 耗尽，请提高 max_tokens 后重试」，而非静默空白。
+- 有内容或仍在工具循环中 → 照常发 `DONE`，行为不变。
+
 ### 终端命令超时重试与分类（Terminal Timeout Retry）
 
 [`tools/terminal_tools.py`](tools/terminal_tools.py) 对 `run_shell` / `run_python` / `run_cmd` 三个终端工具叠加 ctrl+c 软中断 + 超时分类 + 重试上限机制，防止命令卡死导致 Agent 无限等待或无限重试：
@@ -1874,8 +1903,8 @@ with TraceContext(trace_id="req-123", thread_id="thread-abc"):
 - **ctrl+c 软中断**：超时后先发 ctrl+c（Windows `CTRL_BREAK_EVENT` / Unix `SIGINT`），等 5 秒 grace period 收集 partial 输出，再强杀进程树（Windows `taskkill /T` / Unix `killpg`）。相比直接 kill，子进程有机会刷出缓冲输出供 LLM 判断超时原因。
 - **超时原因分类**（`_classify_timeout`）：启发式识别交互式命令 / 网络阻塞 / IO 阻塞 / 命令错误 / 死循环，写入返回结果的 `timeout_reason` 字段，供主模型判断如何修改命令重试。
 - **富结果返回**：超时返回 `{error_type: "timeout", timeout_reason, partial_stdout, partial_stderr, ...}`，主模型读到后自行反思修改命令重试（方案 B，每次重试是模型新发的 tool_call，事件干净）。
-- **软超时由硬超时派生**（[`tools/config.py`](tools/config.py) 的 `soft_timeout_for()`）：三个终端工具函数级 `timeout` 默认值不再是固定的 `DEFAULT_TIMEOUT`，而是 `hard - SOFT_TIMEOUT_MARGIN(10s)`，实测值 `run_shell` **590s**（硬 600s）、`run_python` / `run_cmd` **50s**（硬 60s）。此前 `run_shell` 内层默认 60s 会把 vivado/xsim 长批处理提前掐断（与文档宣称的 600s 矛盾），而 `run_python` / `run_cmd` 内外层同为 60s 则让外层抢先触发，模型只能拿到无信息的裸错误。
-- **重试上限中间件**（[`agent/terminal_retry_cap_mw.py`](agent/terminal_retry_cap_mw.py) `TerminalRetryCapMW`）：无状态中间件，读 `request.state["messages"]` 统计**同一工具**（`run_shell`/`run_python`/`run_cmd`）的**连续**超时次数（streak）：被该工具任意非超时结果重置为 0，且按工具分别计数（`run_shell` 的超时不影响 `run_python`/`run_cmd`），达 `MAX_TIMEOUT_RETRIES`（3 次）则拦截返回失败 `ToolMessage(status="error")`，阻止主模型无限重试。⚠️ 早期实现统计的是**会话生命周期累计**次数，导致长会话中 3 次互不相关的超时永久封禁全部 exec 工具，现已修正为连续语义。注册在 `create_agent` middleware 链最外层（最先拦截）。
+- **软超时由硬超时派生**（[`tools/config.py`](tools/config.py) 的 `soft_timeout_for()`）：三个终端工具函数级 `timeout` 默认值为 `hard - SOFT_TIMEOUT_MARGIN(10s)`，实测值 `run_shell` **590s**（硬 600s）、`run_python` / `run_cmd` **50s**（硬 60s）。
+- **重试上限中间件**（[`agent/terminal_retry_cap_mw.py`](agent/terminal_retry_cap_mw.py) `TerminalRetryCapMW`）：无状态中间件，读 `request.state["messages"]` 统计**同一工具**（`run_shell`/`run_python`/`run_cmd`）的**连续**超时次数（streak）：被该工具任意非超时结果重置为 0，且按工具分别计数（`run_shell` 的超时不影响 `run_python`/`run_cmd`），达 `MAX_TIMEOUT_RETRIES`（3 次）则拦截返回失败 `ToolMessage(status="error")`，阻止主模型无限重试。注册在 `create_agent` middleware 链最外层（最先拦截）。
 - **重复调用熔断中间件**（[`agent/tool_retry_cap_mw.py`](agent/tool_retry_cap_mw.py) `ToolRetryCapMW`）：`TerminalRetryCapMW` 的通用互补——后者只管终端超时，本中间件**面向所有工具**。读 `request.state["messages"]`，用 `AIMessage.tool_calls` 建立 `tool_call_id → (工具名, 参数指纹)` 关联，统计「同一工具 + 同一参数」的失败 ToolMessage 数；达 `MAX_IDENTICAL_FAILURES`（2 次）则拦截第三次相同调用，返回 `ToolMessage(status="error")`（内容以 `[重复调用熔断]` 开头，提示更换参数/改方案/`ask_human`）。设计为 **fail-open**：state 缺失、无法关联 `tool_calls` 时一律放行，`ask_human` 永不拦截。作用域覆盖主 Agent 与团队角色（`graph_builder.py` 与 `team/base.py` 的中间件链均已接入）。
   - **与 prompt 的分工**：`agent/AGENT.md` 与 `ToolExecutionErrorMW` 的反思文案提供"同类失败 ≥2 次即停手"的软约束；本中间件是**确定性硬兜底**，模型不遵守时仍能终止循环。
   - **失败识别口径**（三选一）：① `ToolMessage.status == "error"`；② 内容含标记 `[工具执行失败]` / `[重复调用熔断]` / `[超时重试已达上限]` / `[参数冲突]` / `操作被拒绝`（最后一项对应 `WorkspaceSecurityMW` 的拒绝消息——它不带 `status`，若不登记则路径逃逸这一最高频场景不会被计数）；③ **内容是 JSON 对象且 `success` 为 `false`** —— 终端工具的非超时失败（`run_python`/`run_cmd` 退出码非 0、`run_shell` 非零退出）、`create_tool`、`search` 等都以 dict 形式返回失败而非抛异常，LangGraph 经 `json.dumps` 序列化为 `ToolMessage.content`（如 `{"success": false, "returncode": 1, ...}`），前两条均无法识别。
@@ -1899,7 +1928,7 @@ LCAgentError                    ← 所有 LCAgent 异常的基类（含 detail 
 
 ## 异步 Public API
 
-`AgentCore` 提供全套异步公开方法（[`agent/agent_core.py`](agent/agent_core.py)），供飞书远程控制、调度器等异步入口调用；CLI 命令层亦已全面迁移到异步 API。
+`AgentCore` 提供全套异步公开方法（[`agent/agent_core.py`](agent/agent_core.py)），供飞书远程控制、调度器等异步入口调用；CLI 命令层同样使用异步 API。
 
 | 方法                                                                                                  | 说明                                                                                                                                                                                                    |
 | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1907,8 +1936,7 @@ LCAgentError                    ← 所有 LCAgent 异常的基类（含 detail 
 | `await achat(message)`                                                                              | 普通对话模式，返回最终文本                                                                                                                                                                              |
 | `await aresume(payload)`                                                                            | 恢复被`ask_human` 中断的会话（`Command(resume=...)`）                                                                                                                                               |
 | `await arun_structured(task, thread_id=None)` / `await achat_structured(message, thread_id=None)` | 返回`AgentTurnResult`（含 HITL 结构化中断信息）；`thread_id` 显式指定目标会话                                                                                                                       |
-| `await aswitch_llm(llm_client)`                                                                     | **仅 legacy 全局切换**：替换共享 LLM 并重建图，同时刷新进程级默认会话配置；只影响**新会话**，不再用于会话级切换（会话级请用 `PATCH /api/sessions/{thread_id}/config`）                    |
-| `await role_sw.arebuild_agent_from_team_dir(agent, agent_name, *, task="")`                         | **仅 legacy 全局路径**：按`team/<角色>/` 文件夹名切换主对话 Agent 的角色（读取该目录的 `agent_config.json` + `AGENT.md`）；会话级角色切换已改为写入会话配置，见「会话管理 → 会话基础配置」 |
+| `await aswitch_llm(llm_client)`                                                                     | 全局切换：替换共享 LLM 并重建图，同时刷新进程级默认会话配置；只影响**新会话**（会话级切换请用 `PATCH /api/sessions/{thread_id}/config`） |
 | `await areload_mcp_tools()`                                                                         | 通过 MCP 连接池重载工具并按需重建 Graph                                                                                                                                                                 |
 | `await manually_compact(force=False, thread_id=None)`                                               | 手动触发上下文压缩，返回状态更新字典或`None`；`thread_id` 指定目标会话                                                                                                                              |
 | `await aclose()`                                                                                    | 释放资源（MCP 连接、checkpoint 等）的生命周期收尾                                                                                                                                                       |
@@ -2152,7 +2180,7 @@ resume = {
 
 `_resume_payload_for_interrupts` 会自动区分这两种情况：单 interrupt 直接传值，多 interrupt 按 `interrupt.id` 映射，避免答案错配。
 
-**服务端/Web 异步路径同样自动处理多中断**：`aresume_events`（`/api/chat/resume`）与 `aresume_structured` 在构造 `Command(resume=...)` 前会先调用 `_abuild_resume_command` 读取当前 checkpoint 的挂起中断列表——若存在多个 pending interrupt，会把裸值 payload 自动映射为 `{interrupt.id: payload}`，避免 LangGraph 抛出 "When there are multiple pending interrupts, you must specify the interrupt id when resuming"；若调用方已传入 `{interrupt_id: value}` 映射（如 CLI 的 `_resume_payload_for_interrupts`），则原样透传。单个 interrupt 时保持裸值形式，向后兼容。
+**服务端/Web 异步路径同样自动处理多中断**：`aresume_events`（`/api/chat/resume`）与 `aresume_structured` 在构造 `Command(resume=...)` 前会先调用 `_abuild_resume_command` 读取当前 checkpoint 的挂起中断列表——若存在多个 pending interrupt，会把裸值 payload 自动映射为 `{interrupt.id: payload}`，避免 LangGraph 抛出 "When there are multiple pending interrupts, you must specify the interrupt id when resuming"；若调用方已传入 `{interrupt_id: value}` 映射（如 CLI 的 `_resume_payload_for_interrupts`），则原样透传。单个 interrupt 时保持裸值形式。
 
 **多轮暂停**也支持：恢复后若又遇到新的 `ask_human`，`complete_human_input_turn` 会继续循环处理，直到 `status == "completed"`。例如一个图节点里连续两次 `ask_human`，需要两次 resume 才能完成。
 
@@ -2298,7 +2326,7 @@ Terminator (汇总结果,返回最终答案)
 
 ### 架构(rtl_graph)
 
-RTL 芯片设计流水线：`Manager` 提炼上下文 → `Architect` 五阶段架构（计划/设计/分析/评审/规格）→ `Designer` 规格+编码 ↔ `Verification` 多轮验证 → 验证通过/达上限即终止（END）：
+RTL 芯片设计流水线：`Manager` 提炼上下文 → `Architect` 五阶段架构（计划/设计/分析/评审/规格）→ `Designer` 规格+编码 ↔ `Verification` 多轮验证 → 验证通过/达上限即经 `designer_output` 交付后终止（END）：
 
 ```
 用户任务
@@ -2317,12 +2345,13 @@ Verification (spec_design_task:验证计划)
 │  Verification (verilog_design_task:验证) │──┘
 └──────────────────────────────────────────┘
     ↓ 验证通过 / 达 max_rounds 上限
-   END（终止,不再经 Designer 交付节点）
+Designer (designer_output:整理最终交付物) → END（终止）
 ```
 
-- **多轮交互**：`designer_verilog` → `designer_file_check` → `verification_check` → `sim_exec_check` 构成迭代环，由 `route_after_file_check` / `route_after_sim_check` 条件路由判定。`designer_file_check` 校验本轮产出 RTL 文件存在且非空；`sim_exec_check` 实际执行 Vivado 仿真并检查覆盖率（`scripts/syn_filelist.f` 全部 src 被 `scripts/sim_filelist.f` 包含且报告已生成），仿真+覆盖率通过即终止（END）；失败且轮次未达 `max_rounds`（默认 3）时携带验证反馈回到 Designer 重新编码；达上限强制终止（END），防止死循环。
+- **多轮交互**：`designer_verilog` → `designer_file_check` → `verification_check` → `sim_exec_check` 构成迭代环，由 `route_after_file_check` / `route_after_sim_check` 条件路由判定。`designer_file_check` 校验本轮产出 RTL 文件存在且非空；`sim_exec_check` 实际执行 Vivado 仿真并检查覆盖率（`scripts/syn_filelist.f` 全部 src 被 `scripts/sim_filelist.f` 包含且报告已生成），仿真+覆盖率通过即经 `designer_output` 交付后终止（END）；失败且轮次未达 `max_rounds`（默认 3）时携带验证反馈回到 Designer 重新编码；达上限强制经 `designer_output` 交付后终止（END），防止死循环。
+- **交付节点（零 LLM）**：`designer_output` 是**确定性机械拼装**节点，**不调用任何 LLM、不渲染模板、不做网络/磁盘 IO**——仅把 `task` / `design_spec` / `rtl_code` / `verification_report` / `output_files` 等 state 字段按固定小节拼装成 `final_answer`（空字段整段省略，全空时至少回退 `state["task"]`）。两条终态路径（`sim_exec_check` 通过、达 `max_rounds` 上限）以及 `designer_file_check` 达上限，均先经 `designer_output` 交付再 `→ END`，保证 `final_answer` 非空、跨轮次记忆沉淀与 DONE 事件内容可用。
 - **上下文衔接**：Architect 各阶段任务文本逐级拼接上游产物（计划→设计→分析→评审→规格），Designer/Verification 基于架构规格分工，多轮迭代时第二轮起注入上一轮验证报告反馈。
-- **角色注册**：`team/__init__.py` 未导入 `rtl_designer`/`rtl_verification`，由 `rtl_graph.py` 顶部显式导入触发 `@register_agent` 注册，与 `graph.registry` 无循环导入。
+- **角色注册**：`team/__init__.py` 未导入 `rtl_designer`/`rtl_verification`，由 `rtl_graph.py` 顶部显式导入触发 `@register_agent` 注册，与 `graph.common` 无循环导入。
 
 ### 团队角色
 
@@ -2336,7 +2365,7 @@ Verification (spec_design_task:验证计划)
 
 > **RTL 团队角色模型配置**：`manager`/`architect`/`rtl_designer`/`rtl_verification` 均配置为云雾提供商 `qwen3.7-max`、`max_tokens=4096`。原因：云雾网关对 `max_completion_tokens` 参数的处理存在缺陷——思考型模型（`glm-5.2`/`qwen3.7-max`）的 reasoning token 会计入该预算，复杂设计任务（RTL 编码/验证方案）思考消耗远超 `max_tokens`，触发 `finish=length` 且 `content` 为空，导致工作流节点输出空字符串。`llm/llm_client.py` 中 `CloudmistChatOpenAI` 子类将 `max_completion_tokens` 还原为 `max_tokens` 规避该缺陷（仅 `provider="yunwu"` 生效），详见该文件类文档。
 
-> **固定技能注入**：`VerificationAgent` 经 `fixed_skills: ClassVar[list[str]] = ["vivado-2025.2"]` 类属性始终注入 Vivado 技能指引（验证环境固定使用 Vivado Xsim，不依赖任务关键词自动匹配），由 `skmng.core.build_skill_block` 统一合并注入，见 `team/rtl_verification/rtl_verification.py`。
+> **固定技能注入**：`TeamAgent` 基类保留 `fixed_skills: ClassVar[list[str]] = []` 类属性，`skmng.core.build_skill_block` 支持把角色级固定技能合并进注入块。`VerificationAgent` 声明 `fixed_skills = ["vivado-2025.2"]`（验证环境始终使用 Vivado Xsim，与任务关键词无关，故无条件注入）；该固定技能经**节点路径**生效：`graph/common/node_factory.py::create_llm_node` 生成的节点在执行时读取 `agent.fixed_skills`，以 `fixed_skills=...` 传给 `injector.inject_into_prompt(...)`，最终在 `skmng.core.build_skill_block` 的三来源合并中注入。例外：`verification_check_node` 经 `create_llm_node(..., exclude_skills=("vivado-2025.2",))` **显式 opt-out**（该技能的 add_files 目录通配与 Xsim `sim_filelist.f` 流程冲突）；`exclude_skills` 在三来源合并后统一过滤，故单个节点可剔除角色的 fixed_skills。
 
 > **RTL 角色 MCP 工具注入**：`ArchiAgent` / `DesignerAgent` / `VerificationAgent` 经 `@register_agent(..., mcp_tools=["write_file"])` 声明对 MCP filesystem `write_file` 工具的依赖。`build_workflow` 装配期由 `tools.mcp_loader.load_mcp_tools_by_name_sync` 同步拉取（遍历已启用 MCP server 按名筛选），拉取成功时角色切工具模式（自动挂载 `WorkspaceSecurityMW`，路径解析+逃逸校验与 Worker 一致），各自 workflow 节点的 prompt 引导 LLM 调用 `write_file` 把产出文档写入 workspace（architect 写 `arch_spec.md`、designer 写 `design_spec.md`/`rtl_code.sv`、verification 写 `verification_plan.md`/`verification_report.md`）；MCP 未配置或加载失败时静默降级为纯文本模式（仅输出正文，不写盘），不阻断工作流。声明工具名而非 server 名，解耦 server 配置变更。
 
@@ -2346,7 +2375,7 @@ Verification (spec_design_task:验证计划)
 - **按需工具注入**:Manager/Terminator 纯 LLM 推理,Worker 注入工具列表后用 `create_agent` 构建轻量 ReAct 循环
 - **工具超时 + 错误纠错**:工具经 `tools.tool_wrapper.wrap_tools_with_timeout` 包裹超时保护(防卡死,默认 60 秒+工具级覆盖如 `ask_human` 600 秒);executor 挂载 `ToolExecutionErrorMW`(工具异常转 `ToolMessage(status="error")` + 反思指令,LLM 可读到报错修正重试)与 `WorkspaceSecurityMW`(workspace 路径解析 + 逃逸校验),与主 Agent 的工具执行质量对齐
 - **快速构建**:不加载 MCP Server、不创建 SQLite checkpointer
-- **内建技能注入**:持有 `SkillManager`(`skills_dir` 参数指定目录,默认 `.agents/skills`),`build_skill_block`/`inject_into_prompt` 转发 `skmng.core`(满足 `PromptInjector` 协议),三来源合并(角色级 `fixed_skills` 类属性 + 运行时 `active_names` + 自动匹配);工作流节点可直接以角色实例为注入器,无需外部构造
+- **内建技能注入**:持有 `SkillManager`(`skills_dir` 参数指定目录,默认 `.agents/skills`),`build_skill_block`/`inject_into_prompt` 转发 `skmng.core`(满足 `PromptInjector` 协议),三来源合并(角色级 `fixed_skills` 类属性 + 运行时 `active_names` + 自动匹配);`VerificationAgent` 声明 `fixed_skills = ["vivado-2025.2"]`,由 `create_llm_node` 读取并传参给注入器,实现角色级固定技能无条件注入;单节点可通过 `exclude_skills` opt-out(如 `verification_check_node` 排除 `"vivado-2025.2"` 因与 Xsim 流程冲突)。工作流节点可直接以角色实例为注入器,无需外部构造
 - **类型化执行结果**:`arun_structured` 返回 `AgentTurnResult`(completed / cancelled,复用 `agent/turn_types.py`),调用方可区分"正常完成"与"LLM 失败",工作流节点可据此重试/降级;`ainvoke`/`astream` 保持返回字符串契约不变
 - **运行时指标**:`metrics` 惰性收集器(与 `AgentCore.metrics` 同构)——LLM 调用 token 用量(流式事件与纯文本通道自动提取)、工具执行计数/失败/超时、turn 计数,经 `get_summary()` 汇总
 - **能力边界清晰**:规划/汇总角色不暴露危险工具(如 `run_shell`),Worker 才拥有工具执行能力
@@ -2355,12 +2384,12 @@ Verification (spec_design_task:验证计划)
 
 ### 异步化与跨轮次压缩
 
-工作流节点已全面异步化,`TeamAgent` 提供 `ainvoke`/`astream` 异步能力,节点直接 `await` 角色类 async 业务方法并透传 LangGraph `config`(callbacks 通道)实现 TOKEN 级流式;同时具备技能注入与跨轮次记忆压缩能力:
+工作流节点全面异步化,`TeamAgent` 提供 `arun_structured`/`aresume_structured`/`ainvoke`/`astream` 异步能力,节点经通用工厂统一调用 `TeamAgent` 方法并透传 LangGraph `config`(callbacks 通道)实现 TOKEN 级流式;同时具备技能注入与跨轮次记忆压缩能力:
 
-- **异步节点执行 + TOKEN 流式**:`simple.py` / `rtl_graph.py` 的业务节点(`summarize`/`manager_plan`/`worker_exec`/`terminator_final` 及 RTL 各节点)全部为 `async`,直接 `await` 角色类 async 业务方法(`asummarize_context`/`aplan_task`/`aexecute_task`/`afinalize` 等)并透传 LangGraph 注入的 `config: Optional[RunnableConfig]`。`TeamAgent`(`team/base.py`)提供 `ainvoke`(`astream` 聚合)/`astream` 异步能力:`_astream_with_tools` 经 `agent_executor.astream_events(version="v2")` 过滤 `on_chat_model_stream`;`_astream_pure_text` 经 chat model `astream`。因同事件循环执行,callbacks 自然透传——`NodeTrackingHandler.on_chat_model_stream` 捕获 LLM token 增量转发为 `AgentEvent.token`,`WorkflowAdapter._on_token` 闭包补 `thread_id`/`role="assistant"`/`trace_id` 后注入事件流,实现节点执行期间的 TOKEN 级流式(空块自动过滤)。同步业务方法与 `ainvoke_team_agent()` 兼容辅助已移除,统一走 async 链路。
-- **技能注入(SkillInjector)**:`build_simple_workflow` 接受 `skills_dir` / `auto_match_skills` 参数,构建时创建 `skmng.injector.SkillInjector`(改调 `skmng.core.build_skill_block` 三来源合并:角色级 `fixed_skills` + 运行时 `active_names` + 自动匹配)。节点渲染 prompt 后调用 `inject_into_prompt()` 把命中技能(`match_skills(task)`)的指引块追加到 prompt 末尾,已含技能块时跳过(防重复)。`TeamAgent` 亦内建同等能力(`build_skill_block` / `inject_into_prompt` 转发 `skmng.core`,满足 `PromptInjector` 协议)——节点可直接以角色实例为注入器,无需外部构造;`team/factory.py` 会把角色 `team/team_agents.json` 的 `skills_dir` / `auto_match_skills` / `tool_timeout` 透传给 TeamAgent。
-- **消息通道压缩(compaction)**:`simple.py` / `rtl_graph.py` / `pipline.py` 的 `WorkflowState` / `RTLGraphState` 新增 `messages`(LangGraph `add_messages` 通道)与 `summary` 字段,每个业务节点产出追加一条 `AIMessage`。`build_*_workflow` 接受 `compaction_config` 参数,经 `graph/common.py` 的 `_build_compaction_middleware` 构造中间件,再由 `register_nodes` 工厂统一包装节点(`wrap_node_with_compaction`):消息累计超过阈值(默认 50)时调用 `arun_compaction(force=True)` 把历史消息压缩为增量摘要并入 `summary`,防止长会话撑爆上下文。`compaction_config=None` 且 agent 无 LLM 时静默禁用。
-- **跨轮次上下文延续**:统一入口(CLI/API)经 `WorkflowAdapter`(`session/workflow_adapter.py`)执行——运行前从 workflow 专属会话的 checkpoint `messages` 通道读取历史节点产出(预览最多 5 条、每条截断 200 字符,拼为 `【历史执行记录】` 块),叠加 `MemoryManager.recall_text` 的长期记忆,合并注入 `raw_context`,实现多轮运行间的上下文延续。直接调用 `arun_simple_workflow` + `thread_id` 时,旧的 `_aget_previous_workflow_summary()`(checkpoint 摘要)仍可用(已标记 deprecated,待消息通道完全接管后移除)。
+- **异步节点执行 + TOKEN 流式**:`simple.py` / `rtl_graph.py` 的业务节点(`manager_plan`/`worker_exec`/`terminator_final` 及 RTL 各节点)全部由 `graph/common/node_factory.py::create_llm_node` 工厂构建(节点内嵌 `summarize_context` 为手写节点,复用同一链路),执行路径统一为:`agent.get_template(template_name)` 取模板 → `agent.render_template(...)` 渲染 → 基础提示词前置(`llm.config.load_agent_rules` 按 `agent.tools` 判定) → `injector.inject_into_prompt(...)` 注入技能 → `run_team_turn_with_interrupt(agent, prompt, config)` 执行,并透传 LangGraph 注入的 `config: Optional[RunnableConfig]`。`run_team_turn_with_interrupt`(`graph/common/interrupt_forward.py`)内部调通用 `TeamAgent.arun_structured`;内层被 interrupt 时调外层 `langgraph.types.interrupt()` 暂停外层图,resume 后经 `TeamAgent.aresume_structured` 注入内层恢复,循环处理多次 interrupt。各角色类只是携带 `@register_agent` 元数据的薄注册桩。`TeamAgent`(`team/base.py`)提供 `arun_structured`/`aresume_structured`/`ainvoke`/`astream` 异步能力:`_astream_with_tools` 经 `agent_executor.astream_events(version="v2")` 过滤 `on_chat_model_stream`;`_astream_pure_text` 经 chat model `astream`。因同事件循环执行,callbacks 自然透传——`NodeTrackingHandler.on_chat_model_stream` 捕获 LLM token 增量转发为 `AgentEvent.token`,`WorkflowAdapter._on_token` 闭包补 `thread_id`/`role="assistant"`/`trace_id` 后注入事件流,实现节点执行期间的 TOKEN 级流式(空块自动过滤)。
+- **技能注入(SkillInjector)**:`build_simple_workflow` 接受 `skills_dir` / `auto_match_skills` 参数,构建时创建 `skmng.injector.SkillInjector`。节点渲染 prompt 后调用 `inject_into_prompt()` 把命中技能(`match_skills(task)`)的指引块追加到 prompt 末尾,已含技能块时跳过(防重复)。`skmng.core.build_skill_block` 的三来源合并(角色级 `fixed_skills` + 运行时 `active_names` + 自动匹配)完整生效:`SkillInjector.inject_into_prompt` 接受 `fixed_skills` 参数,节点经 `create_llm_node` 读取 `agent.fixed_skills` 传入(如 `VerificationAgent.fixed_skills = ["vivado-2025.2"]`,验证环境始终注入 Vivado Xsim 指引,与任务关键词无关);需要排除某技能时经 `exclude_skills` 传入(如 `graph/rtl_graph.py` 的 `verification_check_node` 排除 `"vivado-2025.2"`,因该技能的 add_files 目录通配与 Xsim `sim_filelist.f` 流程冲突,作为节点级 opt-out)。`TeamAgent` 亦内建同等能力(`build_skill_block` / `inject_into_prompt` 转发 `skmng.core`,满足 `PromptInjector` 协议)——节点可直接以角色实例为注入器,无需外部构造;`team/factory.py` 会把角色 `team/team_agents.json` 的 `skills_dir` / `auto_match_skills` / `tool_timeout` 透传给 TeamAgent。节点在 `create_llm_node` 内从 `state["active_skills"]` 读取手动加载技能并作为 `active_names` 传入(与 `fixed_skills` / `exclude_skills` 并列),使 `skill:<name>` 加载的技能经 workflow checkpoint per-thread 持久化后真正到达节点 prompt;`arun_compiled_workflow` / `arun_simple_workflow` / `arun_rtl_graph_workflow` / `arun_workflow_by_name` 均接受 `active_skills` 参数(仅非空时写入初始状态,不覆盖 checkpoint 已持久化的值)。`WorkflowAdapter`(`session/workflow_adapter.py`)提供 `list_skills` / `auto_match_skills` / `aload_skill` / `aclear_skills`,经 `graph.aget_state` / `graph.aupdate_state` 读写 workflow 会话 state,使 workflow 会话具备与主 Agent(`SkillOps`)同级的技能读写能力。
+- **消息通道压缩(compaction)**:`simple.py` / `rtl_graph.py` / `pipline.py` 的 `WorkflowState` / `RTLGraphState` 含 `messages`(LangGraph `add_messages` 通道)与 `summary` 字段,每个业务节点产出追加一条 `AIMessage`。`build_*_workflow` 接受 `compaction_config` 参数,经 `graph/common/` 的 `_build_compaction_middleware` 构造中间件,再由 `register_nodes` 以可选 `compaction_mw` 形参对节点统一包装:节点返回后调用 `arun_compaction`(**非 force**,仅预估 token > `max_context_tokens`(默认 100000)时触发)把历史消息压缩为增量摘要并入 `summary`,防止长会话撑爆上下文。`compaction_config=None` 且 agent 无 LLM 时静默禁用。
+- **跨轮次上下文延续**:统一入口(CLI/API)经 `WorkflowAdapter`(`session/workflow_adapter.py`)执行——运行前从 workflow 专属会话的 checkpoint `messages` 通道读取历史节点产出(预览最多 5 条、每条截断 200 字符,拼为 `【历史执行记录】` 块),叠加 `MemoryManager.recall_text` 的长期记忆,合并注入 `raw_context`,实现多轮运行间的上下文延续。
 
 ### 状态隔离机制
 
@@ -2370,7 +2399,7 @@ Verification (spec_design_task:验证计划)
 
 工作流运行期间可实时感知节点执行进度（CLI 打印 + Web 前端节点高亮）：
 
-- **节点级回调**：`arun_simple_workflow` 接受可选 `on_node_start` / `on_node_end` / `on_node_error` 回调（接收 `AgentEvent`，其中 NODE_START / NODE_END / NODE_ERROR 事件携带 `node` 节点名；NODE_END 额外携带 `content` —— 该节点的产出文本，从节点返回值的 `messages` 通道提取，供前端渲染节点结果块）。内部通过 LangGraph 的 `config["callbacks"]` 注入 `NodeTrackingHandler`（位于 `graph/common.py`），利用节点执行时 `metadata["langgraph_node"]` 字段识别业务节点（哨兵节点与内部 agent 子图会被过滤），在节点开始/结束/异常时构造 `AgentEvent` 并触发回调。不传回调时零额外开销。
+- **节点级回调**：`arun_simple_workflow` 接受可选 `on_node_start` / `on_node_end` / `on_node_error` 回调（接收 `AgentEvent`，其中 NODE_START / NODE_END / NODE_ERROR 事件携带 `node` 节点名；NODE_END 额外携带 `content` —— 该节点的产出文本，从节点返回值的 `messages` 通道提取，供前端渲染节点结果块）。内部通过 LangGraph 的 `config["callbacks"]` 注入 `NodeTrackingHandler`（位于 `graph/common/node_tracking.py`），利用节点执行时 `metadata["langgraph_node"]` 字段识别业务节点（哨兵节点与内部 agent 子图会被过滤），在节点开始/结束/异常时构造 `AgentEvent` 并触发回调。不传回调时零额外开销。
 - **CLI 场景**：`run_workflow` 把节点状态打印到终端（`▸ 节点开始: manager_plan` / `✓ 节点完成: manager_plan`）。
 - **Web 场景**：`CommandContext.workflow_event_cb` 把结构化事件（`workflow_node` / `workflow_status`）经 `/api/chat` 的 SSE 流实时推送；服务端将管理型命令的 `dispatch_command` 放到后台线程执行、输出经 `asyncio.Queue` 实时转发，前端 `WorkflowView` 据此高亮节点卡片与流程图。`workflow_node` 的 `done` 状态携带该节点产出（`content` 字段）时，前端在**会话窗口**追加一条带节点名标签的可折叠节点结果块（`web/src/components/Message.tsx` 的 `nodeName` 分支），使节点间的 message/result 可见；节点内 LLM 增量仍经 `token` 事件实时流式展示。
 
@@ -2384,7 +2413,7 @@ Verification (spec_design_task:验证计划)
 
 ### 工作流提示词外置
 
-工作流各节点/记忆提炼的提示词不再硬编码在代码里,而是由各角色 `team/*/AGENT.md` 的 `## workflow:<名称>` 小节驱动(与角色系统提示词同文件)。改 prompt 只改 md,无需动代码:
+工作流各节点/记忆提炼的提示词由各角色 `team/*/AGENT.md` 的 `## workflow:<名称>` 小节驱动(与角色系统提示词同文件)。改 prompt 只改 md,无需动代码:
 
 | 小节                              | 所在文件                                                           | 用途                                               |
 | --------------------------------- | ------------------------------------------------------------------ | -------------------------------------------------- |
@@ -2395,7 +2424,7 @@ Verification (spec_design_task:验证计划)
 | `## workflow:spec_design`       | `team/rtl_designer/AGENT.md`、`team/rtl_verification/AGENT.md` | 设计/验证需求梳理与工程规划模板(环节 1-4)          |
 | `## workflow:verilog_design`    | `team/rtl_designer/AGENT.md`、`team/rtl_verification/AGENT.md` | RTL 编码 / Testbench·UVM 框架模板(环节 5-9)       |
 
-模板用 `{task}`/`{plan}`/`{worker_result}`/`{context_summary}` 占位,运行时以 `TeamAgent.render_template` 做字符串替换(即使模板含 JSON 花括号也不会报错)。各节点在需要时经 `TeamAgent.get_template(name)` 加载对应小节(与系统提示词共用 __init__ 的一次解析缓存,不重复读文件),缺失回退各角色类的 `default_templates` 默认模板。加载/解析逻辑见 `team/base.py`;角色系统提示词在 `TeamAgent.__init__` 自动经 `parse_prompt_sections` 从 `prompt_file` 解析并剥离工作流小节,避免模板混入 system prompt(显式传入 `system_prompt` 时优先)。
+模板用 `{task}`/`{plan}`/`{worker_result}`/`{context_summary}` 占位,运行时以 `TeamAgent.render_template` 做字符串替换(即使模板含 JSON 花括号也不会报错)。各节点在需要时经 `TeamAgent.get_template(name)` 加载对应小节(与系统提示词共用 __init__ 的一次解析缓存,不重复读文件)——AGENT.md 的 `## workflow:*` 小节是工作流提示词的**唯一事实源**;缺失时回退 `TeamAgent.default_templates` 基类兜底机制(默认空 dict,**当前无任何角色覆盖**)。加载/解析逻辑见 `team/base.py`;角色系统提示词在 `TeamAgent.__init__` 自动经 `parse_prompt_sections` 从 `prompt_file` 解析并剥离工作流小节,避免模板混入 system prompt(显式传入 `system_prompt` 时优先)。
 
 ### 使用方式
 
@@ -2441,7 +2470,7 @@ Verification (spec_design_task:验证计划)
 
 ```python
 import asyncio
-from graph.registry import build_workflow
+from graph.common import build_workflow
 from graph.simple import arun_simple_workflow
 
 # 方式1: 构建并运行(异步接口)
@@ -2488,13 +2517,15 @@ result = asyncio.run(run_workflow(context, "simple", "帮我分析项目结构")
 
 ```python
 # team/my_agent/my_agent.py
-from graph.registry import register_agent
+from graph.common import register_agent
 from team.base import TeamAgent
 from tools import all_tools
 
+# 角色类只是携带 @register_agent 元数据的薄注册桩;
+# 工作流提示词写在 AGENT.md 的 ## workflow:<名称> 小节,无需 default_templates
 @register_agent("my_agent", tools=all_tools)
 class MyAgent(TeamAgent):
-    default_templates = {"my_node": "模板..."}
+    pass
 ```
 
 ```
@@ -2522,7 +2553,7 @@ class MyAgent(TeamAgent):
 
 #### 2. 添加新工作流（register_workflow 注册）
 
-所有工作流统一通过 `graph.registry.register_workflow` 注册（唯一入口）,仅调用时机不同:
+所有工作流统一通过 `graph.common.register_workflow` 注册（唯一入口）,仅调用时机不同:
 
 **方式 A — 模块自注册（推荐,内置工作流采用）:**
 
@@ -2530,8 +2561,12 @@ class MyAgent(TeamAgent):
 
 ```python
 # graph/my_workflow.py
-from graph.common import NodeSpec, register_nodes, _build_compaction_middleware
-from graph.registry import register_workflow
+from graph.common import (
+    NodeSpec,
+    _build_compaction_middleware,
+    register_nodes,
+    register_workflow,
+)
 
 def build_my_workflow(agents: dict) -> StateGraph:
     my_agent = agents["my_agent"]
@@ -2560,12 +2595,14 @@ register_workflow(
 
 > ⚠️ **必须用 `register_nodes`/`functools.partial` 而非 `lambda` 绑定 agent 实例**:`partial` 保留 async 函数的 coroutine 特征(LangGraph 据此判定节点为异步并 `await`),`lambda` 会返回未 await 的 coroutine 导致 `InvalidUpdateError`。
 
-`graph/registry.py` 底部 `_load_builtin_workflows()` 在 registry 首次 import 时加载 `graph.simple` / `graph.pipline`,触发其自注册;新增内置工作流时在该函数中补充 import 即可。
+> **`register_nodes` 签名**：`register_nodes(builder, agents, injector, compaction_mw=None, specs=None)`。`compaction_mw` 为 `None` 时行为与未接线一致（仅对 `specs` 中每个节点做 `partial` 绑定后 `builder.add_node`）；非 `None` 时节点返回后由包装器调用 `arun_compaction(messages, existing_summary=...)` 做**节点级增量压缩**——**非 force**：仅当预估 token > `max_context_tokens`（默认 100000）时触发，并把压缩产生的 `messages`/`summary` 合并进节点返回值（`{**result, **update}`，`update["messages"]` 取代节点原 `messages`，不丢不重）。
+
+`graph/common/registry.py` 底部 `_load_builtin_workflows()` 在 registry 首次 import 时加载 `graph.simple` / `graph.pipline`,触发其自注册;新增内置工作流时在该函数中补充 import 即可。
 
 **方式 B — 动态注册（运行时添加,无需改源码,适合插件式/条件式工作流）:**
 
 ```python
-from graph.registry import register_workflow
+from graph.common import register_workflow
 
 register_workflow(
     name="my_flow",
@@ -2783,7 +2820,7 @@ async def main() -> None:
     # 三层架构：先创建 MemoryContext（记忆基础设施），再创建 AgentCore（纯执行内核）
     memory_ctx = await MemoryContext.acreate(
         checkpoint_file="data/checkpoints_async.sqlite",  # Checkpoint + 长期记忆 Store（同一 SQLite 文件）
-        llm_getter=lambda: llm,                            # 供 LLM 抽取/压缩记忆使用（支持热切换）
+        llm_getter=lambda: llm,                            # 创建 Agent 前的默认 getter（内部包装为 thread-aware 解析器，创建后由 bind_llm 覆盖）
         buffer_delay_seconds=30,                           # 记忆防抖窗口（秒）
         max_buffer_messages=40,                            # 单 thread 防抖 buffer 上限
         max_facts_per_thread=60,                           # 单 thread 最大 fact 条数（thread 级 LRU 淘汰）
@@ -2801,7 +2838,7 @@ async def main() -> None:
         enable_mcp=True,
         skills_dir=".agents/skills",
         auto_match_skills=True,
-        max_context_messages=0,                           # 0=关闭长上下文裁剪
+        max_context_tokens=100000,                        # 长上下文压缩触发的预估 token 阈值（0=关闭自动触发）
         context_trim_keep=12,
         checkpointer=memory_ctx.checkpointer,             # ← checkpoint 持久化
         store=memory_ctx.store,                           # ← 长期记忆 Store
@@ -2848,14 +2885,14 @@ async def main() -> None:
     print(llm.list_models())           # 查看当前提供商的可用模型
     await agent.aswitch_llm(llm)       # 重建 Agent 以使用新模型
 
-    # 会话管理（已迁移至 agent.session，异步接口）
+    # 会话管理（agent.session，异步接口）
     agent.session.new_session()                            # 开启新会话
     await agent.session.aswitch_session("thread-abc123")   # 切换到已有会话
     await agent.session.adelete_session("thread-xxx")      # 删除指定会话
     print(await agent.session.alist_sessions())            # 列出所有会话
     print(await agent.session.aexport_session(fmt="markdown"))  # 导出当前会话为 Markdown 文本
 
-    # 会话基础配置（provider / model / 角色，按会话隔离；旧会话首次读取会自动懒迁移并持久化）
+    # 会话基础配置（provider / model / 角色，按会话隔离）
     from session import SessionConfigPatch
     tid = agent.session.current_session_id
     cfg = await agent.session_manager.aget_session_config(tid)     # 读取当前会话配置
@@ -2893,11 +2930,11 @@ asyncio.run(main())
 
 项目所有外置配置均位于 `config/` 目录下，每个配置文件有对应的 `.example` 模板（不含真实密钥），适合纳入版本控制。
 
-> **会话级覆盖**：`agent/agent_config.json` 中的 `provider` / `model` 及 `agent_config.json` 的采样参数，现在只是**新会话的进程级默认值**。已有会话保留各自在 Store 中的 `session_config`（见「会话管理 → 会话基础配置」），不会被默认值改动影响。
+> **会话级覆盖**：`agent/agent_config.json` 中的 `provider` / `model` 及 `agent_config.json` 的采样参数，是**新会话的进程级默认值**。已有会话保留各自在 Store 中的 `session_config`（见「会话管理 → 会话基础配置」），不会被默认值改动影响。
 
 ### 1. `agent_config.json` — Agent 运行时参数
 
-原先硬编码在 `main.py` 的运行时参数已外置到此文件，由 [agent/config.py](agent/config.py) 的 `load_agent_config` 加载并与默认值合并（缺省键不报错）。
+运行时参数由本文件承载，由 [agent/config.py](agent/config.py) 的 `load_agent_config` 加载并与默认值合并（缺省键不报错）。
 
 | 键                        | 类型  | 默认值                      | 说明                                                                                                   |
 | ------------------------- | ----- | --------------------------- | ------------------------------------------------------------------------------------------------------ |
@@ -2910,9 +2947,9 @@ asyncio.run(main())
 | `mcp_config_file`       | str   | `config/mcp_servers.json` | MCP 配置文件（相对项目根或绝对路径）                                                                   |
 | `agent_prompt_file`     | str   | `agent/AGENT.md`          | Agent 核心提示词文件路径（相对项目根或绝对路径）                                                       |
 | `max_execution_history` | int   | 100                         | 执行历史最大条数                                                                                       |
-| `max_context_messages`  | int   | 0                           | 长上下文裁剪阈值（0 = 关闭）                                                                           |
-| `context_trim_keep`     | int   | 12                          | 裁剪时保留的最近消息条数                                                                               |
-| `tool_timeout`          | int   | 120                         | 工具调用超时（秒）                                                                                     |
+| `max_context_tokens`    | int   | 100000                      | 长上下文压缩触发的预估 token 阈值（0 = 关闭自动触发；字符数 /4 粗估）                                  |
+| `context_trim_keep`     | int   | 12                          | 压缩时保留的最近消息条数                                                                               |
+| `tool_timeout`          | int   | 120                         | 工具调用超时（秒）。`0=使用默认超时策略（按工具名覆盖，全局默认 60s）`，与 `tools/config.py` 的 `DEFAULT_TIMEOUT`/`TOOL_TIMEOUTS` 行为一致 |
 | `temperature`           | float | 0.7                         | LLM 采样温度（主对话/调度器/API 默认；团队角色分层配置于 `team/team_agents.json`，缺省回退 default） |
 | `max_tokens`            | int   | 8192                        | LLM 最大生成 token 数（覆盖来源同`temperature`）                                                     |
 | `stream_chunk_timeout`  | float | 300.0                       | LLM 流式响应 chunk 间隔超时（秒；覆盖来源同`temperature`）。显式替代 `langchain-openai` 默认 120s，避免思考型模型网关长时间零字节时误触发告警（详见「LLM 流式 chunk 超时」） |
@@ -2934,7 +2971,7 @@ asyncio.run(main())
 
 #### Agent 核心提示词（`agent/AGENT.md`）
 
-Agent 的核心系统提示词（行为规则）已从 `agent_config.json` 中拆分到独立的 [agent/AGENT.md](agent/AGENT.md) 文件，便于单独维护和版本控制。
+Agent 的核心系统提示词（行为规则）位于独立的 [agent/AGENT.md](agent/AGENT.md) 文件，便于单独维护和版本控制。
 
 加载优先级：
 
@@ -2954,15 +2991,15 @@ Agent 的核心系统提示词（行为规则）已从 `agent_config.json` 中�
 >
 > 因 `create_llm_node` 在模块级定义、构建期拿不到 Agent 实例，节点在**执行时**按 `agent.tools` 判定该角色是否持有工具，从而避免「必须调用工具」等条款落在 Manager / Terminator / Architect 等纯文本角色节点上（既省 token，也避免误导模型调用不存在的工具）。文件缺失或未定义小节时自动跳过；`create_llm_node(..., base_prompts="")` 可关闭注入，传字符串则覆盖默认解析结果。注意主对话 Agent（`AgentCore`）仍读取**完整** `agent/AGENT.md`（两个小节都生效）。
 
-#### 长上下文裁剪（Long-Context Trimming）
+#### 长上下文压缩（Long-Context Compaction）
 
-当某个会话的消息数超过 `max_context_messages` 时，Agent 会自动：
+当某个会话的**预估 token**（字符数 /4 粗估，含工具调用参数文本）超过 `max_context_tokens`（默认 100000）时，Compaction 中间件会在每次 model 调用前自动：
 
-1. 用 LLM 将较早的消息压缩成一份中文摘要；
-2. 开启**新会话**，并把摘要注入后续 system prompt（保留上下文精华）；
-3. 仅保留最近 `context_trim_keep` 条消息，从而避免撞上 LLM 上下文窗口。
+1. 用 LLM 将较早的消息增量摘要成 `state.summary`（随 checkpoint 持久化、per-thread 隔离，**不新开 thread**）；
+2. 仅保留最近 `context_trim_keep` 条消息，避免撞上 LLM 上下文窗口；
+3. **独立** Prune 保留区之外过长的历史工具输出（只保留 `tool_prune_preview` 字符预览，保护最近 `keep_recent` 条消息），即使未达压缩阈值也执行。
 
-> 触发时会在终端打印提示（含新旧 `thread_id`）。默认 `max_context_messages=0`（关闭），需要时在 `agent/agent_config.json` 中设一个合理值（如 60）即可开启。
+> 历史键 `max_context_messages`（按消息条数触发）已移除，替换为 `max_context_tokens`（按预估 token 触发）。旧行为（消息数阈值 + 开启新会话）已废弃，改为在**同一 thread** 内增量摘要 + Prune，摘要随 checkpoint 持久化。
 
 ### 2. `llm_config.json` — LLM 服务商配置
 
@@ -3129,16 +3166,16 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 
 | 测试文件                                          | 覆盖内容                                                                                                                                                                                    |
 | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `tests/session/test_session_config.py`          | 会话基础配置：SessionConfig 序列化/patch、Store 读写、双会话隔离、旧会话懒迁移并持久化、批量读取含缺失、删除连带清理                                                                        |
-| `tests/agent/test_session_config_middleware.py` | 中间件与模型工厂：按会话切换模型、无配置时透传（legacy）、角色提示词覆盖、不污染共享 Agent、缓存命中与有界淘汰、解析失败回退                                                                |
-| `tests/agent/test_session_config_wiring.py`     | 接线回归：SessionConfigMW 位于中间件首位、compaction 同时持有 resolver 与静态模型、进程默认配置推导、异步 config 注入会话配置、双会话产出不同配置、legacy 全局切换只刷新默认值              |
+| `tests/session/test_session_config.py`          | 会话基础配置：SessionConfig 序列化/patch、Store 读写、双会话隔离、会话默认配置初始化并持久化、批量读取含缺失、删除连带清理                                                                        |
+| `tests/agent/test_session_config_middleware.py` | 中间件与模型工厂：按会话切换模型、无配置时透传、角色提示词覆盖、不污染共享 Agent、缓存命中与有界淘汰、解析失败回退                                                                |
+| `tests/agent/test_session_config_wiring.py`     | 接线回归：SessionConfigMW 位于中间件首位、compaction 同时持有 resolver 与静态模型、进程默认配置推导、异步 config 注入会话配置、双会话产出不同配置、全局切换只刷新默认值              |
 | `tests/agent/test_session_config_e2e.py`        | 注入通道端到端回归（真实 `create_agent`）：`context=` 是唯一能填充 `runtime.context` 的通道（省略即静默回落默认模型）、双会话模型与提示词互不污染、`astream_events` 流式通道，以及 `TurnRunners` 三条 `ainvoke` 与 `_arun_graph_events` 的生产调用点守护（移除 `context=config` 即失败） |
-| `tests/api/test_session_config_api.py`          | 会话配置 API：PATCH 契约与 400 校验、会话隔离、角色提示词持久化、新会话自动播种、`GET /api/providers` 会话级返回值、threads 批量读取、legacy 端点的 scope/deprecated 语义且不触碰共享 LLM |
+| `tests/api/test_session_config_api.py`          | 会话配置 API：PATCH 契约与 400 校验、会话隔离、角色提示词持久化、新会话自动播种、`GET /api/providers` 会话级返回值、threads 批量读取、兼容端点的作用域语义且不触碰共享 LLM |
 | `tests/config/test_config.py`                   | 运行时配置：默认值合并、路径解析                                                                                                                                                            |
 | `tests/config/test_config_templates.py`         | 配置模板验证：.example 文件完整性检查                                                                                                                                                       |
 | `tests/tools/test_safety.py`                    | 安全护栏：黑名单拒绝、白名单放行、危险命令确认、路径保护                                                                                                                                    |
-| `tests/tools/test_skills.py`                    | `SkillManager`：列出/读取/匹配(中→英别名)/渲染技能（经 `tools/skills.py` re-export 测旧路径）                                                                                          |
-| `tests/skmng/test_core.py`                      | `skmng.core`：build_skill_block 三来源合并去重、inject_into_prompt 防重复、auto_match=False 行为、fixed_skills 独立注入                                                                   |
+| `tests/tools/test_skills.py`                    | `SkillManager`：列出/读取/匹配(中→英别名)/渲染技能                                                                                          |
+| `tests/skmng/test_core.py`                      | `skmng.core`：build_skill_block 三来源合并去重、inject_into_prompt 防重复、auto_match=False 行为、fixed_skills 参数独立生效；`SkillInjector.inject_into_prompt` 的 fixed_skills 透传与 exclude_skills 节点级 opt-out                                                                   |
 | `tests/tools/test_search.py`                    | `search` 工具：无 Key 降级、Tavily 返回结构(mock)                                                                                                                                         |
 | `tests/cli/test_cli_commands.py`                | CLI 命令分发：路由优先级、状态变更和各领域处理器                                                                                                                                            |
 | `tests/agent/test_human_input.py`               | LangGraph HITL：interrupt、恢复、并行选择和线程隔离                                                                                                                                         |

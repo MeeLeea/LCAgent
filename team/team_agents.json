@@ -7,7 +7,6 @@
     "verbose": true,
     "mcp_config_file": "config/mcp_servers.json",
     "max_execution_history": 100,
-    "max_context_messages": 0,
     "context_trim_keep": 12,
     "tool_timeout": 120,
     "temperature": 0.7,
@@ -15,36 +14,44 @@
     "stream_chunk_timeout": 300.0,
     "latest_msg_cnt": 10,
     "provider": "zhipu",
-    "model": "null"
+    "model": "glm-4-flash"
   },
   "architect": {
     "name": "architect",
-    "agent_prompt_file": "team/architect/AGENT.md"
+    "agent_prompt_file": "team/architect/AGENT.md",
+    "provider": "yunlan",
+    "model": "deepseek-v4.1-flash"
   },
   "rtl_designer": {
     "name": "rtl_designer",
-    "agent_prompt_file": "team/rtl_designer/AGENT.md"
+    "agent_prompt_file": "team/rtl_designer/AGENT.md",
+    "provider": "yunlan",
+    "model": "deepseek-v4.1-flash"
   },
   "rtl_verification": {
     "name": "rtl_verification",
-    "agent_prompt_file": "team/rtl_verification/AGENT.md"
+    "agent_prompt_file": "team/rtl_verification/AGENT.md",
+    "provider": "yunlan",
+    "model": "deepseek-v4.1-flash"
   },
   "manager": {
     "name": "manager",
-    "agent_prompt_file": "team/manager/AGENT.md"
+    "agent_prompt_file": "team/manager/AGENT.md",
+    "provider": "yunlan",
+    "model": "deepseek-v4.1-flash"
   },
   "worker": {
     "name": "worker",
     "agent_prompt_file": "team/worker/AGENT.md",
     "provider": "zhipu",
-    "model": null,
+    "model": "glm-4.7-flash",
     "temperature": 0.3
   },
   "terminator": {
     "name": "terminator",
     "agent_prompt_file": "team/terminator/AGENT.md",
     "provider": "zhipu",
-    "model": null,
+    "model": "glm-4.7-flash",
     "max_tokens": 2048
   }
 }

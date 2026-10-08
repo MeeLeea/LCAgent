@@ -35,7 +35,7 @@ def test_build_middleware_constructs_with_llm():
     agent = SimpleNamespace(name="real", llm=SimpleNamespace(get_chat_model=lambda: MagicMock()))
     mw = _build_compaction_middleware(agent)
     assert mw is not None
-    assert mw.config.max_messages == 50  # 默认配置
+    assert mw.config.max_context_tokens == 100_000  # 默认配置
 
 
 def test_build_middleware_disables_on_construction_error():

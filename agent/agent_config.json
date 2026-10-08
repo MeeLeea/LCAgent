@@ -9,7 +9,7 @@
     "agent_prompt_file": "agent/AGENT.md",
 
     "max_execution_history": 100,
-    "max_context_messages": 200,
+    "max_context_tokens": 100000,
     "context_trim_keep": 32,
     "tool_timeout": 0,
     "temperature": 0.7,

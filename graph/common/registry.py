@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TypeVar
 
 from langchain_core.tools import BaseTool
@@ -233,6 +233,7 @@ async def arun_workflow_by_name(
     memory=None,
     memory_thread_id: str | None = None,
     is_run_mode: bool = False,
+    active_skills: Sequence[str] = (),
 ) -> dict:
     """按名称构建并异步运行工作流(不依赖 CLI 上下文)。
 
@@ -255,4 +256,5 @@ async def arun_workflow_by_name(
         memory=memory,
         memory_thread_id=memory_thread_id,
         is_run_mode=is_run_mode,
+        active_skills=active_skills,
     )

@@ -108,6 +108,25 @@ def stringify_content(content: Any) -> str:
     return str(content)
 
 
+def final_answer_is_empty(msg: Any) -> str | None:
+    """检查 final AIMessage 是否为空（reasoning 耗尽 / finish_reason=length）。
+
+    返回适合展示给用户的原因字符串；有内容或仍在工具循环中返回 None。
+    """
+    if msg is None:
+        return None
+    if getattr(msg, "tool_calls", None):
+        return None  # 还在工具循环中，非终态
+    content = stringify_content(getattr(msg, "content", None))
+    if content and content.strip():
+        return None  # 有内容，正常
+    finish_reason = ((msg.response_metadata or {}).get("finish_reason")) if hasattr(msg, "response_metadata") else "unknown"
+    return (
+        f"模型未返回任何内容（finish_reason={finish_reason}）。"
+        "输出预算可能被推理 token 耗尽，请提高 max_tokens 后重试。"
+    )
+
+
 def build_interrupt_event(value: Any) -> dict[str, Any]:
     """把 ask_human / 危险命令确认 / 批量用户确认的 interrupt.value 转成前端可消费的事件。
 
@@ -190,5 +209,6 @@ def build_interrupt_event(value: Any) -> dict[str, Any]:
 __all__ = [
     "build_interrupt_event",
     "extract_llm_error",
+    "final_answer_is_empty",
     "stringify_content",
 ]

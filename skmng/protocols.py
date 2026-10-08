@@ -22,6 +22,8 @@ class PromptInjector(Protocol):
         prompt: str,
         task: str,
         active_names: Sequence[str] = (),
+        exclude_skills: Sequence[str] = (),
+        fixed_skills: Sequence[str] = (),
     ) -> str:
         """把技能指引块追加到 prompt 末尾,返回注入后的提示词
 
@@ -29,4 +31,6 @@ class PromptInjector(Protocol):
             prompt: 渲染后的节点提示词
             task: 用户任务描述(用于自动匹配)
             active_names: 手动加载的技能名(由节点函数从 state 取值传入)
+            exclude_skills: 需排除的技能名(在三来源合并后统一剔除,可作节点级 opt-out)
+            fixed_skills: 角色级固定依赖技能名(由节点函数从 agent.fixed_skills 取值传入)
         """

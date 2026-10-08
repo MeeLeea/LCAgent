@@ -41,7 +41,11 @@ from .config import (
 )
 from .lock_pool import AgentMemoryLock, ThreadMemoryLockPool
 from .manager import MemoryManager
-from .middleware import ThreadMemoryReadMiddleware
+from .middleware import (
+    ThreadLLMResolver,
+    ThreadMemoryReadMiddleware,
+    default_thread_llm_resolver,
+)
 from .store import ThreadMemoryStore
 
 if TYPE_CHECKING:
@@ -106,15 +110,16 @@ class MemoryContext:
         """MemoryManager 实例（长期记忆召回/消费/压缩/清理）。"""
         return self._memory_manager
 
-    def bind_llm(self, llm_getter: Any) -> None:
-        """运行时替换记忆链路的 LLM 获取器（支持 provider 热切换）。
+    def bind_llm(self, llm_getter: ThreadLLMResolver) -> None:
+        """运行时替换记忆链路的 LLM 解析器（支持 provider 热切换）。
 
         入口程序在创建 AgentCore 后调用，将记忆组件（事实抽取/召回/压缩）
-        的 LLM 来源动态绑定到当前 Agent 的 ``agent.llm``，
-        避免切换提供商后记忆抽取仍使用启动时的旧 LLMClient。
+        的 LLM 来源动态绑定到当前 Agent：resolver 按 thread_id 解析该会话的
+        provider/model，失败或无会话配置时回落 ``agent.llm``，避免切换提供商
+        后记忆抽取仍使用启动时的旧 LLMClient，或跨 provider 误发请求。
 
         Args:
-            llm_getter: 返回当前 LLMClient 的 callable
+            llm_getter: 返回当前 LLMClient 的 thread-aware async resolver
         """
         self._memory_manager.bind_llm(llm_getter)
 
@@ -206,10 +211,11 @@ class MemoryContext:
 
         # 6. 创建 MemoryManager（内部自建写中间件；读中间件复用上面创建的实例，
         #    避免 manager 内部再自建一套造成双实例导致配置分叉）
+        resolver = default_thread_llm_resolver(llm_getter or (lambda: None))
         memory_manager = MemoryManager(
             memory_store=memory_store,
             lock_pool=lock_pool,
-            llm_getter=llm_getter or (lambda: None),
+            llm_getter=resolver,
             recall_limit=recall_limit,
             buffer_delay_seconds=buffer_delay_seconds,
             max_buffer_messages=max_buffer_messages,

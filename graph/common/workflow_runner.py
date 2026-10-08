@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Sequence
 from typing import Any
 
 from langgraph.graph import StateGraph
@@ -22,7 +23,7 @@ logger = logging.getLogger(__name__)
 async def arun_compiled_workflow(
     graph: StateGraph,
     task: str,
-    state_fields: dict[str, str] | None = None,
+    state_fields: dict[str, Any] | None = None,
     raw_context: str = "",
     thread_id: str | None = None,
     workspace_path: str | None = None,
@@ -33,6 +34,7 @@ async def arun_compiled_workflow(
     memory: Any | None = None,
     memory_thread_id: str | None = None,
     is_run_mode: bool = False,
+    active_skills: Sequence[str] = (),
 ) -> dict:
     """通用异步工作流运行器 - 所有工作流共享的 ainvoke 逻辑
 
@@ -53,6 +55,9 @@ async def arun_compiled_workflow(
         memory: MemoryManager 实例（长期记忆召回与结果沉淀）
         memory_thread_id: 长期记忆使用的会话线程 ID
         is_run_mode: 是否运行模式（决定 DONE 事件是否标记为重要记忆）
+        active_skills: 本次运行显式注入的手动加载技能名。**仅当非空时**写入
+            initial_state（避免覆盖 checkpoint 中已持久化的 per-thread 技能，
+            正常重跑时该字段由 checkpoint 恢复并被节点读取）
 
     Returns:
         工作流执行结果字典
@@ -64,13 +69,14 @@ async def arun_compiled_workflow(
             graph, task, state_fields, raw_context, tid,
             workspace_path, on_node_start, on_node_end, on_node_error,
             max_history_chars, memory, memory_thread_id, is_run_mode,
+            active_skills,
         )
 
 
 async def _arun_with_trace(
     graph: StateGraph,
     task: str,
-    state_fields: dict[str, str] | None,
+    state_fields: dict[str, Any] | None,
     raw_context: str,
     tid: str,
     workspace_path: str | None,
@@ -81,6 +87,7 @@ async def _arun_with_trace(
     memory: Any | None,
     memory_thread_id: str | None,
     is_run_mode: bool,
+    active_skills: Sequence[str] = (),
 ) -> dict:
     """在 TraceContext 内执行工作流主体。"""
     logger.info("工作流开始执行 [thread=%s]: %s", tid, task[:120])
@@ -105,11 +112,15 @@ async def _arun_with_trace(
                 f"{raw_context}\n\n{recalled}".strip() if raw_context else recalled
             )
 
-    initial_state: dict[str, str] = {
+    initial_state: dict[str, Any] = {
         "task": task,
         "raw_context": raw_context,
         "context_summary": "",
     }
+    # 仅当显式传入非空技能时才写入 initial_state：正常重跑时该字段由
+    # checkpoint 恢复（per-thread 持久化的手动加载技能），若无条件覆盖会清空它
+    if active_skills:
+        initial_state["active_skills"] = list(active_skills)
     if state_fields:
         initial_state.update(state_fields)
 

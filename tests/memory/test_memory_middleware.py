@@ -17,6 +17,7 @@ from memory.lock_pool import ThreadMemoryLockPool
 from memory.middleware import (
     ThreadMemoryReadMiddleware,
     ThreadMemoryWriteMiddleware,
+    default_thread_llm_resolver,
 )
 from memory.models import ThreadFactItem
 from memory.store import ThreadMemoryStore
@@ -31,6 +32,9 @@ def _make_write_middleware(
     lock_pool = ThreadMemoryLockPool()
     if llm_getter is None:
         llm_getter = lambda: None
+    # 新契约：写中间件接收 thread-aware 异步解析器，helper 统一把零参 getter
+    # 适配为 ThreadLLMResolver，保持既有调用点 `llm_getter=lambda: llm` 不变。
+    llm_getter = default_thread_llm_resolver(llm_getter)
     mw = ThreadMemoryWriteMiddleware(
         memory_store=store,
         lock_pool=lock_pool,
@@ -286,25 +290,40 @@ class _FakeRuntime:
 
 
 class _FakeModelRequest:
-    """最小化 ModelRequest 替身：override() 返回携带真实 SystemMessage 的新实例。"""
+    """最小化 ModelRequest 替身：override() 返回携带新字段的新实例。
 
-    def __init__(self, context, system_message=None):
+    记忆/技能块现注入到 ``messages`` 末尾（尾随 user 消息），不再改
+    ``system_message``，故 override 需同时支持两个字段。
+    """
+
+    def __init__(self, context, system_message=None, messages=None):
         self.runtime = _FakeRuntime(context)
         self.system_message = system_message
+        self.messages = list(messages) if messages is not None else []
 
-    def override(self, system_message=None):
-        return _FakeModelRequest(self.runtime.context, system_message=system_message)
+    def override(self, system_message=None, messages=None):
+        return _FakeModelRequest(
+            self.runtime.context,
+            system_message=system_message,
+            messages=messages,
+        )
 
 
-def _sys_content_text(system_message) -> str:
-    """从 SystemMessage 提取纯文本（content 可能为 text block 列表）。"""
-    content = system_message.content
+def _sys_content_text(message) -> str:
+    """从消息提取纯文本（content 可能为 text block 列表）。"""
+    content = message.content
     if isinstance(content, list):
         return "".join(
             str(block.get("text", "")) if isinstance(block, dict) else str(block)
             for block in content
         )
     return str(content)
+
+
+def _last_message_text(request) -> str:
+    """取 ``request.messages`` 末尾消息的文本（记忆块注入目标）。"""
+    assert request.messages, "request.messages 为空：记忆块未注入"
+    return _sys_content_text(request.messages[-1])
 
 
 class TestReadMiddleware:
@@ -336,17 +355,13 @@ class TestReadMiddleware:
         assert "unknown" in text
 
     def test_awrap_model_call_injects_facts(self):
-        """验证 awrap_model_call 将 facts 注入 SystemMessage。"""
+        """验证 awrap_model_call 把 facts 注入为尾随 user 消息。"""
         async def run():
             store = ThreadMemoryStore()
             await store.save_fact("t1", ThreadFactItem(content="injected fact", category="user_fact"))
             mw = ThreadMemoryReadMiddleware(store)
 
-            # 构建最小化 ModelRequest mock
-            request = MagicMock()
-            request.runtime.context = {"configurable": {"thread_id": "t1"}}
-            request.system_message = None  # 无 system message
-
+            request = _FakeModelRequest(context={"configurable": {"thread_id": "t1"}})
             captured_request = []
 
             async def handler(req):
@@ -356,8 +371,9 @@ class TestReadMiddleware:
             result = await mw.awrap_model_call(request, handler)
             assert result == "result"
             assert len(captured_request) == 1
-            # 验证 new_request 有 system_message
-            assert captured_request[0].system_message is not None
+            # system_message 未被改动；facts 作为尾随 user 消息注入
+            assert captured_request[0].system_message is None
+            assert "injected fact" in _last_message_text(captured_request[0])
 
         asyncio.run(run())
 
@@ -420,7 +436,7 @@ class TestReadMiddleware:
             result = await mw.awrap_model_call(request, handler)
             assert result == "ok"
             assert len(captured) == 1
-            text = _sys_content_text(captured[0].system_message)
+            text = _last_message_text(captured[0])
             assert "fact-1" in text and "fact-2" in text
             assert "fact-0" not in text
 
@@ -450,7 +466,7 @@ class TestReadMiddleware:
                 return "ok"
 
             await mw.awrap_model_call(request, handler)
-            text = _sys_content_text(captured[0].system_message)
+            text = _last_message_text(captured[0])
             assert "fact-0" in text and "fact-1" in text and "fact-2" in text
 
         asyncio.run(run())
@@ -524,7 +540,7 @@ class TestConfigConstants:
         mw = ThreadMemoryWriteMiddleware(
             memory_store=store,
             lock_pool=lock_pool,
-            llm_getter=lambda: None,
+            llm_getter=default_thread_llm_resolver(lambda: None),
         )
         # 未显式传参时，中间件默认值应取自 config.py 的唯一来源
         assert mw._buffer_delay_seconds == MEMORY_BUFFER_DELAY_SECONDS
@@ -631,7 +647,7 @@ class TestAgentScopeRouting:
                 return "ok"
 
             await mw.awrap_model_call(request, handler)
-            text = _sys_content_text(captured[0].system_message)
+            text = _last_message_text(captured[0])
             assert "agent-fact-shared" in text
             assert "thread-fact-local" in text
 
@@ -660,7 +676,7 @@ class TestAgentScopeRouting:
                 return "ok"
 
             await mw.awrap_model_call(request, handler)
-            text = _sys_content_text(captured[0].system_message)
+            text = _last_message_text(captured[0])
             # 注入文本只应出现一次（去重后保留 agent 版本）
             assert text.count(same_content) == 1
             # agent 版本 category 为 user_fact → "用户事实" 标签
@@ -701,7 +717,7 @@ class TestAgentScopeRouting:
                 return "ok"
 
             await mw.awrap_model_call(request, handler)
-            text = _sys_content_text(captured[0].system_message)
+            text = _last_message_text(captured[0])
             # 合并 8 条按 create_time 升序，取最近 5 条 → 应为 thread-0..thread-4
             # （create_time 较晚的 5 条 thread facts）
             for i in range(5):
@@ -1044,7 +1060,7 @@ class TestAgentPruneConditional:
             mw = ThreadMemoryWriteMiddleware(
                 memory_store=store,
                 lock_pool=ThreadMemoryLockPool(),
-                llm_getter=lambda: llm,
+                llm_getter=default_thread_llm_resolver(lambda: llm),
                 buffer_delay_seconds=999,
                 max_buffer_messages=30,
                 agent_lock=fake_lock,
@@ -1069,5 +1085,77 @@ class TestAgentPruneConditional:
 
             assert observed == [True, True]
             assert fake_lock.held is False
+
+        asyncio.run(run())
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  per-thread LLM 解析（thread-aware resolver）
+# ════════════════════════════════════════════════════════════════════════
+
+
+class TestPerThreadLLMResolution:
+    """写中间件必须按 thread_id 解析各自会话的 LLM，而非固定用启动默认 LLM。"""
+
+    @staticmethod
+    def _make_per_thread_middleware(
+        llms: dict[str, _RecordingLLM],
+    ) -> ThreadMemoryWriteMiddleware:
+        """构造直接持有 thread-aware 解析器的写中间件（不经 helper 的零参适配）。"""
+
+        async def resolver(thread_id: str | None):
+            assert thread_id is not None
+            return llms[thread_id]
+
+        return ThreadMemoryWriteMiddleware(
+            memory_store=ThreadMemoryStore(),
+            lock_pool=ThreadMemoryLockPool(),
+            llm_getter=resolver,
+            buffer_delay_seconds=999,
+        )
+
+    def test_extract_facts_uses_per_thread_llm(self):
+        """t1 / t2 各自用自己会话的 LLM 完成 fact 抽取。"""
+
+        async def run():
+            llms = {
+                "t1": _RecordingLLM(
+                    response=json.dumps([{"content": "fact-for-t1", "category": "conv"}])
+                ),
+                "t2": _RecordingLLM(
+                    response=json.dumps([{"content": "fact-for-t2", "category": "conv"}])
+                ),
+            }
+            mw = self._make_per_thread_middleware(llms)
+
+            facts_t1 = await mw._a_extract_facts("t1", [("user", "我偏好 Python", False)])
+            facts_t2 = await mw._a_extract_facts("t2", [("user", "我偏好 Rust", False)])
+
+            # 每个 thread 的抽取结果来自各自的 LLM
+            assert facts_t1[0]["content"] == "fact-for-t1"
+            assert facts_t2[0]["content"] == "fact-for-t2"
+            assert llms["t1"].calls and llms["t2"].calls
+            # 交叉校验：t1 的 LLM 只收到 t1 的对话，t2 同理
+            assert "我偏好 Python" in llms["t1"].calls[0][-1]["content"]
+            assert "我偏好 Rust" in llms["t2"].calls[0][-1]["content"]
+
+        asyncio.run(run())
+
+    def test_distill_lesson_uses_per_thread_llm(self):
+        """lesson 蒸馏同样按 thread_id 解析 LLM。"""
+
+        async def run():
+            llms = {
+                "t1": _RecordingLLM(response="t1 的蒸馏教训"),
+                "t2": _RecordingLLM(response="t2 的蒸馏教训"),
+            }
+            mw = self._make_per_thread_middleware(llms)
+
+            distilled_t1 = await mw._a_distill_lesson("t1", "命令超时 run_shell")
+            distilled_t2 = await mw._a_distill_lesson("t2", "命令超时 run_shell")
+
+            assert distilled_t1 == "t1 的蒸馏教训"
+            assert distilled_t2 == "t2 的蒸馏教训"
+            assert llms["t1"].calls and llms["t2"].calls
 
         asyncio.run(run())

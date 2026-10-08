@@ -2,7 +2,7 @@
 技能注入核心 - 统一三来源合并的技能指引块构建与 prompt 注入
 
 三来源(在 build_skill_block 内部合并去重):
-1. fixed_skills  - 角色级固定依赖(如 rtl_verification 的 vivado-2025.2),由类属性提供
+1. fixed_skills  - 角色级固定依赖,由类属性提供(当前无角色声明)
 2. active_names  - 运行时手动加载的技能(经 state["active_skills"] 传入,Commit 4 透传)
 3. match_skills  - 任务文本自动匹配(确定性关键词打分,不调用 LLM)
 

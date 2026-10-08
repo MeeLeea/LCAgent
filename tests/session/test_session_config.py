@@ -13,6 +13,10 @@ from session import (
     SessionRegistry,
     SessionStore,
 )
+from session.config import (
+    preferred_model_for_provider,
+    resolve_session_config_update,
+)
 
 
 def _config(**overrides: object) -> SessionConfig:
@@ -48,6 +52,67 @@ def test_apply_bumps_version_and_keeps_unset_fields():
 def test_apply_rejects_invalid_values():
     with pytest.raises(SessionConfigError):
         _config().apply(SessionConfigPatch(temperature=3.0))
+
+
+# --------------------------------------------------------------------------- #
+# provider 切换的 model 重解析（CLI / API 唯一实现）
+# --------------------------------------------------------------------------- #
+_PROVIDERS = {
+    "zhipu": {"model": "glm-4-flash", "models": ["glm-4-flash", "glm-4-plus"]},
+    "deepseek": {"model": "deepseek-chat", "models": ["deepseek-chat"]},
+    # 默认 model 不在自身 models 白名单（配置不一致场景）
+    "inconsistent": {"model": "not-listed", "models": ["ok-1", "ok-2"]},
+}
+
+
+def test_preferred_model_for_provider_uses_default_when_listed():
+    assert preferred_model_for_provider(_PROVIDERS, "deepseek") == "deepseek-chat"
+
+
+def test_preferred_model_for_provider_falls_back_to_first_when_default_invalid():
+    assert preferred_model_for_provider(_PROVIDERS, "inconsistent") == "ok-1"
+
+
+def test_preferred_model_for_provider_returns_none_for_unknown():
+    assert preferred_model_for_provider(_PROVIDERS, "ghost") is None
+
+
+def test_resolve_session_config_update_resets_stale_model_on_provider_switch():
+    current = SessionConfig(provider="zhipu", model="glm-4-flash")
+    updated = resolve_session_config_update(
+        current, SessionConfigPatch(provider="deepseek"), providers=_PROVIDERS
+    )
+    assert updated.provider == "deepseek"
+    assert updated.model == "deepseek-chat"
+
+
+def test_resolve_session_config_update_keeps_model_when_same_provider():
+    current = SessionConfig(provider="zhipu", model="glm-4-plus")
+    updated = resolve_session_config_update(
+        current, SessionConfigPatch(provider="zhipu"), providers=_PROVIDERS
+    )
+    assert updated.model == "glm-4-plus"
+
+
+def test_resolve_session_config_update_honours_explicit_model():
+    current = SessionConfig(provider="zhipu", model="glm-4-flash")
+    updated = resolve_session_config_update(
+        current,
+        SessionConfigPatch(provider="zhipu", model="glm-4-plus"),
+        providers=_PROVIDERS,
+    )
+    assert updated.model == "glm-4-plus"
+
+
+def test_resolve_session_config_update_validates_candidates():
+    current = SessionConfig(provider="zhipu", model="glm-4-flash")
+    with pytest.raises(SessionConfigError, match="未知模型"):
+        resolve_session_config_update(
+            current,
+            SessionConfigPatch(model="ghost-model"),
+            providers=_PROVIDERS,
+            models=_PROVIDERS["zhipu"]["models"],
+        )
 
 
 def test_store_set_get_and_update_absent():
@@ -164,4 +229,37 @@ def test_session_config_survives_real_sqlite_reopen(tmp_path):
 
     expected, actual = asyncio.run(run())
     assert actual == expected
+
+
+# --------------------------------------------------------------------------- #
+# apeek_session_config：纯读，不触发默认配置迁移写
+# --------------------------------------------------------------------------- #
+
+
+def test_registry_apeek_returns_stored_config_without_migration():
+    store = SessionStore()
+    registry = SessionRegistry(MemorySaver(), store)
+
+    async def run():
+        await registry.aset_session_config("s1", _config())
+        return await registry.apeek_session_config("s1")
+
+    assert asyncio.run(run()) == _config()
+
+
+def test_registry_apeek_is_read_only_when_store_empty():
+    """store 为空但设有默认配置时，apeek 返回 None 且不持久化默认配置。"""
+    store = SessionStore()
+    registry = SessionRegistry(
+        MemorySaver(), store, default_session_config=_config(provider="default")
+    )
+
+    async def run():
+        peeked = await registry.apeek_session_config("missing")
+        stored_after = await store.aget_session_config("missing")
+        return peeked, stored_after
+
+    peeked, stored_after = asyncio.run(run())
+    assert peeked is None
+    assert stored_after is None  # 未触发 aget_session_config 的默认配置迁移写
 

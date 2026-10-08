@@ -22,7 +22,7 @@ from agent.workspace_mw import WorkspaceSecurityMW
 from graph.simple import arun_compiled_workflow, worker_exec_node
 from team.base import TeamAgent
 
-# 默认模板(与 WorkerAgent.default_templates 对齐,供 CapturingWorker.get_template 兜底)
+# 默认模板(与 Worker AGENT.md 的 ## workflow:* 小节对齐,供 CapturingWorker.get_template 兜底)
 DEFAULT_TEMPLATES: dict[str, str] = {
     "worker_exec": "请执行以下计划:\n\n{plan}",
 }

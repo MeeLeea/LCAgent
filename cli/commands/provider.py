@@ -52,12 +52,21 @@ async def switch_provider(context: CommandContext, user_input: str) -> CommandOu
     else:
         new_provider = user_input[7:].strip().lower()
     try:
+        from session.config import resolve_session_config_update
+
         providers = context.list_providers()
         if new_provider not in providers:
             raise ValueError(f"未知 provider: {new_provider}")
-        default_model = providers[new_provider].get("model")
+        current = await context.agent.session_manager.aget_session_config()
+        if current is None:
+            raise ValueError("当前会话尚无配置，无法切换提供商")
+        # provider 切换时的 model 重解析与 HTTP 路径共用唯一实现，
+        # 避免 CLI/API 对同一操作产生不同的 model 结果。
+        updated = resolve_session_config_update(
+            current, SessionConfigPatch(provider=new_provider), providers=providers
+        )
         config = await context.agent.session_manager.aupdate_session_config(
-            SessionConfigPatch(provider=new_provider, model=str(default_model) if default_model else None)
+            SessionConfigPatch(provider=updated.provider, model=updated.model)
         )
         context.print(f"\n已切换到: {new_provider} ({config.model})（仅当前会话）")
     except SystemExit:

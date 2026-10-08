@@ -13,6 +13,7 @@ except ImportError:
     pass
 
 from agent import AgentCore
+from agent.memory_llm import build_memory_llm_resolver
 from cli.cli_menu import select_menu
 from cli.commands import CommandContext, dispatch_command
 from cli.commands.core import show_ready
@@ -51,7 +52,7 @@ async def build_agent(provider: str, process_type: str | None = None) -> tuple[A
     llm = create_llm(provider, LLM_FILE)
     print("加载运行时配置...")
     config = load_agent_config(AGENT_CONFIG_FILE)
-    agent_prompt_file = config.get("agent_prompt_file")
+    agent_prompt_file = resolve_path(config["agent_prompt_file"], BASE_DIR)
     # 配置中的相对路径统一锚定项目根，避免调用方工作目录影响资源加载。
     skills_dir = resolve_path(config["skills_dir"], BASE_DIR)
     mcp_config_file = resolve_path(config["mcp_config_file"], BASE_DIR)
@@ -73,7 +74,7 @@ async def build_agent(provider: str, process_type: str | None = None) -> tuple[A
         enable_mcp=config["enable_mcp"],
         skills_dir=skills_dir,
         auto_match_skills=config["auto_match_skills"],
-        max_context_messages=config["max_context_messages"],
+        max_context_tokens=config["max_context_tokens"],
         context_trim_keep=config["context_trim_keep"],
         process_type=process_type,
         agent_prompt_file=agent_prompt_file,
@@ -89,8 +90,9 @@ async def build_agent(provider: str, process_type: str | None = None) -> tuple[A
     # 注入 MemoryManager → SessionManager 懒初始化时会自动接收
     agent.set_memory_manager(memory_ctx.memory_manager)
     agent._memory_context = memory_ctx  # 供 aclose 时关闭 SQLite 连接
-    # 动态绑定：记忆组件直接读取 agent 当前 LLM，切换 provider 后自动同步
-    memory_ctx.bind_llm(lambda: agent.llm)
+    # 动态绑定：记忆组件按会话解析 LLM（回落 agent 当前 LLM），
+    # 切换 provider 后自动同步，且会话级 provider/model 正确生效
+    memory_ctx.bind_llm(build_memory_llm_resolver(agent.session, lambda: agent.llm))
     return agent, llm
 
 

@@ -7,8 +7,6 @@
 """
 from __future__ import annotations
 
-from session.config import SessionConfigPatch
-
 from .types import HANDLED, CommandContext, CommandOutcome
 
 
@@ -56,21 +54,11 @@ async def _choose_role(context: CommandContext) -> CommandOutcome:
 async def _switch_role(context: CommandContext, role_name: str, task_text: str) -> CommandOutcome:
     """更新当前会话角色，可选地在切换后立即执行任务。"""
     try:
-        from agent.role_sw import _BASE_DIR, _locate_team_agent_dir
-        from llm.config import load_team_agent_config
-        from team.base import TeamAgent
+        # 与 HTTP 路径共用同一解析实现（agent/role_sw.py），避免两入口行为漂移
+        from agent.role_sw import resolve_role_config_patch
 
-        role_dir = _locate_team_agent_dir(role_name)
-        config = load_team_agent_config(role_name, _BASE_DIR)
-        content = TeamAgent._read_prompt_file(f"{role_dir}/AGENT.md")
-        if content is None:
-            raise FileNotFoundError(f"角色提示词为空: {role_name}")
-        prompt, _ = TeamAgent.parse_prompt_sections(content)
-        patch_values = {"role": role_name, "system_prompt": prompt}
-        for field in ("provider", "model", "temperature", "max_tokens", "max_iterations"):
-            if field in config:
-                patch_values[field] = config[field]
-        await context.agent.session_manager.aupdate_session_config(SessionConfigPatch(**patch_values))
+        patch = resolve_role_config_patch(role_name)
+        await context.agent.session_manager.aupdate_session_config(patch)
     except KeyError as error:
         # 角色不存在:补充展示可用角色,便于用户重试
         from agent.role_sw import get_available_team_roles
