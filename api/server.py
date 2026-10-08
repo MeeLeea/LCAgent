@@ -299,7 +299,7 @@ async def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
     # 采样参数由 LLMClient 内部从全局 agent_config.json 读取，无需外部传参
     new_llm = LLMClient(provider=provider, config_file=LLM_FILE)
     cfg = load_agent_config(AGENT_CONFIG_FILE)
-    agent_prompt_file = cfg.get("agent_prompt_file")
+    agent_prompt_file = resolve_path(cfg["agent_prompt_file"], BASE_DIR)
     skills_dir = resolve_path(cfg["skills_dir"], BASE_DIR)
     mcp_config_file = resolve_path(cfg["mcp_config_file"], BASE_DIR)
     # 三层架构：先创建 MemoryContext（记忆基础设施），再创建 AgentCore（纯执行内核）
@@ -319,7 +319,7 @@ async def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
         enable_mcp=cfg["enable_mcp"],
         skills_dir=skills_dir,
         auto_match_skills=cfg["auto_match_skills"],
-        max_context_messages=cfg["max_context_messages"],
+        max_context_tokens=cfg["max_context_tokens"],
         context_trim_keep=cfg["context_trim_keep"],
         process_type="server",
         agent_prompt_file=agent_prompt_file,

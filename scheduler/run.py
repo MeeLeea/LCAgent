@@ -92,7 +92,7 @@ def make_agent_factory(provider: str):
     """
     # 预加载配置（避免每次创建 agent 都读文件）
     agent_config = load_agent_config(AGENT_CONFIG_FILE)
-    agent_prompt_file = agent_config.get("agent_prompt_file")
+    agent_prompt_file = resolve_path(agent_config["agent_prompt_file"], BASE_DIR)
     skills_dir = resolve_path(agent_config["skills_dir"], BASE_DIR)
     mcp_config_file = resolve_path(agent_config["mcp_config_file"], BASE_DIR)
 
@@ -119,7 +119,7 @@ def make_agent_factory(provider: str):
             enable_mcp=agent_config["enable_mcp"],
             skills_dir=skills_dir,
             auto_match_skills=agent_config["auto_match_skills"],
-            max_context_messages=agent_config["max_context_messages"],
+            max_context_tokens=agent_config["max_context_tokens"],
             context_trim_keep=agent_config["context_trim_keep"],
             process_type="scheduler",
             agent_prompt_file=agent_prompt_file,

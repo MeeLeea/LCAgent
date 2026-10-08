@@ -3,7 +3,7 @@
 NodeSpec 将「节点名 + 节点函数 + 绑定角色」声明成数据，
 register_nodes 批量执行 partial 绑定 + add_node。
 可选 compaction_mw 开启节点级压缩：节点返回后调用 arun_compaction，
-仅在消息数 > max_messages（默认 50）时触发（非 force），
+仅在预估 token > max_context_tokens（默认 100000）时触发（非 force），
 把 messages/summary 合并进节点返回值。
 """
 from __future__ import annotations
@@ -36,7 +36,7 @@ def _wrap_node_with_compaction(fn: Callable, mw: Any) -> Callable:
     """把节点函数包一层节点级 compaction。
 
     节点执行完成后, 用「state 中的历史消息 + 节点本次产出的消息」调用
-    ``mw.arun_compaction(...)``；仅在消息数超过阈值时返回非 None 更新。
+    ``mw.arun_compaction(...)``；仅在预估 token 超过阈值时返回非 None 更新。
 
     Args:
         fn: 已绑定 agent/injector 的节点函数(partial)

@@ -25,7 +25,7 @@ def _build_compaction_middleware(
 
     Args:
         agent: 任一团队 Agent（manager/worker/terminator 等，取其 llm）
-        config: 压缩配置；为 None 时使用默认配置（阈值 50）
+        config: 压缩配置；为 None 时使用默认配置（预估 token 阈值 100000）
 
     Returns:
         压缩中间件实例；无法构造时返回 None

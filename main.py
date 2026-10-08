@@ -52,7 +52,7 @@ async def build_agent(provider: str, process_type: str | None = None) -> tuple[A
     llm = create_llm(provider, LLM_FILE)
     print("加载运行时配置...")
     config = load_agent_config(AGENT_CONFIG_FILE)
-    agent_prompt_file = config.get("agent_prompt_file")
+    agent_prompt_file = resolve_path(config["agent_prompt_file"], BASE_DIR)
     # 配置中的相对路径统一锚定项目根，避免调用方工作目录影响资源加载。
     skills_dir = resolve_path(config["skills_dir"], BASE_DIR)
     mcp_config_file = resolve_path(config["mcp_config_file"], BASE_DIR)
@@ -74,7 +74,7 @@ async def build_agent(provider: str, process_type: str | None = None) -> tuple[A
         enable_mcp=config["enable_mcp"],
         skills_dir=skills_dir,
         auto_match_skills=config["auto_match_skills"],
-        max_context_messages=config["max_context_messages"],
+        max_context_tokens=config["max_context_tokens"],
         context_trim_keep=config["context_trim_keep"],
         process_type=process_type,
         agent_prompt_file=agent_prompt_file,

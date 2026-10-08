@@ -22,7 +22,8 @@ workspace 隔离说明：
     WorkflowState 含 ``messages``（add_messages reducer）与 ``summary`` 字段，
     每个节点把自身产出追加为 AIMessage；`messages`/`summary` 的压缩由
     ``register_nodes`` 的可选 ``compaction_mw`` 包装在节点返回后调用
-    ``arun_compaction`` 完成（非 force：仅当消息数 > ``max_messages``，默认 50 时触发）。
+     ``arun_compaction`` 完成（非 force：仅当预估 token > ``max_context_tokens``，
+     默认 100000 时触发）。
 """
 from __future__ import annotations
 
