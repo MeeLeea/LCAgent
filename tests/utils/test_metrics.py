@@ -395,7 +395,7 @@ class TestCompactionCallback:
         )
         mw = LCAgentCompactionMiddleware(
             model=model,
-            config=CompactionConfig(max_messages=5, keep_recent=2),
+            config=CompactionConfig(max_context_tokens=10, keep_recent=2),
             on_compaction=on_compaction,
         )
         state = {"messages": self._build_messages(10), "summary": ""}
@@ -427,7 +427,7 @@ class TestCompactionCallback:
         )
         mw = LCAgentCompactionMiddleware(
             model=model,
-            config=CompactionConfig(max_messages=5, keep_recent=2),
+            config=CompactionConfig(max_context_tokens=10, keep_recent=2),
             on_compaction=on_compaction,
         )
         state = {"messages": self._build_messages(10), "summary": ""}
@@ -448,7 +448,7 @@ class TestCompactionCallback:
         )
         mw = LCAgentCompactionMiddleware(
             model=model,
-            config=CompactionConfig(max_messages=5, keep_recent=2),
+            config=CompactionConfig(max_context_tokens=10, keep_recent=2),
         )
         state = {"messages": self._build_messages(10), "summary": ""}
         result = mw.before_model(state, runtime=None)
@@ -468,7 +468,7 @@ class TestCompactionCallback:
         )
         mw = LCAgentCompactionMiddleware(
             model=model,
-            config=CompactionConfig(max_messages=5, keep_recent=2),
+            config=CompactionConfig(max_context_tokens=10, keep_recent=2),
             on_compaction=bad_callback,
         )
         state = {"messages": self._build_messages(10), "summary": ""}

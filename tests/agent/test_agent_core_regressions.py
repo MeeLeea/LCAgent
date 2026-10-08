@@ -48,7 +48,7 @@ def test_compaction_retains_recent_messages_in_new_thread_state():
 
     core = object.__new__(AgentCore)
     core.memory = FakeMemory()
-    core.max_context_messages = 5
+    core.max_context_tokens = 5
     core.context_trim_keep = 2
     core.verbose = False
     core.agent_executor = FakeExecutor()
@@ -61,7 +61,7 @@ def test_compaction_retains_recent_messages_in_new_thread_state():
             return SimpleNamespace(text="summary")
 
     core._compaction_middleware = LCAgentCompactionMiddleware(
-        FakeModel(), CompactionConfig(max_messages=5, keep_recent=2)
+        FakeModel(), CompactionConfig(max_context_tokens=5, keep_recent=2)
     )
 
     # 提供 fake session（manually_compact 通过 self.session.aget_messages 读取消息）
@@ -119,7 +119,7 @@ def test_compaction_does_not_change_thread_when_summary_fails():
 
     core = object.__new__(AgentCore)
     core.memory = FakeMemory()
-    core.max_context_messages = 5
+    core.max_context_tokens = 5
     core.context_trim_keep = 2
     core.verbose = False
     core.agent_executor = FakeExecutor()
@@ -131,7 +131,7 @@ def test_compaction_does_not_change_thread_when_summary_fails():
             raise RuntimeError("LLM 不可用")
 
     core._compaction_middleware = LCAgentCompactionMiddleware(
-        FailingModel(), CompactionConfig(max_messages=5, keep_recent=2)
+        FailingModel(), CompactionConfig(max_context_tokens=5, keep_recent=2)
     )
 
     # 提供 fake session（manually_compact 通过 self.session.aget_messages 读取消息）

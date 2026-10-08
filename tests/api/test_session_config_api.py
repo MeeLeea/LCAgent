@@ -248,6 +248,27 @@ def test_patch_role_that_switches_provider_also_resets_model(client, mock_agent)
     assert data["role"] == "worker"
 
 
+def test_patch_role_without_sampling_preserves_session_temperature(client, mock_agent) -> None:
+    """角色自身未声明采样参数（补丁 temperature 为 None）时，不得清空会话已有 temperature。
+
+    architect 等角色自身条目未声明 temperature，解析出的补丁不带该字段；
+    API 合并必须保留会话原值，而不是回落全局默认。
+    """
+    mock_agent.session.aget_session_config = AsyncMock(
+        return_value=SessionConfig(provider="zhipu", model="glm-4-flash", temperature=0.42)
+    )
+    role_patch = SessionConfigPatch(role="architect", system_prompt="architect prompt")
+    with patch("api.server.load_providers", return_value=_providers()), patch(
+        "agent.role_sw.get_available_team_roles", return_value=["architect"]
+    ), patch("api.server._resolve_role_patch", new_callable=AsyncMock, return_value=role_patch):
+        response = client.patch("/api/sessions/thread-role/config", json={"role": "architect"})
+
+    assert response.status_code == 200
+    data = response.json()["session_config"]
+    assert data["role"] == "architect"
+    assert data["temperature"] == 0.42
+
+
 def test_patch_same_provider_keeps_existing_model(client, mock_agent) -> None:
     """provider 未实际变化时不得重置 model，避免覆盖用户已选的模型。"""
     mock_agent.session.aget_session_config = AsyncMock(

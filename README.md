@@ -123,7 +123,7 @@
   - [代码使用示例](#代码使用示例)
   - [运行时配置](#运行时配置)
     - [1. `agent_config.json` — Agent 运行时参数](#1-agent_configjson--agent-运行时参数)
-      - [长上下文裁剪（Long-Context Trimming）](#长上下文裁剪long-context-trimming)
+      - [长上下文压缩（Long-Context Compaction）](#长上下文压缩long-context-compaction)
     - [2. `llm_config.json` — LLM 服务商配置](#2-llm_configjson--llm-服务商配置)
     - [3. `mcp_servers.json` — MCP 服务器配置](#3-mcp_serversjson--mcp-服务器配置)
     - [4. `safety.json` — 安全护栏](#4-safetyjson--安全护栏)
@@ -509,7 +509,7 @@ Agent 有三种执行模式，对应三种不同的交互入口：
 | `models.py`                   | [memory/models.py](memory/models.py)             | `MemoryCategory` / `ThreadFactItem`（含 `scope` 字段：`thread` / `agent`）/ `MemoryInputEvent` / `judge_long_term_memory` 分类判定                                                                                                                                                       |
 | `config.py`                   | [memory/config.py](memory/config.py)             | 运行时参数默认值（buffer 延迟 / 上限 / thread 级 fact 上限 / agent 级 fact 上限 / 召回条数）                                                                                                                                                                                                           |
 
-> 除此之外还有一层 **Compaction 压缩中间件**（[agent/compaction.py](agent/compaction.py)）负责控制**单会话内的上下文长度**：当 checkpoint 恢复的消息数超过阈值时，`before_model` 自动把旧消息增量摘要成 `state.summary`（随 checkpoint 持久化、per-thread 隔离），并 Prune 过长的历史工具输出，无需新开 thread。注意这与记忆系统的 `compress` 命令是两回事（前者压缩会话上下文，后者压缩长期记忆 facts）。详见[可观测性与可靠性 → 长上下文压缩中间件](#长上下文压缩中间件compaction)。
+> 除此之外还有一层 **Compaction 压缩中间件**（[agent/compaction.py](agent/compaction.py)）负责控制**单会话内的上下文长度**：每次 model 调用前按**预估 token**（字符数 /4 粗估）判断，超过 `max_context_tokens` 时 `before_model` 自动把旧消息增量摘要成 `state.summary`（随 checkpoint 持久化、per-thread 隔离）；同时**独立**于压缩触发条件地 Prune 过长的历史工具输出（保护最近 `keep_recent` 条消息），无需新开 thread。注意这与记忆系统的 `compress` 命令是两回事（前者压缩会话上下文，后者压缩长期记忆 facts）。详见[可观测性与可靠性 → 长上下文压缩中间件](#长上下文压缩中间件compaction)。
 
 ### 两级作用域（agent 级 / thread 级）
 
@@ -603,7 +603,7 @@ response = self.llm.chat_with_history(
 | 长期记忆     | 事件驱动自动沉淀，model 调用前注入                    | `ThreadMemoryReadMiddleware` 注入 Store facts（`【长期记忆】` 块）→ 尾随 user 消息                              |
 | 手动技能     | `skill:<name>`                                      | 后续对话都会注入该技能指引，直到`skill:clear`；`SkillInjectionMW` → 尾随 user 消息                              |
 | 自动匹配技能 | `auto_match_skills=true`                            | 根据任务与技能描述的关键词重叠度自动注入相关技能                                                                    |
-| 长上下文压缩 | 消息数超`max_messages` 时 `before_model` 自动触发 | 由 Compaction 中间件增量摘要旧消息，写入`state.summary`（随 checkpoint 持久化、per-thread 隔离）；摘要以 **HumanMessage**（非 system 角色）置于 messages 头部 |
+| 长上下文压缩 | 预估 token 超`max_context_tokens` 时 `before_model` 自动触发 | 由 Compaction 中间件增量摘要旧消息，写入`state.summary`（随 checkpoint 持久化、per-thread 隔离）；摘要以 **HumanMessage**（非 system 角色）置于 messages 头部 |
 
 > **单条 system message 约束（重要）**：payload 中只保留一条 system 消息（`agent/AGENT.md` 全文，
 > 或切角色后合成的 base 规则 + 角色提示词），动态块（技能 / 长期记忆 / 历史摘要）一律**不使用
@@ -1077,7 +1077,7 @@ session/
 
 会话配置的读写使用现有的 `SessionManager._thread_locks[thread_id]` 串行化，同一会话的配置更新与执行互斥，不同会话无需全局锁即可并行。模型由 `SessionModelFactory` 通过既有 `LLMClient` 构造，并按 `(provider, model, temperature, max_tokens)` 使用有界 LRU 缓存，默认上限为 16 个不同模型配置，而不是为每个会话复制模型对象。
 
-配置优先级为：显式请求字段 > 角色目录 `team/team_agents.json` 中 `default` 与角色配置合并后的字段 > 保持原值。设置角色时，会在写入时读取该角色的统一配置和 `AGENT.md`，将解析后的 system prompt 保存到 `system_prompt`；之后即使 `AGENT.md` 被修改，已有会话仍使用原快照。每轮开始时捕获一份不可变配置快照，轮中修改只影响下一轮。
+配置优先级为：显式请求字段 > 角色在 `team/team_agents.json` 中的**自身条目** > 保持原值。角色未显式声明 `temperature` / `max_tokens` / `max_iterations` 时，这些字段保持未设置，由 `SessionModelFactory` 回退到 `agent/agent_config.json` 的全局默认采样；`team_agents.json` 只声明角色级差异（delta），不再提供 `default` 采样兜底。`role:default` 不覆盖 provider/model/采样，保留会话现有值。设置角色时，会在写入时读取该角色的自身配置和 `AGENT.md`，将解析后的 system prompt 保存到 `system_prompt`；之后即使 `AGENT.md` 被修改，已有会话仍使用原快照。每轮开始时捕获一份不可变配置快照，轮中修改只影响下一轮。
 
 **角色提示词拼接基础规则（重要）**：写 `system_prompt` 时不是直接使用 `team/<role>/AGENT.md` 的正文，而是经 `llm.config.compose_role_system_prompt(role_prompt, role=..., has_tools=...)` 合成——**基础规则在前、角色提示词在后**（顺序固定，便于复用同一份稳定 system 前缀）。基础规则来自 `agent/AGENT.md`，按角色能力条件化继承（复用 `load_agent_rules`）：持有工具时包含 `## 重要规则` + `## 工具规则`，无工具角色仅 `## 重要规则`，避免把"必须调用工具"这类条款落到无工具角色上。`role="default"` 时**不拼接**——默认角色的提示词来源就是 `agent/AGENT.md` 自身（`_locate_team_agent_dir("default")` 返回 `agent/` 目录），拼接会使规则小节重复。
 
@@ -1786,25 +1786,26 @@ create_tool(
 - 摘要存入 LangGraph `state.summary` 字段，随 **checkpoint 自动持久化**，天然实现 **per-thread 隔离**（每个 thread 拥有独立 summary），彻底消除跨会话污染。
 - **摘要模型按会话动态解析**：中间件除静态 `model=` 外还接受 `model_resolver`，每次压缩从 runtime context 解析当前会话的模型（解析失败回退静态模型）。这修复了「主模型已按会话切换、摘要却仍用启动时 provider」的静默缺陷。手动路径 `arun_compaction()` 亦可显式传入 `model`。
 - **安全切割**：不会拆开 `AIMessage(tool_calls)` + `ToolMessage` 配对（切割点落在 `ToolMessage` 上时向前回退到对应的 `AIMessage`）。
+- **独立工具输出 Prune**：Prune 不再只是压缩的附赠动作——每次 model 调用前只要历史工具输出的可裁剪收益足够（超过 `max_tool_output_chars * 10` 字符），就独立裁剪保留区之外的历史工具输出，即使预估 token 未达压缩阈值也会执行（保护最后 `keep_recent` 条消息不受影响）。
 - 压缩后用 `RemoveMessage(REMOVE_ALL_MESSAGES)` 先清空 checkpoint 旧消息，再写入 `HumanMessage(摘要) + Pruned 近期消息`（摘要**不用 system 角色**，以保证 payload 只有一条 system 消息），旧消息彻底移除不再占用存储。
 
 触发方式：
 
 | 触发方式 | 入口                                                | 阈值行为                                              |
 | -------- | --------------------------------------------------- | ----------------------------------------------------- |
-| 自动     | `before_model` / `abefore_model` 中间件         | 消息数 >`max_messages`（默认 50）时触发             |
-| 手动     | `AgentCore.manually_compact()` / `compact` 命令 | `force=True` 跳过阈值，仍需消息数 > `keep_recent` |
+| 自动     | `before_model` / `abefore_model` 中间件         | 预估 token（字符数 /4）≥ `max_context_tokens`（默认 100000）时触发；工具输出 Prune 独立执行 |
+| 手动     | `AgentCore.manually_compact()` / `compact` 命令 | `force=True` 跳过 token 阈值，仍需消息数 > `keep_recent` |
 
 `CompactionConfig` 关键参数（`agent/compaction.py`）：
 
 | 参数                      | 默认 | 说明                           |
 | ------------------------- | ---- | ------------------------------ |
-| `max_messages`          | 50   | 触发压缩的消息数阈值           |
-| `keep_recent`           | 20   | 保留最近 N 条消息（原样保留）  |
+| `max_context_tokens`    | 100000 | 触发压缩的预估 token 阈值（0 = 关闭自动触发） |
+| `keep_recent`           | 20   | 保留最近 N 条消息（不参与摘要）  |
 | `max_tool_output_chars` | 200  | 工具输出超过此长度则触发 Prune |
 | `tool_prune_preview`    | 100  | Prune 后保留的预览字符数       |
 
-> 可用 `CompactionConfig.from_kwargs(max_context_messages, context_trim_keep)` 从 AgentCore 现有配置参数构建。
+> 可用 `CompactionConfig.from_kwargs(max_context_tokens, context_trim_keep)` 从 AgentCore 现有配置参数构建。历史键 `max_context_messages`（按消息条数触发）已移除，替换为 `agent_config.json` 的 `max_context_tokens`。
 
 ### MCP 连接池（MCPPool）
 
@@ -1885,6 +1886,15 @@ with TraceContext(trace_id="req-123", thread_id="thread-abc"):
 - **与压缩/工具重试无冲突**：`create_agent` 把 `before_model` 编译为**独立节点**（独立 superstep），模型节点崩溃时 `next=("model",)`，重放不会重入压缩 → 无双重压缩；`TerminalRetryCapMW` 统计的是已提交的 `state.messages` 中的超时 ToolMessage，模型级重启不产生消息 → 无交互。
 - **作用域**：仅 `provider ∈ {yunlan, yunlan-gpt}` 的 `CloudmistChatOpenAI` 具备此重启能力；其他 provider 走 `init_chat_model`，暂无流层重试（症状集中于云雾网关，属有意收敛的作用域限制）。
 - **已知边界**：若停滞发生在**已有可见内容之后**，任何重试方案都会重复文本，故此时直接上抛。若产品要求「内容已开始后仍零错误重试」，唯一无重复路径是牺牲实时流式（改非流式缓冲整段再合成 token），属产品级取舍。
+
+#### 空最终回答检测（Empty Final Answer）
+
+思考型模型（如 `deepseek-v4.1-flash`）的 **reasoning token 计入 `max_tokens`**。当输出预算被推理 token 耗尽时，网关返回 `finish_reason=length` 且 `content` 为空的 `AIMessage`。若流式层静默产出空的 `DONE`，Web UI 会显示一片空白且无任何提示。
+
+[`agent/streaming.py`](agent/streaming.py) 的 `arun_events` / `aresume_events` 现在会记录最后一次 `on_chat_model_end` 的 `AIMessage`，在流结束且未被 interrupt / cancelled 接管时调用 [`llm/message_utils.py`](llm/message_utils.py) 的 `final_answer_is_empty()` 检测：
+
+- 终态 `AIMessage` 既无内容、也无 `tool_calls`（不在工具循环中）→ 发 `ERROR` 事件（携带 `finish_reason`），前端明确提示「输出预算可能被推理 token 耗尽，请提高 max_tokens 后重试」，而非静默空白。
+- 有内容或仍在工具循环中 → 照常发 `DONE`，行为不变。
 
 ### 终端命令超时重试与分类（Terminal Timeout Retry）
 
@@ -2378,7 +2388,7 @@ Designer (designer_output:整理最终交付物) → END（终止）
 
 - **异步节点执行 + TOKEN 流式**:`simple.py` / `rtl_graph.py` 的业务节点(`manager_plan`/`worker_exec`/`terminator_final` 及 RTL 各节点)全部由 `graph/common/node_factory.py::create_llm_node` 工厂构建(节点内嵌 `summarize_context` 为手写节点,复用同一链路),执行路径统一为:`agent.get_template(template_name)` 取模板 → `agent.render_template(...)` 渲染 → 基础提示词前置(`llm.config.load_agent_rules` 按 `agent.tools` 判定) → `injector.inject_into_prompt(...)` 注入技能 → `run_team_turn_with_interrupt(agent, prompt, config)` 执行,并透传 LangGraph 注入的 `config: Optional[RunnableConfig]`。`run_team_turn_with_interrupt`(`graph/common/interrupt_forward.py`)内部调通用 `TeamAgent.arun_structured`;内层被 interrupt 时调外层 `langgraph.types.interrupt()` 暂停外层图,resume 后经 `TeamAgent.aresume_structured` 注入内层恢复,循环处理多次 interrupt。各角色类只是携带 `@register_agent` 元数据的薄注册桩。`TeamAgent`(`team/base.py`)提供 `arun_structured`/`aresume_structured`/`ainvoke`/`astream` 异步能力:`_astream_with_tools` 经 `agent_executor.astream_events(version="v2")` 过滤 `on_chat_model_stream`;`_astream_pure_text` 经 chat model `astream`。因同事件循环执行,callbacks 自然透传——`NodeTrackingHandler.on_chat_model_stream` 捕获 LLM token 增量转发为 `AgentEvent.token`,`WorkflowAdapter._on_token` 闭包补 `thread_id`/`role="assistant"`/`trace_id` 后注入事件流,实现节点执行期间的 TOKEN 级流式(空块自动过滤)。
 - **技能注入(SkillInjector)**:`build_simple_workflow` 接受 `skills_dir` / `auto_match_skills` 参数,构建时创建 `skmng.injector.SkillInjector`。节点渲染 prompt 后调用 `inject_into_prompt()` 把命中技能(`match_skills(task)`)的指引块追加到 prompt 末尾,已含技能块时跳过(防重复)。`skmng.core.build_skill_block` 的三来源合并(角色级 `fixed_skills` + 运行时 `active_names` + 自动匹配)完整生效:`SkillInjector.inject_into_prompt` 接受 `fixed_skills` 参数,节点经 `create_llm_node` 读取 `agent.fixed_skills` 传入(如 `VerificationAgent.fixed_skills = ["vivado-2025.2"]`,验证环境始终注入 Vivado Xsim 指引,与任务关键词无关);需要排除某技能时经 `exclude_skills` 传入(如 `graph/rtl_graph.py` 的 `verification_check_node` 排除 `"vivado-2025.2"`,因该技能的 add_files 目录通配与 Xsim `sim_filelist.f` 流程冲突,作为节点级 opt-out)。`TeamAgent` 亦内建同等能力(`build_skill_block` / `inject_into_prompt` 转发 `skmng.core`,满足 `PromptInjector` 协议)——节点可直接以角色实例为注入器,无需外部构造;`team/factory.py` 会把角色 `team/team_agents.json` 的 `skills_dir` / `auto_match_skills` / `tool_timeout` 透传给 TeamAgent。节点在 `create_llm_node` 内从 `state["active_skills"]` 读取手动加载技能并作为 `active_names` 传入(与 `fixed_skills` / `exclude_skills` 并列),使 `skill:<name>` 加载的技能经 workflow checkpoint per-thread 持久化后真正到达节点 prompt;`arun_compiled_workflow` / `arun_simple_workflow` / `arun_rtl_graph_workflow` / `arun_workflow_by_name` 均接受 `active_skills` 参数(仅非空时写入初始状态,不覆盖 checkpoint 已持久化的值)。`WorkflowAdapter`(`session/workflow_adapter.py`)提供 `list_skills` / `auto_match_skills` / `aload_skill` / `aclear_skills`,经 `graph.aget_state` / `graph.aupdate_state` 读写 workflow 会话 state,使 workflow 会话具备与主 Agent(`SkillOps`)同级的技能读写能力。
-- **消息通道压缩(compaction)**:`simple.py` / `rtl_graph.py` / `pipline.py` 的 `WorkflowState` / `RTLGraphState` 含 `messages`(LangGraph `add_messages` 通道)与 `summary` 字段,每个业务节点产出追加一条 `AIMessage`。`build_*_workflow` 接受 `compaction_config` 参数,经 `graph/common/` 的 `_build_compaction_middleware` 构造中间件,再由 `register_nodes` 以可选 `compaction_mw` 形参对节点统一包装:节点返回后调用 `arun_compaction`(**非 force**,仅消息数 > `max_messages`(默认 50)时触发)把历史消息压缩为增量摘要并入 `summary`,防止长会话撑爆上下文。`compaction_config=None` 且 agent 无 LLM 时静默禁用。
+- **消息通道压缩(compaction)**:`simple.py` / `rtl_graph.py` / `pipline.py` 的 `WorkflowState` / `RTLGraphState` 含 `messages`(LangGraph `add_messages` 通道)与 `summary` 字段,每个业务节点产出追加一条 `AIMessage`。`build_*_workflow` 接受 `compaction_config` 参数,经 `graph/common/` 的 `_build_compaction_middleware` 构造中间件,再由 `register_nodes` 以可选 `compaction_mw` 形参对节点统一包装:节点返回后调用 `arun_compaction`(**非 force**,仅预估 token > `max_context_tokens`(默认 100000)时触发)把历史消息压缩为增量摘要并入 `summary`,防止长会话撑爆上下文。`compaction_config=None` 且 agent 无 LLM 时静默禁用。
 - **跨轮次上下文延续**:统一入口(CLI/API)经 `WorkflowAdapter`(`session/workflow_adapter.py`)执行——运行前从 workflow 专属会话的 checkpoint `messages` 通道读取历史节点产出(预览最多 5 条、每条截断 200 字符,拼为 `【历史执行记录】` 块),叠加 `MemoryManager.recall_text` 的长期记忆,合并注入 `raw_context`,实现多轮运行间的上下文延续。
 
 ### 状态隔离机制
@@ -2585,7 +2595,7 @@ register_workflow(
 
 > ⚠️ **必须用 `register_nodes`/`functools.partial` 而非 `lambda` 绑定 agent 实例**:`partial` 保留 async 函数的 coroutine 特征(LangGraph 据此判定节点为异步并 `await`),`lambda` 会返回未 await 的 coroutine 导致 `InvalidUpdateError`。
 
-> **`register_nodes` 签名**：`register_nodes(builder, agents, injector, compaction_mw=None, specs=None)`。`compaction_mw` 为 `None` 时行为与未接线一致（仅对 `specs` 中每个节点做 `partial` 绑定后 `builder.add_node`）；非 `None` 时节点返回后由包装器调用 `arun_compaction(messages, existing_summary=...)` 做**节点级增量压缩**——**非 force**：仅当消息数 > `max_messages`（默认 50）时触发，并把压缩产生的 `messages`/`summary` 合并进节点返回值（`{**result, **update}`，`update["messages"]` 取代节点原 `messages`，不丢不重）。
+> **`register_nodes` 签名**：`register_nodes(builder, agents, injector, compaction_mw=None, specs=None)`。`compaction_mw` 为 `None` 时行为与未接线一致（仅对 `specs` 中每个节点做 `partial` 绑定后 `builder.add_node`）；非 `None` 时节点返回后由包装器调用 `arun_compaction(messages, existing_summary=...)` 做**节点级增量压缩**——**非 force**：仅当预估 token > `max_context_tokens`（默认 100000）时触发，并把压缩产生的 `messages`/`summary` 合并进节点返回值（`{**result, **update}`，`update["messages"]` 取代节点原 `messages`，不丢不重）。
 
 `graph/common/registry.py` 底部 `_load_builtin_workflows()` 在 registry 首次 import 时加载 `graph.simple` / `graph.pipline`,触发其自注册;新增内置工作流时在该函数中补充 import 即可。
 
@@ -2828,7 +2838,7 @@ async def main() -> None:
         enable_mcp=True,
         skills_dir=".agents/skills",
         auto_match_skills=True,
-        max_context_messages=0,                           # 0=关闭长上下文裁剪
+        max_context_tokens=100000,                        # 长上下文压缩触发的预估 token 阈值（0=关闭自动触发）
         context_trim_keep=12,
         checkpointer=memory_ctx.checkpointer,             # ← checkpoint 持久化
         store=memory_ctx.store,                           # ← 长期记忆 Store
@@ -2937,9 +2947,9 @@ asyncio.run(main())
 | `mcp_config_file`       | str   | `config/mcp_servers.json` | MCP 配置文件（相对项目根或绝对路径）                                                                   |
 | `agent_prompt_file`     | str   | `agent/AGENT.md`          | Agent 核心提示词文件路径（相对项目根或绝对路径）                                                       |
 | `max_execution_history` | int   | 100                         | 执行历史最大条数                                                                                       |
-| `max_context_messages`  | int   | 0                           | 长上下文裁剪阈值（0 = 关闭）                                                                           |
-| `context_trim_keep`     | int   | 12                          | 裁剪时保留的最近消息条数                                                                               |
-| `tool_timeout`          | int   | 120                         | 工具调用超时（秒）                                                                                     |
+| `max_context_tokens`    | int   | 100000                      | 长上下文压缩触发的预估 token 阈值（0 = 关闭自动触发；字符数 /4 粗估）                                  |
+| `context_trim_keep`     | int   | 12                          | 压缩时保留的最近消息条数                                                                               |
+| `tool_timeout`          | int   | 120                         | 工具调用超时（秒）。`0=使用默认超时策略（按工具名覆盖，全局默认 60s）`，与 `tools/config.py` 的 `DEFAULT_TIMEOUT`/`TOOL_TIMEOUTS` 行为一致 |
 | `temperature`           | float | 0.7                         | LLM 采样温度（主对话/调度器/API 默认；团队角色分层配置于 `team/team_agents.json`，缺省回退 default） |
 | `max_tokens`            | int   | 8192                        | LLM 最大生成 token 数（覆盖来源同`temperature`）                                                     |
 | `stream_chunk_timeout`  | float | 300.0                       | LLM 流式响应 chunk 间隔超时（秒；覆盖来源同`temperature`）。显式替代 `langchain-openai` 默认 120s，避免思考型模型网关长时间零字节时误触发告警（详见「LLM 流式 chunk 超时」） |
@@ -2981,15 +2991,15 @@ Agent 的核心系统提示词（行为规则）位于独立的 [agent/AGENT.md]
 >
 > 因 `create_llm_node` 在模块级定义、构建期拿不到 Agent 实例，节点在**执行时**按 `agent.tools` 判定该角色是否持有工具，从而避免「必须调用工具」等条款落在 Manager / Terminator / Architect 等纯文本角色节点上（既省 token，也避免误导模型调用不存在的工具）。文件缺失或未定义小节时自动跳过；`create_llm_node(..., base_prompts="")` 可关闭注入，传字符串则覆盖默认解析结果。注意主对话 Agent（`AgentCore`）仍读取**完整** `agent/AGENT.md`（两个小节都生效）。
 
-#### 长上下文裁剪（Long-Context Trimming）
+#### 长上下文压缩（Long-Context Compaction）
 
-当某个会话的消息数超过 `max_context_messages` 时，Agent 会自动：
+当某个会话的**预估 token**（字符数 /4 粗估，含工具调用参数文本）超过 `max_context_tokens`（默认 100000）时，Compaction 中间件会在每次 model 调用前自动：
 
-1. 用 LLM 将较早的消息压缩成一份中文摘要；
-2. 开启**新会话**，并把摘要注入后续 system prompt（保留上下文精华）；
-3. 仅保留最近 `context_trim_keep` 条消息，从而避免撞上 LLM 上下文窗口。
+1. 用 LLM 将较早的消息增量摘要成 `state.summary`（随 checkpoint 持久化、per-thread 隔离，**不新开 thread**）；
+2. 仅保留最近 `context_trim_keep` 条消息，避免撞上 LLM 上下文窗口；
+3. **独立** Prune 保留区之外过长的历史工具输出（只保留 `tool_prune_preview` 字符预览，保护最近 `keep_recent` 条消息），即使未达压缩阈值也执行。
 
-> 触发时会在终端打印提示（含新旧 `thread_id`）。默认 `max_context_messages=0`（关闭），需要时在 `agent/agent_config.json` 中设一个合理值（如 60）即可开启。
+> 历史键 `max_context_messages`（按消息条数触发）已移除，替换为 `max_context_tokens`（按预估 token 触发）。旧行为（消息数阈值 + 开启新会话）已废弃，改为在**同一 thread** 内增量摘要 + Prune，摘要随 checkpoint 持久化。
 
 ### 2. `llm_config.json` — LLM 服务商配置
 

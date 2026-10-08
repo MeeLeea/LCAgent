@@ -13,6 +13,7 @@ from llm.config import (
     _load_agent_prompt,
     compose_role_system_prompt,
     load_agent_config,
+    load_team_agent_role_entry,
     resolve_path,
 )
 
@@ -174,4 +175,43 @@ def test_compose_role_prompt_empty_role_prompt_falls_back_to_rules():
 
     assert composed.startswith(AGENT_RULES_HEADING)
     assert composed == composed.strip()
+
+
+# ──────────────────────────────────────────────
+# max_context_tokens: token 阈值取代消息数阈值
+# ──────────────────────────────────────────────
+
+
+def test_defaults_use_max_context_tokens_not_messages():
+    """DEFAULTS 暴露 max_context_tokens（默认 100000），不再有 max_context_messages。"""
+    assert DEFAULTS["max_context_tokens"] == 100_000
+    assert "max_context_messages" not in DEFAULTS
+
+
+def test_global_agent_config_uses_max_context_tokens():
+    """真实 agent/agent_config.json 使用 max_context_tokens，不再有 max_context_messages。"""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    cfg = load_agent_config(os.path.join(root, "agent", "agent_config.json"))
+
+    assert cfg["max_context_tokens"] == 100_000
+    assert "max_context_messages" not in cfg
+
+
+# ──────────────────────────────────────────────
+# load_team_agent_role_entry: 角色自身条目（不与 default 合并）
+# ──────────────────────────────────────────────
+
+
+def test_load_team_agent_role_entry_returns_role_own_entry():
+    """worker 自身条目声明 temperature=0.3，应原样返回该值。"""
+    entry = load_team_agent_role_entry("worker", ROOT)
+
+    assert entry["temperature"] == 0.3
+
+
+def test_load_team_agent_role_entry_does_not_merge_default():
+    """default 声明了 temperature=0.7，但 architect 自身未声明 → 结果不含 temperature 键。"""
+    entry = load_team_agent_role_entry("architect", ROOT)
+
+    assert "temperature" not in entry
 
