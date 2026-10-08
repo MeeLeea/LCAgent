@@ -6,6 +6,7 @@
 3. to_sse_dict 输出 workflow_node 格式（兼容前端协议）
 4. NODE_* 事件不进入 is_terminal / is_memory_worthy（白名单排除）
 5. 未知事件类型兜底带诊断字段
+6. HEARTBEAT 心跳事件序列化为 {"type": "heartbeat"}，且不终止流、不写记忆
 """
 from __future__ import annotations
 
@@ -110,3 +111,19 @@ class TestNodeEventExclusion:
         assert not AgentEvent.node_start(node="n").is_memory_worthy
         assert not AgentEvent.node_end(node="n").is_memory_worthy
         assert not AgentEvent.node_error(node="n").is_memory_worthy
+
+
+class TestHeartbeatEvent:
+    """HEARTBEAT 静默期心跳事件测试"""
+
+    def test_heartbeat_sse(self):
+        """heartbeat 序列化为 {"type": "heartbeat"}，前端据此重置 watchdog"""
+        event = AgentEvent.heartbeat(thread_id="t1", trace_id="tr1")
+        assert event.event_type == EventType.HEARTBEAT
+        assert event.to_sse_dict() == {"type": "heartbeat"}
+
+    def test_heartbeat_not_terminal_not_memory_worthy(self):
+        """心跳是纯保活事件：不得终止流，也不得写入记忆"""
+        event = AgentEvent.heartbeat(thread_id="t1")
+        assert not event.is_terminal
+        assert not event.is_memory_worthy

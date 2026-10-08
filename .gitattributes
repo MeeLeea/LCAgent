@@ -1,0 +1,31 @@
+# 统一行尾策略：仓库内一律 LF，工作区检出亦为 LF。
+#
+# 背景：此前仓库无 .gitattributes 且 Windows 端 core.autocrlf=true，
+# 导致「索引存 LF / 工作区存 CRLF」并存，git status 长期把大量文件误报为
+# 已修改（内容比对却无差异），掩盖真实改动。
+#
+# 规则说明：
+#   text=auto  —— git 自动识别文本文件并做行尾归一化（二进制文件不受影响）
+#   eol=lf     —— 检出到工作区时使用 LF，与索引一致，消除假阳性
+* text=auto eol=lf
+
+# 明确标记为二进制的类型（避免被误判为文本而改写行尾）
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.zip  binary
+*.gz   binary
+*.exe  binary
+*.dll  binary
+*.so   binary
+*.pyc  binary
+*.sqlite binary
+*.db   binary
+
+# Windows 专用脚本保留 CRLF（部分工具对其敏感）
+*.ps1  text eol=crlf
+*.bat  text eol=crlf
+*.cmd  text eol=crlf

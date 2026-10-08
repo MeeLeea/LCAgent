@@ -1,0 +1,325 @@
+"""会话基础配置 - 每个会话（Session / thread_id）独立的 provider / model / 角色。
+
+设计要点：
+- **唯一事实源**是 ``SessionStore`` 的 ``session_config`` 命名空间（见 session/store.py），
+  不是 checkpoint state；checkpoint 只保存只读快照用于诊断。
+- 本模块只定义**不可变数据类型 + 结构校验 + 序列化**，不 import ``llm`` / ``agent`` /
+  其余 session 模块，避免循环导入并保持 Session 层依赖轻量。
+- provider / role / model 的**存在性**校验由调用方注入候选列表完成
+  （API / CLI / Registry 层各自持有 load_providers() / get_available_team_roles()），
+  本模块只做类型与取值范围的校验。
+- ``SessionConfig`` 是 frozen dataclass，可安全跨协程共享：
+  请求开始处捕获一份快照，本轮执行期间配置恒定（前端中途改配置只影响下一轮）。
+"""
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, replace
+from typing import Any
+
+#: ``max_iterations`` 兜底默认值（正常路径由 AgentCore 的配置推导，不依赖此常量）。
+DEFAULT_MAX_ITERATIONS = 25
+
+#: temperature 合法区间（与主流 provider 的取值域一致）。
+MIN_TEMPERATURE = 0.0
+MAX_TEMPERATURE = 2.0
+
+#: ``config["configurable"]`` 中承载会话配置的键名（middleware 据此读取）。
+CONFIGURABLE_KEY = "session_config"
+
+#: Store 中 ``session_config`` 命名空间使用的 kind（4 层 namespace 的最后一层）。
+STORE_KIND = "session_config"
+
+
+class SessionConfigError(ValueError):
+    """会话配置非法（字段类型错误 / 取值越界 / 候选不存在）。"""
+
+
+@dataclass(frozen=True, slots=True)
+class SessionConfig:
+    """单个会话的基础配置（不可变）。
+
+    Attributes:
+        provider: 提供商标识（``config/llm_config.json`` 的 providers 键）。
+        model: 模型名；``None`` 表示使用该 provider 的默认模型。
+        role: 团队角色名（``team/<role>/`` 目录名）；``None`` 表示不使用角色。
+        system_prompt: 设置角色时解析出的系统提示词快照。在**写入时**解析并保存，
+            避免每轮重新读文件导致同一会话中途漂移。
+        temperature: 采样温度；``None`` 表示使用 provider / 全局默认。
+        max_tokens: 最大生成 token；``None`` 表示使用 provider / 全局默认。
+        max_iterations: 该会话的图递归上限（= LangGraph ``recursion_limit``）。
+        version: 乐观并发版本号，每次写回自增；用于诊断"本轮实际用了哪一版配置"。
+    """
+
+    provider: str
+    model: str | None = None
+    role: str | None = None
+    system_prompt: str | None = None
+    temperature: float | None = None
+    max_tokens: int | None = None
+    max_iterations: int = DEFAULT_MAX_ITERATIONS
+    version: int = 1
+
+    def to_dict(self) -> dict[str, Any]:
+        """转 JSON 兼容 dict（LangGraph Store 只接受可序列化基础值）。"""
+        return {
+            "provider": self.provider,
+            "model": self.model,
+            "role": self.role,
+            "system_prompt": self.system_prompt,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "max_iterations": self.max_iterations,
+            "version": self.version,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> SessionConfig:
+        """从 dict 还原；容忍历史数据缺字段（缺失即取默认值）。
+
+        Raises:
+            SessionConfigError: provider 缺失或为空。
+        """
+        provider = data.get("provider")
+        if not isinstance(provider, str) or not provider.strip():
+            raise SessionConfigError(f"session_config 缺少合法 provider: {provider!r}")
+        return cls(
+            provider=provider,
+            model=_opt_str(data.get("model")),
+            role=_opt_str(data.get("role")),
+            system_prompt=_opt_str(data.get("system_prompt")),
+            temperature=_opt_float(data.get("temperature")),
+            max_tokens=_opt_int(data.get("max_tokens")),
+            max_iterations=_opt_int(data.get("max_iterations")) or DEFAULT_MAX_ITERATIONS,
+            version=_opt_int(data.get("version")) or 1,
+        )
+
+    def apply(self, patch: SessionConfigPatch) -> SessionConfig:
+        """应用一次部分更新，``version`` 自增。
+
+        patch 中为 ``None`` 的字段表示**不修改**；因此无法用 patch 把
+        model / role 重置为 ``None``，需要时用完整 ``set`` 语义（整体替换）。
+        """
+        changes: dict[str, Any] = {"version": self.version + 1}
+        for field_name in (
+            "provider",
+            "model",
+            "role",
+            "system_prompt",
+            "temperature",
+            "max_tokens",
+            "max_iterations",
+        ):
+            value = getattr(patch, field_name)
+            if value is not None:
+                changes[field_name] = value
+        updated = replace(self, **changes)
+        validate_session_config(updated)
+        return updated
+
+
+@dataclass(frozen=True, slots=True)
+class SessionConfigPatch:
+    """会话配置的部分更新请求；``None`` 表示该字段不修改。"""
+
+    provider: str | None = None
+    model: str | None = None
+    role: str | None = None
+    system_prompt: str | None = None
+    temperature: float | None = None
+    max_tokens: int | None = None
+    max_iterations: int | None = None
+
+
+def validate_session_config(
+    config: SessionConfig,
+    *,
+    providers: Iterable[str] | None = None,
+    roles: Iterable[str] | None = None,
+    models: Iterable[str] | None = None,
+) -> None:
+    """校验配置的结构合法性，并在调用方提供候选集合时校验存在性。
+
+    候选集合参数由调用方按自身能力注入（API 层通常三者都有，CLI 层可能有），
+    未注入的维度只做结构校验。
+
+    Raises:
+        SessionConfigError: 任一校验失败。
+    """
+    if not isinstance(config.provider, str) or not config.provider.strip():
+        raise SessionConfigError("provider 必须是非空字符串")
+    if not isinstance(config.max_iterations, int) or config.max_iterations < 1:
+        raise SessionConfigError(f"max_iterations 必须是 >=1 的整数，收到 {config.max_iterations!r}")
+    if not isinstance(config.version, int) or config.version < 1:
+        raise SessionConfigError(f"version 必须是 >=1 的整数，收到 {config.version!r}")
+    if config.temperature is not None:
+        if not isinstance(config.temperature, (int, float)):
+            raise SessionConfigError(f"temperature 必须是数字，收到 {config.temperature!r}")
+        if not (MIN_TEMPERATURE <= float(config.temperature) <= MAX_TEMPERATURE):
+            raise SessionConfigError(
+                f"temperature 必须位于 [{MIN_TEMPERATURE}, {MAX_TEMPERATURE}]，收到 {config.temperature!r}"
+            )
+    if config.max_tokens is not None and (
+        not isinstance(config.max_tokens, int) or config.max_tokens < 1
+    ):
+        raise SessionConfigError(f"max_tokens 必须是 >=1 的整数，收到 {config.max_tokens!r}")
+
+    if providers is not None and config.provider not in set(providers):
+        raise SessionConfigError(f"未知 provider: {config.provider!r}")
+    if roles is not None and config.role is not None and config.role not in set(roles):
+        raise SessionConfigError(f"未知角色: {config.role!r}")
+    if models is not None and config.model is not None and config.model not in set(models):
+        raise SessionConfigError(f"未知模型: {config.model!r}")
+
+
+def preferred_model_for_provider(
+    providers: Mapping[str, Mapping[str, Any]], provider: str
+) -> str | None:
+    """取 provider 的默认模型；默认模型未列入其 ``models`` 白名单时回落首个可用模型。
+
+    配置不一致（如 ``yunlan-gpt`` 的默认 ``model`` 不在自身 ``models`` 中）不应让
+    「切换供应商」永久失败——候选必须出自 ``models`` 才能通过显式校验。
+    ``providers`` 无该 provider 或无默认/白名单模型时返回 ``None``。
+
+    Args:
+        providers: ``load_providers()`` 返回的 provider 配置字典。
+        provider: 目标提供商标识。
+
+    Returns:
+        目标 provider 的可用模型名；无可用模型时返回 ``None``。
+    """
+    conf = providers.get(provider, {})
+    default_model = conf.get("model")
+    models = conf.get("models", [])
+    if default_model is not None and (not models or default_model in models):
+        return default_model
+    return models[0] if models else None
+
+
+def resolve_session_config_update(
+    current: SessionConfig,
+    patch: SessionConfigPatch,
+    *,
+    providers: Mapping[str, Mapping[str, Any]] | None = None,
+    roles: Iterable[str] | None = None,
+    models: Iterable[str] | None = None,
+) -> SessionConfig:
+    """应用一次会话配置更新，并在 provider 实际变化时重解析 model。
+
+    这是 provider/model 更新语义的**唯一实现**（PATCH 端点、CLI ``switch:``、
+    旧版 ``/api/providers/switch`` 共用），避免「切 provider 后 model 漂移」
+    在各入口表现不一致（历史缺陷：CLI 与 API 各自实现，行为分叉）。
+
+    流程：
+        1. ``current.apply(patch)``（结构校验 + version 自增）
+        2. provider 实际变化且未显式给出 model 时，把 model 重解析为该 provider
+           的可用模型（默认模型不在白名单时回落 ``models[0]``）。显式传入的
+           model 始终以请求为准；provider 未实际变化时不重置 model，避免覆盖
+           用户已选模型。
+        3. 按调用方注入的候选集合做存在性校验。
+
+    Args:
+        current: 当前会话配置快照。
+        patch: 部分更新请求（``None`` 字段表示不修改）。
+        providers: provider 配置字典；提供时校验 provider 存在并支持 model 重解析。
+        roles: 可用角色候选；提供时校验 role 存在。
+        models: 目标 provider 的可用模型候选；提供时校验 model 存在。
+
+    Returns:
+        更新后的 ``SessionConfig``（未持久化，由调用方负责写回）。
+
+    Raises:
+        SessionConfigError: 任一校验失败（越界 / 候选不存在）。
+    """
+    provider = patch.provider or current.provider
+    provider_switched = patch.provider is not None and patch.provider != current.provider
+    result = current.apply(patch)
+    if provider_switched and patch.model is None and providers is not None:
+        result = replace(
+            result, model=preferred_model_for_provider(providers, provider)
+        )
+    validate_session_config(
+        result,
+        providers=providers.keys() if providers is not None else None,
+        roles=roles,
+        models=models,
+    )
+    return result
+
+
+def session_config_to_configurable(config: SessionConfig) -> dict[str, Any]:
+    """构造注入 ``config["configurable"]`` 的会话配置片段。
+
+    与 ``thread_id`` / ``workspace_path`` 同处 configurable。注意：LangGraph **不会**
+    把 ``configurable`` 自动映射到 ``request.runtime.context`` —— ``ModelRequest.runtime``
+    是 ``Runtime``，它没有 ``config`` 属性，且 ``context`` 只由调用方的 ``context=``
+    参数填充。因此图调用处必须写 ``ainvoke(..., config=config, context=config)``
+    （见 ``agent/turn_runners.py`` / ``agent/streaming.py``），把同一份
+    ``{"configurable": {...}}`` 同时经两条通道传入：``config=`` 供 checkpointer，
+    ``context=`` 供中间件读取。
+    """
+    return {CONFIGURABLE_KEY: config.to_dict()}
+
+
+def session_config_from_runtime_context(context: Any) -> SessionConfig | None:
+    """从 ``request.runtime.context`` 提取会话配置。
+
+    兼容两种形态：``context`` 是 dict（含 ``configurable`` 子 dict），
+    或 ``context`` 是带 ``configurable`` 属性的对象。任一环节缺失返回 ``None``
+    （middleware 据此回退到构建期默认模型，保证旧调用路径不炸）。
+    """
+    configurable: Any = None
+    if isinstance(context, Mapping):
+        configurable = context.get("configurable")
+    else:
+        configurable = getattr(context, "configurable", None)
+    if not isinstance(configurable, Mapping):
+        return None
+    raw = configurable.get(CONFIGURABLE_KEY)
+    if not isinstance(raw, Mapping):
+        return None
+    try:
+        return SessionConfig.from_dict(raw)
+    except SessionConfigError:
+        return None
+
+
+def _opt_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    return value if isinstance(value, str) else str(value)
+
+
+def _opt_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
+def _opt_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+__all__ = [
+    "CONFIGURABLE_KEY",
+    "DEFAULT_MAX_ITERATIONS",
+    "MAX_TEMPERATURE",
+    "MIN_TEMPERATURE",
+    "STORE_KIND",
+    "SessionConfig",
+    "SessionConfigError",
+    "SessionConfigPatch",
+    "preferred_model_for_provider",
+    "resolve_session_config_update",
+    "session_config_from_runtime_context",
+    "session_config_to_configurable",
+    "validate_session_config",
+]

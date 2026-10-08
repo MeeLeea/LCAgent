@@ -1,5 +1,5 @@
 // API 客户端：REST 请求 + SSE 流式解析
-import type { ProvidersInfo, ThreadSummary, RawMessage, StreamEvent, WorkflowInfo, MetricsSummary, CompactResult, MemorySummary, CompressResult, SafetyConfig, SkillInfo, ExportResult, WorkspaceInfo, BrowseResult } from './types'
+import type { ProvidersInfo, ThreadSummary, RawMessage, StreamEvent, WorkflowInfo, MetricsSummary, CompactResult, MemorySummary, CompressResult, SafetyConfig, SkillInfo, ExportResult, WorkspaceInfo, BrowseResult, SessionConfigPatch, SessionConfigResponse } from './types'
 
 // Vite 构建期从 config/server_config.json 注入的后端地址（Tauri 模式使用）
 declare const __SERVER_HOST__: string
@@ -37,7 +37,7 @@ async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 /** 终止性事件：收到这些事件后流一定结束，前端据此复位 isStreaming */
-const TERMINAL_TYPES = new Set(['done', 'error', 'cancelled', 'interrupt'])
+const TERMINAL_TYPES = new Set(['done', 'error', 'cancelled', 'interrupt', 'attach_expired'])
 
 /**
  * 读取 SSE 流并把每个 data: 事件回调出去。
@@ -80,12 +80,13 @@ async function consumeSSE(
 
 /**
  * 发起一次 SSE 流式请求。
+ * body 为 null 时使用 GET（如 attach 重连端点），否则 POST JSON。
  * 保证：无论流如何结束，onEvent 至少会收到一个终止事件（done/error）。
  * 返回 abort 函数（用户主动中止时调用）。
  */
 function streamRequest(
   url: string,
-  body: Record<string, unknown>,
+  body: Record<string, unknown> | null,
   onEvent: (ev: StreamEvent) => void,
 ): () => void {
   const controller = new AbortController()
@@ -93,9 +94,9 @@ function streamRequest(
   let abortedByUser = false
 
   fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    method: body ? 'POST' : 'GET',
+    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
     signal: controller.signal,
   })
     .then(async (res) => {
@@ -132,29 +133,38 @@ function streamRequest(
 export const api = {
   health: () => jsonFetch<{ status: string }>(`${BASE}/health`),
 
-  getProviders: () => jsonFetch<ProvidersInfo>(`${BASE}/providers`),
-  switchProvider: (provider: string) =>
+  getProviders: (threadId?: string | null) =>
+    jsonFetch<ProvidersInfo>(`${BASE}/providers${threadId ? `?thread_id=${encodeURIComponent(threadId)}` : ''}`),
+  updateSessionConfig: (threadId: string, patch: SessionConfigPatch) =>
+    jsonFetch<SessionConfigResponse>(`${BASE}/sessions/${encodeURIComponent(threadId)}/config`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(
+        Object.fromEntries(Object.entries(patch).filter(([, value]) => value !== undefined)),
+      ),
+    }),
+  switchProvider: (provider: string, threadId?: string | null) =>
     jsonFetch(`${BASE}/providers/switch`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ provider }),
+      body: JSON.stringify({ provider, ...(threadId ? { thread_id: threadId } : {}) }),
     }),
-  switchModel: (model: string) =>
+  switchModel: (model: string, threadId?: string | null) =>
     jsonFetch(`${BASE}/models/switch`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model }),
+      body: JSON.stringify({ model, ...(threadId ? { thread_id: threadId } : {}) }),
     }),
 
   getTools: () => jsonFetch<{ tools: string[] }>(`${BASE}/tools`),
 
   // ── 团队角色 ──
   getRoles: () => jsonFetch<{ roles: string[]; current: string | null }>(`${BASE}/roles`),
-  switchRole: (role: string, task?: string) =>
+  switchRole: (role: string, task?: string, threadId?: string | null) =>
     jsonFetch<{ role: string; current: string | null }>(`${BASE}/roles/switch`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ role, task }),
+      body: JSON.stringify({ role, task, ...(threadId ? { thread_id: threadId } : {}) }),
     }),
 
   getWorkflows: () => jsonFetch<{ workflows: string[] }>(`${BASE}/workflows`),
@@ -189,6 +199,21 @@ export const api = {
     body: { payload: Record<string, unknown>; thread_id?: string | null },
     onEvent: (ev: StreamEvent) => void,
   ): (() => void) => streamRequest(`${BASE}/chat/resume`, body, onEvent),
+
+  /** 查询线程是否有正在进行的流式生成（页面刷新后据此决定是否 attach） */
+  getStreamStatus: (thread_id: string) =>
+    jsonFetch<{ thread_id: string; streaming: boolean }>(
+      `${BASE}/threads/${encodeURIComponent(thread_id)}/stream-status`,
+    ),
+
+  /**
+   * 重连到正在进行的流式执行（GET SSE）：先重放刷新期间错过的事件，再实时接收。
+   * 无活跃流时后端返回 attach_expired 事件，调用方应回退到历史消息加载。
+   */
+  attachChat: (
+    thread_id: string,
+    onEvent: (ev: StreamEvent) => void,
+  ): (() => void) => streamRequest(`${BASE}/chat/attach/${encodeURIComponent(thread_id)}`, null, onEvent),
 
   /**
    * 请求停止指定会话的生成（幂等）。

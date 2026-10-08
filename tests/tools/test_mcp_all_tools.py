@@ -138,7 +138,6 @@ class TestLoadAllMcpToolsSync:
 
 def _register_fake_role(
     role_name: str,
-    config_file: str = "team/architect/agent_config.json",
     *,
     tools=None,
     mcp_tools=None,
@@ -148,7 +147,7 @@ def _register_fake_role(
 
     用 try/finally 由调用方负责清理,避免污染全局注册表。
     """
-    @register_agent(role_name, config_file, tools=tools, mcp_tools=mcp_tools, mcp_all=mcp_all)
+    @register_agent(role_name, tools=tools, mcp_tools=mcp_tools, mcp_all=mcp_all)
     class FakeAgent(TeamAgent):
         pass
 
@@ -191,7 +190,7 @@ def _patch_build_team_agent(team_mod, captured: dict):
     """
     original_build = team_mod.build_team_agent
 
-    def _spy_build(agent_class, config_file, base_dir, tools=None, **kwargs):
+    def _spy_build(agent_class, agent_name, base_dir, tools=None, **kwargs):
         captured[agent_class.__name__] = tools
         inst = object.__new__(agent_class)
         inst.tools = tools or []
@@ -231,16 +230,12 @@ def test_build_workflow_mcp_all_injection_distinct_classes():
     # 用不同类名,让 captured 字典能区分
     @register_agent(
         "fake_all_role",
-        "team/architect/agent_config.json",
         mcp_all=True,
     )
     class FakeAllAgent(TeamAgent):
         pass
 
-    @register_agent(
-        "fake_none_role",
-        "team/manager/agent_config.json",
-    )
+    @register_agent("fake_none_role")
     class FakeNoneAgent(TeamAgent):
         pass
 
@@ -291,7 +286,6 @@ def test_build_workflow_mcp_all_and_mcp_tools_mutex_warning(caplog):
 
     @register_agent(
         "fake_mutex_role",
-        "team/architect/agent_config.json",
         mcp_tools=["write_file"],
         mcp_all=True,
     )
@@ -341,7 +335,6 @@ def test_build_workflow_mcp_all_degrade_on_empty(caplog):
 
     @register_agent(
         "fake_degrade_role",
-        "team/architect/agent_config.json",
         mcp_all=True,
     )
     class FakeDegradeAgent(TeamAgent):
@@ -389,7 +382,6 @@ def test_mcp_all_false_preserves_existing_behavior():
 
     @register_agent(
         "fake_regression_role",
-        "team/architect/agent_config.json",
         mcp_tools=["write_file"],
         # 不传 mcp_all,默认 False
     )

@@ -1,24 +1,40 @@
-"""团队角色切换 - 从 team/<角色>/ 目录重建主对话 Agent 的角色
+"""团队角色目录发现 + 角色配置解析 - 扫描 team/<角色>/ 定位角色并合成配置补丁。
 
-对外提供两个能力(供 AgentCore 委托调用):
+对外提供(供 CLI / API 委托调用):
+    - get_available_team_roles: 扫描 team/ 列出可用角色
     - _locate_team_agent_dir: 扫描 team/ 精确定位角色目录
-    - arebuild_agent_from_team_dir: 读取角色 agent_config.json + AGENT.md,
-      就地把传入的 AgentCore 切换为该角色的提示词/LLM
+    - resolve_role_config_patch: 角色的唯一解析入口：定位目录→读配置→读 AGENT.md
+      →剥离 workflow 小节→拼基础规则→合并 provider/model/采样参数，产出
+      ``SessionConfigPatch``
 
 从 agent_core.py 抽离,避免核心调度模块承载角色目录扫描逻辑。
+
+**配置优先级**（``resolve_role_config_patch``）：只取角色在 ``team_agents.json`` 中的
+**自身条目**，不再与 ``default`` 合并。角色未声明 ``temperature`` / ``max_tokens`` /
+``max_iterations`` 时保持未设置，由会话模型工厂回退到 ``agent/agent_config.json`` 的全局
+默认采样；``team_agents.json`` 仅声明角色级差异。``role:default`` 不覆盖 provider/model/采样，
+保留会话现有值。
+
+**角色切换的写入口**仍只有两处(会话级角色切换由会话配置实现,写入
+``SessionConfig.role`` / ``SessionConfig.system_prompt``,经
+``agent/session_config_middleware.py::SessionConfigMW`` 在每次 model 调用时生效):
+    - CLI:  ``cli/commands/role.py::_switch_role``
+    - HTTP: ``api/server.py::_resolve_role_patch``
+
+但这两处**不再各自复制解析逻辑**,统一委托 ``resolve_role_config_patch``,避免
+"同一角色在两入口解析结果漂移"的历史缺陷。
+
+历史遗留的 ``arebuild_agent_from_team_dir`` 已删除:它就地改写**共享** AgentCore
+实例(``agent_core_prompt`` / ``llm`` + 重建共享图),会篡改**所有**会话,与
+per-session 隔离模型冲突。
 """
 from __future__ import annotations
 
-import logging
+import json
 import os
-from typing import TYPE_CHECKING
+from typing import Any
 
-from llm.llm_client import LLMClient
-
-if TYPE_CHECKING:
-    from agent.agent_core import AgentCore
-
-logger = logging.getLogger(__name__)
+from session.config import SessionConfigPatch
 
 # 项目根目录(基于本文件位置计算: agent/role_sw.py -> 上两级)
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -35,16 +51,30 @@ def get_available_team_roles() -> list[str]:
         return []
 
     available: list[str] = ["default"]
+    
+    # 从统一配置获取定义的角色
+    unified_config_path = os.path.join(_BASE_DIR, "team", "team_agents.json")
+    unified_roles: set[str] = set()
+    if os.path.exists(unified_config_path):
+        try:
+            with open(unified_config_path, "r", encoding="utf-8") as f:
+                team_config = json.load(f)
+            unified_roles = set(team_config.keys()) - {"default"}
+        except (OSError, json.JSONDecodeError):
+            pass
+    
     for entry in sorted(os.listdir(_TEAM_DIR)):
         if entry in _NON_ROLE_DIRS:
             continue
         sub_dir = os.path.join(_TEAM_DIR, entry)
         if not os.path.isdir(sub_dir):
             continue
-        # 仅将同时具备 agent_config.json + AGENT.md 的目录视为合法角色
-        has_config = os.path.isfile(os.path.join(sub_dir, "agent_config.json"))
+        # 合法角色：在统一配置中定义，且有 AGENT.md
+        has_unified = entry in unified_roles
         has_prompt = os.path.isfile(os.path.join(sub_dir, "AGENT.md"))
-        if has_config and has_prompt:
+        # 兼容：过渡期保留 agent_config.json 检查
+        has_config = os.path.isfile(os.path.join(sub_dir, "agent_config.json"))
+        if (has_unified or has_config) and has_prompt:
             available.append(entry)
 
     return available
@@ -81,95 +111,66 @@ def _locate_team_agent_dir(agent_name: str) -> str:
     return agent_dir
 
 
-async def arebuild_agent_from_team_dir(
-    agent: AgentCore, agent_name: str, *, task: str = ""
-) -> None:
-    """按 team/ 角色文件夹名重建主对话 Agent 的角色(唯一对外入口)
+#: 角色配置可覆盖的采样类字段（provider/model 之外的写入字段）。
+_ROLE_PATCH_FIELDS = ("provider", "model", "temperature", "max_tokens", "max_iterations")
 
-    扫描 team/ 定位目标角色目录,读取其 agent_config.json 与 AGENT.md,
-    复用现有构建链把主 AgentCore 切换为该角色的提示词/LLM:
 
-    - 仅提示词变化 → 重建 executor（system_prompt 已改为静态字符串）
-    - provider/model 变化 → 重建 LLMClient 并重建 executor
+def resolve_role_config_patch(
+    role_name: str,
+    *,
+    base_dir: str = _BASE_DIR,
+    explicit: SessionConfigPatch | None = None,
+) -> SessionConfigPatch:
+    """解析角色并合成为该会话的配置补丁（CLI / API 共用唯一实现）。
 
-    整个过程就地修改传入的 AgentCore 实例,不返回新对象。
+    完整流程：定位角色目录 → 加载 ``team/team_agents.json`` 中该角色**自身**的条目
+    → 读取 ``AGENT.md`` → 剥离 ``## workflow:*`` 小节 → 拼接基础规则得到 system prompt
+    → 合并 provider/model/采样参数，产出 ``SessionConfigPatch``。
+
+    字段优先级（``explicit`` 非 None 时）：显式请求字段 > 角色自身配置字段 > 不修改。
+    ``explicit=None``（CLI 路径）时：角色自身配置中存在的字段一律覆盖。
+
+    **采样参数回退**：只读取角色自身条目，**不合并** ``team_agents.json`` 的 ``default``。
+    角色未显式声明 ``temperature`` / ``max_tokens`` / ``max_iterations`` 时，这些字段保持
+    未设置，由 ``SessionModelFactory`` 回退到 ``agent/agent_config.json`` 的全局默认采样。
+    ``team_agents.json`` 只声明角色级差异（delta）。``role_name="default"`` 一律不产生任何
+    覆盖（不覆盖 provider/model/采样），保留会话现有值。
 
     Args:
-        agent: 待切换角色的 AgentCore 实例(就地修改)
-        agent_name: team/ 下的角色文件夹名(如 "manager"/"worker")
-        task: 可选任务描述,用于切换后自动匹配注入技能
+        role_name: 角色名（``team/<role>/`` 目录名，或 ``"default"``）。
+        base_dir: 项目根目录（用于定位 ``team/team_agents.json``）。
+        explicit: 调用方已显式给出的补丁；其非 None 字段优先于角色配置。
+
+    Returns:
+        合成后的 ``SessionConfigPatch``（含 role + system_prompt）。
 
     Raises:
-        KeyError: 角色文件夹不存在或缺少必需文件
-        FileNotFoundError: AGENT.md 读取失败(内容为空)
+        KeyError: 角色不存在（由 ``_locate_team_agent_dir`` 抛出）。
+        FileNotFoundError: 角色提示词为空或无法读取。
     """
-    agent._ensure_not_closed()
-
-    # 1. 扫描 team/ 定位目标角色目录
-    role_dir = _locate_team_agent_dir(agent_name)
-    config_path = os.path.join(role_dir, "agent_config.json")
-    prompt_path = os.path.join(role_dir, "AGENT.md")
-
-    # 2. 读取角色配置与提示词(复用现有能力)
-    from llm.config import load_agent_config
+    # 延迟导入：避免 agent 包与 llm/team 在模块加载期形成循环依赖
+    from llm.config import compose_role_system_prompt, load_team_agent_role_entry
     from team.base import TeamAgent
 
-    config = load_agent_config(config_path)
-    content = TeamAgent._read_prompt_file(prompt_path)
+    role_dir = _locate_team_agent_dir(role_name)
+    # 只取角色自身条目（不合并 default）：default 不再作为采样兜底来源。
+    # role:default 不覆盖 provider/model/采样，保留会话现有值 →
+    # 经 SessionModelFactory 回退到 agent_config.json 的全局默认。
+    config = {} if role_name == "default" else load_team_agent_role_entry(role_name, base_dir)
+    content = TeamAgent._read_prompt_file(os.path.join(role_dir, "AGENT.md"))
     if content is None:
-        raise FileNotFoundError(f"角色提示词文件为空或无法读取: {prompt_path}")
+        raise FileNotFoundError(f"角色提示词为空: {role_name}")
+    role_prompt, _ = TeamAgent.parse_prompt_sections(content)
+    # 角色提示词拼接基础规则（主对话 Agent 持有工具，故附带「工具规则」）；
+    # role="default" 时内部特判不拼接，避免 agent/AGENT.md 规则重复
+    explicit_prompt = explicit.system_prompt if explicit is not None else None
+    composed_prompt = explicit_prompt or compose_role_system_prompt(role_prompt, role=role_name)
 
-    # 剥离 ## workflow:* 小节,只取角色系统提示词
-    role_prompt, _templates = TeamAgent.parse_prompt_sections(content)
-
-    # provider/model 经 load_agent_config 的 cfg.update(data) 透传(cfg 不过滤键)，
-    # 直接读取即可。
-    # 3. 判断是否需要切换 LLM(provider/model 变化)
-    #    目标 provider：角色显式配置优先，否则沿用当前 LLM 的 provider。
-    target_provider = (config.get("provider") or agent.llm.provider).lower()
-    #    目标 model：角色显式配置优先；未配置时回退到「目标 provider」在
-    #    llm_config.json 中声明的默认 model，而非沿用当前 LLM 的 model。
-    #    否则从 yunwu(qwen3.7-max) 切到 zhipu(model=null) 时，会把旧 provider 的
-    #    model 误带到新 provider，触发网关 400「modelCode：不存在」。
-    configured_model = config.get("model")
-    if configured_model:
-        target_model = configured_model
-    else:
-        from llm.llm_client import load_providers
-
-        _providers = load_providers(agent.llm.config_file)
-        target_model = _providers.get(target_provider, {}).get("model")
-    llm_changed = (
-        target_provider != agent.llm.provider or target_model != agent.llm.model
-    )
-
-    async with agent._state_lock:
-        # 更新角色核心提示词
-        agent.agent_core_prompt = role_prompt
-        agent.name = config.get("name", agent.name)
-        agent.max_iterations = config.get("max_iterations", agent.max_iterations)
-
-        if llm_changed:
-            # LLM 变化:重建 LLMClient + 重建 executor
-            # 采样参数来源：角色级 agent_config.json（load_agent_config 已合并 DEFAULTS，
-            # 未显式配置时自动落到 DEFAULTS 默认值）
-            temperature = config.get("temperature")
-            max_tokens = config.get("max_tokens")
-            agent.llm = LLMClient(
-                provider=target_provider,
-                model=target_model,
-                config_file=agent.llm.config_file,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            await agent._arebuild_agent_executor()
-        else:
-            # 仅提示词变化:重建 executor 以使用新的 system_prompt
-            await agent._arebuild_agent_executor()
-
-    if agent.verbose:
-        logger.info(
-            "已切换到 team 角色: %s (LLM %s)",
-            agent_name,
-            "已重建" if llm_changed else "未变",
-        )
+    values: dict[str, Any] = {"role": role_name, "system_prompt": composed_prompt}
+    for field in _ROLE_PATCH_FIELDS:
+        explicit_value = getattr(explicit, field) if explicit is not None else None
+        if explicit_value is not None:
+            values[field] = explicit_value
+        elif field in config and config[field] is not None:
+            values[field] = config[field]
+    return SessionConfigPatch(**values)

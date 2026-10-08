@@ -225,6 +225,85 @@ netstat -ano | findstr 8001
 .\LCA.ps1 --build
 ```
 
+## 🗄️ 一次性数据迁移脚本
+
+### `migrate_agent_memory_namespace.py`
+
+**用途**：把 agent 级长期记忆（`user_fact` / `lesson`）从旧 namespace
+`("server", "global_facts")` 复制到新的共享 namespace `("global", "global_facts")`。
+背景是长期记忆的 `agent_key` 与 `process_type` 解耦，历史记忆需要迁移到共享命名空间。
+
+**特性**：
+
+- 复用项目自身的 LangGraph `AsyncSqliteStore`（与 `memory/agent_memory.py` 构造方式一致），
+  不直接对 `store` 表执行 raw SQL，遵循 WAL 与 Store 序列化约定。
+- 复用 `ThreadFactItem.from_dict` / `to_dict`，目标条目沿用源 `fact_id` 作为 Store key，
+  并将条目内 `thread_id` 改写为 `"global"`，其余字段原样保留。
+- **默认 dry-run（只读）**，只有显式 `--apply` 才会写库；脚本幂等，可安全重跑。
+- `--delete-source` 仅在 `--apply` 下生效，且必须在校验（目标 namespace 是源的超集）
+  通过后才会删除源数据。
+- 可在 `api/server.py` 进程存活时运行（写入幂等、竞争窗口短，WAL + `busy_timeout` 兜底）。
+
+**先 dry-run，再 apply**：
+
+```bash
+# 1. 预演（只读，必须第一步执行，确认源条数符合预期）
+uv run python scripts/migrate_agent_memory_namespace.py --dry-run
+
+# 2. 确认无误后真正复制
+uv run python scripts/migrate_agent_memory_namespace.py --apply
+
+# 3. （可选）校验通过后删除旧 namespace 数据
+uv run python scripts/migrate_agent_memory_namespace.py --apply --delete-source
+```
+
+**参数**：
+
+| 参数              | 说明                                                                                    |
+| ----------------- | --------------------------------------------------------------------------------------- |
+| `--apply`         | 真正执行复制（默认仅 dry-run，不写入任何数据）                                          |
+| `--dry-run`       | 仅报告将要执行的操作，不写入（默认行为；与 `--apply` 互斥）                             |
+| `--delete-source` | 复制并校验通过后删除旧 namespace 数据（仅在 `--apply` 下生效）                          |
+| `--db`            | SQLite 数据库路径，相对路径基于项目根目录（默认 `data/checkpoints_async.sqlite`）      |
+
+> ⚠️ **`--delete-source` 注意事项**：删除不可逆。务必先执行一次 `--apply`（不带
+> `--delete-source`）并确认校验通过、新 namespace 数据正常后，再执行
+> `--apply --delete-source`；单独传 `--delete-source`（不带 `--apply`）会被忽略并打印警告。
+
+## 🧹 一次性数据清理脚本
+
+### `cleanup_polluted_agent_lessons.py`
+
+**用途**：删除 agent 级长期记忆（`(agent_key, "global_facts")`）中被污染的
+`lesson` 条目。背景是历史 bug：危险命令确认（工具内 `interrupt()` 抛
+`GraphInterrupt`）被事件流误映射为 `[工具执行失败]` TOOL_RESULT，确定性
+lesson 路径又把错误原文逐字写入跨会话共享 namespace（完整命令脚本 +
+反思指令后缀以"经验教训"形式注入所有会话）。代码层已修复，本脚本清理存量。
+
+**判定标准**：`category == "lesson"` 且 content 含
+`[工具执行失败]` / `请反思失败原因` / `GraphInterrupt` / `dangerous_command` 任一标记。
+
+**先 dry-run，再 apply**：
+
+```bash
+# 1. 预演（只读，确认待删条数与内容符合预期）
+uv run python scripts/cleanup_polluted_agent_lessons.py --dry-run
+
+# 2. 确认后真正删除（不可逆）
+uv run python scripts/cleanup_polluted_agent_lessons.py --apply
+```
+
+**参数**：
+
+| 参数          | 说明                                                              |
+| ------------- | ----------------------------------------------------------------- |
+| `--apply`     | 真正执行删除（默认仅 dry-run；删除不可逆）                        |
+| `--dry-run`   | 仅报告将要删除的条目（默认行为；与 `--apply` 互斥）               |
+| `--db`        | SQLite 数据库路径，相对路径基于项目根目录（默认 `data/checkpoints_async.sqlite`） |
+| `--agent-key` | agent 级 namespace 标识（默认 `global`）                          |
+
+> ⚠️ 建议在 `api/server.py` / CLI 进程停止时运行，防止在途防抖 buffer 把旧事件重新写回。
+
 ## 📖 更多文档
 
 - [Web 前端文档](../web/README.md)

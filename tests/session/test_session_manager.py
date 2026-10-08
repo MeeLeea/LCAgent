@@ -4,11 +4,11 @@
   pytest tests/session/test_session_manager.py -v
 """
 import asyncio
-from typing import Any
 
 from memory.lock_pool import ThreadMemoryLockPool
 from memory.manager import MemoryManager
-from memory.models import MemoryCategory, ThreadFactItem
+from memory.middleware import default_thread_llm_resolver
+from memory.models import ThreadFactItem
 from memory.store import ThreadMemoryStore
 from session.manager import SessionManager
 
@@ -37,7 +37,7 @@ def _make_manager() -> MemoryManager:
     return MemoryManager(
         memory_store=store,
         lock_pool=lock_pool,
-        llm_getter=lambda: None,
+        llm_getter=default_thread_llm_resolver(lambda: None),
     )
 
 

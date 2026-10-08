@@ -23,19 +23,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from .lock_pool import ThreadMemoryLockPool
+from utils.events import AgentEvent, EventType
+
+from .lock_pool import AgentMemoryLock, ThreadMemoryLockPool
 from .middleware import (
+    ThreadLLMResolver,
     ThreadMemoryReadMiddleware,
     ThreadMemoryWriteMiddleware,
 )
 from .models import MemoryCategory, ThreadFactItem
 from .store import ThreadMemoryStore
-
-if TYPE_CHECKING:
-    from utils.events import AgentEvent
 
 logger = logging.getLogger(__name__)
 
@@ -60,25 +59,36 @@ class MemoryManager:
     Args:
         memory_store: ThreadMemoryStore 实例（长期记忆 Store 封装）
         lock_pool: ThreadMemoryLockPool 实例（per-thread 并发锁）
-        llm_getter: 返回当前 LLMClient 的 callable（支持 LLM 热切换）
+        llm_getter: 返回当前 LLMClient 的 thread-aware async resolver（支持按会话
+            解析 provider/model，失败回落默认 LLM）
         recall_limit: 召回长期记忆时的默认条数上限
         buffer_delay_seconds: 防抖缓冲窗口（秒），透传给写中间件
         max_buffer_messages: 单 thread 缓冲区上限，透传给写中间件
+        read_middleware: 读中间件实例。由 MemoryContext 创建后注入以复用同一实例
+            （避免 manager 内部再自建造成双实例）；为 None 时内部自建，
+            供测试等无外部注入场景使用
+        agent_lock: agent 级跨进程互斥锁（保护 agent namespace 的写入/清空/压缩）。
+            由 MemoryContext 传入基于文件锁的实例以实现跨进程互斥；为 None 时
+            内部自建进程内锁 ``AgentMemoryLock(path=None)``，供测试使用
     """
 
     def __init__(
         self,
         memory_store: ThreadMemoryStore,
         lock_pool: ThreadMemoryLockPool,
-        llm_getter: Callable[[], Any],
+        llm_getter: ThreadLLMResolver,
         recall_limit: int = _DEFAULT_RECALL_LIMIT,
         buffer_delay_seconds: int | None = None,
         max_buffer_messages: int | None = None,
+        read_middleware: ThreadMemoryReadMiddleware | None = None,
+        agent_lock: AgentMemoryLock | None = None,
     ) -> None:
         self._store = memory_store
         self._lock_pool = lock_pool
         self._llm_getter = llm_getter
         self._recall_limit = recall_limit
+        # agent 级互斥锁：agent namespace 跨进程共享，写入/清空/压缩必须串行化
+        self._agent_lock = agent_lock if agent_lock is not None else AgentMemoryLock()
 
         # 写中间件：事件接收 + 防抖 + Fact 抽取流水线
         self._write_middleware = ThreadMemoryWriteMiddleware(
@@ -87,12 +97,16 @@ class MemoryManager:
             llm_getter=llm_getter,
             buffer_delay_seconds=buffer_delay_seconds,
             max_buffer_messages=max_buffer_messages,
+            agent_lock=self._agent_lock,
         )
 
         # 读中间件：awrap_model_call 时注入 thread facts 到 SystemMessage
-        # （recall_limit 约束每次注入的 fact 条数，与显式召回 recall() 一致）
-        self._read_middleware = ThreadMemoryReadMiddleware(
-            memory_store, recall_limit=recall_limit
+        # （recall_limit 约束每次注入的 fact 条数，与显式召回 recall() 一致）。
+        # 复用 MemoryContext 注入的实例，避免双实例导致配置分叉；未注入时自建。
+        self._read_middleware = (
+            read_middleware
+            if read_middleware is not None
+            else ThreadMemoryReadMiddleware(memory_store, recall_limit=recall_limit)
         )
 
     # ============ 属性暴露 ============
@@ -112,15 +126,21 @@ class MemoryManager:
         """写中间件实例（供 flush_all / shutdown 等生命周期管理使用）。"""
         return self._write_middleware
 
-    def bind_llm(self, llm_getter: Callable[[], Any]) -> None:
-        """运行时替换 LLM 获取器，并同步到写中间件（支持 provider 热切换）。
+    @property
+    def agent_lock(self) -> AgentMemoryLock:
+        """agent 级跨进程互斥锁（供测试与诊断观察持锁状态）。"""
+        return self._agent_lock
 
-        入口创建 Agent 后调用，将记忆组件（召回/压缩/事实抽取）的 LLM
-        来源动态绑定到 ``agent.llm``，确保切换提供商后记忆链路不再使用
-        启动时的旧 LLMClient。
+    def bind_llm(self, llm_getter: ThreadLLMResolver) -> None:
+        """运行时替换 LLM 解析器，并同步到写中间件（支持 provider 热切换）。
+
+        入口创建 Agent 后调用，把记忆组件（召回/压缩/事实抽取）的 LLM
+        来源替换为 thread-aware resolver：按 thread_id 解析该会话的
+        provider/model，无会话配置或解析失败时回落默认 LLM（``agent.llm``），
+        确保切换提供商后记忆链路不再使用启动时的旧 LLMClient。
 
         Args:
-            llm_getter: 返回当前 LLMClient 的 callable
+            llm_getter: 返回当前 LLMClient 的 thread-aware async resolver
         """
         self._llm_getter = llm_getter
         self._write_middleware.bind_llm(llm_getter)
@@ -189,9 +209,10 @@ class MemoryManager:
 
         读取 ``user_fact`` / ``lesson`` 类的 agent 级记忆，按 ``create_time``
         升序返回，截取最近 ``limit`` 条。与 thread 级 :meth:`recall` 不同，
-        agent 级记忆跨会话共享且无 thread 上下文，因此 **不进行 touch 更新**
-        （store 未提供 agent 级 touch 方法），LRU 淘汰依赖
-        :meth:`ThreadMemoryStore.prune_agent_facts`。
+        agent 级记忆跨会话共享且无 thread 上下文，此处不主动 touch 更新
+        ``last_used_at``——agent 级 LRU 依赖读中间件注入时的
+        :meth:`ThreadMemoryStore.touch_agent_fact` 与写流水线末尾的
+        :meth:`ThreadMemoryStore.prune_agent_facts` 共同维护。
 
         Args:
             limit: 返回条数上限（为 None 时使用构造时设定的 recall_limit）
@@ -241,10 +262,27 @@ class MemoryManager:
     async def clear_agent_facts(self) -> int:
         """清空 agent 级全部长期记忆。
 
+        执行顺序（关键，防"复活"）：
+
+        1. 先 ``flush_all()`` 把所有 thread 的防抖 buffer 写库——agent 级 facts
+           可能来自任意 thread 的 buffer，若先清空再 flush，在途事件会立即把
+           agent facts 写回；而丢弃全部 buffer 又会连带毁掉其它 thread 尚未
+           沉淀的 thread 级 facts，故只能先冲刷再清空。
+        2. 再持 agent 锁执行清空，与正在进行的写流水线（进程内 / 跨进程）串行化，
+           防止清空过程中有并发写入插入。
+
+        锁序约束：本方法只获取 agent 锁，绝不获取 per-thread 锁，避免与
+        ``ThreadMemoryWriteMiddleware._a_run_pipeline``（先 per-thread 锁、
+        后 agent 锁）形成反向加锁导致死锁。
+
         Returns:
             被清除的 fact 数量
         """
-        return await self._store.clear_agent_facts()
+        # 1. 先冲刷全部防抖 buffer，防止清空后被在途 flush 写回"复活"
+        await self._write_middleware.flush_all()
+        # 2. 持 agent 锁清空，与并发写流水线串行化
+        async with self._agent_lock:
+            return await self._store.clear_agent_facts()
 
     # ============ 事件消费（写） ============
 
@@ -290,17 +328,60 @@ class MemoryManager:
             return
 
         role = event.role or "assistant"
+        # 提取真实事件类型：TOOL_RESULT 走 tool_result（供失败计数/lesson 判定），
+        # DONE 走 message（模型最终输出）
+        evt_type = "tool_result" if event.event_type == EventType.TOOL_RESULT else "message"
+        tool_name = event.tool_name if event.event_type == EventType.TOOL_RESULT else ""
         try:
             await self._write_middleware.submit_event(
                 event.thread_id,
                 role,
                 event.content,
                 event.is_important,
+                event_type=evt_type,
+                tool_name=tool_name,
             )
         except Exception as error:
             logger.debug("事件记忆消费失败: %s", error)
 
     # ============ 压缩 & 清理 ============
+
+    async def _asummarize_facts_text(self, history_text: str, thread_id: str | None = None) -> str:
+        """调用 LLM 把 facts 文本压缩为摘要（thread / agent 两级共用）。
+
+        resolver 为异步接口，须在进入线程池前解析出 LLM；LLMClient 无异步
+        chat 接口，阻塞调用放入线程池（``asyncio.to_thread``），避免阻塞事件循环。
+
+        Args:
+            history_text: 已拼接好的 facts 历史文本
+            thread_id: 会话线程 ID；为 None 时回落默认 LLM（agent 级压缩）
+
+        Returns:
+            去除首尾空白后的摘要文本；LLM 调用失败时返回空字符串
+        """
+        system_prompt = (
+            "你是一个记忆压缩助手。请将以下历史对话记录压缩成一份简洁的摘要，要求：\n"
+            "1. 保留所有关键信息、用户意图、重要决策和事实\n"
+            "2. 去除重复和冗余内容\n"
+            "3. 按主题分条目组织，使用 '- ' 开头\n"
+            "4. 保持事实准确，不要添加推测内容\n"
+            "5. 用中文输出"
+        )
+
+        llm = await self._llm_getter(thread_id)
+
+        def _sync_summarize() -> str:
+            try:
+                return llm.chat(
+                    [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"以下是历史对话记录，请压缩成摘要:\n\n{history_text}"},
+                    ]
+                ).strip()
+            except Exception:
+                return ""
+
+        return await asyncio.to_thread(_sync_summarize)
 
     async def compress(self, thread_id: str) -> dict[str, Any]:
         """压缩指定会话的长期记忆：读取全部 facts，用 LLM 生成摘要后替换。
@@ -327,28 +408,7 @@ class MemoryManager:
         history_text = "\n\n".join(history_lines)
 
         # 2. 调用 LLM 生成摘要
-        system_prompt = (
-            "你是一个记忆压缩助手。请将以下历史对话记录压缩成一份简洁的摘要，要求：\n"
-            "1. 保留所有关键信息、用户意图、重要决策和事实\n"
-            "2. 去除重复和冗余内容\n"
-            "3. 按主题分条目组织，使用 '- ' 开头\n"
-            "4. 保持事实准确，不要添加推测内容\n"
-            "5. 用中文输出"
-        )
-
-        def _sync_summarize() -> str:
-            try:
-                llm = self._llm_getter()
-                return llm.chat(
-                    [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": f"以下是历史对话记录，请压缩成摘要:\n\n{history_text}"},
-                    ]
-                ).strip()
-            except Exception:
-                return ""
-
-        summary = await asyncio.to_thread(_sync_summarize)
+        summary = await self._asummarize_facts_text(history_text, thread_id)
         if not summary:
             return {"success": False, "error": "LLM 调用失败或返回空摘要"}
 
@@ -371,6 +431,59 @@ class MemoryManager:
             "compressed_chars": compressed_chars,
             "summary": summary,
         }
+
+    async def compress_agent(self) -> dict[str, Any]:
+        """压缩 agent 级（跨会话共享）长期记忆。
+
+        只作用于 agent namespace（``user_fact`` / ``lesson``），不影响 thread 级记忆；
+        压缩不可逆——原 facts 被删除并替换为单条摘要。
+
+        整个"读取 → 摘要 → 替换"序列在 agent 锁内执行，防止并发写入者在
+        压缩过程中插入新 fact，导致读到的快照与写回结果不一致而丢数据。
+        LLM 调用较慢但属罕见用户触发操作，允许持锁执行。
+
+        Returns:
+            ``{"success": bool, "original_count": int, "original_chars": int,
+            "compressed_chars": int, "summary": str}``；
+            无记忆或 LLM 失败时返回 ``{"success": False, "error": str}``
+        """
+        async with self._agent_lock:
+            facts = await self._store.query_agent_facts()
+            if not facts:
+                return {"success": False, "error": "没有 agent 级长期记忆可压缩"}
+
+            # 1. 拼接所有 facts 为文本
+            history_lines: list[str] = []
+            original_chars = 0
+            for idx, fact in enumerate(facts, 1):
+                line = f"[{idx}] ({fact.create_time}) [{fact.category}] {fact.content}"
+                history_lines.append(line)
+                original_chars += len(fact.content)
+            history_text = "\n\n".join(history_lines)
+
+            # 2. 调用 LLM 生成摘要
+            summary = await self._asummarize_facts_text(history_text, None)
+            if not summary:
+                return {"success": False, "error": "LLM 调用失败或返回空摘要"}
+
+            # 3. 用摘要替换全部 agent 级 facts
+            result = await self._store.replace_agent_facts_with_summary(summary)
+            compressed_chars = len(summary)
+
+            logger.info(
+                "agent 级记忆压缩: %d 条 → 1 条摘要 (%d → %d 字符)",
+                result["original_count"],
+                original_chars,
+                compressed_chars,
+            )
+
+            return {
+                "success": result["success"],
+                "original_count": result["original_count"],
+                "original_chars": original_chars,
+                "compressed_chars": compressed_chars,
+                "summary": summary,
+            }
 
     async def clear(self, thread_id: str, release_lock: bool = False) -> int:
         """清空指定会话的 thread 级长期记忆 facts（线程安全）。

@@ -134,7 +134,7 @@ def test_resume_structured_invokes_command_resume_with_same_thread_config():
             calls.append((command, config))
             return {"messages": [AIMessage(content="resumed")]} 
 
-        async def ainvoke(self, command, config):
+        async def ainvoke(self, command, config, context=None):
             calls.append((command, config))
             return {"messages": [AIMessage(content="resumed")]} 
 
@@ -285,7 +285,7 @@ def test_aresume_structured_resumes_with_interrupt_id_mapping():
             calls.append((command, config))
             return {"messages": [AIMessage(content="resumed")]}
 
-        async def ainvoke(self, command, config):
+        async def ainvoke(self, command, config, context=None):
             calls.append((command, config))
             return {"messages": [AIMessage(content="resumed")]}
 
@@ -674,7 +674,7 @@ def test_resume_after_switching_thread_proceeds_in_default_chat_mode():
                 return {"__interrupt__": [Interrupt(value={"kind": "human_choice"}, id="i-1")]}
             return {"messages": [AIMessage(content="should not resume")]} 
 
-        async def ainvoke(self, value, config):
+        async def ainvoke(self, value, config, context=None):
             self.calls += 1
             if self.calls == 1:
                 return {"__interrupt__": [Interrupt(value={"kind": "human_choice"}, id="i-1")]}
@@ -714,7 +714,7 @@ def test_interrupted_run_completes_after_resume():
                 return {"__interrupt__": [Interrupt(value={"kind": "human_choice"}, id="i-1")]}
             return {"messages": [AIMessage(content="approved result")]}
 
-        async def ainvoke(self, value, config):
+        async def ainvoke(self, value, config, context=None):
             self.calls += 1
             if self.calls == 1:
                 return {"__interrupt__": [Interrupt(value={"kind": "human_choice"}, id="i-1")]}

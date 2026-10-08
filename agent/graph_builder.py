@@ -20,9 +20,15 @@ from skmng.middleware import SkillInjectionMW
 from tools.tool_wrapper import wrap_tools_with_timeout
 
 from .compaction import LCAgentCompactionMiddleware, LCAgentState
+from .session_config_middleware import (
+    SessionConfigMW,
+    SessionModelFactory,
+    build_session_model_resolver,
+)
 from .terminal_retry_cap_mw import TerminalRetryCapMW
 from .tool_arg_validator_mw import ToolArgValidatorMW
 from .tool_error_mw import ToolExecutionErrorMW
+from .tool_retry_cap_mw import ToolRetryCapMW
 from .workspace_mw import WorkspaceSecurityMW
 
 logger = logging.getLogger(__name__)
@@ -49,14 +55,24 @@ class GraphBuilder:
         """
         chat_model = self.llm.get_chat_model()
 
+        factory = getattr(self, "_session_model_factory", None)
+        if factory is None:
+            factory = SessionModelFactory()
+            self._session_model_factory = factory
+
         # 静态系统提示词（技能注入由 SkillInjectionMW 在 model 调用时完成）
         system_prompt = self._get_system_prompt()
 
         # 压缩中间件：消息超阈值时自动增量摘要 + Prune 工具输出
         compaction_middleware = LCAgentCompactionMiddleware(
             model=chat_model,
+            model_resolver=build_session_model_resolver(factory, chat_model),
             config=self.compaction_config,
             on_compaction=self.metrics.record_compaction,
+        )
+        session_config_middleware = SessionConfigMW(
+            model_factory=factory.get,
+            default_model=chat_model,
         )
 
         # 技能注入中间件：从 state.active_skills 读取技能并注入 system prompt
@@ -80,6 +96,11 @@ class GraphBuilder:
         # 放在 middleware 列表最前 = 最外层，最先拦截，包住 tool_error_mw
         terminal_retry_middleware = TerminalRetryCapMW()
 
+        # 重复调用熔断中间件：读 state 统计「同一工具 + 同一参数」的历史失败次数，
+        # 达上限(2次)则拦截后续相同调用，阻止主模型在路径/参数/MCP 报错上原样重试
+        # （与 terminal_retry_middleware 互补：后者只管终端超时，本中间件管所有工具）
+        retry_cap_middleware = ToolRetryCapMW()
+
         # 工具错误纠错中间件：捕获工具执行异常 → 转 ToolMessage(status="error")，
         # 附加异常类型 + workspace 提示 + 反思指令，使 LLM 能读到报错并修正重试
         tool_error_middleware = ToolExecutionErrorMW()
@@ -94,7 +115,10 @@ class GraphBuilder:
             store=self._store,
             state_schema=LCAgentState,
             middleware=[
+                # 会话配置必须最外层，先覆盖模型和角色提示词，再由压缩与技能中间件叠加。
+                session_config_middleware,
                 terminal_retry_middleware,
+                retry_cap_middleware,
                 tool_error_middleware,
                 compaction_middleware,
                 skill_middleware,
@@ -118,7 +142,8 @@ class GraphBuilder:
         - MCP 工具列表变化（areload_mcp_tools 检测到工具签名不同）
         - LLM 切换（aswitch_llm，model 对象变化）
 
-        所有会话共享同一编译图，重建后对所有会话即时生效。
+        所有会话共享同一编译图，重建后对所有会话即时生效；会话级模型配置
+        通过中间件按请求解析，不通过 ``aswitch_llm`` 注入。
 
         注意：调用方必须已持有 _state_lock（此方法不再自行加锁，
         避免在 areload_mcp_tools 内部调用时死锁）。
@@ -136,7 +161,7 @@ class GraphBuilder:
 
     async def aswitch_llm(self, llm_client: LLMClient):
         """
-        异步切换LLM提供商
+        异步切换全局默认 LLM（遗留路径）。图仍是共享的，会话级配置通过中间件流入。
 
         使用 _state_lock 保护共享状态。
 
@@ -145,4 +170,14 @@ class GraphBuilder:
         """
         async with self._state_lock:
             self.llm = llm_client
+            from session.config import SessionConfig
+
+            self.session.set_default_session_config(
+                SessionConfig(
+                    provider=llm_client.provider,
+                    model=llm_client.model,
+                    max_iterations=self.max_iterations,
+                )
+            )
+            logger.warning("aswitch_llm 仅影响新会话，已有会话继续使用各自配置")
             await self._arebuild_agent_executor()

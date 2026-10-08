@@ -29,6 +29,7 @@ from typing import Any
 
 from memory.manager import MemoryManager
 
+from .config import SessionConfig, SessionConfigPatch
 from .registry import SessionRegistry
 
 logger = logging.getLogger(__name__)
@@ -300,6 +301,24 @@ class SessionManager:
         """切换到指定会话。"""
         return await self.session.aswitch_session(session_id)
 
+    async def aget_session_config(
+        self, thread_id: str | None = None
+    ) -> SessionConfig | None:
+        """在目标会话锁内读取会话配置。"""
+        tid = self._resolve_thread_id(thread_id)
+        lock = await self._get_thread_lock(tid)
+        async with lock:
+            return await self.session.aget_session_config(tid)
+
+    async def aupdate_session_config(
+        self, patch: SessionConfigPatch, thread_id: str | None = None
+    ) -> SessionConfig:
+        """在目标会话锁内更新会话配置。"""
+        tid = self._resolve_thread_id(thread_id)
+        lock = await self._get_thread_lock(tid)
+        async with lock:
+            return await self.session.aupdate_session_config(tid, patch)
+
     async def adelete_session(self, session_id: str) -> bool:
         """删除会话。
 
@@ -356,12 +375,30 @@ class SessionManager:
         sid = self.current_session_id
         return await self._memory.compress(sid)
 
+    async def acompress_agent_memory(self) -> dict[str, Any]:
+        """压缩 agent 级（跨会话共享）长期记忆。"""
+        if self._memory is None:
+            return {"success": False, "error": "MemoryManager 未初始化"}
+        return await self._memory.compress_agent()
+
     async def aclear_long_term_memory(self, session_id: str | None = None) -> int:
         """清空长期记忆。"""
         if self._memory is None:
             return 0
         sid = self._resolve_thread_id(session_id)
         return await self._memory.clear(sid)
+
+    async def aclear_agent_memory(self) -> int:
+        """清空 agent 级（跨会话共享）长期记忆（user_fact / lesson）。"""
+        if self._memory is None:
+            return 0
+        return await self._memory.clear_agent_facts()
+
+    async def arecall_agent_memory(self, limit: int | None = None) -> str:
+        """召回 agent 级长期记忆并格式化为文本片段。"""
+        if self._memory is None:
+            return ""
+        return await self._memory.recall_agent_text(limit)
 
     # ============ 执行历史 ============
 

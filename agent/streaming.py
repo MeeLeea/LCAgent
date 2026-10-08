@@ -16,9 +16,10 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langgraph.errors import GraphBubbleUp
 
 from llm.llm_client import RETRY_ATTEMPTS, RETRY_MAX_DELAY, should_retry
-from llm.message_utils import extract_llm_error, stringify_content
+from llm.message_utils import extract_llm_error, final_answer_is_empty, stringify_content
 from tools.terminal_tools import UserRejectedCommandError
 from utils.events import AgentEvent
 from utils.logging_config import TraceContext, generate_trace_id
@@ -43,6 +44,7 @@ class Streaming:
         thread_id: str,
         trace_id: str,
         collected_output: list[str] | None = None,
+        final_ai: list[AIMessage] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """内部方法：直接消费 LangGraph astream_events，映射为 AgentEvent。
 
@@ -55,6 +57,8 @@ class Streaming:
             thread_id: 会话线程 ID（写入事件）
             trace_id: 追踪 ID
             collected_output: 可选列表，收集 TOKEN 文本用于最终 DONE 事件
+            final_ai: 可选列表（长度 1），记录最后一次 on_chat_model_end 的
+                      AIMessage，供调用方检测最终回答是否为空
         """
         graph = self.agent_executor
         recorded_msg_ids: set[str] = set()
@@ -86,6 +90,11 @@ class Streaming:
                         async for _ev in graph.astream_events(
                             input_or_command,
                             config=config,
+                            # 会话配置注入通道：config["configurable"] 只喂给
+                            # checkpointer，不会进入 runtime.context（ModelRequest.runtime
+                            # 是 Runtime，无 config 属性）。必须用 context= 显式传同一份
+                            # 数据，SessionConfigMW 才能读到 session_config / thread_id。
+                            context=config,
                             version="v2",
                         ):
                             await _q.put(_ev)
@@ -102,11 +111,20 @@ class Streaming:
                             timeout=HEARTBEAT_INTERVAL,
                         )
                     except TimeoutError:
-                        # 工具执行期间长时间无事件：发心跳重置前端 watchdog
-                        for _tc_id in active_tool_call_ids.values():
-                            yield AgentEvent.tool_running(
-                                tool_call_id=_tc_id,
-                                name=active_tool_names.get(_tc_id, ""),
+                        # 长时间无事件：发心跳重置前端 watchdog。
+                        # 工具执行期间发 tool_running（携带工具名）；LLM 静默期（无活跃工具）
+                        # 也必须发 heartbeat，否则前端 90s watchdog 会早于 langchain 的
+                        # stream_chunk_timeout 误报"响应超时"。
+                        if active_tool_call_ids:
+                            for _tc_id in active_tool_call_ids.values():
+                                yield AgentEvent.tool_running(
+                                    tool_call_id=_tc_id,
+                                    name=active_tool_names.get(_tc_id, ""),
+                                    thread_id=thread_id,
+                                    trace_id=trace_id,
+                                )
+                        else:
+                            yield AgentEvent.heartbeat(
                                 thread_id=thread_id,
                                 trace_id=trace_id,
                             )
@@ -206,6 +224,18 @@ class Streaming:
                         # handle_tool_error 逃逸到 on_tool_error 事件。此处增强错误信息，
                         # 加入异常类型名 + 修正提示，让 LLM 即使在异常逃逸时也能自愈。
                         error_obj = data_dict.get("error")
+                        if isinstance(error_obj, GraphBubbleUp):
+                            # 中断/父命令传播类控制流信号（危险命令确认、ask_human 等）
+                            # 不是工具失败：LangGraph 以 interrupt 状态暂停图，用户交互
+                            # 由 INTERRUPT 事件通道承载。绝不能转成 [工具执行失败]
+                            # TOOL_RESULT——否则前端工具卡片误显示失败，且记忆流水线会把
+                            # HITL 确认计为工具失败、累积成跨会话"经验教训"（历史 bug）。
+                            # 仅清理 run_id 映射，不发任何内容事件。
+                            run_id = ev.get("run_id", "")
+                            tc_id = active_tool_call_ids.pop(run_id, "")
+                            if tc_id:
+                                active_tool_names.pop(tc_id, None)
+                            continue
                         if error_obj is not None:
                             exc_type = type(error_obj).__name__
                             exc_msg = str(error_obj).strip() or "无详细信息"
@@ -256,6 +286,12 @@ class Streaming:
                                     provider=getattr(llm, "provider", ""),
                                     model=getattr(llm, "model", "") or "",
                                 )
+                            # 记录最终 AIMessage：调用方在流结束后据此检测
+                            # 空回答（reasoning token 耗尽 / finish_reason=length）
+                            if final_ai is not None:
+                                # 覆写为最新（也是最终）AIMessage；用切片赋值兼容空/已占位列表，
+                                # 杜绝 `list assignment index out of range`（历史回归，见 test_empty_response_guard）
+                                final_ai[:] = [output]
                             # 提前发出 TOOL_CALL：LLM 回复完成时 tool_calls 已确定，
                             # 无需等待 LangGraph 路由到工具节点（on_tool_start），
                             # 前端可更早显示工具名 + "执行中"
@@ -363,9 +399,10 @@ class Streaming:
 
         with TraceContext(trace_id=trace_id, thread_id=tid):
             logger.info("arun_events: %s", message[:100])
-            config = self._invoke_config(thread_id)
+            config = await self._ainvoke_config(thread_id)
             input_msg = HumanMessage(content=message)
             collected_output: list[str] = []
+            _ai_holder: list[AIMessage] = []
 
             with self._temp_verbose(False):
                 async for ev in self._arun_graph_events(
@@ -374,6 +411,7 @@ class Streaming:
                     tid,
                     trace_id,
                     collected_output,
+                    final_ai=_ai_holder,
                 ):
                     if ev.is_terminal:
                         # ERROR / CANCELLED → 记录 interrupt 状态后返回
@@ -388,6 +426,14 @@ class Streaming:
             if interrupt_ev is not None:
                 await self._acapture_pending_interrupt(config, "chat" if not is_run_mode else "run")
                 yield interrupt_ev
+                return
+
+            # 空最终回答检测：reasoning token 耗尽 / finish_reason=length 时
+            # 模型可能返回空 AIMessage，静默 yield 空 DONE 会让前端显示空白。
+            # 发 ERROR 事件明确提示原因，而非静默空白（interrupt/cancelled 优先）。
+            _reason = final_answer_is_empty(_ai_holder[0]) if _ai_holder else None
+            if _reason:
+                yield AgentEvent.error(_reason, thread_id=tid, trace_id=trace_id)
                 return
 
             # 正常完成：清理中断状态，yield DONE
@@ -425,7 +471,7 @@ class Streaming:
 
         with TraceContext(trace_id=trace_id, thread_id=tid):
             logger.info("aresume_events: thread=%s", tid)
-            config = self._invoke_config(thread_id)
+            config = await self._ainvoke_config(thread_id)
 
             # 从 SessionStore 读取 per-session 中断模式
             mode = await self._get_store().aget_interrupt_mode(tid)
@@ -433,6 +479,7 @@ class Streaming:
                 mode = "chat"
 
             collected_output: list[str] = []
+            _ai_holder: list[AIMessage] = []
 
             resume_command = await self._abuild_resume_command(config, payload)
 
@@ -443,6 +490,7 @@ class Streaming:
                     tid,
                     trace_id,
                     collected_output,
+                    final_ai=_ai_holder,
                 ):
                     if ev.is_terminal:
                         if ev.event_type.value == "cancelled":
@@ -456,6 +504,14 @@ class Streaming:
             if interrupt_ev is not None:
                 await self._acapture_pending_interrupt(config, mode)
                 yield interrupt_ev
+                return
+
+            # 空最终回答检测：reasoning token 耗尽 / finish_reason=length 时
+            # 模型可能返回空 AIMessage，发 ERROR 明确提示而非静默空白
+            # （interrupt/cancelled 优先）。
+            _reason = final_answer_is_empty(_ai_holder[0]) if _ai_holder else None
+            if _reason:
+                yield AgentEvent.error(_reason, thread_id=tid, trace_id=trace_id)
                 return
 
             # 正常完成

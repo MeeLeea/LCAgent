@@ -9,6 +9,7 @@
 import pytest
 
 from skmng.core import build_skill_block, inject_into_prompt
+from skmng.injector import SkillInjector
 from skmng.manager import SkillManager
 
 
@@ -30,6 +31,13 @@ def _make_skill_manager(tmp_path) -> SkillManager:
         encoding="utf-8",
     )
     return SkillManager(str(skills_root))
+
+
+def _make_injector(tmp_path) -> SkillInjector:
+    """构造指向测试技能目录的 SkillInjector(复用 _make_skill_manager 的目录结构)"""
+    _make_skill_manager(tmp_path)
+    return SkillInjector(skills_dir=str(tmp_path / "skills"))
+
 
 
 def test_build_skill_block_auto_match_only(tmp_path):
@@ -136,6 +144,48 @@ def test_inject_into_prompt_skip_when_already_injected():
     prompt_with_block = f"计划\n\n{block}"
     # 再次注入应原样返回(不重复追加)
     assert inject_into_prompt(prompt_with_block, block) == prompt_with_block
+
+
+# ──────────────────────────────────────────────
+# SkillInjector: fixed_skills 透传 + exclude_skills 节点级 opt-out
+# ──────────────────────────────────────────────
+
+
+def test_injector_inject_into_prompt_with_fixed_skills(tmp_path):
+    """SkillInjector 透传 fixed_skills:任务不命中关键词也注入(角色级固定依赖)
+
+    回归保护:injector 曾硬编码 fixed_skills=(),使角色的 fixed_skills 永远
+    到不了 skmng.core.build_skill_block;此测试锁定 fixed_skills 参数贯通。
+    """
+    injector = _make_injector(tmp_path)
+    # 任务不含 Vivado 关键词,纯自动匹配不会命中 vivado
+    assert "vivado-2025.2" not in injector.inject_into_prompt(
+        "执行验证", "验证 RTL 功能"
+    )
+    # fixed_skills 传入时,vivado 始终注入
+    prompt = injector.inject_into_prompt(
+        "执行验证", "验证 RTL 功能", fixed_skills=("vivado-2025.2",)
+    )
+    assert "vivado-2025.2" in prompt
+    assert "创建工程 TCL" in prompt
+
+
+def test_injector_fixed_skills_removed_by_exclude_skills(tmp_path):
+    """exclude_skills 在三来源合并后过滤:节点可 opt-out 角色的 fixed_skills
+
+    这是 verification_check_node 的契约:角色的 fixed_skills 仍传入,但该节点
+    经 exclude_skills=("vivado-2025.2",) 显式剔除(与 Xsim sim_filelist.f 流程冲突)。
+    """
+    injector = _make_injector(tmp_path)
+    prompt = injector.inject_into_prompt(
+        "执行验证",
+        "验证 RTL 功能",
+        fixed_skills=("vivado-2025.2",),
+        exclude_skills=("vivado-2025.2",),
+    )
+    assert "vivado-2025.2" not in prompt
+    # 三来源被排除后为空,原 prompt 原样返回
+    assert prompt == "执行验证"
 
 
 if __name__ == "__main__":

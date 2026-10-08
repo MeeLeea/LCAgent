@@ -18,6 +18,7 @@ from .scheduler_tool import (
     schedule_task,
 )
 from .search import search
+from .search_file_content import search_file_content
 from .terminal_tools import run_cmd, run_python, run_shell
 
 # 导出所有本地工具供Agent使用
@@ -39,6 +40,7 @@ all_tools = [
     cleanup_finished_tasks,
     ask_human,
     request_user_confirmation,
+    search_file_content,
 ]
 
 __all__ = [
@@ -60,4 +62,5 @@ __all__ = [
     'run_shell',
     'schedule_task',
     'search',
+    'search_file_content',
 ]

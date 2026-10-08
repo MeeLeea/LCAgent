@@ -45,6 +45,8 @@ class TeamAgent:
     # LLM 采样参数默认值(子类可通过类属性或 __init__ 参数覆盖)
     temperature: float = 0.7
     max_tokens: int = 2048
+    # 流式响应 chunk 间隔超时(秒):显式替代 langchain-openai 默认 120s
+    stream_chunk_timeout: float = 300.0
 
     # 工作流节点提示词的默认模板(子类覆盖;仅 AGENT.md 缺失或未定义小节时兜底)
     default_templates: ClassVar[dict[str, str]] = {}
@@ -66,6 +68,7 @@ class TeamAgent:
         config_file: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        stream_chunk_timeout: float | None = None,
         tool_timeout: float | None = None,
         prompt_file: str | None = None,
         skills_dir: str | None = None,
@@ -86,6 +89,8 @@ class TeamAgent:
             config_file: LLM 配置文件路径(默认 config/llm_config.json)
             temperature: LLM 采样温度,不传则用类属性默认值
             max_tokens: LLM 最大生成 token 数,不传则用类属性默认值
+            stream_chunk_timeout: LLM 流式响应 chunk 间隔超时(秒),不传(None)时
+                回退类属性默认值(300.0),显式替代 langchain-openai 默认 120s
             tool_timeout: 工具执行超时秒数(0 或 None 时使用 tools.tool_wrapper 的
                 默认超时策略:全局 60 秒 + 工具级覆盖如 ask_human 600 秒)
             prompt_file: 角色 AGENT.md 路径,同时提供系统提示词与工作流节点提示词模板
@@ -100,6 +105,11 @@ class TeamAgent:
         # 参数优先,否则回退到类属性默认值
         self.temperature = temperature if temperature is not None else self.temperature
         self.max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+        self.stream_chunk_timeout = (
+            stream_chunk_timeout
+            if stream_chunk_timeout is not None
+            else self.stream_chunk_timeout
+        )
         # 工具超时:0 或 None 视为未配置,由 wrap_tools_with_timeout 落默认策略
         self.tool_timeout = (
             tool_timeout if tool_timeout is not None and tool_timeout > 0 else None
@@ -114,6 +124,7 @@ class TeamAgent:
             config_file=config_file,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
+            stream_chunk_timeout=self.stream_chunk_timeout,
         )
         self.name = name
         self.prompt_file = prompt_file
@@ -242,17 +253,22 @@ class TeamAgent:
         self,
         task: str,
         active_names: Sequence[str] = (),
+        exclude_skills: Sequence[str] = (),
+        fixed_skills: Sequence[str] | None = None,
     ) -> str:
         """根据任务匹配技能并渲染指引块(内建技能注入能力)
 
         转发 skmng.core.build_skill_block 实现三来源合并:
-        - fixed_skills(self 类属性,角色级固定依赖)
+        - fixed_skills(self 类属性,角色级固定依赖;显式传入时以传入值为准)
         - active_names(由节点函数从 state["active_skills"] 取值传入)
         - match_skills(auto_match_skills 开启时按任务文本自动匹配)
 
         Args:
             task: 用户任务描述(用于技能匹配)
             active_names: 手动加载的技能名(由节点函数从 state 取值传入)
+            exclude_skills: 需排除的技能名(在三来源合并后统一剔除)
+            fixed_skills: 角色级固定依赖技能名;None 时回退 self.fixed_skills
+                (保持类属性默认来源),显式传入时以传入值为准
 
         Returns:
             技能指引块文本;未命中任何技能或未开启自动匹配时返回空串
@@ -261,8 +277,11 @@ class TeamAgent:
             self.skill_manager,
             task,
             active_names=tuple(active_names),
-            fixed_skills=tuple(self.fixed_skills),
+            fixed_skills=(
+                tuple(self.fixed_skills) if fixed_skills is None else tuple(fixed_skills)
+            ),
             auto_match=self.auto_match_skills,
+            exclude_skills=tuple(exclude_skills),
         )
 
     def inject_into_prompt(
@@ -270,6 +289,8 @@ class TeamAgent:
         prompt: str,
         task: str,
         active_names: Sequence[str] = (),
+        exclude_skills: Sequence[str] = (),
+        fixed_skills: Sequence[str] | None = None,
     ) -> str:
         """将技能指引块追加到 prompt 末尾(已含 skill 块时跳过)
 
@@ -280,11 +301,13 @@ class TeamAgent:
             prompt: 渲染后的节点提示词
             task: 用户任务描述
             active_names: 手动加载的技能名(由节点函数从 state 取值传入)
+            exclude_skills: 需排除的技能名(在三来源合并后统一剔除)
+            fixed_skills: 角色级固定依赖技能名;None 时回退 self.fixed_skills
 
         Returns:
             注入技能指引块后的提示词
         """
-        block = self.build_skill_block(task, active_names)
+        block = self.build_skill_block(task, active_names, exclude_skills, fixed_skills)
         return _inject_into_prompt(prompt, block)
     
     @property
@@ -309,6 +332,7 @@ class TeamAgent:
         # 且 agent_core 早已在顶层导入该模块,此处只是保险)
         from agent.terminal_retry_cap_mw import TerminalRetryCapMW
         from agent.tool_error_mw import ToolExecutionErrorMW
+        from agent.tool_retry_cap_mw import ToolRetryCapMW
         from agent.workspace_mw import WorkspaceSecurityMW
         from tools.tool_wrapper import wrap_tools_with_timeout
 
@@ -321,14 +345,20 @@ class TeamAgent:
             self.tools, getattr(self, "tool_timeout", None)
         )
 
-        # 中间件链:终端超时重试上限(达3次超时则拦截) + 工具错误纠错
+        # 中间件链:终端超时重试上限(达3次超时则拦截) + 重复调用熔断
+        # (同一工具同一参数失败达2次则拦截) + 工具错误纠错
         # (异常 → ToolMessage(status="error") + 反思指令) + 工作空间安全
         # (路径解析 + 逃逸校验),使工作流内工具调用同样受 workspace 隔离约束
         self.agent_executor = create_agent(
             model=chat_model,
             tools=wrapped_tools,
             system_prompt=self.system_prompt,
-            middleware=[TerminalRetryCapMW(), ToolExecutionErrorMW(), WorkspaceSecurityMW()],
+            middleware=[
+                TerminalRetryCapMW(),
+                ToolRetryCapMW(),
+                ToolExecutionErrorMW(),
+                WorkspaceSecurityMW(),
+            ],
             checkpointer=getattr(self, "_checkpointer", None),
         )
     

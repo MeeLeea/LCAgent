@@ -1,5 +1,4 @@
 import asyncio
-import logging
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -49,7 +48,7 @@ def test_compaction_retains_recent_messages_in_new_thread_state():
 
     core = object.__new__(AgentCore)
     core.memory = FakeMemory()
-    core.max_context_messages = 5
+    core.max_context_tokens = 5
     core.context_trim_keep = 2
     core.verbose = False
     core.agent_executor = FakeExecutor()
@@ -62,7 +61,7 @@ def test_compaction_retains_recent_messages_in_new_thread_state():
             return SimpleNamespace(text="summary")
 
     core._compaction_middleware = LCAgentCompactionMiddleware(
-        FakeModel(), CompactionConfig(max_messages=5, keep_recent=2)
+        FakeModel(), CompactionConfig(max_context_tokens=5, keep_recent=2)
     )
 
     # 提供 fake session（manually_compact 通过 self.session.aget_messages 读取消息）
@@ -120,7 +119,7 @@ def test_compaction_does_not_change_thread_when_summary_fails():
 
     core = object.__new__(AgentCore)
     core.memory = FakeMemory()
-    core.max_context_messages = 5
+    core.max_context_tokens = 5
     core.context_trim_keep = 2
     core.verbose = False
     core.agent_executor = FakeExecutor()
@@ -132,7 +131,7 @@ def test_compaction_does_not_change_thread_when_summary_fails():
             raise RuntimeError("LLM 不可用")
 
     core._compaction_middleware = LCAgentCompactionMiddleware(
-        FailingModel(), CompactionConfig(max_messages=5, keep_recent=2)
+        FailingModel(), CompactionConfig(max_context_tokens=5, keep_recent=2)
     )
 
     # 提供 fake session（manually_compact 通过 self.session.aget_messages 读取消息）
@@ -232,7 +231,6 @@ def test_clear_history_resets_tool_call_dedupe_state():
 def test_arun_stops_after_user_rejects_command(monkeypatch):
     # Given: 图执行期间终端工具收到用户拒绝信号。
     from agent.agent_core import AgentCore
-
     from tools.terminal_tools import run_shell
 
     monkeypatch.setattr("tools.terminal_tools.confirm", lambda prompt: False)
@@ -245,7 +243,7 @@ def test_arun_stops_after_user_rejects_command(monkeypatch):
             self.calls += 1
             return run_shell.invoke({"command": "python cleanup.py"})
 
-        async def ainvoke(self, value, config):
+        async def ainvoke(self, value, config, context=None):
             self.calls += 1
             return run_shell.invoke({"command": "python cleanup.py"})
 
@@ -281,7 +279,7 @@ def test_aresume_stops_after_user_rejects_command():
         def invoke(self, value, config):
             raise UserRejectedCommandError("python cleanup.py")
 
-        async def ainvoke(self, value, config):
+        async def ainvoke(self, value, config, context=None):
             raise UserRejectedCommandError("python cleanup.py")
 
         def get_state(self, config):
@@ -330,7 +328,7 @@ def test_arun_repairs_checkpoint_after_user_rejects_command():
         def invoke(self, value, config):
             raise UserRejectedCommandError("python cleanup.py")
 
-        async def ainvoke(self, value, config):
+        async def ainvoke(self, value, config, context=None):
             raise UserRejectedCommandError("python cleanup.py")
 
         def get_state(self, config):
@@ -516,7 +514,7 @@ class _FakeToolExecutor:
     def __init__(self, events):
         self.events = events
 
-    async def astream_events(self, inputs, config=None, version=None):
+    async def astream_events(self, inputs, config=None, version=None, context=None):
         for e in self.events:
             yield e
 

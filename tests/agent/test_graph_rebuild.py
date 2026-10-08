@@ -25,7 +25,7 @@ def _make_minimal_core():
     core.agent_core_prompt = "base prompt"
     core.auto_match_skills = False
     core._state_lock = asyncio.Lock()
-    core.compaction_config = CompactionConfig(max_messages=999, keep_recent=10)
+    core.compaction_config = CompactionConfig(max_context_tokens=999999, keep_recent=10)
     return core
 
 
@@ -52,7 +52,7 @@ class FakeExecutor:
         self.invoke_calls += 1
         return {"messages": [AIMessage(content="done")]}
 
-    async def ainvoke(self, value, config):
+    async def ainvoke(self, value, config, context=None):
         self.invoke_calls += 1
         return {"messages": [AIMessage(content="done")]}
 

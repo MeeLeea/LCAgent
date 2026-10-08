@@ -14,7 +14,7 @@ Agent核心调度模块 - 基于LangChain 1.x + LangGraph
 - turn_types.py      AgentTurnResult（避免 mixin 反向导入 agent_core）
 - tool_error_mw.py   工具错误纠错中间件 ToolExecutionErrorMW
 - workspace_mw.py    工作空间安全中间件 WorkspaceSecurityMW
-- role_sw.py         团队角色切换
+- role_sw.py         团队角色目录发现（可用角色扫描 / 角色目录定位）
 """
 from __future__ import annotations
 
@@ -73,7 +73,7 @@ class AgentCore(
         enable_mcp: bool,
         skills_dir: str | None,
         auto_match_skills: bool,
-        max_context_messages: int,
+        max_context_tokens: int,
         context_trim_keep: int,
         process_type: str | None,
         agent_prompt_file: str | None,
@@ -90,8 +90,7 @@ class AgentCore(
         self.llm = llm_client
         self.max_iterations = max_iterations
         self.verbose = verbose
-        self.max_context_messages = max_context_messages
-        self.context_trim_keep = context_trim_keep
+        self.max_context_tokens = max_context_tokens
         self.tool_timeout = tool_timeout if tool_timeout > 0 else None
         self._short_term_size = short_term_size
         self._closed = False
@@ -99,7 +98,7 @@ class AgentCore(
         # 压缩配置：before_model 中间件自动触发 + manually_compact 手动触发
         # summary 存入 LangGraph state（随 checkpoint 持久化），天然 per-thread 隔离
         self.compaction_config = CompactionConfig.from_kwargs(
-            max_context_messages=max_context_messages,
+            max_context_tokens=max_context_tokens,
             context_trim_keep=context_trim_keep,
         )
 
@@ -147,7 +146,7 @@ class AgentCore(
         self._session_manager = None
         self._memory_manager: Any = None
         self._session_store: SessionStore | None = SessionStore(
-            max_history=max_execution_history
+            backend=store, max_history=max_execution_history
         )
 
         # LangGraph 原语（由入口程序 / MemoryContext 注入）
@@ -174,7 +173,7 @@ class AgentCore(
         enable_mcp: bool = True,
         skills_dir: str | None = None,
         auto_match_skills: bool = True,
-        max_context_messages: int = 0,
+        max_context_tokens: int = 0,
         context_trim_keep: int = 12,
         process_type: str | None = None,
         agent_prompt_file: str | None = None,
@@ -198,12 +197,13 @@ class AgentCore(
             enable_mcp: 是否启用 MCP 工具加载
             skills_dir: 技能目录路径
             auto_match_skills: 任务开始时是否自动匹配注入技能
-            max_context_messages: 长上下文裁剪阈值(0=关闭);超过则自动摘要并开新会话
-            context_trim_keep: 裁剪时保留的最近消息条数
+            max_context_tokens: 长上下文压缩触发的预估 token 阈值(0=关闭自动触发)
+            context_trim_keep: 压缩时保留的最近消息条数
             process_type: 进程类型标识(server/scheduler/feishu)，用于多进程隔离
             agent_prompt_file: Agent核心提示词文件路径(为 None 时使用配置默认值)
             max_execution_history: 执行历史最大条数(防止内存泄漏)
-            tool_timeout: 工具执行默认超时秒数(0=禁用超时)
+            tool_timeout: 工具执行默认超时秒数(0=使用默认超时策略，按工具名覆盖，全局默认60s)。
+                          注释与 tools/config.py 的 DEFAULT_TIMEOUT/TOOL_TIMEOUTS 行为一致
             short_term_size: 短期上下文窗口消息条数（对应配置键 latest_msg_cnt，
                              传给 SessionRegistry.aget_short_term 兜底）
             checkpointer: LangGraph checkpointer 原语（由入口程序 / MemoryContext 注入）
@@ -221,7 +221,7 @@ class AgentCore(
             enable_mcp=enable_mcp,
             skills_dir=skills_dir,
             auto_match_skills=auto_match_skills,
-            max_context_messages=max_context_messages,
+            max_context_tokens=max_context_tokens,
             context_trim_keep=context_trim_keep,
             process_type=process_type,
             agent_prompt_file=agent_prompt_file,
@@ -252,7 +252,7 @@ class AgentCore(
         enable_mcp: bool = True,
         skills_dir: str | None = None,
         auto_match_skills: bool = True,
-        max_context_messages: int = 0,
+        max_context_tokens: int = 0,
         context_trim_keep: int = 12,
         process_type: str | None = None,
         agent_prompt_file: str | None = None,
@@ -276,7 +276,7 @@ class AgentCore(
             enable_mcp=enable_mcp,
             skills_dir=skills_dir,
             auto_match_skills=auto_match_skills,
-            max_context_messages=max_context_messages,
+            max_context_tokens=max_context_tokens,
             context_trim_keep=context_trim_keep,
             process_type=process_type,
             agent_prompt_file=agent_prompt_file,
@@ -331,6 +331,21 @@ class AgentCore(
             "configurable": {"thread_id": sid},
             "recursion_limit": getattr(self, "max_iterations", 25),
         }
+
+    async def _ainvoke_config(self, thread_id: str | None = None) -> dict[str, Any]:
+        """构建带会话配置快照的 LangGraph 调用 config。
+
+        每轮只从 SessionRegistry 读取一次 immutable 配置；没有会话配置时严格
+        回退到同步兼容路径，避免影响 object.__new__ 测试实例和旧调用方。
+        """
+        reg = getattr(self, "_session_registry", None)
+        sid = self._current_sid(thread_id)
+        if reg is None:
+            return self._invoke_config(sid)
+        context = await reg.aget_context(sid)
+        if context.session_config is None:
+            return self._invoke_config(sid)
+        return context.config
 
     def _thread_id_from_config(self, config: dict[str, Any]) -> str | None:
         configurable = config.get("configurable")

@@ -17,6 +17,7 @@ def _invoke_with_tools_dir(
     args: dict[str, str | bool | None],
 ) -> dict[str, object]:
     monkeypatch.setattr(create_tool_module, "DEFAULT_TOOL_DIR", str(tmp_path))
+    monkeypatch.setattr(create_tool_module, "DEFAULT_TEST_DIR", str(tmp_path / "tests" / "tools"))
     return create_tool.invoke(args)
 
 

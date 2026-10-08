@@ -11,10 +11,7 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from dataclasses import dataclass, field
-
-from langgraph.graph import END
 
 from agent.turn_types import AgentTurnResult
 from graph.rtl_graph import (
@@ -41,7 +38,7 @@ from graph.rtl_graph import (
 )
 from team.base import TeamAgent
 
-# 默认模板(与各角色类的 default_templates 一致,供 FakeRTLAgent.get_template 兜底)
+# 默认模板(与各角色 AGENT.md 的 ## workflow:* 小节一致,供 FakeRTLAgent.get_template 兜底)
 DEFAULT_TEMPLATES: dict[str, str] = {
     "summarize_context": "你是一个工作流上下文提炼助手。",
     "architect_plan": "请为以下芯片架构设计任务制定详细的执行计划:\n\n{task}\n\n",
@@ -333,7 +330,8 @@ def test_build_rtl_graph_workflow_conditional_edges():
     edges = {(e.source, e.target) for e in graph.get_graph().edges}
     assert ("designer_file_check", "verification_check") in edges
     assert ("designer_file_check", "designer_verilog") in edges
-    assert ("sim_exec_check", "__end__") in edges
+    assert ("sim_exec_check", "designer_output") in edges
+    assert ("designer_output", "__end__") in edges
     assert ("sim_exec_check", "designer_verilog") in edges
 
 
@@ -415,7 +413,7 @@ def test_run_rtl_graph_pass_once(tmp_path, monkeypatch):
     assert result["design_spec"] == "module uart;"
     assert result["verification_plan"] == "验证结论: PASS\nRTL 无问题"
     assert result["verification_report"] == "验证结论: PASS\nRTL 无问题"
-    # 仿真通过 → sim_check_passed 为 True(路由据此进入 END)
+    # 仿真通过 → sim_check_passed 为 True(路由据此进入 designer_output 交付)
     assert result["sim_check_passed"] is True
 
     designer_calls = [c[0] for c in designer.calls]
@@ -607,17 +605,17 @@ def test_coverage_inclusion_ok_no_syn(tmp_path):
 
 
 def test_route_after_file_check():
-    """designer_file_check 路由:通过→verification_check;失败未达上限→回环;达上限→END。"""
+    """designer_file_check 路由:通过→verification_check;失败未达上限→回环;达上限→designer_output。"""
     assert route_after_file_check({"file_check_passed": True, "round": 1, "max_rounds": 3}) == "verification_check"
     assert route_after_file_check({"file_check_passed": False, "round": 1, "max_rounds": 3}) == "designer_verilog"
-    assert route_after_file_check({"file_check_passed": False, "round": 3, "max_rounds": 3}) == END
+    assert route_after_file_check({"file_check_passed": False, "round": 3, "max_rounds": 3}) == "designer_output"
 
 
 def test_route_after_sim_check():
-    """sim_exec_check 路由:通过→END;失败未达上限→回环;达上限→END。"""
-    assert route_after_sim_check({"sim_check_passed": True, "round": 1, "max_rounds": 3}) == END
+    """sim_exec_check 路由:通过→designer_output;失败未达上限→回环;达上限→designer_output。"""
+    assert route_after_sim_check({"sim_check_passed": True, "round": 1, "max_rounds": 3}) == "designer_output"
     assert route_after_sim_check({"sim_check_passed": False, "round": 1, "max_rounds": 3}) == "designer_verilog"
-    assert route_after_sim_check({"sim_check_passed": False, "round": 3, "max_rounds": 3}) == END
+    assert route_after_sim_check({"sim_check_passed": False, "round": 3, "max_rounds": 3}) == "designer_output"
 
 
 async def _run_file_check(state, workspace):
@@ -672,7 +670,7 @@ async def _run_sim_check(workspace, monkeypatch, rc=0):
         return _FakeProc(rc)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake)
-    return await sim_exec_check_node(dict(), agent, config=config)
+    return await sim_exec_check_node({}, agent, config=config)
 
 
 def test_sim_exec_check_node_pass(tmp_path, monkeypatch):

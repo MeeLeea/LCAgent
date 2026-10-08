@@ -8,7 +8,8 @@
 - touch_fact 更新 last_used_at
 - clear_thread_memory 全量清理
 - replace_with_summary 压缩摘要替换
-- per-thread 隔离
+- replace_agent_facts_with_summary agent 级摘要替换
+- per-thread 隔离 / agent_key 跨 store 共享与隔离
 """
 from __future__ import annotations
 
@@ -329,16 +330,16 @@ class TestAgentScope:
     """agent 级 facts 测试：跨会话共享 / 写路由 / 读聚合 / 隔离 / LRU / touch。"""
 
     def test_save_and_query_agent_facts(self):
-        """save_agent_fact → query_agent_facts 可读回；thread_id 被强制设为 "default"。"""
+        """save_agent_fact → query_agent_facts 可读回；thread_id 被强制设为 agent_key。"""
         async def run():
-            store = ThreadMemoryStore()  # process_type=None → _agent_key="default"
+            store = ThreadMemoryStore()  # agent_key 默认 "global"
             item = _make_fact("跨会话偏好", "user_fact")
             await store.save_agent_fact(item)
 
             facts = await store.query_agent_facts()
             assert len(facts) == 1
             assert facts[0].content == "跨会话偏好"
-            assert facts[0].thread_id == "default"
+            assert facts[0].thread_id == "global"
 
         asyncio.run(run())
 
@@ -378,8 +379,8 @@ class TestAgentScope:
             facts = await store.query_agent_facts()
             contents = {f.content for f in facts}
             assert contents == {"agent-0", "agent-1", "agent-2"}
-            # thread_id 被统一设为 agent_key="default"
-            assert all(f.thread_id == "default" for f in facts)
+            # thread_id 被统一设为 agent_key="global"
+            assert all(f.thread_id == "global" for f in facts)
 
         asyncio.run(run())
 
@@ -446,10 +447,10 @@ class TestAgentScope:
 
         asyncio.run(run())
 
-    def test_agent_key_uses_process_type(self):
-        """process_type="server" 时 agent namespace 的 _agent_key="server"。"""
+    def test_agent_key_uses_explicit_value(self):
+        """agent_key="server" 时 agent namespace 的 _agent_key="server"。"""
         async def run():
-            store = ThreadMemoryStore(process_type="server")
+            store = ThreadMemoryStore(agent_key="server")
             # 直接验证 namespace 构造
             ns = store._facts_namespace("", scope="agent")
             assert ns == ("server", "global_facts")
@@ -470,13 +471,100 @@ class TestAgentScope:
             store = ThreadMemoryStore(backend=backend)
             # thread "t1" 的视角写入 agent fact
             await store.save_agent_fact(_make_fact("shared-fact", "user_fact"))
-            # 同 backend、不同 process_type 的 store 读不到（隔离）
-            store_other = ThreadMemoryStore(backend=backend, process_type="other")
+            # 同 backend、不同 agent_key 的 store 读不到（隔离）
+            store_other = ThreadMemoryStore(backend=backend, agent_key="other")
             assert await store_other.query_agent_facts() == []
-            # 同 backend、同 process_type 的 store 可读（共享）
-            store_same = ThreadMemoryStore(backend=backend)  # process_type=None → "default"
+            # 同 backend、同 agent_key 的 store 可读（共享）
+            store_same = ThreadMemoryStore(backend=backend)  # agent_key 默认 "global"
             facts = await store_same.query_agent_facts()
             assert len(facts) == 1
             assert facts[0].content == "shared-fact"
 
         asyncio.run(run())
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  agent 级摘要替换 & agent_key 跨 store 共享
+# ════════════════════════════════════════════════════════════════════════
+
+
+def test_replace_agent_facts_with_summary_replaces_all():
+    """3 条 agent facts（user_fact/lesson 混合）→ 单条摘要，scope 与 thread_id 正确。"""
+    async def run():
+        store = ThreadMemoryStore()
+        items = [
+            _make_fact("偏好-1", "user_fact"),
+            _make_fact("教训-1", "lesson"),
+            _make_fact("偏好-2", "user_fact"),
+        ]
+        for item in items:
+            item.scope = "agent"
+        await store.save_agent_facts_batch(items)
+        assert await store.count_agent_facts() == 3
+
+        result = await store.replace_agent_facts_with_summary("这是 agent 摘要")
+        assert result["success"] is True
+        assert result["original_count"] == 3
+        assert result["summary"] == "这是 agent 摘要"
+
+        facts = await store.query_agent_facts()
+        assert len(facts) == 1
+        assert facts[0].content.startswith("[历史记忆摘要]")
+        assert facts[0].scope == "agent"
+        assert facts[0].thread_id == store.agent_key
+
+    asyncio.run(run())
+
+
+def test_replace_agent_facts_with_summary_does_not_touch_thread_facts():
+    """agent 摘要替换不影响 thread 级 facts（数量与内容不变）。"""
+    async def run():
+        store = ThreadMemoryStore()
+        thread_items = [_make_fact(f"thread-{i}", "conv") for i in range(2)]
+        await store.save_facts_batch("t1", thread_items)
+        agent_items = [_make_fact(f"agent-{i}", "user_fact") for i in range(2)]
+        await store.save_agent_facts_batch(agent_items)
+
+        await store.replace_agent_facts_with_summary("agent 摘要")
+
+        thread_facts = await store.query_facts("t1")
+        assert len(thread_facts) == 2
+        assert {f.content for f in thread_facts} == {"thread-0", "thread-1"}
+
+    asyncio.run(run())
+
+
+def test_replace_agent_facts_with_summary_empty_namespace():
+    """无 agent facts 时仍写入单条摘要（镜像 thread 级行为）。"""
+    async def run():
+        store = ThreadMemoryStore()
+        result = await store.replace_agent_facts_with_summary("空摘要")
+        assert result["success"] is True
+        assert result["original_count"] == 0
+
+        facts = await store.query_agent_facts()
+        assert len(facts) == 1
+        assert facts[0].content.startswith("[历史记忆摘要]")
+        assert facts[0].scope == "agent"
+
+    asyncio.run(run())
+
+
+def test_agent_facts_visible_across_stores_with_same_agent_key():
+    """同 backend + 同 agent_key 的两个 store（模拟两进程）共享可见；不同 agent_key 隔离。"""
+    async def run():
+        backend = InMemoryStore()
+        store_a = ThreadMemoryStore(backend=backend, agent_key="global")
+        store_b = ThreadMemoryStore(backend=backend, agent_key="global")
+        store_c = ThreadMemoryStore(backend=backend, agent_key="isolated")
+
+        item = _make_fact("跨进程事实", "user_fact")
+        item.scope = "agent"
+        await store_a.save_agent_facts_batch([item])
+
+        facts_b = await store_b.query_agent_facts()
+        assert len(facts_b) == 1
+        assert facts_b[0].content == "跨进程事实"
+        assert await store_c.query_agent_facts() == []
+
+    asyncio.run(run())

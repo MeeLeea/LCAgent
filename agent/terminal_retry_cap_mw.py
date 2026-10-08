@@ -4,15 +4,16 @@
 - terminal_tools.py 超时后返回富结果（含 error_type:"timeout" + timeout_reason
   + partial_stdout），ReAct 主模型读到后自行判断超时原因并修改命令重试
   （每次重试是模型新发的 tool_call，新 id，事件干净，无 dedup 问题）。
-- 本中间件只做硬性 cap：读 request.state["messages"]，统计当前会话状态里
-  exec 工具（run_shell/run_python/run_cmd）的超时次数，达 MAX_TIMEOUT_RETRIES(3)
-  则拦截，返回最终失败 ToolMessage(status="error")，阻止主模型再次重试。
+- 本中间件只做硬性 cap：读 request.state["messages"]，统计「同一工具连续超时」
+  的次数（被该工具任意非超时结果重置为 0，且按工具分别计数），达
+  MAX_TIMEOUT_RETRIES(3) 则拦截，返回最终失败 ToolMessage(status="error")，
+  阻止主模型再次重试。
 
 设计要点：
 - 无状态中间件（与 WorkspaceSecurityMW 一致），所有会话共享同一编译图，
   隔离由 request.state（per-thread checkpoint）保证。
-- 读 state.messages 计数历史超时，不嵌入 LLM 调用（主模型本身就是 LLM，
-  在 ReAct 循环里读富结果反思重试即可，无需冗余的中间件内 LLM 调用）。
+- 读 state.messages 计数「同一工具的连续超时」，不嵌入 LLM 调用（主模型本身
+  就是 LLM，在 ReAct 循环里读富结果反思重试即可，无需冗余的中间件内 LLM 调用）。
 - 放行时正常 await handler，让工具执行 + ToolExecutionErrorMW 正常工作。
 - 拦截时返回 ToolMessage(status="error")，告知主模型已达上限停止重试。
 - 与 WorkspaceSecurityMW 互补：workspace 负责 cwd/路径逃逸，本中间件负责
@@ -37,8 +38,8 @@ _EXEC_TOOLS: frozenset[str] = frozenset({
     "run_cmd",
 })
 
-# 同一会话状态内 exec 工具超时的最大允许累计次数（含已发生的）
-# 达到此值后拦截后续 exec 工具调用，阻止主模型无限重试超时命令
+# 同一工具连续超时的最大允许次数（含已发生的）
+# 被该工具任意非超时结果重置为 0；达到此值后拦截该工具后续调用
 MAX_TIMEOUT_RETRIES: int = 3
 
 
@@ -63,10 +64,12 @@ def is_timeout_content(content: Any) -> bool:
 class TerminalRetryCapMW(AgentMiddleware):
     """终端命令超时重试上限中间件。
 
-    拦截 run_shell/run_python/run_cmd 的工具调用，在读 state 统计历史超时
-    次数达上限时直接返回失败 ToolMessage，阻止主模型无限重试超时命令。
-    未达上限时正常放行，让主模型在 ReAct 循环中读富结果自行反思修改命令重试
-    （方案 B，不嵌入独立 LLM 调用，主模型本身就是 LLM）。
+    拦截 run_shell/run_python/run_cmd 的工具调用，在读 state 统计「同一工具
+    连续超时」次数达上限时直接返回失败 ToolMessage，阻止主模型无限重试超时命令。
+    连续超时由该工具任意非超时结果重置为 0，且按工具分别计数（run_shell 的
+    超时不会影响 run_python/run_cmd）。未达上限时正常放行，让主模型在 ReAct
+    循环中读富结果自行反思修改命令重试（方案 B，不嵌入独立 LLM 调用，主模型
+    本身就是 LLM）。
     """
 
     def wrap_tool_call(
@@ -79,10 +82,10 @@ class TerminalRetryCapMW(AgentMiddleware):
         if tool_name not in _EXEC_TOOLS:
             return handler(request)
 
-        timeout_count = self._count_prior_timeouts(request.state)
+        timeout_count = self._count_consecutive_timeouts(request.state, tool_name)
         if timeout_count >= MAX_TIMEOUT_RETRIES:
             logger.warning(
-                "终端命令超时重试已达上限(%d/%d)，拦截工具 %s 的执行",
+                "终端命令连续超时已达上限(%d/%d)，拦截工具 %s 的执行",
                 timeout_count, MAX_TIMEOUT_RETRIES, tool_name,
             )
             return self._build_cap_message(request, timeout_count)
@@ -99,10 +102,10 @@ class TerminalRetryCapMW(AgentMiddleware):
         if tool_name not in _EXEC_TOOLS:
             return await handler(request)
 
-        timeout_count = self._count_prior_timeouts(request.state)
+        timeout_count = self._count_consecutive_timeouts(request.state, tool_name)
         if timeout_count >= MAX_TIMEOUT_RETRIES:
             logger.warning(
-                "终端命令超时重试已达上限(%d/%d)，拦截工具 %s 的执行",
+                "终端命令连续超时已达上限(%d/%d)，拦截工具 %s 的执行",
                 timeout_count, MAX_TIMEOUT_RETRIES, tool_name,
             )
             return self._build_cap_message(request, timeout_count)
@@ -110,14 +113,19 @@ class TerminalRetryCapMW(AgentMiddleware):
         return await handler(request)
 
     @staticmethod
-    def _count_prior_timeouts(state: Any) -> int:
-        """统计当前会话状态 messages 里 exec 工具的超时累计次数。
+    def _count_consecutive_timeouts(state: Any, tool_name: str) -> int:
+        """统计当前会话状态 messages 里「指定工具」的连续超时次数（streak）。
+
+        从旧到新遍历消息，只考虑 name == tool_name 的 ToolMessage：
+        超时则 streak + 1，非超时则 streak 重置为 0（中间穿插的其他工具消息
+        不影响 streak）。返回最终连续超时次数（不含本次尚未执行的工具调用）。
 
         Args:
             state: request.state（dict/list/BaseModel，LangGraph 注入的当前状态快照）
+            tool_name: 本次调用的工具名
 
         Returns:
-            exec 工具超时的累计次数（不含本次尚未执行的工具调用）
+            该工具在历史末尾的连续超时次数；state 不可提取时返回 0
         """
         if state is None:
             return 0
@@ -129,16 +137,18 @@ class TerminalRetryCapMW(AgentMiddleware):
         else:
             messages = getattr(state, "messages", [])
 
-        count = 0
+        streak = 0
         for msg in messages:
-            # 只统计 ToolMessage（AIMessage/UserMessage 不是工具结果）
+            # 只统计本次工具的 ToolMessage（其他工具/其他消息类型不参与）
             if not isinstance(msg, ToolMessage):
                 continue
-            if getattr(msg, "name", "") not in _EXEC_TOOLS:
+            if getattr(msg, "name", "") != tool_name:
                 continue
             if is_timeout_content(getattr(msg, "content", "")):
-                count += 1
-        return count
+                streak += 1
+            else:
+                streak = 0
+        return streak
 
     @staticmethod
     def _build_cap_message(request: ToolCallRequest, timeout_count: int) -> ToolMessage:

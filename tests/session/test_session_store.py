@@ -8,6 +8,7 @@ import asyncio
 from langgraph.checkpoint.memory import MemorySaver
 
 from session import (
+    SessionConfig,
     SessionContext,
     SessionRegistry,
     SessionStore,
@@ -98,16 +99,34 @@ def test_delete_session_clears_all_state():
         await store.aappend_history("s1", {"step": 1})
         await store.aadd_recorded_call_ids("s1", {"call-x"})
         await store.aset_interrupt_mode("s1", "run")
+        await store.aset_session_config("s1", SessionConfig(provider="p1"))
         await store.adelete_session("s1")
         h = await store.aget_history("s1")
         ids = await store.aget_recorded_call_ids("s1")
         m = await store.aget_interrupt_mode("s1")
-        return h, ids, m
+        config = await store.aget_session_config("s1")
+        return h, ids, m, config
 
-    h, ids, m = asyncio.run(run())
+    h, ids, m, config = asyncio.run(run())
     assert h == []
     assert ids == set()
     assert m is None
+    assert config is None
+
+
+def test_session_config_namespace_isolated_from_history_and_interrupts():
+    store = SessionStore()
+
+    async def run():
+        config = SessionConfig(provider="provider-a", model="model-a")
+        await store.aset_session_config("s1", config)
+        await store.aappend_history("s1", {"step": 1})
+        await store.aset_interrupt_mode("s1", "run")
+        await store.aclear_history("s1")
+        await store.aclear_interrupt("s1")
+        return await store.aget_session_config("s1")
+
+    assert asyncio.run(run()) == SessionConfig(provider="provider-a", model="model-a")
 
 
 def test_empty_session_returns_defaults():
@@ -205,7 +224,7 @@ def test_registry_alist_sessions_includes_current_for_memory():
 # SessionRegistry: 并发会话隔离（无状态化核心验证）
 # --------------------------------------------------------------------------- #
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from langchain_core.messages import AIMessage, HumanMessage
 
@@ -221,7 +240,7 @@ def _put_checkpoint(cp, thread_id, messages):
     checkpoint = {
         "v": 1,
         "id": str(uuid.uuid4()),
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": datetime.now(UTC).isoformat(),
         "channel_values": {"messages": messages},
         "channel_versions": versions,
         "versions_seen": {},

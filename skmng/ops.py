@@ -80,8 +80,8 @@ class SkillOps:
         不依赖 LangGraph 中间件上下文。
 
         Args:
-            force: 为 True 时跳过 max_messages 阈值检查,允许在消息数
-                   未超阈值时强制压缩(仍需消息数 > keep_recent 才能安全切割)。
+            force: 为 True 时跳过 max_context_tokens 阈值检查,允许在预估
+                   token 未超阈值时强制压缩(仍需消息数 > keep_recent 才能安全切割)。
             thread_id: 目标会话线程 ID(为 None 时使用当前会话)
 
         Returns:

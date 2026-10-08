@@ -29,17 +29,23 @@ __all__ = [
 """
 
 
+def _patch_dirs(monkeypatch, tool_dir: str, test_dir: str) -> None:
+    """重定向工具目录与测试目录，避免污染真实 tools/ 与 tests/tools/。"""
+    monkeypatch.setattr(create_tool_module, "DEFAULT_TOOL_DIR", tool_dir)
+    monkeypatch.setattr(create_tool_module, "DEFAULT_TEST_DIR", test_dir)
+
+
 def _invoke_with_tools_dir(
     monkeypatch,
     tmp_path,
     args: dict[str, str | bool | None],
 ) -> dict[str, object]:
-    monkeypatch.setattr(create_tool_module, "DEFAULT_TOOL_DIR", str(tmp_path))
+    _patch_dirs(monkeypatch, str(tmp_path), str(tmp_path / "tests" / "tools"))
     return create_tool.invoke(args)
 
 
 def test_create_tool_default_path_saves_to_tools_dir(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(create_tool_module, "DEFAULT_TOOL_DIR", str(tmp_path))
+    _patch_dirs(monkeypatch, str(tmp_path), str(tmp_path / "tests" / "tools"))
     result = create_tool.invoke(VALID_ARGS)
 
     assert result["success"] is True
@@ -187,7 +193,7 @@ def test_nested_logic_keeps_relative_indent(monkeypatch, tmp_path) -> None:
 def test_create_tool_registers_in_tools_init(monkeypatch, tmp_path) -> None:
     init_path = tmp_path / "__init__.py"
     init_path.write_text(INIT_STUB, encoding="utf-8")
-    monkeypatch.setattr(create_tool_module, "DEFAULT_TOOL_DIR", str(tmp_path))
+    _patch_dirs(monkeypatch, str(tmp_path), str(tmp_path / "tests" / "tools"))
 
     result = create_tool.invoke({**VALID_ARGS, "tool_path": str(tmp_path)})
 
@@ -202,7 +208,7 @@ def test_create_tool_registers_in_tools_init(monkeypatch, tmp_path) -> None:
 def test_create_tool_register_is_idempotent(monkeypatch, tmp_path) -> None:
     init_path = tmp_path / "__init__.py"
     init_path.write_text(INIT_STUB, encoding="utf-8")
-    monkeypatch.setattr(create_tool_module, "DEFAULT_TOOL_DIR", str(tmp_path))
+    _patch_dirs(monkeypatch, str(tmp_path), str(tmp_path / "tests" / "tools"))
 
     first = create_tool.invoke({**VALID_ARGS, "tool_path": str(tmp_path)})
     second = create_tool.invoke({**VALID_ARGS, "tool_path": str(tmp_path)})
@@ -237,7 +243,7 @@ def test_full_pipeline_registers_and_imports(monkeypatch, tmp_path) -> None:
     )
     md_file = pkg / "sample.md"
     md_file.write_text("hello", encoding="utf-8")
-    monkeypatch.setattr(create_tool_module, "DEFAULT_TOOL_DIR", str(pkg))
+    _patch_dirs(monkeypatch, str(pkg), str(tmp_path / "tests" / "tools"))
     monkeypatch.syspath_prepend(str(tmp_path))
 
     result = create_tool.invoke({**VALID_ARGS, "tool_path": str(pkg)})

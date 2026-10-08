@@ -7,6 +7,8 @@ AgentCore 产生 ``AgentEvent`` 事件流 → SessionManager 和 MemoryManager
 - TOKEN: LLM 文本增量
 - TOOL_CALL: 工具调用开始
 - TOOL_RESULT: 工具执行结果
+- TOOL_RUNNING: 工具执行期心跳（长耗时工具执行期间定期发出，重置前端 watchdog）
+- HEARTBEAT: LLM 静默期心跳（无活跃工具时事件队列长时间静默发出，重置前端 watchdog）
 - INTERRUPT: 被 ask_human / 危险命令确认中断
 - CANCELLED: 用户拒绝执行危险命令
 - ERROR: 执行异常
@@ -45,6 +47,14 @@ class EventType(str, Enum):
 
     TOOL_RUNNING = "tool_running"
     """工具执行中心跳（长耗时工具执行期间定期发出，重置前端 watchdog）"""
+
+    HEARTBEAT = "heartbeat"
+    """LLM 静默期心跳（无活跃工具时事件队列静默期发出，重置前端 watchdog）。
+
+    区别于 TOOL_RUNNING（工具执行期心跳）：TOOL_RUNNING 仅在长耗时工具执行期间
+    发出并携带工具信息；HEARTBEAT 在 LLM 流静默且无活跃工具时发出，纯占位保活，
+    不携带任何工具信息，前端仅用于重置 watchdog。
+    """
 
     INTERRUPT = "interrupt"
     """被 ask_human / 危险命令确认中断"""
@@ -212,6 +222,25 @@ class AgentEvent:
             event_type=EventType.TOOL_RUNNING,
             tool_call_id=tool_call_id,
             tool_name=name,
+            thread_id=thread_id,
+            trace_id=trace_id,
+        )
+
+    @classmethod
+    def heartbeat(
+        cls,
+        *,
+        thread_id: str = "",
+        trace_id: str = "",
+    ) -> AgentEvent:
+        """创建 LLM 静默期心跳事件。
+
+        LLM 流长时间无事件（且无活跃工具）时定期发出，纯保活事件，
+        供前端重置 watchdog 防止误触发响应超时。
+        不携带任何工具信息，不渲染 UI、不沉淀记忆、不是终止事件。
+        """
+        return cls(
+            event_type=EventType.HEARTBEAT,
             thread_id=thread_id,
             trace_id=trace_id,
         )
@@ -389,6 +418,8 @@ class AgentEvent:
         - token: {"type": "token", "content": str}
         - tool_call: {"type": "tool_call", "id", "name", "args"}
         - tool_result: {"type": "tool_result", "id", "name", "content"}
+        - tool_running: {"type": "tool_running", "id", "name"}
+        - heartbeat: {"type": "heartbeat"}（LLM 静默期保活，仅重置前端 watchdog）
         - interrupt: {"type": "interrupt", "prompt", "choices"}；当携带分组
           待确认项时附带 "items" 键（仅 user_confirmation 类中断）
         - cancelled: {"type": "cancelled", "content"}
@@ -420,6 +451,8 @@ class AgentEvent:
                 "id": self.tool_call_id,
                 "name": self.tool_name,
             }
+        elif self.event_type == EventType.HEARTBEAT:
+            return {"type": "heartbeat"}
         elif self.event_type == EventType.INTERRUPT:
             return make_interrupt_dict(
                 self.interrupt_prompt,

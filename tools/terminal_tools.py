@@ -14,7 +14,7 @@ from typing import Any
 from langchain_core.tools import tool
 from langgraph.errors import GraphInterrupt
 
-from .config import DEFAULT_TIMEOUT, MAX_OUTPUT_CHARS
+from .config import MAX_OUTPUT_CHARS, soft_timeout_for
 from .safety import check_command, check_exec, confirm
 
 # 超时后 ctrl+c 软中断的 grace period（秒）：给子进程时间刷出缓冲输出并清理
@@ -254,7 +254,11 @@ def _guard_exec(file_path: str) -> dict[str, Any] | None:
 
 
 @tool
-def run_shell(command: str, cwd: str | None = None, timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
+def run_shell(
+    command: str,
+    cwd: str | None = None,
+    timeout: float = soft_timeout_for("run_shell"),
+) -> dict[str, Any]:
     """
     运行 Shell 命令（跨平台）。
     在 Windows 上使用 PowerShell，在 Linux/Mac 上使用 bash/sh。
@@ -272,7 +276,9 @@ def run_shell(command: str, cwd: str | None = None, timeout: float = DEFAULT_TIM
     Args:
         command: shell 命令字符串，如 "dir" / "ls -la" / "Get-ChildItem"
         cwd: 工作目录（绝对路径），默认为当前目录
-        timeout: 超时时间（秒），默认 60 秒
+        timeout: 内层软超时（秒），默认 590 秒（外层包装器硬超时 600s - 安全余量 10s）。
+            超过后先发 ctrl+c 软中断、等 grace period 收集缓冲输出，再强杀进程树，
+            返回含 timeout_reason / partial_stdout / partial_stderr 的富超时结果供自纠。
 
     Returns:
         包含执行结果的字典：success, returncode, stdout, stderr, command, cwd
@@ -343,7 +349,12 @@ def run_shell(command: str, cwd: str | None = None, timeout: float = DEFAULT_TIM
 
 
 @tool
-def run_python(file_path: str, script_args: str = "", cwd: str | None = None, timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
+def run_python(
+    file_path: str,
+    script_args: str = "",
+    cwd: str | None = None,
+    timeout: float = soft_timeout_for("run_python"),
+) -> dict[str, Any]:
     """
     运行 Python 脚本文件（.py）。
     使用当前 Python 解释器执行，可传递命令行参数。
@@ -352,7 +363,9 @@ def run_python(file_path: str, script_args: str = "", cwd: str | None = None, ti
         file_path: Python 脚本路径（相对或绝对），如 "tools/demo.py"
         script_args: 传给脚本的命令行参数字符串，如 "--name test --count 3"，默认为空
         cwd: 工作目录（绝对路径），默认为当前目录
-        timeout: 超时时间（秒），默认 60 秒
+        timeout: 内层软超时（秒），默认 50 秒（外层包装器硬超时 60s - 安全余量 10s）。
+            超过后先发 ctrl+c 软中断、等 grace period 收集缓冲输出，再强杀进程树，
+            返回含 timeout_reason / partial_stdout / partial_stderr 的富超时结果供自纠。
 
     Returns:
         包含执行结果的字典：success, returncode, stdout, stderr, file_path, script_args
@@ -428,7 +441,12 @@ def run_python(file_path: str, script_args: str = "", cwd: str | None = None, ti
 
 
 @tool
-def run_cmd(file_path: str, script_args: str = "", cwd: str | None = None, timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
+def run_cmd(
+    file_path: str,
+    script_args: str = "",
+    cwd: str | None = None,
+    timeout: float = soft_timeout_for("run_cmd"),
+) -> dict[str, Any]:
     """
     运行 CMD/PowerShell 脚本文件（.bat / .cmd / .ps1）。
     自动根据扩展名选择解释器：
@@ -439,7 +457,9 @@ def run_cmd(file_path: str, script_args: str = "", cwd: str | None = None, timeo
         file_path: 脚本路径（相对或绝对），如 "build.ps1" / "deploy.bat"
         script_args: 传给脚本的参数字符串，如 "Release x64"，默认为空
         cwd: 工作目录（绝对路径），默认为当前目录
-        timeout: 超时时间（秒），默认 60 秒
+        timeout: 内层软超时（秒），默认 50 秒（外层包装器硬超时 60s - 安全余量 10s）。
+            超过后先发 ctrl+c 软中断、等 grace period 收集缓冲输出，再强杀进程树，
+            返回含 timeout_reason / partial_stdout / partial_stderr 的富超时结果供自纠。
 
     Returns:
         包含执行结果的字典：success, returncode, stdout, stderr, file_path, script_args, script_type

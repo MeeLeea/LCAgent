@@ -10,17 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
-from unittest.mock import MagicMock
+from typing import Any, Self
+from unittest.mock import MagicMock, patch
 
 from memory.lock_pool import ThreadMemoryLockPool
 from memory.middleware import (
-    MEMORY_BUFFER_DELAY_SECONDS,
-    MAX_BUFFER_MESSAGE_COUNT,
     ThreadMemoryReadMiddleware,
     ThreadMemoryWriteMiddleware,
+    default_thread_llm_resolver,
 )
-from memory.models import MemoryCategory, ThreadFactItem
+from memory.models import ThreadFactItem
 from memory.store import ThreadMemoryStore
 
 
@@ -33,6 +32,9 @@ def _make_write_middleware(
     lock_pool = ThreadMemoryLockPool()
     if llm_getter is None:
         llm_getter = lambda: None
+    # 新契约：写中间件接收 thread-aware 异步解析器，helper 统一把零参 getter
+    # 适配为 ThreadLLMResolver，保持既有调用点 `llm_getter=lambda: llm` 不变。
+    llm_getter = default_thread_llm_resolver(llm_getter)
     mw = ThreadMemoryWriteMiddleware(
         memory_store=store,
         lock_pool=lock_pool,
@@ -115,7 +117,7 @@ class TestBufferTruncation:
 
             assert len(mw._buffer["t1"]) == 3
             # 保留最后 3 条
-            contents = [c for _, c, _ in mw._buffer["t1"]]
+            contents = [c for _, c, _, _, _ in mw._buffer["t1"]]
             assert contents == ["msg-2", "msg-3", "msg-4"]
 
         asyncio.run(run())
@@ -288,25 +290,40 @@ class _FakeRuntime:
 
 
 class _FakeModelRequest:
-    """最小化 ModelRequest 替身：override() 返回携带真实 SystemMessage 的新实例。"""
+    """最小化 ModelRequest 替身：override() 返回携带新字段的新实例。
 
-    def __init__(self, context, system_message=None):
+    记忆/技能块现注入到 ``messages`` 末尾（尾随 user 消息），不再改
+    ``system_message``，故 override 需同时支持两个字段。
+    """
+
+    def __init__(self, context, system_message=None, messages=None):
         self.runtime = _FakeRuntime(context)
         self.system_message = system_message
+        self.messages = list(messages) if messages is not None else []
 
-    def override(self, system_message=None):
-        return _FakeModelRequest(self.runtime.context, system_message=system_message)
+    def override(self, system_message=None, messages=None):
+        return _FakeModelRequest(
+            self.runtime.context,
+            system_message=system_message,
+            messages=messages,
+        )
 
 
-def _sys_content_text(system_message) -> str:
-    """从 SystemMessage 提取纯文本（content 可能为 text block 列表）。"""
-    content = system_message.content
+def _sys_content_text(message) -> str:
+    """从消息提取纯文本（content 可能为 text block 列表）。"""
+    content = message.content
     if isinstance(content, list):
         return "".join(
             str(block.get("text", "")) if isinstance(block, dict) else str(block)
             for block in content
         )
     return str(content)
+
+
+def _last_message_text(request) -> str:
+    """取 ``request.messages`` 末尾消息的文本（记忆块注入目标）。"""
+    assert request.messages, "request.messages 为空：记忆块未注入"
+    return _sys_content_text(request.messages[-1])
 
 
 class TestReadMiddleware:
@@ -338,17 +355,13 @@ class TestReadMiddleware:
         assert "unknown" in text
 
     def test_awrap_model_call_injects_facts(self):
-        """验证 awrap_model_call 将 facts 注入 SystemMessage。"""
+        """验证 awrap_model_call 把 facts 注入为尾随 user 消息。"""
         async def run():
             store = ThreadMemoryStore()
             await store.save_fact("t1", ThreadFactItem(content="injected fact", category="user_fact"))
             mw = ThreadMemoryReadMiddleware(store)
 
-            # 构建最小化 ModelRequest mock
-            request = MagicMock()
-            request.runtime.context = {"configurable": {"thread_id": "t1"}}
-            request.system_message = None  # 无 system message
-
+            request = _FakeModelRequest(context={"configurable": {"thread_id": "t1"}})
             captured_request = []
 
             async def handler(req):
@@ -358,8 +371,9 @@ class TestReadMiddleware:
             result = await mw.awrap_model_call(request, handler)
             assert result == "result"
             assert len(captured_request) == 1
-            # 验证 new_request 有 system_message
-            assert captured_request[0].system_message is not None
+            # system_message 未被改动；facts 作为尾随 user 消息注入
+            assert captured_request[0].system_message is None
+            assert "injected fact" in _last_message_text(captured_request[0])
 
         asyncio.run(run())
 
@@ -422,7 +436,7 @@ class TestReadMiddleware:
             result = await mw.awrap_model_call(request, handler)
             assert result == "ok"
             assert len(captured) == 1
-            text = _sys_content_text(captured[0].system_message)
+            text = _last_message_text(captured[0])
             assert "fact-1" in text and "fact-2" in text
             assert "fact-0" not in text
 
@@ -452,7 +466,7 @@ class TestReadMiddleware:
                 return "ok"
 
             await mw.awrap_model_call(request, handler)
-            text = _sys_content_text(captured[0].system_message)
+            text = _last_message_text(captured[0])
             assert "fact-0" in text and "fact-1" in text and "fact-2" in text
 
         asyncio.run(run())
@@ -513,11 +527,24 @@ class TestLockPool:
 
 
 class TestConfigConstants:
-    def test_default_buffer_delay(self):
-        assert MEMORY_BUFFER_DELAY_SECONDS == 20
+    """中间件默认值来自 memory/config.py（单一来源，避免分叉常量）。"""
 
-    def test_default_max_buffer_messages(self):
-        assert MAX_BUFFER_MESSAGE_COUNT == 30
+    def test_default_values_come_from_config(self):
+        from memory.config import (
+            MEMORY_BUFFER_DELAY_SECONDS,
+            MEMORY_MAX_BUFFER_MESSAGES,
+        )
+
+        store = ThreadMemoryStore()
+        lock_pool = ThreadMemoryLockPool()
+        mw = ThreadMemoryWriteMiddleware(
+            memory_store=store,
+            lock_pool=lock_pool,
+            llm_getter=default_thread_llm_resolver(lambda: None),
+        )
+        # 未显式传参时，中间件默认值应取自 config.py 的唯一来源
+        assert mw._buffer_delay_seconds == MEMORY_BUFFER_DELAY_SECONDS
+        assert mw._max_buffer_messages == MEMORY_MAX_BUFFER_MESSAGES
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -620,7 +647,7 @@ class TestAgentScopeRouting:
                 return "ok"
 
             await mw.awrap_model_call(request, handler)
-            text = _sys_content_text(captured[0].system_message)
+            text = _last_message_text(captured[0])
             assert "agent-fact-shared" in text
             assert "thread-fact-local" in text
 
@@ -649,7 +676,7 @@ class TestAgentScopeRouting:
                 return "ok"
 
             await mw.awrap_model_call(request, handler)
-            text = _sys_content_text(captured[0].system_message)
+            text = _last_message_text(captured[0])
             # 注入文本只应出现一次（去重后保留 agent 版本）
             assert text.count(same_content) == 1
             # agent 版本 category 为 user_fact → "用户事实" 标签
@@ -690,7 +717,7 @@ class TestAgentScopeRouting:
                 return "ok"
 
             await mw.awrap_model_call(request, handler)
-            text = _sys_content_text(captured[0].system_message)
+            text = _last_message_text(captured[0])
             # 合并 8 条按 create_time 升序，取最近 5 条 → 应为 thread-0..thread-4
             # （create_time 较晚的 5 条 thread facts）
             for i in range(5):
@@ -731,5 +758,404 @@ class TestAgentScopeRouting:
             thread_facts = await store.query_facts("t1")
             assert agent_facts[0].last_used_at != "2026-01-01T00:00:00"
             assert thread_facts[0].last_used_at != "2026-01-01T00:00:00"
+
+        asyncio.run(run())
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  确定性预判定（judge_long_term_memory 精简后的行为）
+# ════════════════════════════════════════════════════════════════════════
+
+
+class _RecordingLLM:
+    """记录 chat 调用消息的 mock，用于验证 important 标注透传。"""
+
+    def __init__(self, response: str = "[]"):
+        self._response = response
+        self.calls: list[list[dict[str, str]]] = []
+
+    def chat(self, messages: list[dict[str, str]]) -> str:
+        self.calls.append(messages)
+        return self._response
+
+
+class TestDeterministicJudgment:
+    """失败次数驱动的确定性判定：SKIP 生效 + 失败≥2 分类锁定 lesson（内容经 LLM 蒸馏）。"""
+
+    def test_single_failed_tool_result_skipped(self):
+        """单次失败的工具结果应被确定性丢弃，不触发 LLM 抽取也不落库。"""
+        async def run():
+            llm = _RecordingLLM(response=json.dumps([]))
+            mw, store = _make_write_middleware(llm_getter=lambda: llm)
+            await mw.submit_event(
+                "t1",
+                "assistant",
+                "[工具执行失败] run_shell 抛出了 TimeoutError",
+                event_type="tool_result",
+                tool_name="run_shell",
+            )
+            await mw._aflush_thread("t1")
+
+            # 单次失败 → SKIP：既不调 LLM，也不落库
+            assert llm.calls == []
+            assert await store.query_facts("t1") == []
+            assert await store.query_agent_facts() == []
+
+        asyncio.run(run())
+
+    def test_two_failed_tool_results_become_lesson(self):
+        """同类失败 ≥2 次记为 lesson（agent 级）：分类确定性锁定，内容经 LLM 蒸馏。
+
+        历史 bug 回归：确定性 lesson 曾把错误原文逐字入库（含巨型命令与
+        反思指令后缀），污染跨会话共享 namespace。现在必须存蒸馏文本。
+        """
+        async def run():
+            distilled_text = "run_shell 反复超时：命令含交互式等待，应改为非交互参数后执行"
+            llm = _RecordingLLM(response=distilled_text)
+            mw, store = _make_write_middleware(llm_getter=lambda: llm)
+            for _ in range(2):
+                await mw.submit_event(
+                    "t1",
+                    "assistant",
+                    "命令超时 run_shell",
+                    event_type="tool_result",
+                    tool_name="run_shell",
+                )
+            await mw._aflush_thread("t1")
+
+            # 失败 ≥2 → 分类不再交 LLM 判定，但内容走蒸馏通道（调用一次 chat）
+            assert len(llm.calls) == 1
+            agent_facts = await store.query_agent_facts()
+            assert len(agent_facts) == 1
+            assert agent_facts[0].category == "lesson"
+            assert agent_facts[0].scope == "agent"
+            # 存的是蒸馏文本，不是错误原文
+            assert agent_facts[0].content == distilled_text
+
+        asyncio.run(run())
+
+    def test_lesson_distill_failure_discards_raw_text(self):
+        """蒸馏 LLM 调用失败时该条 lesson 丢弃，绝不回退逐字存原文。"""
+        async def run():
+            class _BoomLLM:
+                def chat(self, messages):
+                    raise RuntimeError("LLM unavailable")
+
+            mw, store = _make_write_middleware(llm_getter=lambda: _BoomLLM())
+            for _ in range(2):
+                await mw.submit_event(
+                    "t1",
+                    "assistant",
+                    "[工具执行失败] run_shell 抛出了 TimeoutError: 巨型命令原文……",
+                    event_type="tool_result",
+                    tool_name="run_shell",
+                )
+            await mw._aflush_thread("t1")
+
+            assert await store.query_agent_facts() == []
+            assert await store.query_facts("t1") == []
+
+        asyncio.run(run())
+
+    def test_lesson_distill_empty_response_discarded(self):
+        """LLM 判定无教训（返回空 / 空数组）时该条 lesson 丢弃。"""
+        async def run():
+            for empty_response in ("", "[]"):
+                llm = _RecordingLLM(response=empty_response)
+                mw, store = _make_write_middleware(llm_getter=lambda llm=llm: llm)
+                for _ in range(2):
+                    await mw.submit_event(
+                        "t1",
+                        "assistant",
+                        "命令超时 run_shell",
+                        event_type="tool_result",
+                        tool_name="run_shell",
+                    )
+                await mw._aflush_thread("t1")
+                assert await store.query_agent_facts() == [], (
+                    f"空响应 {empty_response!r} 不应落库"
+                )
+
+        asyncio.run(run())
+
+    def test_hitl_interrupt_content_not_counted_as_failure(self):
+        """含 GraphInterrupt / dangerous_command 标记的 TOOL_RESULT 不算工具失败：
+        不计数、不蒸馏、不落库（安全确认是正常 HITL 流程，不是踩坑）。"""
+        async def run():
+            llm = _RecordingLLM(response="[]")
+            mw, store = _make_write_middleware(llm_getter=lambda: llm)
+            hitl_content = (
+                "[工具执行失败] GraphInterrupt: (Interrupt(value={'kind': "
+                "'dangerous_command', 'prompt': '⚠ 检测到危险命令'}, id='abc'))"
+            )
+            for _ in range(3):
+                await mw.submit_event(
+                    "t1",
+                    "assistant",
+                    hitl_content,
+                    event_type="tool_result",
+                    tool_name="run_shell",
+                )
+            await mw._aflush_thread("t1")
+
+            assert llm.calls == []
+            assert await store.query_agent_facts() == []
+            assert await store.query_facts("t1") == []
+            # 失败计数未被污染
+            assert mw._failure_counts.get(("t1", "run_shell"), 0) == 0
+
+        asyncio.run(run())
+
+    def test_distilled_lesson_deduplicated_against_existing(self):
+        """蒸馏出的 lesson 与既有 agent 级 fact 内容相同时被去重（历史 bug：
+        直接构造的 lesson 曾绕过查重）。"""
+        async def run():
+            same_text = "重复教训：路径要相对化"
+            llm = _RecordingLLM(response=same_text)
+            mw, store = _make_write_middleware(llm_getter=lambda: llm)
+            await store.save_agent_fact(
+                ThreadFactItem(content=same_text, category="lesson", scope="agent")
+            )
+            for _ in range(2):
+                await mw.submit_event(
+                    "t1",
+                    "assistant",
+                    "命令超时 run_shell",
+                    event_type="tool_result",
+                    tool_name="run_shell",
+                )
+            await mw._aflush_thread("t1")
+
+            agent_facts = await store.query_agent_facts()
+            assert len(agent_facts) == 1  # 仅预置那条，蒸馏结果被去重
+
+        asyncio.run(run())
+
+    def test_strip_tool_error_boilerplate(self):
+        """蒸馏前剥离反思指令 / workspace 提示后缀并截断超长内容。"""
+        from memory.middleware import _LESSON_SOURCE_MAX_CHARS, _strip_tool_error_boilerplate
+
+        streaming_style = (
+            "[工具执行失败] KeyError: 'dst_path'。请反思失败原因（参数是否正确、"
+            "参数组合是否合法、路径是否有效），修正后重试"
+        )
+        cleaned = _strip_tool_error_boilerplate(streaming_style)
+        assert "请反思失败原因" not in cleaned
+        assert "修正后重试" not in cleaned
+        assert "KeyError" in cleaned
+
+        mw_style = (
+            "[工具执行失败] run_shell 抛出了 FileNotFoundError: x。"
+            "工作空间根目录为 D:/work/demo。文件类工具请基于工作空间根目录使用相对路径，"
+            "若相对路径首段与工作空间目录名重复会导致路径重复拼接，应去除该前缀。"
+            "请反思失败原因（参数是否正确、路径是否有效、前置条件是否满足），修正后重试"
+        )
+        cleaned = _strip_tool_error_boilerplate(mw_style)
+        assert "请反思失败原因" not in cleaned
+        assert "工作空间根目录为" not in cleaned
+        assert "文件类工具请基于" not in cleaned
+        assert "FileNotFoundError" in cleaned
+
+        long_cleaned = _strip_tool_error_boilerplate("x" * (_LESSON_SOURCE_MAX_CHARS + 500))
+        assert len(long_cleaned) <= _LESSON_SOURCE_MAX_CHARS + 10
+        assert long_cleaned.endswith("…(已截断)")
+
+    def test_important_message_marked_in_llm_prompt(self):
+        """important=True 的消息应带 [用户明确要求记住] 标注传入 LLM。"""
+        async def run():
+            llm = _RecordingLLM(response=json.dumps([]))
+            mw, _ = _make_write_middleware(llm_getter=lambda: llm)
+            await mw.submit_event("t1", "user", "记住我喜欢蓝色", important=True)
+            await mw._aflush_thread("t1")
+
+            # important 消息进入 LLM 抽取，且对话文本带标注
+            assert llm.calls
+            conversation = llm.calls[0][-1]["content"]
+            assert "用户明确要求记住" in conversation
+            assert "我喜欢蓝色" in conversation
+
+        asyncio.run(run())
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  Agent 级写入/淘汰：条件化 prune + agent 锁（FIX 1 / FIX 2d）
+# ════════════════════════════════════════════════════════════════════════
+
+
+class _FakeAgentLock:
+    """agent 锁测试替身：仅实现 async 上下文协议并记录持锁状态。"""
+
+    def __init__(self) -> None:
+        self.held = False
+
+    async def __aenter__(self) -> Self:
+        self.held = True
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self.held = False
+
+
+class TestAgentPruneConditional:
+    """仅当本批次确实写入 agent facts 时才触发 prune_agent_facts。"""
+
+    def test_prune_agent_facts_not_called_when_no_agent_items(self):
+        """仅抽出 thread 级 category（conv）时不得调用 prune_agent_facts。"""
+
+        async def run():
+            llm = _FakeLLM(response=json.dumps([
+                {"content": "本次对话要点", "category": "conv", "confidence": 0.8}
+            ]))
+            mw, store = _make_write_middleware(llm_getter=lambda: llm)
+            calls: list[str] = []
+            original_prune = store.prune_agent_facts
+
+            async def spy_prune() -> int:
+                calls.append("prune_agent_facts")
+                return await original_prune()
+
+            with patch.object(store, "prune_agent_facts", spy_prune):
+                await mw.submit_event("t1", "user", "讨论要点")
+                await mw._aflush_thread("t1")
+
+            assert calls == []
+            assert await store.query_agent_facts() == []
+            assert len(await store.query_facts("t1")) == 1
+
+        asyncio.run(run())
+
+    def test_prune_agent_facts_called_when_agent_items_written(self):
+        """抽出 user_fact（agent 级）时应调用 prune_agent_facts。"""
+
+        async def run():
+            llm = _FakeLLM(response=json.dumps([
+                {"content": "用户偏好深色主题", "category": "user_fact", "confidence": 0.9}
+            ]))
+            mw, store = _make_write_middleware(llm_getter=lambda: llm)
+            calls: list[str] = []
+            original_prune = store.prune_agent_facts
+
+            async def spy_prune() -> int:
+                calls.append("prune_agent_facts")
+                return await original_prune()
+
+            with patch.object(store, "prune_agent_facts", spy_prune):
+                await mw.submit_event("t1", "user", "我喜欢深色主题")
+                await mw._aflush_thread("t1")
+
+            assert calls == ["prune_agent_facts"]
+            assert await store.count_agent_facts() == 1
+
+        asyncio.run(run())
+
+    def test_agent_write_and_prune_hold_agent_lock(self):
+        """agent 级批量写入与 prune 必须在 agent 锁持有期间执行。"""
+
+        async def run():
+            llm = _FakeLLM(response=json.dumps([
+                {"content": "用户偏好深色主题", "category": "user_fact", "confidence": 0.9}
+            ]))
+            store = ThreadMemoryStore()
+            fake_lock = _FakeAgentLock()
+            mw = ThreadMemoryWriteMiddleware(
+                memory_store=store,
+                lock_pool=ThreadMemoryLockPool(),
+                llm_getter=default_thread_llm_resolver(lambda: llm),
+                buffer_delay_seconds=999,
+                max_buffer_messages=30,
+                agent_lock=fake_lock,
+            )
+            observed: list[bool] = []
+            original_save = store.save_agent_facts_batch
+            original_prune = store.prune_agent_facts
+
+            async def spy_save(items: list[ThreadFactItem]) -> None:
+                observed.append(fake_lock.held)
+                await original_save(items)
+
+            async def spy_prune() -> int:
+                observed.append(fake_lock.held)
+                return await original_prune()
+
+            with patch.object(store, "save_agent_facts_batch", spy_save), patch.object(
+                store, "prune_agent_facts", spy_prune
+            ):
+                await mw.submit_event("t1", "user", "我喜欢深色主题")
+                await mw._aflush_thread("t1")
+
+            assert observed == [True, True]
+            assert fake_lock.held is False
+
+        asyncio.run(run())
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  per-thread LLM 解析（thread-aware resolver）
+# ════════════════════════════════════════════════════════════════════════
+
+
+class TestPerThreadLLMResolution:
+    """写中间件必须按 thread_id 解析各自会话的 LLM，而非固定用启动默认 LLM。"""
+
+    @staticmethod
+    def _make_per_thread_middleware(
+        llms: dict[str, _RecordingLLM],
+    ) -> ThreadMemoryWriteMiddleware:
+        """构造直接持有 thread-aware 解析器的写中间件（不经 helper 的零参适配）。"""
+
+        async def resolver(thread_id: str | None):
+            assert thread_id is not None
+            return llms[thread_id]
+
+        return ThreadMemoryWriteMiddleware(
+            memory_store=ThreadMemoryStore(),
+            lock_pool=ThreadMemoryLockPool(),
+            llm_getter=resolver,
+            buffer_delay_seconds=999,
+        )
+
+    def test_extract_facts_uses_per_thread_llm(self):
+        """t1 / t2 各自用自己会话的 LLM 完成 fact 抽取。"""
+
+        async def run():
+            llms = {
+                "t1": _RecordingLLM(
+                    response=json.dumps([{"content": "fact-for-t1", "category": "conv"}])
+                ),
+                "t2": _RecordingLLM(
+                    response=json.dumps([{"content": "fact-for-t2", "category": "conv"}])
+                ),
+            }
+            mw = self._make_per_thread_middleware(llms)
+
+            facts_t1 = await mw._a_extract_facts("t1", [("user", "我偏好 Python", False)])
+            facts_t2 = await mw._a_extract_facts("t2", [("user", "我偏好 Rust", False)])
+
+            # 每个 thread 的抽取结果来自各自的 LLM
+            assert facts_t1[0]["content"] == "fact-for-t1"
+            assert facts_t2[0]["content"] == "fact-for-t2"
+            assert llms["t1"].calls and llms["t2"].calls
+            # 交叉校验：t1 的 LLM 只收到 t1 的对话，t2 同理
+            assert "我偏好 Python" in llms["t1"].calls[0][-1]["content"]
+            assert "我偏好 Rust" in llms["t2"].calls[0][-1]["content"]
+
+        asyncio.run(run())
+
+    def test_distill_lesson_uses_per_thread_llm(self):
+        """lesson 蒸馏同样按 thread_id 解析 LLM。"""
+
+        async def run():
+            llms = {
+                "t1": _RecordingLLM(response="t1 的蒸馏教训"),
+                "t2": _RecordingLLM(response="t2 的蒸馏教训"),
+            }
+            mw = self._make_per_thread_middleware(llms)
+
+            distilled_t1 = await mw._a_distill_lesson("t1", "命令超时 run_shell")
+            distilled_t2 = await mw._a_distill_lesson("t2", "命令超时 run_shell")
+
+            assert distilled_t1 == "t1 的蒸馏教训"
+            assert distilled_t2 == "t2 的蒸馏教训"
+            assert llms["t1"].calls and llms["t2"].calls
 
         asyncio.run(run())

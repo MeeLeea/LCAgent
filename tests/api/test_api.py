@@ -23,7 +23,7 @@ import sqlite3
 import sys
 import tempfile
 from collections.abc import AsyncIterator
-from datetime import timezone
+from datetime import UTC
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -31,6 +31,8 @@ import pytest
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
+
+from session.config import SessionConfig
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -44,6 +46,13 @@ def mock_agent():
     agent = MagicMock()
     agent.session = MagicMock()
     agent.session.current_session_id = "test-thread-123"
+    default_session_config = SessionConfig(provider="zhipu", model="glm-4-flash")
+    agent.session.aget_session_config = AsyncMock(return_value=default_session_config)
+    agent.session.aget_session_configs = AsyncMock(return_value={})
+    agent.session.aset_session_config = AsyncMock(return_value=None)
+    agent.session.aupdate_session_config = AsyncMock(return_value=default_session_config)
+    agent.session.default_session_config = default_session_config
+    agent.session.set_default_session_config = MagicMock()
     agent.session.checkpointer = None  # 测试无持久化
     agent.session.new_session = MagicMock(return_value="new-thread-456")
     agent.session.new_workflow_session = MagicMock(return_value="server-workflow-simple-abc12345")
@@ -53,7 +62,8 @@ def mock_agent():
     agent.session.is_workflow_session = MagicMock(return_value=False)
     agent.session.workflow_name_of = MagicMock(return_value=None)
     agent.session.aswitch_session = AsyncMock()
-    agent.session.aexport_session = AsyncMock()
+    # 导出端点已改为委托 aexport_session，需返回字符串（否则 MagicMock 会被 FastAPI 序列化导致 RecursionError）
+    agent.session.aexport_session = AsyncMock(return_value="对话导出 - test-thread-123")
     # workspace 绑定（GET/POST/DELETE /api/threads/{thread_id}/workspace）
     agent.session.aget_workspace = AsyncMock(return_value=None)
     agent.session.aset_workspace = AsyncMock(return_value="/real/abs/workspace")
@@ -72,6 +82,7 @@ def mock_agent():
     # execute_command 端点用 set_current_session 切换当前会话
     agent.set_current_session = MagicMock()
     agent.session_manager.aclear_long_term_memory = AsyncMock(return_value=2)
+    agent.session_manager.aclear_agent_memory = AsyncMock(return_value=3)
     agent.get_available_tools = MagicMock(return_value=["calculator", "web_search", "ask_human"])
     agent.switch_llm = MagicMock()
     agent.aswitch_llm = AsyncMock(side_effect=agent.switch_llm)
@@ -243,7 +254,7 @@ def temp_checkpoint_db():
         {"configurable": {"thread_id": "thread-1", "checkpoint_ns": ""}},
         {
             "id": checkpoint_id,
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": datetime.now(UTC).isoformat(),
             "channel_values": {"messages": test_messages},
         },
         {},
@@ -328,30 +339,22 @@ def test_get_providers(client, mock_llm):
 
 
 def test_switch_provider(client, mock_agent, mock_llm):
-    """测试切换提供商"""
-    with patch("api.server.LLMClient") as mock_llm_class:
-        new_llm = MagicMock()
-        new_llm.get_info = MagicMock(
-            return_value={
-                "provider": "deepseek",
-                "provider_name": "DeepSeek",
-                "model": "deepseek-chat",
-            }
-        )
-        mock_llm_class.return_value = new_llm
-        
-        response = client.post(
-            "/api/providers/switch",
-            json={"provider": "deepseek"}
-        )
-        
-        assert response.status_code == 200
-        data = response.json()
-        assert data["provider"] == "deepseek"
-        assert data["model"] == "deepseek-chat"
-        
-        # 验证调用
-        mock_agent.switch_llm.assert_called_once_with(new_llm)
+    """测试未指定会话时只更新进程默认配置。"""
+    with patch("api.server.load_providers", return_value={
+        "zhipu": {"name": "智谱AI", "model": "glm-4-flash", "models": ["glm-4-flash"]},
+        "deepseek": {"name": "DeepSeek", "model": "deepseek-chat", "models": ["deepseek-chat"]},
+    }):
+        response = client.post("/api/providers/switch", json={"provider": "deepseek"})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["scope"] == "default"
+    assert data["thread_id"] is None
+    assert data["deprecated"] is True
+    assert data["session_config"]["provider"] == "deepseek"
+    assert data["session_config"]["model"] == "deepseek-chat"
+    mock_agent.session.set_default_session_config.assert_called_once()
+    mock_agent.switch_llm.assert_not_called()
 
 
 def test_switch_provider_invalid(client):
@@ -368,17 +371,21 @@ def test_switch_provider_invalid(client):
 
 
 def test_switch_model(client, mock_agent, mock_llm):
-    """测试切换模型"""
-    response = client.post(
-        "/api/models/switch",
-        json={"model": "glm-4-plus"}
-    )
-    
+    """测试未指定会话时只更新进程默认配置。"""
+    with patch("api.server.load_providers", return_value={
+        "zhipu": {"name": "智谱AI", "model": "glm-4-flash", "models": ["glm-4-flash", "glm-4-plus"]},
+    }):
+        response = client.post("/api/models/switch", json={"model": "glm-4-plus"})
+
     assert response.status_code == 200
-    
-    # 验证调用
-    mock_llm.switch_model.assert_called_once_with("glm-4-plus")
-    mock_agent.switch_llm.assert_called_once_with(mock_llm)
+    data = response.json()
+    assert data["scope"] == "default"
+    assert data["deprecated"] is True
+    assert data["session_config"]["model"] == "glm-4-plus"
+    mock_agent.session.set_default_session_config.assert_called_once()
+    mock_agent.session.aset_session_config.assert_not_awaited()
+    mock_llm.switch_model.assert_not_called()
+    mock_agent.switch_llm.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #
@@ -402,6 +409,9 @@ def test_get_tools(client, mock_agent):
 def test_get_roles(client, mock_agent):
     """测试列出可用团队角色与当前角色名"""
     mock_agent.name = "manager"
+    mock_agent.session.aget_session_config = AsyncMock(
+        return_value=SessionConfig(provider="zhipu", model="glm-4-flash", role="manager")
+    )
     with patch(
         "agent.role_sw.get_available_team_roles",
         return_value=["manager", "terminator", "worker"],
@@ -415,58 +425,62 @@ def test_get_roles(client, mock_agent):
 
 
 def test_switch_role(client, mock_agent):
-    """测试切换团队角色：调用 role_sw.arebuild_agent_from_team_dir 并返回新角色"""
-    mock_agent.name = "worker"
-    with patch(
-        "agent.role_sw.arebuild_agent_from_team_dir", new_callable=AsyncMock
-    ) as mock_rebuild:
+    """测试切换团队角色时更新进程默认配置。"""
+    from session.config import SessionConfigPatch
+
+    with patch("api.server._resolve_role_patch", new_callable=AsyncMock, return_value=SessionConfigPatch(
+        role="worker", system_prompt="worker prompt"
+    )):
         response = client.post("/api/roles/switch", json={"role": "worker"})
 
     assert response.status_code == 200
     data = response.json()
+    assert data["scope"] == "default"
     assert data["role"] == "worker"
-    assert data["current"] == "worker"
-    mock_rebuild.assert_awaited_once_with(mock_agent, "worker", task="")
+    assert data["session_config"]["system_prompt"] == "worker prompt"
+    mock_agent.session.set_default_session_config.assert_called_once()
+    mock_agent.switch_llm.assert_not_called()
 
 
 def test_switch_role_with_task(client, mock_agent):
-    """测试切换角色时携带 task，task 透传给 role_sw.arebuild_agent_from_team_dir"""
-    mock_agent.name = "manager"
-    with patch(
-        "agent.role_sw.arebuild_agent_from_team_dir", new_callable=AsyncMock
-    ) as mock_rebuild:
+    """测试携带 task 的 legacy 角色切换仍持久化解析后的配置。"""
+    from session.config import SessionConfigPatch
+
+    with patch("api.server._resolve_role_patch", new_callable=AsyncMock, return_value=SessionConfigPatch(
+        role="manager", system_prompt="manager prompt"
+    )):
         response = client.post(
             "/api/roles/switch",
             json={"role": "manager", "task": "分析项目结构"},
         )
 
     assert response.status_code == 200
-    mock_rebuild.assert_awaited_once_with(mock_agent, "manager", task="分析项目结构")
+    data = response.json()
+    assert data["role"] == "manager"
+    assert data["session_config"]["system_prompt"] == "manager prompt"
+    mock_agent.session.set_default_session_config.assert_called_once()
+    mock_agent.switch_llm.assert_not_called()
 
 
 def test_switch_role_unknown(client, mock_agent):
-    """测试切换到未知角色返回 404"""
-    with patch(
-        "agent.role_sw.arebuild_agent_from_team_dir",
-        new_callable=AsyncMock,
-        side_effect=KeyError("未找到 team 角色: ghost。可用角色: manager, worker"),
-    ), patch(
-        "agent.role_sw.get_available_team_roles",
-        return_value=["manager", "worker"],
-    ):
+    """测试切换到未知角色返回 400。"""
+    from fastapi import HTTPException
+
+    with patch("api.server._resolve_role_patch", new_callable=AsyncMock,
+               side_effect=HTTPException(status_code=400, detail="角色不存在: ghost")):
         response = client.post("/api/roles/switch", json={"role": "ghost"})
 
-    assert response.status_code == 404
+    assert response.status_code == 400
     assert "ghost" in response.json()["detail"]
 
 
 def test_switch_role_empty_prompt(client, mock_agent):
     """测试角色提示词文件为空返回 400"""
-    with patch(
-        "agent.role_sw.arebuild_agent_from_team_dir",
-        new_callable=AsyncMock,
-        side_effect=FileNotFoundError("角色提示词文件为空或无法读取: team/broken/AGENT.md"),
-    ):
+    from fastapi import HTTPException
+
+    with patch("api.server._resolve_role_patch", new_callable=AsyncMock, side_effect=HTTPException(
+        status_code=400, detail="角色提示词为空或无法读取: broken"
+    )):
         response = client.post("/api/roles/switch", json={"role": "broken"})
 
     assert response.status_code == 400
@@ -1265,7 +1279,7 @@ def test_workflow_management_stop_mid_stream(client, mock_agent):
                 for line in resp.iter_lines():
                     if line.startswith("data: "):
                         events.append(json.loads(line[6:]))
-        except Exception as e:  # noqa: BLE001 - 仅用于测试断言收集
+        except Exception as e:
             errors.append(e)
 
     with patch("api.server.dispatch_command", hanging_dispatch):
@@ -1555,14 +1569,27 @@ def test_clear_memory_short(client, mock_agent):
 
 
 def test_clear_memory_all(client, mock_agent):
-    """测试清空全部记忆"""
+    """测试清空全部记忆（含 agent 级跨会话记忆，与 CLI clear all 语义一致）"""
     response = client.delete("/api/memory?scope=all")
     assert response.status_code == 200
 
     data = response.json()
     assert data["scope"] == "all"
     mock_agent.session_manager.aclear_long_term_memory.assert_awaited_once()
+    mock_agent.session_manager.aclear_agent_memory.assert_awaited_once()
     mock_agent.session.new_session.assert_called_once()
+
+
+def test_clear_memory_agent_scope(client, mock_agent):
+    """测试 agent scope 清空 agent 级跨会话记忆（补齐 CLI clear agent 语义）"""
+    response = client.delete("/api/memory?scope=agent")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["scope"] == "agent"
+    mock_agent.session_manager.aclear_agent_memory.assert_awaited_once()
+    mock_agent.session_manager.aclear_long_term_memory.assert_not_called()
+    mock_agent.session.new_session.assert_not_called()
 
 
 def test_clear_memory_invalid_scope(client, mock_agent):
@@ -1662,11 +1689,12 @@ def test_get_skills(client, mock_agent):
 # 会话导出
 # --------------------------------------------------------------------------- #
 def test_export_thread(client, mock_agent, temp_checkpoint_db):
-    """测试导出会话为文本"""
-    mock_agent.session.aget_messages.return_value = [
-        HumanMessage(content="测试消息1"),
-        AIMessage(content="回复1"),
-    ]
+    """测试导出会话为文本：端点委托 aexport_session 并透传 thread_id/fmt"""
+    mock_agent.session.aexport_session.return_value = (
+        "对话导出 - thread-1\n"
+        + "=" * 40
+        + "\n\n【用户】\n测试消息1\n\n【助手】\n回复1"
+    )
     response = client.get("/api/threads/thread-1/export")
     assert response.status_code == 200
 
@@ -1674,21 +1702,22 @@ def test_export_thread(client, mock_agent, temp_checkpoint_db):
     assert data["thread_id"] == "thread-1"
     assert data["format"] == "text"
     assert "测试消息" in data["content"]
-    mock_agent.session.aget_messages.assert_awaited_once_with(session_id="thread-1")
+    mock_agent.session.aexport_session.assert_awaited_once_with("thread-1", fmt="text")
 
 
 def test_export_thread_markdown(client, mock_agent, temp_checkpoint_db):
-    """测试导出会话为 Markdown"""
-    mock_agent.session.aget_messages.return_value = [
-        HumanMessage(content="测试消息1"),
-        AIMessage(content="回复1"),
-    ]
+    """测试导出会话为 Markdown：端点委托 aexport_session 并透传 fmt=markdown"""
+    mock_agent.session.aexport_session.return_value = (
+        "# 对话导出 - thread-1\n\n**用户**:\n\n测试消息1\n\n---\n\n**助手**:\n\n回复1"
+    )
     response = client.get("/api/threads/thread-1/export?fmt=markdown")
     assert response.status_code == 200
 
     data = response.json()
+    assert data["thread_id"] == "thread-1"
     assert data["format"] == "markdown"
-    mock_agent.session.aget_messages.assert_awaited_once_with(session_id="thread-1")
+    assert "测试消息" in data["content"]
+    mock_agent.session.aexport_session.assert_awaited_once_with("thread-1", fmt="markdown")
 
 
 def test_export_thread_invalid_format(client, mock_agent):

@@ -11,10 +11,9 @@ const STATUS_META = {
 
 export function TopBar({ collapsed, onToggle }: { collapsed: boolean; onToggle: () => void }) {
   const providers = useStore((s) => s.providers)
-  const currentProvider = useStore((s) => s.currentProvider)
-  const currentModel = useStore((s) => s.currentModel)
   const threads = useStore((s) => s.threads)
   const currentThreadId = useStore((s) => s.currentThreadId)
+  const sessionConfig = useStore((s) => (s.currentThreadId ? s.sessionConfigs[s.currentThreadId] : undefined))
   const switchProvider = useStore((s) => s.switchProvider)
   const switchModel = useStore((s) => s.switchModel)
   const connectionStatus = useStore((s) => s.connectionStatus)
@@ -27,7 +26,7 @@ export function TopBar({ collapsed, onToggle }: { collapsed: boolean; onToggle: 
   }, [checkConnection])
 
   const currentThread = threads.find((t) => t.thread_id === currentThreadId)
-  const activeProvider = providers.find((p) => p.key === currentProvider)
+  const activeProvider = providers.find((p) => p.key === sessionConfig?.provider)
   const models = activeProvider?.models ?? []
   const meta = STATUS_META[connectionStatus]
 
@@ -55,7 +54,7 @@ export function TopBar({ collapsed, onToggle }: { collapsed: boolean; onToggle: 
       <div className="model-selector">
         <Cpu size={13} />
         <select
-          value={currentProvider ?? ''}
+          value={sessionConfig?.provider ?? ''}
           onChange={(e) => switchProvider(e.target.value)}
           title="切换提供商"
         >
@@ -68,7 +67,7 @@ export function TopBar({ collapsed, onToggle }: { collapsed: boolean; onToggle: 
         </select>
         <span style={{ color: 'var(--text-faint)' }}>/</span>
         <select
-          value={currentModel ?? ''}
+          value={sessionConfig?.model ?? ''}
           onChange={(e) => switchModel(e.target.value)}
           title="切换模型"
         >

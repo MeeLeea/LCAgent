@@ -21,7 +21,7 @@ from graph.simple import (
 )
 from team.base import TeamAgent
 
-# 默认模板(与各角色类的 default_templates 一致,供 FakeAgent 兜底)
+# 默认模板(与各角色 AGENT.md 的 ## workflow:* 小节一致,供 FakeAgent 兜底)
 DEFAULT_TEMPLATES: dict[str, str] = {
     "manager_plan": "请为以下任务制定详细的执行计划:\n\n{task}\n\n记忆上下文摘要:\n{context_summary}",
     "summarize_context": "你是一个工作流上下文提炼助手。",
@@ -40,8 +40,7 @@ class FakeAgent:
 
     summarize 节点(summarize_context 节点)的 prompt 含 ``summarize_context``
     模板前缀(节点把模板拼到 raw 前部),据此识别后返回 ``summary_response``,
-    与原 ``asummarize_context`` 返回 summary_response 的语义对齐;其余节点
-    回退 ``response``。
+    其余节点回退 ``response``。
     """
 
     # summarize_context 节点 prompt 的特征字符串(节点模板固定,稳定可识别)
@@ -53,6 +52,7 @@ class FakeAgent:
     prompt_file: str | None = None
     default_templates: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_TEMPLATES))
     calls: list[tuple[str, str]] = field(default_factory=list)
+    last_prompt: str = ""
 
     async def ainvoke(self, task: str, config=None) -> str:
         """异步版 invoke:记录调用并返回模拟结果(兼容 TeamAgent.ainvoke 既有调用方)"""
@@ -91,6 +91,7 @@ class FakeAgent:
         记录 (arun_structured, prompt) 并返回 completed(self._next(prompt))
         """
         self.calls.append(("arun_structured", prompt))
+        self.last_prompt = prompt
         return AgentTurnResult.completed(self._next(prompt))
 
 
@@ -202,6 +203,31 @@ def test_terminator_final_node_no_summary():
     prompt = terminator.calls[0][1]
     assert "记忆上下文摘要:" in prompt
     assert "用户偏好" not in prompt
+
+
+def test_factory_nodes_do_not_inject_agent_rules():
+    """工厂化节点传 base_prompts=""，prompt 不含 load_agent_rules 产物（「重要规则」）
+
+    证明 create_llm_node 的 base_prompts="" 生效：三个标准节点的 prompt 与恢复文件的
+    手写节点逐字一致，不注入 agent/AGENT.md 的「重要规则」/「工具规则」前缀。
+    """
+    manager = FakeAgent(name="manager", response="计划")
+    worker = FakeAgent(name="worker", response="结果")
+    terminator = FakeAgent(name="terminator", response="答案")
+
+    asyncio.run(manager_plan_node({"task": "任务", "context_summary": ""}, manager))
+    asyncio.run(worker_exec_node({"plan": "计划"}, worker))
+    asyncio.run(
+        terminator_final_node(
+            {"task": "任务", "plan": "计划", "worker_result": "结果"}, terminator
+        )
+    )
+
+    for agent in (manager, worker, terminator):
+        # 节点确有 prompt 产出（排除"prompt 为空所以不含规则"的假通过）
+        assert agent.last_prompt
+        assert "重要规则" not in agent.last_prompt
+        assert "工具规则" not in agent.last_prompt
 
 
 # ==================== 测试 AGENT.md 提示词模板 ====================
@@ -385,7 +411,7 @@ def test_register_agent_decorator():
     from graph.common import AGENT_REGISTRY, register_agent
     from team.base import TeamAgent
     
-    @register_agent("fake_role", "team/fake/agent_config.json", tools=None)
+    @register_agent("fake_role", tools=None)
     class FakeRoleAgent(TeamAgent):
         pass
     
@@ -393,7 +419,6 @@ def test_register_agent_decorator():
         assert "fake_role" in AGENT_REGISTRY
         spec = AGENT_REGISTRY["fake_role"]
         assert spec["agent_class"] is FakeRoleAgent
-        assert spec["config_file"] == "team/fake/agent_config.json"
         assert spec["tools"] is None
         # 装饰器应原样返回被装饰的类
         assert FakeRoleAgent.__name__ == "FakeRoleAgent"
@@ -409,7 +434,7 @@ def test_register_agent_tools_passthrough():
     
     fake_tools = ["tool_a", "tool_b"]
     
-    @register_agent("fake_worker", "team/fake_worker/agent_config.json", tools=fake_tools)
+    @register_agent("fake_worker", tools=fake_tools)
     class FakeWorkerAgent(TeamAgent):
         pass
     
@@ -427,7 +452,6 @@ def test_register_agent_mcp_tools_passthrough():
     # 显式声明 mcp_tools
     @register_agent(
         "fake_mcp_role",
-        "team/fake_mcp/agent_config.json",
         tools=None,
         mcp_tools=["write_file"],
     )
@@ -442,7 +466,7 @@ def test_register_agent_mcp_tools_passthrough():
         AGENT_REGISTRY.pop("fake_mcp_role", None)
 
     # 不传 mcp_tools 时默认 None
-    @register_agent("fake_no_mcp", "team/fake_no_mcp/agent_config.json")
+    @register_agent("fake_no_mcp")
     class FakeNoMcpAgent(TeamAgent):
         pass
 
@@ -462,7 +486,6 @@ def test_builtin_agents_registered():
         assert role in AGENT_REGISTRY
         spec = AGENT_REGISTRY[role]
         assert issubclass(spec["agent_class"], TeamAgent)
-        assert spec["config_file"].startswith(f"team/{role}/")
     
     # Worker 注入全部本地工具,Manager/Terminator 纯文本模式
     assert AGENT_REGISTRY["worker"]["tools"] is not None
@@ -500,9 +523,10 @@ def test_build_workflow_mcp_tools_injection():
     - 未声明 mcp_tools 的角色,tools 保持原样(本地 tools 或 None)
     - MCP 加载失败(返回空)时,角色降级为纯文本模式(tools=None)
     """
-    from graph.common import AGENT_REGISTRY, register_agent, build_workflow
-    from team.base import TeamAgent
     from dataclasses import dataclass
+
+    from graph.common import AGENT_REGISTRY, build_workflow, register_agent
+    from team.base import TeamAgent
 
     @dataclass
     class FakeTool:
@@ -516,7 +540,6 @@ def test_build_workflow_mcp_tools_injection():
     # 用 fake role 测试,避免污染真实 architect 注册项
     @register_agent(
         "fake_mcp_inject_role",
-        "team/architect/agent_config.json",  # 复用 architect 配置避免新建文件
         tools=None,
         mcp_tools=["write_file"],
     )
@@ -526,7 +549,6 @@ def test_build_workflow_mcp_tools_injection():
     # 另注册一个无 mcp_tools 的角色作对照
     @register_agent(
         "fake_no_mcp_inject_role",
-        "team/manager/agent_config.json",
         tools=None,
     )
     class FakeNoMcpInjectAgent(TeamAgent):
@@ -540,7 +562,7 @@ def test_build_workflow_mcp_tools_injection():
 
         original_build = team_mod.build_team_agent
 
-        def _spy_build(agent_class, config_file, base_dir, tools=None, **kwargs):
+        def _spy_build(agent_class, agent_name, base_dir, tools=None, **kwargs):
             captured[agent_class.__name__] = tools
             # 返回一个最小实例,避免真实 LLM/MCP 初始化
             inst = object.__new__(agent_class)

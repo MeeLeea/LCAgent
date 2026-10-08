@@ -35,6 +35,7 @@ from lark_oapi.ws import Client as LarkWSClient
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, BASE_DIR)
 from main import LLM_FILE, build_agent
+from session.config import SessionConfigPatch
 
 REMOTE_CONFIG_FILE = os.path.join(BASE_DIR, "config", "remote_control.json")
 REMOTE_THREAD_FILE = os.path.join(BASE_DIR, "data", "remote_thread_id.txt")
@@ -209,7 +210,8 @@ def start_agent() -> str:
         agent, llm, tid = _run_on_agent_loop(_astart_agent, timeout=30)
         with _agent_lock:
             _agent = agent
-            _agent_info = {"provider": llm.provider, "model": llm.model, "status": "running"}
+            config = _run_on_agent_loop(lambda: agent.session.aget_session_config(tid))
+            _agent_info = {"provider": config.provider if config else llm.provider, "model": config.model if config and config.model else llm.model, "status": "running"}
         return f"✅ Agent 已启动\n  模型: {llm.model}\n  会话: {tid}"
     except Exception as e:
         with _agent_lock:
@@ -389,7 +391,8 @@ def _handle_model_menu(chat_id: str, inp: str = "") -> None:
         flat = [(k, m) for k, v in providers.items() for m in v.get("models", [])]
         if not flat: return _send_text(chat_id, "无可用模型")
         _model_menu_cache[chat_id] = flat
-        cur = (agent.llm.provider, agent.llm.model)
+        config = _run_on_agent_loop(lambda: agent.session.aget_session_config(agent.session.current_session_id))
+        cur = (config.provider, config.model) if config else (agent.llm.provider, agent.llm.model)
         lines = ["📋 回复编号切换：", ""]
         for i, (p, m) in enumerate(flat, 1):
             lines.append(f"  {i:>2}. {p}: {m}{' ← 当前' if (p, m) == cur else ''}")
@@ -407,24 +410,16 @@ def _handle_model_menu(chat_id: str, inp: str = "") -> None:
     _send_text(chat_id, f"❌ 未匹配「{inp}」")
 
 def _do_switch(chat_id: str, agent, pk: str, mn: str) -> None:
-    old = f"{agent.llm.provider}: {agent.llm.model}"
+    thread_id = chat_id
     try:
-        def _switch() -> None:
-            if agent.llm.provider != pk:
-                from cli.commands.provider import create_llm
-                # 采样参数由 LLMClient 内部从全局 agent_config.json 读取，无需外部传参
-                agent.llm = create_llm(pk, LLM_FILE)
-                if agent.llm.model != mn: agent.llm.switch_model(mn)
-            else:
-                agent.llm.switch_model(mn)
-            agent.agent_executor = agent._create_agent_executor()
+        async def _switch_async() -> Any:
+            return await agent.session_manager.aupdate_session_config(
+                SessionConfigPatch(provider=pk, model=mn), thread_id=thread_id
+            )
 
-        async def _switch_async() -> None:
-            _switch()
-
-        _run_on_agent_loop(lambda: _switch_async())
-        with _agent_lock: _agent_info.update(provider=agent.llm.provider, model=agent.llm.model)
-        _send_text(chat_id, f"✅ {old} → {pk}: {mn}")
+        config = _run_on_agent_loop(_switch_async)
+        with _agent_lock: _agent_info.update(provider=config.provider, model=config.model or mn)
+        _send_text(chat_id, f"✅ 当前会话已切换 → {pk}: {mn}")
     except Exception as e:
         _send_text(chat_id, f"❌ 切换失败: {e}")
 
@@ -444,7 +439,12 @@ def _agent_task(chat_id: str, method: str, payload: str) -> None:
             agent = get_agent()
             if not agent: return _send_text(chat_id, "⚠️ 请先启动agent")
             _clear_pending_interrupt(agent)
-            turn = _run_on_agent_loop(lambda: agent.arun_structured(payload)) if method == "run" else _run_on_agent_loop(lambda: agent.achat_structured(payload))
+            thread_id = chat_id
+            turn = (
+                _run_on_agent_loop(lambda: agent.arun_structured(payload, thread_id=thread_id))
+                if method == "run"
+                else _run_on_agent_loop(lambda: agent.achat_structured(payload, thread_id=thread_id))
+            )
             _handle_turn_result(chat_id, agent, turn, method)
         except Exception as e:
             _send_text(chat_id, f"❌ {e}")

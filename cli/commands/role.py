@@ -40,10 +40,11 @@ async def _choose_role(context: CommandContext) -> CommandOutcome:
         context.print("\n当前没有可用团队角色(目录 team/ 为空或缺少 agent_config.json/AGENT.md)")
         return HANDLED
 
+    current_config = await context.agent.session_manager.aget_session_config()
     selected = context.select_menu(
         "选择团队角色",
         [(name, name) for name in roles],
-        current=getattr(context.agent, "name", None),
+        current=current_config.role if current_config else getattr(context.agent, "name", None),
     )
     if selected is None:
         return HANDLED
@@ -51,12 +52,13 @@ async def _choose_role(context: CommandContext) -> CommandOutcome:
 
 
 async def _switch_role(context: CommandContext, role_name: str, task_text: str) -> CommandOutcome:
-    """按角色名重建主 Agent,可选地在切换后立即执行任务。"""
+    """更新当前会话角色，可选地在切换后立即执行任务。"""
     try:
-        # role_sw.arebuild_agent_from_team_dir 为异步入口,就地把 AgentCore 切换为目标角色
-        from agent.role_sw import arebuild_agent_from_team_dir
+        # 与 HTTP 路径共用同一解析实现（agent/role_sw.py），避免两入口行为漂移
+        from agent.role_sw import resolve_role_config_patch
 
-        await arebuild_agent_from_team_dir(context.agent, role_name, task=task_text)
+        patch = resolve_role_config_patch(role_name)
+        await context.agent.session_manager.aupdate_session_config(patch)
     except KeyError as error:
         # 角色不存在:补充展示可用角色,便于用户重试
         from agent.role_sw import get_available_team_roles

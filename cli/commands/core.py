@@ -42,6 +42,7 @@ async def show_info(context: CommandContext) -> CommandOutcome:
     context.print(f"Checkpoint: {mem['checkpoint_backend']} → {mem['checkpoint_file']}")
     context.print(f"已存消息:   {mem['checkpoint_messages']} 条")
     context.print(f"长期记忆:   {mem['long_term_count']} 条")
+    context.print(f"agent 级记忆: {mem['agent_fact_count']} 条 (跨会话共享)")
     context.print(f"总会话数:   {mem['total_threads']}")
     return HANDLED
 
@@ -62,8 +63,10 @@ _HELP_LINES = [
     "  - 输入 'model:<模型名>' 切换模型 (如 model:glm-4-flash)",
     "  - 输入 'info' 查看当前模型信息 + 记忆状态",
     "  - 输入 'tools' 查看可用工具",
-    "  - 输入 'clear [long|short|all]' 清理记忆(默认 long)",
+    "  - 输入 'clear [long|short|agent|all]' 清理记忆(默认 long; agent 清 agent 级跨会话记忆)",
+    "  - 输入 'agent memory' 查看 agent 级(跨会话共享)长期记忆",
     "  - 输入 'compress' 压缩长期记忆(LLM摘要后替换原内容)",
+    "  - 输入 'compress agent' 压缩 agent 级长期记忆(跨会话共享; 默认 compress 压缩 thread 级)",
     "  - 输入 'compact' 手动压缩当前会话上下文(增量摘要+工具输出裁剪)",
     "  - 输入 'thread' 查看所有会话(方向键选择切换,Ctrl+D 删除高亮会话)",
     "  - 输入 'thread:new' 开启新会话(原会话保留)",
