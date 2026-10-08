@@ -289,7 +289,9 @@ class Streaming:
                             # 记录最终 AIMessage：调用方在流结束后据此检测
                             # 空回答（reasoning token 耗尽 / finish_reason=length）
                             if final_ai is not None:
-                                final_ai[0] = output
+                                # 覆写为最新（也是最终）AIMessage；用切片赋值兼容空/已占位列表，
+                                # 杜绝 `list assignment index out of range`（历史回归，见 test_empty_response_guard）
+                                final_ai[:] = [output]
                             # 提前发出 TOOL_CALL：LLM 回复完成时 tool_calls 已确定，
                             # 无需等待 LangGraph 路由到工具节点（on_tool_start），
                             # 前端可更早显示工具名 + "执行中"
