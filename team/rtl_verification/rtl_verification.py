@@ -22,3 +22,9 @@ class VerificationAgent(TeamAgent):
     # 显式 opt-out(其 add_files 目录通配与 Xsim sim_filelist.f 流程冲突)。
     fixed_skills: ClassVar[list[str]] = ["vivado-2025.2"]
 
+    # 本角色产出的 workflow state 通道（供 graph 动态组合 State schema）
+    state_fields: ClassVar[dict[str, type]] = {
+        "verification_plan": str,
+        "verification_report": str,
+    }
+

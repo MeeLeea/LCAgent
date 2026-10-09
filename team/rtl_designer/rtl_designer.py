@@ -1,6 +1,8 @@
 """
 Designer Agent - 数字芯片 RTL 设计工程师,负责规格梳理、模块拆分、Filelist 生成与可综合 RTL 编码
 """
+from typing import ClassVar
+
 from graph.common import register_agent
 from team.base import TeamAgent
 from tools.human_confirmation import request_user_confirmation
@@ -21,3 +23,10 @@ from tools.human_confirmation import request_user_confirmation
 )
 class DesignerAgent(TeamAgent):
     """设计师 Agent。工作流提示词见 AGENT.md 的 `## workflow:*` 小节,LLM 参数见 team_agents.json。"""
+
+    # 本角色产出的 workflow state 通道（供 graph 动态组合 State schema）
+    state_fields: ClassVar[dict[str, type]] = {
+        "design_spec": str,
+        "rtl_code": str,
+        "output_files": list[str],
+    }

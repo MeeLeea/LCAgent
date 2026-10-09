@@ -55,6 +55,9 @@ class TeamAgent:
     # 不走配置穿透、不走 state;aclear_skills 只清 state 不影响此处)。
     # 例: rtl_verification 设 ["vivado-2025.2"] 始终注入 Vivado Xsim 指引
     fixed_skills: ClassVar[list[str]] = []
+
+    # 本角色产出的 workflow state 通道（子类覆盖；供 graph 动态组合 State schema）
+    state_fields: ClassVar[dict[str, type]] = {}
     
     def __init__(
         self,
