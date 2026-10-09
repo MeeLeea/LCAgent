@@ -2,7 +2,7 @@
 
 arun_compiled_workflow 封装了跨轮次记忆压缩、长期记忆召回注入、
 节点进度回调、workspace 隔离等通用逻辑，各工作流只需提供
-自己特有的初始状态字段（state_fields）。
+自己特有的初始状态字段（initial_fields）。
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 async def arun_compiled_workflow(
     graph: StateGraph,
     task: str,
-    state_fields: dict[str, Any] | None = None,
+    initial_fields: dict[str, Any] | None = None,
     raw_context: str = "",
     thread_id: str | None = None,
     workspace_path: str | None = None,
@@ -38,13 +38,15 @@ async def arun_compiled_workflow(
 ) -> dict:
     """通用异步工作流运行器 - 所有工作流共享的 ainvoke 逻辑
 
-    各工作流只需提供自己特有的初始状态字段（state_fields），通用字段
-    （task / raw_context / context_summary）由本函数自动填充。
+    各工作流只需提供自己特有的初始状态字段（initial_fields），通用底座字段
+    （task / raw_context）由本函数自动填充；context_summary 等角色声明通道
+    由调用方经 initial_fields 显式传入（见 D2）。
 
     Args:
         graph: 编译好的 LangGraph StateGraph
         task: 用户任务
-        state_fields: 工作流特有的初始状态字段（值为空串的占位）
+        initial_fields: 工作流特有的初始状态字段（键须为图的已声明 state 通道，
+            否则在可自省 schema 时抛 ValueError；值为空串的占位）
         raw_context: 原始记忆文本，为空则不注入记忆
         thread_id: 会话线程 ID。为 None 时自动生成（无持久化绑定）
         workspace_path: 会话绑定的工作空间绝对路径
@@ -66,7 +68,7 @@ async def arun_compiled_workflow(
 
     with TraceContext(trace_id=tid, thread_id=tid):
         return await _arun_with_trace(
-            graph, task, state_fields, raw_context, tid,
+            graph, task, initial_fields, raw_context, tid,
             workspace_path, on_node_start, on_node_end, on_node_error,
             max_history_chars, memory, memory_thread_id, is_run_mode,
             active_skills,
@@ -76,7 +78,7 @@ async def arun_compiled_workflow(
 async def _arun_with_trace(
     graph: StateGraph,
     task: str,
-    state_fields: dict[str, Any] | None,
+    initial_fields: dict[str, Any] | None,
     raw_context: str,
     tid: str,
     workspace_path: str | None,
@@ -115,14 +117,14 @@ async def _arun_with_trace(
     initial_state: dict[str, Any] = {
         "task": task,
         "raw_context": raw_context,
-        "context_summary": "",
     }
     # 仅当显式传入非空技能时才写入 initial_state：正常重跑时该字段由
     # checkpoint 恢复（per-thread 持久化的手动加载技能），若无条件覆盖会清空它
     if active_skills:
         initial_state["active_skills"] = list(active_skills)
-    if state_fields:
-        initial_state.update(state_fields)
+    if initial_fields:
+        _guard_initial_fields_subset(graph, initial_fields)
+        initial_state.update(initial_fields)
 
     if on_node_start or on_node_end or on_node_error:
         known_nodes = {
@@ -153,6 +155,47 @@ async def _arun_with_trace(
 
     logger.info("工作流执行完成 [thread=%s]", tid)
     return result
+
+
+def _guard_initial_fields_subset(
+    graph: StateGraph, initial_fields: dict[str, Any]
+) -> None:
+    """轻量守卫：initial_fields 的键必须是图的已声明 state 通道。
+
+    LangGraph 对未知输入键静默丢弃，initial_fields 拼错字段名不会报错、只会
+    静默丢字段（见计划 §4.7 Oracle 守护）。这里自省图的 schema 通道集合，
+    存在未声明键时抛 ``ValueError``（中文提示，列出全部违规键）。
+
+    schema 自省放在 try/except 中（fail-open）：若当前 LangGraph 版本取不到
+    通道集合，则跳过守卫，不阻断既有调用方。
+    """
+    try:
+        declared = _schema_channel_names(graph)
+    except Exception as error:  # 自省不可用时跳过守卫（fail-open）
+        logger.debug("自省 workflow 图 schema 失败,跳过 initial_fields 子集守卫: %s", error)
+        return
+    unexpected = sorted(set(initial_fields) - declared)
+    if unexpected:
+        raise ValueError(
+            f"initial_fields 含未在 workflow State schema 中声明的通道: {unexpected};"
+            f" 请核对键名（可用通道: {sorted(declared)}）"
+        )
+
+
+def _schema_channel_names(graph: StateGraph) -> set[str]:
+    """从编译图提取已声明的 state 通道名集合。
+
+    优先用 ``get_input_jsonschema()``（只含真实 state 通道，无内部哨兵/分支
+    节点名）；回退到 ``graph.channels``（含 __start__ / __pregel_tasks /
+    branch:* 等内部键，仅放大允许集合，不影响子集守卫正确性）。
+    """
+    schema = graph.get_input_jsonschema()
+    if isinstance(schema, dict):
+        properties = schema.get("properties") or {}
+        if properties:
+            return set(properties)
+    channels = getattr(graph, "channels", None)
+    return set(channels) if channels else set()
 
 
 async def _aget_previous_workflow_summary(

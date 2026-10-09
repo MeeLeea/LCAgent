@@ -298,7 +298,7 @@ class WorkflowAdapter:
             thread_id: 目标 workflow 会话 ID
 
         Returns:
-            {"summary", "messages_before", "messages_after"} 或 None（无消息/失败）
+            {"messages_before", "messages_after"} 或 None（无消息/失败）
         """
         tid = self._current_sid(thread_id)
         msgs = await self._registry.aget_messages(tid)
@@ -308,19 +308,6 @@ class WorkflowAdapter:
         workflow_name = self._registry.workflow_name_of(tid)
         if not workflow_name:
             return None
-
-        # 读取当前 state 中的已有摘要
-        existing_summary = ""
-        config = {"configurable": {"thread_id": tid}}
-        try:
-            getter = getattr(self._checkpointer, "aget_tuple", None)
-            tup = await getter(config) if callable(getter) else None
-            if tup is not None and tup.checkpoint is not None:
-                existing_summary = (
-                    tup.checkpoint.get("channel_values", {}).get("summary", "") or ""
-                )
-        except Exception as error:
-            logger.debug("读取 workflow 摘要失败: %s", error)
 
         # 惰性构造压缩中间件（从任一角色 agent 的 llm）
         from graph.common import build_workflow
@@ -332,13 +319,18 @@ class WorkflowAdapter:
         if mw is None:
             return None
 
-        update = await mw.arun_compaction(msgs, existing_summary=existing_summary, force=force)
+        # 工作流 State 无 summary 通道：existing_summary 固定为空串（D1-A），
+        # 手动 compact 仅压缩 messages
+        update = await mw.arun_compaction(msgs, existing_summary="", force=force)
         if update is None:
             return None
 
+        # summary 已不再持久化到任何通道，写回前丢弃以免污染 state
+        # （LangGraph 对未声明通道写入静默丢弃，不会崩，但保持语义干净）
+        update.pop("summary", None)
+        config: dict[str, Any] = {"configurable": {"thread_id": tid}}
         await _graph.aupdate_state(config, update)
         return {
-            "summary": update["summary"],
             "messages_before": len(msgs),
             "messages_after": len(update["messages"]) - 1,
         }

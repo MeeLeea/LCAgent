@@ -4,7 +4,7 @@ NodeSpec 将「节点名 + 节点函数 + 绑定角色」声明成数据，
 register_nodes 批量执行 partial 绑定 + add_node。
 可选 compaction_mw 开启节点级压缩：节点返回后调用 arun_compaction，
 仅在预估 token > max_context_tokens（默认 100000）时触发（非 force），
-把 messages/summary 合并进节点返回值。
+把 messages 合并进节点返回值。
 """
 from __future__ import annotations
 
@@ -37,6 +37,7 @@ def _wrap_node_with_compaction(fn: Callable, mw: Any) -> Callable:
 
     节点执行完成后, 用「state 中的历史消息 + 节点本次产出的消息」调用
     ``mw.arun_compaction(...)``；仅在预估 token 超过阈值时返回非 None 更新。
+    压缩仅作用于 ``messages`` 通道（工作流 State 已无 summary 通道，见 D1-A）。
 
     Args:
         fn: 已绑定 agent/injector 的节点函数(partial)
@@ -58,11 +59,12 @@ def _wrap_node_with_compaction(fn: Callable, mw: Any) -> Callable:
         if not msgs:
             return result
         accumulated = list(state.get("messages", []) or []) + list(msgs)
-        update = await mw.arun_compaction(
-            accumulated, existing_summary=state.get("summary", "") or ""
-        )
+        update = await mw.arun_compaction(accumulated, existing_summary="")
         if update is None:
             return result
+        # 工作流 State 无 summary 通道，丢弃以免污染返回值（LangGraph 对未声明
+        # 通道写入静默丢弃，但为保持返回值语义干净必须显式 pop）
+        update.pop("summary", None)
         # 刻意用 {**result, **update}: update["messages"](RemoveAll + 摘要 + kept,
         # kept 已含节点新产出)取代 result["messages"], 不丢不重。禁止改成相加。
         return {**result, **update}
@@ -87,7 +89,7 @@ def register_nodes(
         agents: 角色实例字典
         injector: 技能注入器(SkillInjector)
         compaction_mw: 可选的节点级压缩中间件; 非 None 时节点返回后调用
-            ``arun_compaction`` 并合并 messages/summary
+            ``arun_compaction`` 并合并 messages（仅 messages 通道，State 无 summary）
         specs: 节点规格列表
     """
     for spec in specs or []:
