@@ -47,6 +47,9 @@ from graph.common.registry import (
     register_workflow,
 )
 
+# 动态 State schema 组合器
+from graph.common.schema import compose_state_schema
+
 # 通用运行器
 from graph.common.workflow_runner import (
     _aget_previous_workflow_summary,
@@ -70,6 +73,7 @@ __all__ = [
     "arun_compiled_workflow",
     "arun_workflow_by_name",
     "build_workflow",
+    "compose_state_schema",
     "create_llm_node",
     "get_workflow_runner",
     "list_workflows",
