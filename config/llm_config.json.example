@@ -4,7 +4,8 @@
       "name": "Example Provider",
       "base_url": "https://api.example.com/v1",
       "env_key": "EXAMPLE_PROVIDER_TOKEN",
-      "model": "example-chat-model"
+      "model": ["example-chat-model"],
+      api_key: "8888"
     }
   },
   "tavily": {
