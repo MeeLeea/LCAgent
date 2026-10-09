@@ -13,20 +13,27 @@
 from __future__ import annotations
 
 import asyncio
+import types
 from typing import ClassVar
 
 from langchain_core.messages import AIMessage
 
 from graph.rtl_graph import (
     build_rtl_graph_workflow,
-    designer_output_node,
     route_after_file_check,
     route_after_sim_check,
 )
+from team.rtl_designer.rtl_designer import DesignerAgent
 
 
 class _FakeGraphAgent:
-    """仅用于图构建的最小 fake Agent(无 llm,构建期不调用任何方法)。"""
+    """仅用于图构建的最小 fake Agent(无 llm,构建期不调用任何方法)。
+
+    ``__getattr__`` 对 ``*_node`` 属性返回一个 bound 空实现:节点实现下沉到
+    角色类后,build_rtl_graph_workflow 的 NodeSpec 经 ``agents[role].xxx_node``
+    在构建期取方法引用(register_nodes 的 bound-method 分支只补绑 injector),
+    本 fake 借此对未来新增节点免疫,无需逐节点补桩。
+    """
 
     name = "fake"
     tools: ClassVar[list] = []
@@ -38,6 +45,14 @@ class _FakeGraphAgent:
 
     def render_template(self, template: str, **kwargs) -> str:
         return template
+
+    def __getattr__(self, name: str):
+        if name.endswith("_node"):
+            async def _stub(state, injector=None, config=None):
+                return {}
+
+            return types.MethodType(_stub, self)
+        raise AttributeError(name)
 
 
 def _fake_agents() -> dict:
@@ -106,6 +121,17 @@ def test_route_after_file_check_max_rounds_delivers():
     assert route_after_file_check({"file_check_passed": False, "round": 1, "max_rounds": 3}) == "designer_verilog"
 
 
+def _run_designer_output(state: dict, agent: _RecordingAgent) -> dict:
+    """把 DesignerAgent 的真实交付节点方法绑到 _RecordingAgent 上执行。
+
+    节点实现已下沉为 DesignerAgent.designer_output_node(bound-method 形态);
+    MethodType 绑定后任一被禁用的 self.* LLM/模板方法若被调用,_RecordingAgent
+    会记录并抛错,零 LLM 契约的回归保护保持不变。
+    """
+    bound = types.MethodType(DesignerAgent.designer_output_node, agent)
+    return asyncio.run(bound(state))
+
+
 # ==================== 用例 (d):非空交付 + 零 LLM 契约 ====================
 
 def test_designer_output_non_empty_and_zero_llm():
@@ -119,7 +145,7 @@ def test_designer_output_non_empty_and_zero_llm():
         "output_files": ["src/uart.sv"],
     }
 
-    result = asyncio.run(designer_output_node(state, agent, injector=None, config=None))
+    result = _run_designer_output(state, agent)
 
     assert result["final_answer"]
     assert isinstance(result["final_answer"], str)
@@ -140,12 +166,12 @@ def test_designer_output_all_empty_still_non_empty_with_task():
     agent = _RecordingAgent()
 
     # 仅 task 非空:仍须输出含 task 的非空文本
-    result = asyncio.run(designer_output_node({"task": "边界任务X"}, agent, injector=None, config=None))
+    result = _run_designer_output({"task": "边界任务X"}, agent)
     assert result["final_answer"]
     assert "边界任务X" in result["final_answer"]
     assert result["messages"][0].content == result["final_answer"]
 
     # 完全空 state(含 task 为空的极端):仍须非空
-    result_empty = asyncio.run(designer_output_node({}, agent, injector=None, config=None))
+    result_empty = _run_designer_output({}, agent)
     assert result_empty["final_answer"]
     assert agent.calls == []

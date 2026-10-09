@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import types
 from dataclasses import dataclass, field
 from typing import ClassVar
 from unittest.mock import patch
@@ -15,12 +16,11 @@ from cli.commands.workflow import workflow_command
 from graph.simple import (
     arun_simple_workflow,
     build_simple_workflow,
-    manager_plan_node,
-    summarize_context,
-    terminator_final_node,
-    worker_exec_node,
 )
 from team.base import TeamAgent
+from team.manager.manager import ManagerAgent
+from team.terminator.terminator import TerminatorAgent
+from team.worker.worker import WorkerAgent
 
 # 默认模板(与各角色 AGENT.md 的 ## workflow:* 小节一致,供 FakeAgent 兜底)
 DEFAULT_TEMPLATES: dict[str, str] = {
@@ -96,10 +96,27 @@ class FakeAgent:
         return AgentTurnResult.completed(self._next(prompt))
 
 
+@dataclass
 class FakeManagerAgent(FakeAgent):
-    """模拟 Manager 角色:声明 context_summary/plan 通道(与 ManagerAgent.state_fields 一致)。"""
+    """模拟 Manager 角色:声明 context_summary/plan 通道(与 ManagerAgent.state_fields 一致)。
+
+    __post_init__ 把 ManagerAgent 的真实节点方法 summarize_context_node 绑到
+    本实例上(types.MethodType):build_simple_workflow 的 NodeSpec 经
+    ``agents["manager"].summarize_context_node`` 取引用(register_nodes 的
+    bound-method 分支只补绑 injector),运行期执行的是真实节点逻辑,
+    执行后端由本 Fake 的 arun_structured 提供(不联网)。
+
+    注:必须重新加 @dataclass 装饰器——装饰器只在处理类体时检查
+    __post_init__ 是否存在并生成调用;父类 FakeAgent 类体无 __post_init__,
+    其 __init__ 不含调用,子类后补定义不会生效。
+    """
 
     state_fields: ClassVar[dict[str, type]] = {"context_summary": str, "plan": str}
+
+    def __post_init__(self) -> None:
+        self.summarize_context_node = types.MethodType(
+            ManagerAgent.summarize_context_node, self
+        )
 
 
 class FakeWorkerAgent(FakeAgent):
@@ -117,11 +134,11 @@ class FakeTerminatorAgent(FakeAgent):
 # ==================== 测试工作流节点 ====================
 
 def test_summarize_context_node():
-    """测试 summarize 节点:Manager 提炼记忆上下文摘要"""
+    """测试 summarize 节点:Manager 提炼记忆上下文摘要(经 ManagerAgent 真实节点方法)"""
     manager = FakeManagerAgent(name="manager", summary_response="记忆摘要: 项目背景A")
     state = {"raw_context": "用户: 之前聊过项目A"}
 
-    result = asyncio.run(summarize_context(state, manager))
+    result = asyncio.run(manager.summarize_context_node(state))
 
     assert result["context_summary"] == "记忆摘要: 项目背景A"
     assert len(manager.calls) == 1
@@ -136,7 +153,7 @@ def test_manager_plan_node():
     manager = FakeManagerAgent(name="manager", response="计划: 步骤1、步骤2")
     state = {"task": "帮我分析项目结构"}
     
-    result = asyncio.run(manager_plan_node(state, manager))
+    result = asyncio.run(ManagerAgent.plan_node(state, manager))
     
     assert result["plan"] == "计划: 步骤1、步骤2"
     assert len(manager.calls) == 1
@@ -149,7 +166,7 @@ def test_worker_exec_node():
     worker = FakeWorkerAgent(name="worker", response="已完成步骤1和步骤2")
     state = {"plan": "计划: 步骤1、步骤2"}
     
-    result = asyncio.run(worker_exec_node(state, worker))
+    result = asyncio.run(WorkerAgent.exec_node(state, worker))
     
     assert result["worker_result"] == "已完成步骤1和步骤2"
     assert len(worker.calls) == 1
@@ -166,7 +183,7 @@ def test_terminator_final_node():
         "worker_result": "已完成步骤1和步骤2"
     }
     
-    result = asyncio.run(terminator_final_node(state, terminator))
+    result = asyncio.run(TerminatorAgent.final_node(state, terminator))
     
     assert result["final_answer"] == "最终答案: 项目包含3个模块"
     assert len(terminator.calls) == 1
@@ -182,7 +199,7 @@ def test_manager_plan_node_with_summary():
     manager = FakeManagerAgent(name="manager", response="计划")
     state = {"task": "任务", "context_summary": "用户偏好中文"}
 
-    result = asyncio.run(manager_plan_node(state, manager))
+    result = asyncio.run(ManagerAgent.plan_node(state, manager))
 
     assert result["plan"] == "计划"
     prompt = manager.calls[0][1]
@@ -200,7 +217,7 @@ def test_terminator_final_node_with_summary():
         "context_summary": "用户偏好中文",
     }
 
-    result = asyncio.run(terminator_final_node(state, terminator))
+    result = asyncio.run(TerminatorAgent.final_node(state, terminator))
 
     assert result["final_answer"] == "最终答案"
     prompt = terminator.calls[0][1]
@@ -217,7 +234,7 @@ def test_terminator_final_node_no_summary():
         "worker_result": "结果",
     }
 
-    asyncio.run(terminator_final_node(state, terminator))
+    asyncio.run(TerminatorAgent.final_node(state, terminator))
 
     prompt = terminator.calls[0][1]
     assert "记忆上下文摘要:" in prompt
@@ -234,10 +251,10 @@ def test_factory_nodes_do_not_inject_agent_rules():
     worker = FakeWorkerAgent(name="worker", response="结果")
     terminator = FakeTerminatorAgent(name="terminator", response="答案")
 
-    asyncio.run(manager_plan_node({"task": "任务", "context_summary": ""}, manager))
-    asyncio.run(worker_exec_node({"plan": "计划"}, worker))
+    asyncio.run(ManagerAgent.plan_node({"task": "任务", "context_summary": ""}, manager))
+    asyncio.run(WorkerAgent.exec_node({"plan": "计划"}, worker))
     asyncio.run(
-        terminator_final_node(
+        TerminatorAgent.final_node(
             {"task": "任务", "plan": "计划", "worker_result": "结果"}, terminator
         )
     )

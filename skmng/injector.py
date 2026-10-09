@@ -89,7 +89,7 @@ class SkillInjector:
             exclude_skills: 需排除的技能名(技能目录名,如 "vivado-2025.2");
                 透传给 build_skill_block,使被排除技能不进入最终指引块
             fixed_skills: 角色级固定依赖技能名;由节点函数从 agent.fixed_skills
-                取值传入(见 graph.common.node_factory),不依赖任务关键词始终注入
+                取值传入(见 team.node_factory),不依赖任务关键词始终注入
 
         Returns:
             注入技能指引块后的提示词

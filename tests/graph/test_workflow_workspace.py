@@ -19,8 +19,9 @@ from unittest.mock import MagicMock
 
 from agent.turn_types import AgentTurnResult
 from agent.workspace_mw import WorkspaceSecurityMW
-from graph.simple import arun_compiled_workflow, worker_exec_node
+from graph.simple import arun_compiled_workflow
 from team.base import TeamAgent
+from team.worker.worker import WorkerAgent
 
 # 默认模板(与 Worker AGENT.md 的 ## workflow:* 小节对齐,供 CapturingWorker.get_template 兜底)
 DEFAULT_TEMPLATES: dict[str, str] = {
@@ -69,7 +70,7 @@ def test_worker_exec_node_passes_workspace_config():
     state = {"plan": "计划: 步骤1"}
     config = {"configurable": {"thread_id": "t1", "workspace_path": "C:/ws"}}
 
-    result = asyncio.run(worker_exec_node(state, worker, config=config))
+    result = asyncio.run(WorkerAgent.exec_node(state, worker, config=config))
 
     assert result["worker_result"] == "done"
     assert worker.received_config == config
@@ -80,7 +81,7 @@ def test_worker_exec_node_config_default_none():
     worker = CapturingWorker()
     state = {"plan": "计划: 步骤1"}
 
-    result = asyncio.run(worker_exec_node(state, worker))
+    result = asyncio.run(WorkerAgent.exec_node(state, worker))
 
     assert result["worker_result"] == "done"
     assert worker.received_config is None
@@ -105,7 +106,7 @@ def test_real_langgraph_injects_config_into_worker_exec_node():
     worker = CapturingWorker()
     graph = StateGraph(WfState)
     graph.add_node(
-        "worker_exec", partial(worker_exec_node, agent=worker, injector=None)
+        "worker_exec", partial(WorkerAgent.exec_node, agent=worker, injector=None)
     )
     graph.add_edge(START, "worker_exec")
     graph.add_edge("worker_exec", END)

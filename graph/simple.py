@@ -2,16 +2,17 @@
 监督者模式工作流 - Manager 拆解 → Worker 执行 → Terminator 汇总
 
 节点进度跟踪与通用运行器已提取至 graph/common/，本文件仅保留
-工作流状态定义、节点函数与图构建逻辑。
+工作流状态定义、LLM 节点定义与图构建逻辑。
 
 节点执行链路说明：
     节点函数在自身渲染 prompt（get_template + render_template + 技能注入）后，
-    调 ``run_team_turn_with_interrupt(agent, prompt, config)``（见 graph/common.py）。
+    调 ``run_team_turn_with_interrupt(agent, prompt, config)``（见 team/interrupt.py）。
     helper 内部经 ``TeamAgent.arun_structured`` 流式执行 LLM（token 增量经
     config["callbacks"] 流出到外层事件流）；工具内 ``interrupt()`` 时透传给
     外层 graph 的 checkpointer，由外层 resume 恢复（对照 plan team-checkpointer-interrupt）。
-    summarize_context 节点直接把 ``summarize_context`` 模板内容拼到 prompt 前部
-    作系统指令（经 _astream_messages 的 system 消息语义）。
+    summarize 节点实现已下沉至 ``ManagerAgent.summarize_context_node``
+    (team/manager/manager.py,与 rtl_graph 工作流共用),经 register_nodes 的
+    bound-method 分支注册;其余节点为本文件模块级的 create_llm_node 产物。
 
 workspace 隔离说明：
     worker_exec 节点接收 LangGraph 注入的 config（含 configurable.workspace_path），
@@ -30,10 +31,7 @@ workspace 隔离说明：
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any, Optional
 
-from langchain_core.messages import AIMessage
-from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 
 from agent.compaction import CompactionConfig
@@ -43,66 +41,18 @@ from graph.common import (
     _build_compaction_middleware,
     arun_compiled_workflow,
     compose_state_schema,
-    create_llm_node,
     register_nodes,
     register_workflow,
-    run_team_turn_with_interrupt,
 )
 from skmng.injector import SkillInjector
-from team.base import TeamAgent
-
+from team import ManagerAgent, TerminatorAgent, WorkerAgent
 
 # 2. 节点函数(提示词模板由各角色 TeamAgent 懒加载,节点需要时调用 get_template)
-async def summarize_context(
-    state: dict[str, Any],
-    agent: TeamAgent,
-    injector=None,
-    config: Optional[RunnableConfig] = None,  # noqa: UP045 - 见 worker_exec_node 注释
-) -> dict[str, Any]:
-    """Manager 提炼记忆上下文,生成分发给下游节点的上下文摘要
-
-    raw_context 为空时短路返回空串,跳过 LLM 调用。非空时把
-    ``summarize_context`` 模板内容拼到 prompt 前部作为指令(经
-    _astream_messages 的 system 消息语义,helper 单 prompt 通道下合并为用户消息),
-    调 ``run_team_turn_with_interrupt`` 流式执行。
-
-    config 透传(含 callbacks):使 summarize 的 LLM token 增量可流出到外层事件流。
-    """
-    raw = state.get("raw_context", "")
-    # raw 为空时短路返回空串(不调 helper)
-    if not raw:
-        return {"context_summary": "", "messages": [AIMessage(content="")]}
-    # summarize 节点不注入技能块(不调 injector)
-    prompt = f"{agent.get_template('summarize_context')}\n\n{raw}"
-    result = await run_team_turn_with_interrupt(agent, prompt, config)
-    return {"context_summary": result, "messages": [AIMessage(content=result)]}
-
-
-manager_plan_node = create_llm_node(
-    template_name="manager_plan",
-    output_field="plan",
-    template_vars_fn=lambda s: {"task": s["task"], "context_summary": s.get("context_summary", "")},
-    match_text_fn=lambda s: s["task"],
-    base_prompts="",
-)
-
-
-worker_exec_node = create_llm_node(
-    template_name="worker_exec",
-    output_field="worker_result",
-    template_vars_fn=lambda s: {"plan": s["plan"]},
-    match_text_fn=lambda s: s["plan"],
-    base_prompts="",
-)
-
-
-terminator_final_node = create_llm_node(
-    template_name="terminator_final",
-    output_field="final_answer",
-    template_vars_fn=lambda s: {"task": s["task"], "plan": s["plan"], "worker_result": s["worker_result"], "context_summary": s.get("context_summary", "")},
-    match_text_fn=lambda s: s["task"],
-    base_prompts="",
-)
+# 全部节点实现归属角色类:
+#   summarize        → ManagerAgent.summarize_context_node 实例方法(与 rtl_graph 共用)
+#   manager_plan     → ManagerAgent.plan_node 类属性(create_llm_node 闭包)
+#   worker_exec      → WorkerAgent.exec_node 类属性
+#   terminator_final → TerminatorAgent.final_node 类属性
 
 
 # 3. 构建工作流图
@@ -152,10 +102,10 @@ def build_simple_workflow(
         injector,
         compaction_mw,
         [
-            NodeSpec("summarize", summarize_context, role="manager"),
-            NodeSpec("manager_plan", manager_plan_node, role="manager"),
-            NodeSpec("worker_exec", worker_exec_node, role="worker"),
-            NodeSpec("terminator_final", terminator_final_node, role="terminator"),
+            NodeSpec("summarize", manager.summarize_context_node, role="manager"),
+            NodeSpec("manager_plan", ManagerAgent.plan_node, role="manager"),
+            NodeSpec("worker_exec", WorkerAgent.exec_node, role="worker"),
+            NodeSpec("terminator_final", TerminatorAgent.final_node, role="terminator"),
         ],
     )
 

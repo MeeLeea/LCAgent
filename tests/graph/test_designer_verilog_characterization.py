@@ -1,8 +1,8 @@
-"""designer_verilog_node 行为保持(characterization)测试。
+"""designer_verilog 节点行为保持(characterization)测试。
 
-本文件在 **未改动** 的 ``graph/rtl_graph.py`` 上即应通过,用于钉住
-``designer_verilog_node`` 的现有可观测行为,使后续"改用 create_llm_node
-工厂"的重构不能静默漂移。覆盖:
+钉住 ``DesignerAgent.verilog_node``(由 graph/rtl_graph.py 的 designer_verilog_node
+下沉为 DesignerAgent 类属性,create_llm_node 闭包)的现有可观测行为,
+使后续重构不能静默漂移。覆盖:
 
 1. prompt 内容:task + 【设计规格与Filelist】 + 【验证计划】;
    仅当 ``round > 0 and verification_report`` 时追加
@@ -28,8 +28,8 @@ from typing import Any
 from langchain_core.messages import AIMessage
 
 from agent.turn_types import AgentTurnResult
-from graph.rtl_graph import designer_verilog_node
 from team.base import TeamAgent
+from team.rtl_designer.rtl_designer import DesignerAgent
 
 # 与 team/rtl_designer/AGENT.md 的 ## workflow:verilog_design 默认模板一致
 DEFAULT_TEMPLATES: dict[str, str] = {
@@ -125,7 +125,7 @@ def test_prompt_contains_task_spec_and_plan_without_feedback_at_round_zero():
     """round==0:prompt 含 task/设计规格/验证计划,不含反馈小节与「重要规则」前缀。"""
     designer = FakeDesignerAgent()
     state = _initial_state(design_spec="规格D", verification_plan="计划V")
-    asyncio.run(designer_verilog_node(state, designer))
+    asyncio.run(DesignerAgent.verilog_node(state, designer))
     prompt = designer.calls[0][1]
 
     assert prompt == _expected_prompt(state)
@@ -146,7 +146,7 @@ def test_prompt_appends_feedback_when_round_positive_and_report_present():
         verification_report="验证结论: FAIL\n波特率错误",
         round=1,
     )
-    asyncio.run(designer_verilog_node(state, designer))
+    asyncio.run(DesignerAgent.verilog_node(state, designer))
     prompt = designer.calls[0][1]
 
     assert prompt == _expected_prompt(state)
@@ -158,7 +158,7 @@ def test_prompt_omits_feedback_when_round_positive_but_report_empty():
     """round>0 但 report 为空:不追加反馈小节。"""
     designer = FakeDesignerAgent()
     state = _initial_state(design_spec="规格D", round=2, verification_report="")
-    asyncio.run(designer_verilog_node(state, designer))
+    asyncio.run(DesignerAgent.verilog_node(state, designer))
     prompt = designer.calls[0][1]
 
     assert prompt == _expected_prompt(state)
@@ -171,7 +171,7 @@ def test_prompt_omits_feedback_at_round_zero_even_with_report():
     state = _initial_state(
         design_spec="规格D", round=0, verification_report="验证结论: FAIL"
     )
-    asyncio.run(designer_verilog_node(state, designer))
+    asyncio.run(DesignerAgent.verilog_node(state, designer))
     prompt = designer.calls[0][1]
 
     assert prompt == _expected_prompt(state)
@@ -182,7 +182,7 @@ def test_prompt_omits_spec_and_plan_sections_when_empty():
     """design_spec/verification_plan 为空:对应小节整段省略。"""
     designer = FakeDesignerAgent()
     state = _initial_state(design_spec="", verification_plan="")
-    asyncio.run(designer_verilog_node(state, designer))
+    asyncio.run(DesignerAgent.verilog_node(state, designer))
     prompt = designer.calls[0][1]
 
     assert prompt == _expected_prompt(state)
@@ -195,11 +195,11 @@ def test_prompt_omits_spec_and_plan_sections_when_empty():
 def test_round_is_state_round_plus_one():
     """round == state["round"] + 1。"""
     designer = FakeDesignerAgent()
-    result = asyncio.run(designer_verilog_node(_initial_state(round=0), designer))
+    result = asyncio.run(DesignerAgent.verilog_node(_initial_state(round=0), designer))
     assert result["round"] == 1
 
     designer2 = FakeDesignerAgent()
-    result2 = asyncio.run(designer_verilog_node(_initial_state(round=2), designer2))
+    result2 = asyncio.run(DesignerAgent.verilog_node(_initial_state(round=2), designer2))
     assert result2["round"] == 3
 
 
@@ -224,7 +224,7 @@ def test_output_files_parsed_from_workspace_filelist(tmp_path):
     designer = FakeDesignerAgent()
     state = _initial_state(design_spec="规格D", verification_plan="计划V")
     result = asyncio.run(
-        designer_verilog_node(
+        DesignerAgent.verilog_node(
             state, designer, config={"configurable": {"workspace_path": str(tmp_path)}}
         )
     )
@@ -239,7 +239,7 @@ def test_output_files_parsed_from_workspace_filelist(tmp_path):
 def test_output_files_empty_when_config_is_none():
     """config 为 None:output_files 优雅降级为空列表。"""
     designer = FakeDesignerAgent()
-    result = asyncio.run(designer_verilog_node(_initial_state(), designer))
+    result = asyncio.run(DesignerAgent.verilog_node(_initial_state(), designer))
     assert result["output_files"] == []
 
 
@@ -247,7 +247,7 @@ def test_output_files_empty_when_no_workspace_path():
     """config 无 workspace_path:output_files 优雅降级为空列表。"""
     designer = FakeDesignerAgent()
     result = asyncio.run(
-        designer_verilog_node(
+        DesignerAgent.verilog_node(
             _initial_state(), designer, config={"configurable": {}}
         )
     )
@@ -258,7 +258,7 @@ def test_output_files_empty_when_filelist_missing(tmp_path):
     """workspace 存在但 filelist 缺失:output_files 为空列表。"""
     designer = FakeDesignerAgent()
     result = asyncio.run(
-        designer_verilog_node(
+        DesignerAgent.verilog_node(
             _initial_state(),
             designer,
             config={"configurable": {"workspace_path": str(tmp_path)}},
@@ -272,7 +272,7 @@ def test_output_files_empty_when_filelist_missing(tmp_path):
 def test_messages_and_rtl_code_match_result():
     """messages == [AIMessage(content=result)],rtl_code == result。"""
     designer = FakeDesignerAgent(response="module top; endmodule")
-    result = asyncio.run(designer_verilog_node(_initial_state(), designer))
+    result = asyncio.run(DesignerAgent.verilog_node(_initial_state(), designer))
     assert result["rtl_code"] == "module top; endmodule"
     assert result["messages"] == [AIMessage(content="module top; endmodule")]
 
@@ -284,7 +284,7 @@ def test_injector_called_with_prompt_and_assembled_prompt_task():
     designer = FakeDesignerAgent()
     injector = RecordingInjector()
     state = _initial_state(design_spec="规格D", verification_plan="计划V")
-    asyncio.run(designer_verilog_node(state, designer, injector))
+    asyncio.run(DesignerAgent.verilog_node(state, designer, injector))
 
     assert len(injector.calls) == 1
     injected_prompt, injected_task = injector.calls[0]

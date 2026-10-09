@@ -172,7 +172,7 @@ class WorkflowAdapter:
         仅 graph.ainvoke 的输入不同（initial_state vs resume_command）。
 
         外层 graph 从被 interrupt 的节点恢复，节点内
-        run_team_turn_with_interrupt 的 interrupt() 返回 resume_value，
+        run_team_turn_with_interrupt（team/interrupt.py）的 interrupt() 返回 resume_value，
         调 aresume_structured 恢复内层 TeamAgent。
 
         Args:
@@ -232,7 +232,7 @@ class WorkflowAdapter:
         """加载技能到指定 workflow 会话（写入 state.active_skills）。
 
         技能名存入 workflow 会话的 per-thread checkpoint state，由节点经
-        ``create_llm_node`` 读取 ``state["active_skills"]`` 后注入提示词。
+        ``create_llm_node``（team/node_factory.py）读取 ``state["active_skills"]`` 后注入提示词。
         与 ``SkillOps.aload_skill`` 语义一致，仅图来源不同。
 
         Args:

@@ -5,23 +5,19 @@
 
 子模块:
     node_tracking      — NodeTrackingHandler 回调处理器
-    interrupt_forward   — run_team_turn_with_interrupt 中断转发
-    node_factory        — create_llm_node 节点工厂
     workflow_runner     — arun_compiled_workflow 通用运行器
     compaction_utils    — _build_compaction_middleware 压缩中间件构造
     node_spec           — NodeSpec / register_nodes 声明式注册
     registry            — WORKFLOWS / AGENT_REGISTRY / build_workflow 注册表
+
+注: create_llm_node(节点工厂) 与 run_team_turn_with_interrupt(中断转发)
+已随节点实现下沉迁至 team/ 包(team.node_factory / team.interrupt),
+其 runtime 依赖本来就是 team.base,不再属 graph 编排基建。
 """
 from __future__ import annotations
 
 # 压缩中间件构造工具
 from graph.common.compaction_utils import _build_compaction_middleware
-
-# 中断转发
-from graph.common.interrupt_forward import run_team_turn_with_interrupt
-
-# 节点工厂
-from graph.common.node_factory import create_llm_node
 
 # 声明式节点规格与注册
 from graph.common.node_spec import NodeSpec, register_nodes
@@ -74,11 +70,9 @@ __all__ = [
     "arun_workflow_by_name",
     "build_workflow",
     "compose_state_schema",
-    "create_llm_node",
     "get_workflow_runner",
     "list_workflows",
     "register_agent",
     "register_nodes",
     "register_workflow",
-    "run_team_turn_with_interrupt",
 ]
