@@ -19,21 +19,22 @@ workspace 隔离说明：
     WorkspaceSecurityMW 约束（见 graph/common.arun_compiled_workflow）。
 
 会话化说明：
-    WorkflowState 含 ``messages``（add_messages reducer）与 ``summary`` 字段，
-    每个节点把自身产出追加为 AIMessage；`messages`/`summary` 的压缩由
-    ``register_nodes`` 的可选 ``compaction_mw`` 包装在节点返回后调用
-     ``arun_compaction`` 完成（非 force：仅当预估 token > ``max_context_tokens``，
-     默认 100000 时触发）。
+    State schema 由 ``compose_state_schema(agents)`` 动态组合（底座含 task /
+    raw_context / messages(add_messages reducer) / active_skills;各角色经
+    ``state_fields`` 声明自身产出通道,如 Manager 的 context_summary/plan）。
+    每个节点把自身产出追加为 AIMessage; ``messages`` 的压缩由 registers_nodes
+    的可选 ``compaction_mw`` 包装在节点返回后调用 ``arun_compaction`` 完成
+    （非 force：仅当预估 token > ``max_context_tokens``，默认 100000 时触发）。
+    底座不再含工作流级 ``summary`` 通道。
 """
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Annotated, Optional, TypedDict
+from typing import Any, Optional
 
-from langchain_core.messages import AIMessage, AnyMessage
+from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
-from langgraph.graph.message import add_messages
 
 from agent.compaction import CompactionConfig
 from graph.common import (
@@ -41,6 +42,7 @@ from graph.common import (
     NodeSpec,
     _build_compaction_middleware,
     arun_compiled_workflow,
+    compose_state_schema,
     create_llm_node,
     register_nodes,
     register_workflow,
@@ -50,32 +52,13 @@ from skmng.injector import SkillInjector
 from team.base import TeamAgent
 
 
-# 1. 定义工作流状态
-class WorkflowState(TypedDict, total=False):
-    """监督者工作流状态"""
-
-    task: str             # 用户原始任务
-    raw_context: str      # 原始记忆文本(当前会话+长期记忆,仅 summarize 节点消费)
-    context_summary: str  # Manager 提炼后的上下文摘要(注入 plan/final 节点)
-    plan: str             # Manager 拆解的执行计划
-    worker_result: str    # Worker 执行结果
-    final_answer: str     # Terminator 最终答案
-    # 会话化消息通道:各节点产出追加为 AIMessage,经 add_messages reducer 累积;
-    # 超阈值时由 compaction 中间件压缩(摘要进 summary,旧消息清空)
-    messages: Annotated[list[AnyMessage], add_messages]
-    summary: str          # 历史消息摘要(compaction 产物,随 checkpoint 持久化)
-    # 本 workflow 线程手动加载的技能名列表(经 skill:<name> 写入,随 checkpoint
-    # per-thread 持久化);节点经 create_llm_node 读取并注入 prompt
-    active_skills: list[str]
-
-
 # 2. 节点函数(提示词模板由各角色 TeamAgent 懒加载,节点需要时调用 get_template)
 async def summarize_context(
-    state: WorkflowState,
+    state: dict[str, Any],
     agent: TeamAgent,
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 见 worker_exec_node 注释
-) -> WorkflowState:
+) -> dict[str, Any]:
     """Manager 提炼记忆上下文,生成分发给下游节点的上下文摘要
 
     raw_context 为空时短路返回空串,跳过 LLM 调用。非空时把
@@ -157,7 +140,7 @@ def build_simple_workflow(
     # compaction 中间件:消息通道超阈值时节点级增量压缩(agent 无 llm 时禁用)
     compaction_mw = _build_compaction_middleware(manager, compaction_config)
 
-    builder = StateGraph(WorkflowState)
+    builder = StateGraph(compose_state_schema(agents))
 
     # 添加节点(声明式 NodeSpec 表:partial 绑定 + compaction 包装 + add_node 三步合一)
     # 注意:register_nodes 内部用 functools.partial 绑定 agent 实例;提示词模板由节点内懒加载
@@ -229,7 +212,7 @@ async def arun_simple_workflow(
     return await arun_compiled_workflow(
         graph,
         task,
-        state_fields={"plan": "", "worker_result": "", "final_answer": ""},
+        initial_fields={"context_summary": "", "plan": "", "worker_result": "", "final_answer": ""},
         raw_context=raw_context,
         thread_id=thread_id,
         workspace_path=workspace_path,

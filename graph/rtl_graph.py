@@ -33,12 +33,11 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import Sequence
-from typing import Annotated, Any, Optional, TypedDict
+from typing import Any, Optional
 
-from langchain_core.messages import AIMessage, AnyMessage
+from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
-from langgraph.graph.message import add_messages
 
 # 显式导入 RTL 角色模块,触发 @register_agent 装饰器注册(team/__init__.py 未导入)
 import team.rtl_designer.rtl_designer
@@ -49,6 +48,7 @@ from graph.common import (
     NodeSpec,
     _build_compaction_middleware,
     arun_compiled_workflow,
+    compose_state_schema,
     create_llm_node,
     register_nodes,
     register_workflow,
@@ -56,41 +56,6 @@ from graph.common import (
 )
 from skmng.injector import SkillInjector
 from team.base import TeamAgent
-
-
-# 1. 定义工作流状态
-class RTLGraphState(TypedDict, total=False):
-    """RTL 芯片设计流水线工作流状态"""
-
-    task: str               # 用户原始任务
-    raw_context: str        # 原始记忆文本(仅 summarize 节点消费)
-    context_summary: str    # Manager 提炼后的上下文摘要
-    arch_plan: str          # Architect 架构执行计划
-    arch_design: str        # Architect 架构方案设计
-    arch_analysis: str      # Architect PPA 权衡分析
-    arch_review: str        # Architect 多维评审意见
-    arch_spec: str          # Architect 规格文档
-    design_spec: str        # Designer 规格梳理与 Filelist
-    verification_plan: str  # Verification 验证计划
-    rtl_code: str           # Designer 输出的 RTL 源码
-    verification_report: str  # Verification 验证报告(含验证结论标记)
-    round: int              # 当前设计-验证迭代轮次
-    max_rounds: int         # 最大迭代轮次(超限强制交付)
-    final_answer: str       # Designer 最终交付内容
-    # 会话化消息通道:各节点产出追加为 AIMessage,经 add_messages reducer 累积;
-    # 超阈值时由 compaction 中间件压缩(摘要进 summary,旧消息清空)
-    messages: Annotated[list[AnyMessage], add_messages]
-    summary: str            # 历史消息摘要(compaction 产物,随 checkpoint 持久化)
-    # 校验状态(新增 check 节点使用)
-    output_files: list[str]   # designer_verilog 解析 syn_filelist.f 得到的待交付 RTL 文件相对路径列表
-    file_check_passed: bool   # designer_file_check 文件存在/非空校验结果
-    sim_check_passed: bool    # sim_exec_check 仿真+覆盖率校验结果
-    sim_status: str           # sim_exec_check 结论(PASS/FAIL/ERROR)
-    sim_log_path: str         # sim_exec_check 写出的完整 Vivado 日志路径
-    # 本 workflow 线程手动加载的技能名列表(经 skill:<name> 写入,随 checkpoint
-    # per-thread 持久化);节点经 create_llm_node 读取并注入 prompt
-    active_skills: list[str]
-
 
 # 2. 节点函数(提示词模板由各角色 TeamAgent 懒加载,节点需要时调用 get_template)
 
@@ -139,11 +104,11 @@ def _write_text_file(path: str, text: str) -> None:
 
 
 async def summarize_context(
-    state: RTLGraphState,
+    state: dict[str, Any],
     agent: TeamAgent,
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
-) -> RTLGraphState:
+) -> dict[str, Any]:
     """Manager 提炼记忆上下文,生成分发给下游节点的上下文摘要
 
     raw_context 为空时短路返回空串,跳过 LLM 调用。非空时把
@@ -164,19 +129,19 @@ async def summarize_context(
 
 
 # ---- 上游产物拼接辅助:承载各节点原有的 parts 逻辑,供模板变量与技能匹配文本复用 ----
-def _architect_design_task(s: RTLGraphState) -> str:
+def _architect_design_task(s: dict[str, Any]) -> str:
     task = s["task"]
     plan = s.get("arch_plan", "")
     return f"{task}\n\n【架构执行计划】\n{plan}" if plan else task
 
 
-def _architect_analyze_task(s: RTLGraphState) -> str:
+def _architect_analyze_task(s: dict[str, Any]) -> str:
     task = s["task"]
     design = s.get("arch_design", "")
     return f"{task}\n\n【架构方案设计】\n{design}" if design else task
 
 
-def _architect_review_task(s: RTLGraphState) -> str:
+def _architect_review_task(s: dict[str, Any]) -> str:
     task = s["task"]
     design = s.get("arch_design", "")
     analysis = s.get("arch_analysis", "")
@@ -188,7 +153,7 @@ def _architect_review_task(s: RTLGraphState) -> str:
     return "\n\n".join(parts)
 
 
-def _architect_spec_task(s: RTLGraphState) -> str:
+def _architect_spec_task(s: dict[str, Any]) -> str:
     task = s["task"]
     design = s.get("arch_design", "")
     review = s.get("arch_review", "")
@@ -200,13 +165,13 @@ def _architect_spec_task(s: RTLGraphState) -> str:
     return "\n\n".join(parts)
 
 
-def _designer_spec_task(s: RTLGraphState) -> str:
+def _designer_spec_task(s: dict[str, Any]) -> str:
     task = s["task"]
     arch_spec = s.get("arch_spec", "")
     return f"{task}\n\n【架构规格文档】\n{arch_spec}" if arch_spec else task
 
 
-def _verification_plan_task(s: RTLGraphState) -> str:
+def _verification_plan_task(s: dict[str, Any]) -> str:
     task = s["task"]
     arch_spec = s.get("arch_spec", "")
     design_spec = s.get("design_spec", "")
@@ -218,7 +183,7 @@ def _verification_plan_task(s: RTLGraphState) -> str:
     return "\n\n".join(parts)
 
 
-def _verification_check_task(s: RTLGraphState) -> str:
+def _verification_check_task(s: dict[str, Any]) -> str:
     task = s["task"]
     design_spec = s.get("design_spec", "")
     vplan = s.get("verification_plan", "")
@@ -237,7 +202,7 @@ def _verification_check_task(s: RTLGraphState) -> str:
     return "\n\n".join(parts)
 
 
-def _designer_verilog_task(s: RTLGraphState) -> str:
+def _designer_verilog_task(s: dict[str, Any]) -> str:
     """Designer RTL 编码节点的任务文本:task + 设计规格 + 验证计划 + 上轮验证反馈。
 
     与手写节点逐字一致(拼装逻辑承载原 parts 逻辑,供模板变量与技能匹配文本复用):
@@ -259,7 +224,7 @@ def _designer_verilog_task(s: RTLGraphState) -> str:
 
 
 def _designer_verilog_extra(
-    state: RTLGraphState,
+    state: dict[str, Any],
     result: str,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 node_fn 注解形态一致
 ) -> dict[str, Any]:
@@ -358,11 +323,11 @@ verification_check_node = create_llm_node(
 
 # ---- 校验节点(代码型,不调用 LLM) ----
 async def designer_file_check_node(
-    state: RTLGraphState,
+    state: dict[str, Any],
     agent: TeamAgent,
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
-) -> RTLGraphState:
+) -> dict[str, Any]:
     """designer_verilog 之后:校验 output_files 中每个 RTL 文件存在且非空。
 
     文件清单由 designer_verilog_node 解析 scripts/syn_filelist.f 得到。
@@ -388,11 +353,11 @@ async def designer_file_check_node(
 
 
 async def sim_exec_check_node(
-    state: RTLGraphState,
+    state: dict[str, Any],
     agent: TeamAgent,
     injector=None,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
-) -> RTLGraphState:
+) -> dict[str, Any]:
     """verification_check 之后:实际执行 scripts/start.tcl 并做覆盖率兜底。
 
     1. 用 asyncio.create_subprocess_exec 调用 Vivado batch 跑 start.tcl(不阻塞事件循环);
@@ -468,11 +433,11 @@ async def sim_exec_check_node(
 
 
 async def designer_output_node(
-    state: RTLGraphState,
+    state: dict[str, Any],
     agent: TeamAgent,  # 保留签名以兼容 register_nodes 的 partial 绑定;本体不再使用
     injector=None,  # 同上
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 designer_verilog_node 一致
-) -> RTLGraphState:
+) -> dict[str, Any]:
     """Designer 交付节点:机械拼装最终交付物(零 LLM 调用)。
 
     本节点不调用任何 LLM、不渲染模板、不做网络/磁盘 IO,仅做确定性字符串拼装:
@@ -526,7 +491,7 @@ def verification_passed(report: str) -> bool:
     return "PASS" in upper and "FAIL" not in upper
 
 
-def route_after_file_check(state: RTLGraphState) -> str:
+def route_after_file_check(state: dict[str, Any]) -> str:
     """designer_file_check 后的条件路由:文件校验通过 → verification_check;
     失败且未达轮次上限 → 回 designer_verilog 重做;达上限 → designer_output 交付。"""
     if state.get("file_check_passed"):
@@ -536,7 +501,7 @@ def route_after_file_check(state: RTLGraphState) -> str:
     return "designer_verilog"
 
 
-def route_after_sim_check(state: RTLGraphState) -> str:
+def route_after_sim_check(state: dict[str, Any]) -> str:
     """sim_exec_check 后的条件路由:仿真+覆盖率通过 → designer_output 交付;
     失败且未达轮次上限 → 回 designer_verilog 重做;达上限 → designer_output 交付。"""
     if state.get("sim_check_passed"):
@@ -583,7 +548,20 @@ def build_rtl_graph_workflow(
     # compaction 中间件:消息通道超阈值时节点级增量压缩(agent 无 llm 时禁用)
     compaction_mw = _build_compaction_middleware(manager, compaction_config)
 
-    builder = StateGraph(RTLGraphState)
+    builder = StateGraph(
+        compose_state_schema(
+            agents,
+            extra_channels={
+                "round": int,
+                "max_rounds": int,
+                "final_answer": str,
+                "file_check_passed": bool,
+                "sim_check_passed": bool,
+                "sim_status": str,
+                "sim_log_path": str,
+            },
+        )
+    )
 
     # 添加节点(声明式 NodeSpec 表:partial 绑定 + compaction 包装 + add_node 三步合一)
     # 注意:register_nodes 内部用 functools.partial 绑定 agent 实例;提示词模板由节点内懒加载
@@ -691,7 +669,8 @@ async def arun_rtl_graph_workflow(
     return await arun_compiled_workflow(
         graph,
         task,
-        state_fields={
+        initial_fields={
+            "context_summary": "",
             "arch_plan": "",
             "arch_design": "",
             "arch_analysis": "",
