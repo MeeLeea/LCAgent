@@ -3,8 +3,8 @@
 覆盖 5 个用例:
 1. ``compaction_mw=None`` → 节点返回值不含 RemoveMessage, 其它字段原样透传
 2. 估算 token <= max_context_tokens(arun_compaction 返回 None) → 与未包装时逐字相同
-3. 估算 token > max_context_tokens 且摘要模型可用 → summary 非空、messages 含摘要 HumanMessage、
-   且 messages[-1] 仍是节点自身产出
+3. 估算 token > max_context_tokens 且摘要模型可用 → messages 含摘要 HumanMessage、
+   工作流 State 无 summary 通道(D1-A)、且 messages[-1] 仍是节点自身产出
 4. 节点返回的其它字段(out)在压缩后仍保留(守护 ``{**result, **update}``)
 5. config 注入回归: 包装后的节点仍收到 LangGraph 注入的 config(workspace_path 可达)
    —— 守护 ``config`` 注解必须是 ``Optional[RunnableConfig]``(写成 ``Any`` 会静默失效)
@@ -53,11 +53,13 @@ def _make_mw(max_context_tokens: int, keep_recent: int = 1) -> LCAgentCompaction
 
 
 class _WfState(TypedDict, total=False):
-    """工作流 state: ``messages`` 必须是 add_messages 通道, 否则 RemoveMessage 不被消费。"""
+    """工作流 state: ``messages`` 必须是 add_messages 通道, 否则 RemoveMessage 不被消费。
+
+    注意: 工作流 State 已无 ``summary`` 通道(D1-A), 节点级压缩仅作用于 messages。
+    """
 
     out: str
     messages: Annotated[list[AnyMessage], add_messages]
-    summary: str
 
 
 async def _node(
@@ -110,12 +112,13 @@ def test_below_threshold_is_identical_to_unwrapped():
 
 
 def test_above_threshold_compacts_and_keeps_node_output():
-    """用例 3: 超阈值压缩后 summary 非空、含 SystemMessage、末条仍是节点产出。"""
+    """用例 3: 超阈值压缩 messages 后含摘要 HumanMessage、无 summary 通道、末条仍是节点产出。"""
     state_in = {"messages": [AIMessage(content=f"m{i}", id=f"m{i}") for i in range(4)]}
 
     out = _run_graph(_make_mw(max_context_tokens=2, keep_recent=1), _node, state_in)
 
-    assert out.get("summary"), "压缩后 summary 必须非空"
+    assert "summary" not in out, "工作流 State 无 summary 通道(D1-A), 压缩不得写回 summary"
+    assert "messages" in out, "压缩结果必须包含 messages"
     assert any(isinstance(m, HumanMessage) for m in out["messages"]), "缺少摘要 HumanMessage"
     assert not any(isinstance(m, SystemMessage) for m in out["messages"]), (
         "摘要不得使用 system 角色（避免 payload 出现多条 system 消息）"
@@ -129,7 +132,9 @@ def test_other_node_fields_survive_compaction():
 
     out = _run_graph(_make_mw(max_context_tokens=2, keep_recent=1), _node, state_in)
 
-    assert out.get("summary"), "前置条件: 本用例必须触发压缩"
+    assert any(isinstance(m, HumanMessage) for m in out["messages"]), (
+        "前置条件: 本用例必须触发压缩(应在 messages 中出现摘要 HumanMessage)"
+    )
     assert out["out"] == "x", "节点返回的 out 字段在压缩后丢失(合并语义被改坏)"
 
 

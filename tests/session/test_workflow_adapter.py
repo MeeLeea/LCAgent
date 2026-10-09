@@ -641,7 +641,7 @@ def test_manually_compact_non_workflow_session_returns_none():
 
 
 def test_manually_compact_applies_update(monkeypatch):
-    """有消息 + 可压缩时返回摘要统计并写回 checkpoint。"""
+    """有消息 + 可压缩时返回消息统计并写回 checkpoint（仅压缩 messages，无 summary）。"""
     reg = _make_registry()
     reg.aget_messages = AsyncMock(
         return_value=[AIMessage(content="历史") for _ in range(3)]
@@ -650,7 +650,7 @@ def test_manually_compact_applies_update(monkeypatch):
     class _FakeCheckpointer:
         async def aget_tuple(self, config):
             return types.SimpleNamespace(
-                checkpoint={"channel_values": {"summary": "旧摘要"}}
+                checkpoint={"channel_values": {"messages": []}}
             )
 
     fake_graph = FakeGraph()
@@ -675,8 +675,9 @@ def test_manually_compact_applies_update(monkeypatch):
 
     result = asyncio.run(adapter.manually_compact(force=True))
 
-    assert result == {"summary": "新摘要", "messages_before": 3, "messages_after": 2}
-    assert fake_mw.seen_summary == "旧摘要"
+    # D1-A：返回值不再含 summary（summary 已不落任何通道），仅回 messages 统计
+    assert result == {"messages_before": 3, "messages_after": 2}
+    assert fake_mw.seen_summary == ""  # existing_summary 固定为空串（State 无 summary）
     assert len(fake_graph.update_calls) == 1
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from typing import ClassVar
 from unittest.mock import patch
 
 import pytest
@@ -95,11 +96,29 @@ class FakeAgent:
         return AgentTurnResult.completed(self._next(prompt))
 
 
+class FakeManagerAgent(FakeAgent):
+    """模拟 Manager 角色:声明 context_summary/plan 通道(与 ManagerAgent.state_fields 一致)。"""
+
+    state_fields: ClassVar[dict[str, type]] = {"context_summary": str, "plan": str}
+
+
+class FakeWorkerAgent(FakeAgent):
+    """模拟 Worker 角色:声明 worker_result 通道(与 WorkerAgent.state_fields 一致)。"""
+
+    state_fields: ClassVar[dict[str, type]] = {"worker_result": str}
+
+
+class FakeTerminatorAgent(FakeAgent):
+    """模拟 Terminator 角色:声明 final_answer 通道(与 TerminatorAgent.state_fields 一致)。"""
+
+    state_fields: ClassVar[dict[str, type]] = {"final_answer": str}
+
+
 # ==================== 测试工作流节点 ====================
 
 def test_summarize_context_node():
     """测试 summarize 节点:Manager 提炼记忆上下文摘要"""
-    manager = FakeAgent(name="manager", summary_response="记忆摘要: 项目背景A")
+    manager = FakeManagerAgent(name="manager", summary_response="记忆摘要: 项目背景A")
     state = {"raw_context": "用户: 之前聊过项目A"}
 
     result = asyncio.run(summarize_context(state, manager))
@@ -114,7 +133,7 @@ def test_summarize_context_node():
 
 def test_manager_plan_node():
     """测试 Manager 节点:拆解任务"""
-    manager = FakeAgent(name="manager", response="计划: 步骤1、步骤2")
+    manager = FakeManagerAgent(name="manager", response="计划: 步骤1、步骤2")
     state = {"task": "帮我分析项目结构"}
     
     result = asyncio.run(manager_plan_node(state, manager))
@@ -127,7 +146,7 @@ def test_manager_plan_node():
 
 def test_worker_exec_node():
     """测试 Worker 节点:执行计划"""
-    worker = FakeAgent(name="worker", response="已完成步骤1和步骤2")
+    worker = FakeWorkerAgent(name="worker", response="已完成步骤1和步骤2")
     state = {"plan": "计划: 步骤1、步骤2"}
     
     result = asyncio.run(worker_exec_node(state, worker))
@@ -140,7 +159,7 @@ def test_worker_exec_node():
 
 def test_terminator_final_node():
     """测试 Terminator 节点:汇总结果"""
-    terminator = FakeAgent(name="terminator", response="最终答案: 项目包含3个模块")
+    terminator = FakeTerminatorAgent(name="terminator", response="最终答案: 项目包含3个模块")
     state = {
         "task": "帮我分析项目结构",
         "plan": "计划: 步骤1、步骤2",
@@ -160,7 +179,7 @@ def test_terminator_final_node():
 
 def test_manager_plan_node_with_summary():
     """测试 Manager 节点:有记忆摘要时注入摘要块"""
-    manager = FakeAgent(name="manager", response="计划")
+    manager = FakeManagerAgent(name="manager", response="计划")
     state = {"task": "任务", "context_summary": "用户偏好中文"}
 
     result = asyncio.run(manager_plan_node(state, manager))
@@ -173,7 +192,7 @@ def test_manager_plan_node_with_summary():
 
 def test_terminator_final_node_with_summary():
     """测试 Terminator 节点:有记忆摘要时注入摘要块"""
-    terminator = FakeAgent(name="terminator", response="最终答案")
+    terminator = FakeTerminatorAgent(name="terminator", response="最终答案")
     state = {
         "task": "任务",
         "plan": "计划",
@@ -191,7 +210,7 @@ def test_terminator_final_node_with_summary():
 
 def test_terminator_final_node_no_summary():
     """测试 Terminator 节点:无记忆摘要时摘要段头仍在但内容为空"""
-    terminator = FakeAgent(name="terminator", response="最终答案")
+    terminator = FakeTerminatorAgent(name="terminator", response="最终答案")
     state = {
         "task": "任务",
         "plan": "计划",
@@ -211,9 +230,9 @@ def test_factory_nodes_do_not_inject_agent_rules():
     证明 create_llm_node 的 base_prompts="" 生效：三个标准节点的 prompt 与恢复文件的
     手写节点逐字一致，不注入 agent/AGENT.md 的「重要规则」/「工具规则」前缀。
     """
-    manager = FakeAgent(name="manager", response="计划")
-    worker = FakeAgent(name="worker", response="结果")
-    terminator = FakeAgent(name="terminator", response="答案")
+    manager = FakeManagerAgent(name="manager", response="计划")
+    worker = FakeWorkerAgent(name="worker", response="结果")
+    terminator = FakeTerminatorAgent(name="terminator", response="答案")
 
     asyncio.run(manager_plan_node({"task": "任务", "context_summary": ""}, manager))
     asyncio.run(worker_exec_node({"plan": "计划"}, worker))
@@ -281,9 +300,9 @@ def test_role_agent_md_strips_workflow_sections():
 
 def test_build_simple_workflow():
     """测试构建监督者工作流图"""
-    manager = FakeAgent(name="manager")
-    worker = FakeAgent(name="worker")
-    terminator = FakeAgent(name="terminator")
+    manager = FakeManagerAgent(name="manager")
+    worker = FakeWorkerAgent(name="worker")
+    terminator = FakeTerminatorAgent(name="terminator")
     
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
     
@@ -301,9 +320,9 @@ def test_build_simple_workflow():
 
 def test_workflow_edges():
     """测试工作流边的正确连接"""
-    manager = FakeAgent(name="manager")
-    worker = FakeAgent(name="worker")
-    terminator = FakeAgent(name="terminator")
+    manager = FakeManagerAgent(name="manager")
+    worker = FakeWorkerAgent(name="worker")
+    terminator = FakeTerminatorAgent(name="terminator")
     
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
     graph_obj = graph.get_graph()
@@ -333,9 +352,9 @@ def test_build_simple_workflow_with_prompt_file(tmp_path):
         encoding="utf-8",
     )
 
-    manager = FakeAgent(name="manager", response="计划X", summary_response="摘要S", prompt_file=str(manager_md))
-    worker = FakeAgent(name="worker", response="结果X", prompt_file=str(worker_md))
-    terminator = FakeAgent(name="terminator", response="答案X", prompt_file=str(terminator_md))
+    manager = FakeManagerAgent(name="manager", response="计划X", summary_response="摘要S", prompt_file=str(manager_md))
+    worker = FakeWorkerAgent(name="worker", response="结果X", prompt_file=str(worker_md))
+    terminator = FakeTerminatorAgent(name="terminator", response="答案X", prompt_file=str(terminator_md))
 
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
     asyncio.run(graph.ainvoke({
@@ -358,9 +377,9 @@ def test_build_simple_workflow_with_prompt_file(tmp_path):
 
 def test_run_simple_workflow():
     """测试运行工作流并验证状态流转"""
-    manager = FakeAgent(name="manager", response="计划: A、B、C")
-    worker = FakeAgent(name="worker", response="执行结果: 完成A、B、C")
-    terminator = FakeAgent(name="terminator", response="最终答案: 全部完成")
+    manager = FakeManagerAgent(name="manager", response="计划: A、B、C")
+    worker = FakeWorkerAgent(name="worker", response="执行结果: 完成A、B、C")
+    terminator = FakeTerminatorAgent(name="terminator", response="最终答案: 全部完成")
     
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
     result = asyncio.run(arun_simple_workflow(graph, "测试任务"))
@@ -712,9 +731,9 @@ def test_workflow_command_parse():
 
 def test_workflow_thread_isolation():
     """测试多次运行使用独立 thread_id"""
-    manager = FakeAgent(name="manager", response="计划1")
-    worker = FakeAgent(name="worker", response="结果1")
-    terminator = FakeAgent(name="terminator", response="答案1")
+    manager = FakeManagerAgent(name="manager", response="计划1")
+    worker = FakeWorkerAgent(name="worker", response="结果1")
+    terminator = FakeTerminatorAgent(name="terminator", response="答案1")
     
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
     
@@ -749,9 +768,9 @@ def test_workflow_thread_isolation():
 
 def test_run_simple_workflow_with_memory():
     """测试带记忆运行时:摘要注入 plan/final 节点,worker 不注入"""
-    manager = FakeAgent(name="manager", response="计划: A、B、C", summary_response="记忆摘要: 用户偏好中文")
-    worker = FakeAgent(name="worker", response="执行结果: 完成")
-    terminator = FakeAgent(name="terminator", response="最终答案: 完成")
+    manager = FakeManagerAgent(name="manager", response="计划: A、B、C", summary_response="记忆摘要: 用户偏好中文")
+    worker = FakeWorkerAgent(name="worker", response="执行结果: 完成")
+    terminator = FakeTerminatorAgent(name="terminator", response="最终答案: 完成")
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
 
     result = asyncio.run(arun_simple_workflow(graph, "测试任务", raw_context="用户: 之前聊过偏好中文"))
@@ -926,9 +945,9 @@ def test_run_workflow_error_event():
 
 def test_run_simple_workflow_node_callbacks():
     """测试节点进度回调:4 个业务节点按链路顺序各触发 start/end 且 start 先于 end"""
-    manager = FakeAgent(name="manager", response="计划: A")
-    worker = FakeAgent(name="worker", response="结果: 完成")
-    terminator = FakeAgent(name="terminator", response="答案: 完成")
+    manager = FakeManagerAgent(name="manager", response="计划: A")
+    worker = FakeWorkerAgent(name="worker", response="结果: 完成")
+    terminator = FakeTerminatorAgent(name="terminator", response="答案: 完成")
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
 
     events: list[tuple[str, str]] = []
@@ -950,9 +969,9 @@ def test_run_simple_workflow_node_callbacks():
 
 def test_run_simple_workflow_no_callbacks_still_works():
     """测试不传回调时工作流正常运行(向后兼容)"""
-    manager = FakeAgent(name="manager", response="计划")
-    worker = FakeAgent(name="worker", response="结果")
-    terminator = FakeAgent(name="terminator", response="答案")
+    manager = FakeManagerAgent(name="manager", response="计划")
+    worker = FakeWorkerAgent(name="worker", response="结果")
+    terminator = FakeTerminatorAgent(name="terminator", response="答案")
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
 
     result = asyncio.run(arun_simple_workflow(graph, "测试任务"))
@@ -1230,9 +1249,9 @@ def test_workflow_cross_round_compression():
     """同一 thread_id + checkpointer 多轮运行时,第二轮注入上一轮工作流记录"""
     from langgraph.checkpoint.memory import MemorySaver
 
-    manager = FakeAgent(name="manager", response="计划: A、B、C", summary_response="摘要")
-    worker = FakeAgent(name="worker", response="执行结果: 完成")
-    terminator = FakeAgent(name="terminator", response="最终答案: 全部完成")
+    manager = FakeManagerAgent(name="manager", response="计划: A、B、C", summary_response="摘要")
+    worker = FakeWorkerAgent(name="worker", response="执行结果: 完成")
+    terminator = FakeTerminatorAgent(name="terminator", response="最终答案: 全部完成")
 
     checkpointer = MemorySaver()
     graph = build_simple_workflow(
@@ -1270,9 +1289,9 @@ def test_workflow_cross_round_compression_truncation():
     """跨轮次记录超长时截断,不撑爆上下文"""
     from langgraph.checkpoint.memory import MemorySaver
 
-    manager = FakeAgent(name="manager", response="计划", summary_response="摘要")
-    worker = FakeAgent(name="worker", response="结果")
-    terminator = FakeAgent(name="terminator", response="答案")
+    manager = FakeManagerAgent(name="manager", response="计划", summary_response="摘要")
+    worker = FakeWorkerAgent(name="worker", response="结果")
+    terminator = FakeTerminatorAgent(name="terminator", response="答案")
 
     checkpointer = MemorySaver()
     graph = build_simple_workflow(
@@ -1294,9 +1313,9 @@ def test_workflow_cross_round_compression_truncation():
 
 def test_workflow_cross_round_no_checkpointer():
     """无 checkpointer 时跨轮次压缩静默降级,不影响运行"""
-    manager = FakeAgent(name="manager", response="计划", summary_response="摘要")
-    worker = FakeAgent(name="worker", response="结果")
-    terminator = FakeAgent(name="terminator", response="答案")
+    manager = FakeManagerAgent(name="manager", response="计划", summary_response="摘要")
+    worker = FakeWorkerAgent(name="worker", response="结果")
+    terminator = FakeTerminatorAgent(name="terminator", response="答案")
 
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
 

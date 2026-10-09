@@ -14,7 +14,11 @@ from __future__ import annotations
 import asyncio
 
 from graph.simple import arun_simple_workflow, build_simple_workflow
-from tests.graph.test_workflow import FakeAgent
+from tests.graph.test_workflow import (
+    FakeManagerAgent,
+    FakeTerminatorAgent,
+    FakeWorkerAgent,
+)
 from utils.events import EventType
 
 
@@ -36,9 +40,9 @@ class FakeMemory:
 
 def _build_graph():
     """构建 simple 工作流(Fake agents,无 llm → 不启用 compaction)。"""
-    manager = FakeAgent(name="manager", response="计划", summary_response="摘要")
-    worker = FakeAgent(name="worker", response="结果")
-    terminator = FakeAgent(name="terminator", response="最终答案: 完成")
+    manager = FakeManagerAgent(name="manager", response="计划", summary_response="摘要")
+    worker = FakeWorkerAgent(name="worker", response="结果")
+    terminator = FakeTerminatorAgent(name="terminator", response="最终答案: 完成")
     graph = build_simple_workflow(
         {"manager": manager, "worker": worker, "terminator": terminator}
     )
@@ -137,9 +141,9 @@ def test_coexists_with_checkpoint_summary():
     """长期记忆与 checkpoint 跨轮次摘要并存(raw_context 同时含两段)。"""
     from langgraph.checkpoint.memory import MemorySaver
 
-    manager = FakeAgent(name="manager", response="计划2", summary_response="摘要2")
-    worker = FakeAgent(name="worker", response="结果2")
-    terminator = FakeAgent(name="terminator", response="答案2")
+    manager = FakeManagerAgent(name="manager", response="计划2", summary_response="摘要2")
+    worker = FakeWorkerAgent(name="worker", response="结果2")
+    terminator = FakeTerminatorAgent(name="terminator", response="答案2")
     checkpointer = MemorySaver()
     graph = build_simple_workflow(
         {"manager": manager, "worker": worker, "terminator": terminator},

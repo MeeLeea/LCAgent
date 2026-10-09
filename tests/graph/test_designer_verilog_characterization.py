@@ -23,11 +23,12 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from typing import Any
 
 from langchain_core.messages import AIMessage
 
 from agent.turn_types import AgentTurnResult
-from graph.rtl_graph import RTLGraphState, designer_verilog_node
+from graph.rtl_graph import designer_verilog_node
 from team.base import TeamAgent
 
 # 与 team/rtl_designer/AGENT.md 的 ## workflow:verilog_design 默认模板一致
@@ -70,9 +71,9 @@ class RecordingInjector:
         return prompt
 
 
-def _initial_state(**overrides) -> RTLGraphState:
+def _initial_state(**overrides) -> dict[str, Any]:
     """构造完整初始状态(带默认值),与 tests/graph/test_rtl_graph.py 一致。"""
-    state: RTLGraphState = {
+    state: dict[str, Any] = {
         "task": "设计一个 UART 模块",
         "raw_context": "",
         "context_summary": "",
@@ -93,7 +94,7 @@ def _initial_state(**overrides) -> RTLGraphState:
     return state
 
 
-def _expected_prompt_task(state: RTLGraphState) -> str:
+def _expected_prompt_task(state: dict[str, Any]) -> str:
     """按节点现有拼装逻辑复算 prompt_task(独立于生产实现,避免同源)。"""
     task = state["task"]
     parts = [task]
@@ -109,7 +110,7 @@ def _expected_prompt_task(state: RTLGraphState) -> str:
     return "\n\n".join(parts)
 
 
-def _expected_prompt(state: RTLGraphState) -> str:
+def _expected_prompt(state: dict[str, Any]) -> str:
     """渲染模板外壳后的完整 prompt。"""
     return (
         DEFAULT_TEMPLATES["verilog_design"].replace(

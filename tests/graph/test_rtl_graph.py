@@ -12,10 +12,10 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from typing import Any, ClassVar
 
 from agent.turn_types import AgentTurnResult
 from graph.rtl_graph import (
-    RTLGraphState,
     _coverage_inclusion_ok,
     _parse_filelist,
     architect_analyze_node,
@@ -98,6 +98,43 @@ class FakeRTLAgent:
         return AgentTurnResult.completed(self._next(task))
 
 
+class FakeRTLManagerAgent(FakeRTLAgent):
+    """模拟 RTL Manager 角色:声明 context_summary/plan 通道(与 ManagerAgent.state_fields 一致)。"""
+
+    state_fields: ClassVar[dict[str, type]] = {"context_summary": str, "plan": str}
+
+
+class FakeRTLArchitectAgent(FakeRTLAgent):
+    """模拟 Architect 角色:声明 arch_plan..arch_spec 五通道(与 ArchiAgent.state_fields 一致)。"""
+
+    state_fields: ClassVar[dict[str, type]] = {
+        "arch_plan": str,
+        "arch_design": str,
+        "arch_analysis": str,
+        "arch_review": str,
+        "arch_spec": str,
+    }
+
+
+class FakeRTLDesignerAgent(FakeRTLAgent):
+    """模拟 Designer 角色:声明 design_spec/rtl_code/output_files(与 DesignerAgent.state_fields 一致)。"""
+
+    state_fields: ClassVar[dict[str, type]] = {
+        "design_spec": str,
+        "rtl_code": str,
+        "output_files": list[str],
+    }
+
+
+class FakeRTLVerificationAgent(FakeRTLAgent):
+    """模拟 Verification 角色:声明 verification_plan/report(与 VerificationAgent.state_fields 一致)。"""
+
+    state_fields: ClassVar[dict[str, type]] = {
+        "verification_plan": str,
+        "verification_report": str,
+    }
+
+
 def build_fake_agents(
     manager_response: str = "摘要",
     arch_response: str = "架构输出",
@@ -106,20 +143,19 @@ def build_fake_agents(
 ) -> dict:
     """构建四个角色的 FakeRTLAgent 字典"""
     return {
-        "manager": FakeRTLAgent(name="manager", response=manager_response),
-        "architect": FakeRTLAgent(name="architect", response=arch_response),
-        "rtl_designer": FakeRTLAgent(name="rtl_designer", response=designer_response),
-        "rtl_verification": FakeRTLAgent(
-            name="rtl_verification",
+        "manager": FakeRTLManagerAgent(name="manager", response=manager_response),
+        "architect": FakeRTLArchitectAgent(name="architect", response=arch_response),
+        "rtl_designer": FakeRTLDesignerAgent(name="rtl_designer", response=designer_response),
+        "rtl_verification": FakeRTLVerificationAgent(name="rtl_verification",
             response=verifier_sequence[-1] if verifier_sequence else "验证结论: PASS",
             sequence=list(verifier_sequence or []),
         ),
     }
 
 
-def initial_state(**overrides) -> RTLGraphState:
+def initial_state(**overrides) -> dict[str, Any]:
     """构造完整初始状态(带默认值)"""
-    state: RTLGraphState = {
+    state: dict[str, Any] = {
         "task": "设计一个 UART 模块",
         "raw_context": "",
         "context_summary": "",
@@ -144,7 +180,7 @@ def initial_state(**overrides) -> RTLGraphState:
 
 def test_summarize_context_node():
     """Manager 提炼记忆上下文摘要"""
-    manager = FakeRTLAgent(name="manager", response="摘要: 用户偏好中文")
+    manager = FakeRTLManagerAgent(name="manager", response="摘要: 用户偏好中文")
     result = asyncio.run(summarize_context(initial_state(raw_context="历史对话"), manager))
     assert result["context_summary"] == "摘要: 用户偏好中文"
     # 节点改调 run_team_turn_with_interrupt → arun_structured,prompt 含模板+raw
@@ -154,7 +190,7 @@ def test_summarize_context_node():
 
 def test_architect_plan_node():
     """Architect 制定执行计划(注入上下文摘要)"""
-    architect = FakeRTLAgent(name="architect", response="计划")
+    architect = FakeRTLArchitectAgent(name="architect", response="计划")
     state = initial_state(context_summary="摘要S")
     result = asyncio.run(architect_plan_node(state, architect))
     assert result["arch_plan"] == "计划"
@@ -164,7 +200,7 @@ def test_architect_plan_node():
 
 def test_architect_design_node_injects_plan():
     """Architect 设计节点把执行计划拼入任务"""
-    architect = FakeRTLAgent(name="architect", response="方案")
+    architect = FakeRTLArchitectAgent(name="architect", response="方案")
     state = initial_state(arch_plan="计划P")
     result = asyncio.run(architect_design_node(state, architect))
     assert result["arch_design"] == "方案"
@@ -174,7 +210,7 @@ def test_architect_design_node_injects_plan():
 
 def test_architect_analyze_node_injects_design():
     """Architect 分析节点把方案设计拼入任务"""
-    architect = FakeRTLAgent(name="architect", response="分析")
+    architect = FakeRTLArchitectAgent(name="architect", response="分析")
     state = initial_state(arch_design="方案D")
     result = asyncio.run(architect_analyze_node(state, architect))
     assert result["arch_analysis"] == "分析"
@@ -183,7 +219,7 @@ def test_architect_analyze_node_injects_design():
 
 def test_architect_review_node_injects_design_and_analysis():
     """Architect 评审节点拼入方案设计与分析"""
-    architect = FakeRTLAgent(name="architect", response="评审")
+    architect = FakeRTLArchitectAgent(name="architect", response="评审")
     state = initial_state(arch_design="方案D", arch_analysis="分析A")
     result = asyncio.run(architect_review_node(state, architect))
     assert result["arch_review"] == "评审"
@@ -194,7 +230,7 @@ def test_architect_review_node_injects_design_and_analysis():
 
 def test_architect_spec_node_injects_design_and_review():
     """Architect 规格节点拼入方案设计与评审"""
-    architect = FakeRTLAgent(name="architect", response="规格")
+    architect = FakeRTLArchitectAgent(name="architect", response="规格")
     state = initial_state(arch_design="方案D", arch_review="评审R")
     result = asyncio.run(architect_spec_node(state, architect))
     assert result["arch_spec"] == "规格"
@@ -205,7 +241,7 @@ def test_architect_spec_node_injects_design_and_review():
 
 def test_designer_spec_node_injects_arch_spec():
     """Designer 规格节点拼入架构规格"""
-    designer = FakeRTLAgent(name="rtl_designer", response="设计规格")
+    designer = FakeRTLDesignerAgent(name="rtl_designer", response="设计规格")
     state = initial_state(arch_spec="规格S")
     result = asyncio.run(designer_spec_node(state, designer))
     assert result["design_spec"] == "设计规格"
@@ -214,7 +250,7 @@ def test_designer_spec_node_injects_arch_spec():
 
 def test_verification_plan_node_injects_specs():
     """Verification 计划节点拼入架构规格与设计规格"""
-    verifier = FakeRTLAgent(name="rtl_verification", response="验证计划")
+    verifier = FakeRTLVerificationAgent(name="rtl_verification", response="验证计划")
     state = initial_state(arch_spec="规格S", design_spec="设计规格D")
     result = asyncio.run(verification_plan_node(state, verifier))
     assert result["verification_plan"] == "验证计划"
@@ -225,7 +261,7 @@ def test_verification_plan_node_injects_specs():
 
 def test_designer_verilog_node_increments_round():
     """Designer 编码节点输出 RTL 并递增轮次"""
-    designer = FakeRTLAgent(name="rtl_designer", response="module uart;")
+    designer = FakeRTLDesignerAgent(name="rtl_designer", response="module uart;")
     state = initial_state(design_spec="规格D", verification_plan="计划V")
     result = asyncio.run(designer_verilog_node(state, designer))
     assert result["rtl_code"] == "module uart;"
@@ -235,7 +271,7 @@ def test_designer_verilog_node_increments_round():
 
 def test_designer_verilog_node_injects_feedback_on_later_rounds():
     """Designer 第二轮编码时拼入上一轮验证反馈"""
-    designer = FakeRTLAgent(name="rtl_designer", response="module uart;")
+    designer = FakeRTLDesignerAgent(name="rtl_designer", response="module uart;")
     state = initial_state(
         design_spec="规格D",
         verification_plan="计划V",
@@ -251,7 +287,7 @@ def test_designer_verilog_node_injects_feedback_on_later_rounds():
 
 def test_verification_check_node_requires_verdict_marker():
     """Verification 检查节点输出验证报告,并强制要求结论标记"""
-    verifier = FakeRTLAgent(name="rtl_verification", response="验证结论: PASS\n无问题")
+    verifier = FakeRTLVerificationAgent(name="rtl_verification", response="验证结论: PASS\n无问题")
     state = initial_state(design_spec="规格D", rtl_code="module uart;")
     result = asyncio.run(verification_check_node(state, verifier))
     assert result["verification_report"] == "验证结论: PASS\n无问题"
@@ -385,11 +421,10 @@ def _patch_vivado(monkeypatch, rc_seq):
 
 def test_run_rtl_graph_pass_once(tmp_path, monkeypatch):
     """验证一次通过:designer_verilog 只执行一次,仿真驱动路由直接交付。"""
-    manager = FakeRTLAgent(name="manager", response="摘要: 用户偏好中文")
-    architect = FakeRTLAgent(name="architect", response="架构: 单核 UART")
-    designer = FakeRTLAgent(name="rtl_designer", response="module uart;")
-    verifier = FakeRTLAgent(
-        name="rtl_verification",
+    manager = FakeRTLManagerAgent(name="manager", response="摘要: 用户偏好中文")
+    architect = FakeRTLArchitectAgent(name="architect", response="架构: 单核 UART")
+    designer = FakeRTLDesignerAgent(name="rtl_designer", response="module uart;")
+    verifier = FakeRTLVerificationAgent(name="rtl_verification",
         response="验证结论: PASS\nRTL 无问题",
     )
     agents = {
@@ -424,11 +459,10 @@ def test_run_rtl_graph_pass_once(tmp_path, monkeypatch):
 
 def test_run_rtl_graph_multi_round_iteration(tmp_path, monkeypatch):
     """验证仿真失败→成功多轮迭代:sim 第一次退出码 1,第二次 0,designer_verilog 执行两次。"""
-    manager = FakeRTLAgent(name="manager", response="摘要")
-    architect = FakeRTLAgent(name="architect", response="架构方案")
-    designer = FakeRTLAgent(name="rtl_designer", response="module uart;")
-    verifier = FakeRTLAgent(
-        name="rtl_verification",
+    manager = FakeRTLManagerAgent(name="manager", response="摘要")
+    architect = FakeRTLArchitectAgent(name="architect", response="架构方案")
+    designer = FakeRTLDesignerAgent(name="rtl_designer", response="module uart;")
+    verifier = FakeRTLVerificationAgent(name="rtl_verification",
         sequence=[
             "验证结论: FAIL\n波特率配置错误",
             "验证结论: PASS\n修改后正确",
@@ -464,11 +498,10 @@ def test_run_rtl_graph_multi_round_iteration(tmp_path, monkeypatch):
 
 def test_run_rtl_graph_forced_output_at_max_rounds(tmp_path, monkeypatch):
     """验证仿真一直失败达 max_rounds 上限强制交付(不无限循环)。"""
-    manager = FakeRTLAgent(name="manager", response="摘要")
-    architect = FakeRTLAgent(name="architect", response="架构方案")
-    designer = FakeRTLAgent(name="rtl_designer", response="module uart;")
-    verifier = FakeRTLAgent(
-        name="rtl_verification",
+    manager = FakeRTLManagerAgent(name="manager", response="摘要")
+    architect = FakeRTLArchitectAgent(name="architect", response="架构方案")
+    designer = FakeRTLDesignerAgent(name="rtl_designer", response="module uart;")
+    verifier = FakeRTLVerificationAgent(name="rtl_verification",
         response="验证结论: FAIL\n始终有问题",
     )
     agents = {
@@ -497,10 +530,10 @@ def test_run_rtl_graph_forced_output_at_max_rounds(tmp_path, monkeypatch):
 
 def test_run_rtl_graph_with_context_memory(tmp_path, monkeypatch):
     """带记忆上下文运行:manager 提炼后注入 architect_plan;仿真通过一次交付。"""
-    manager = FakeRTLAgent(name="manager", response="摘要: 用户偏好 SystemVerilog")
-    architect = FakeRTLAgent(name="architect", response="架构方案")
-    designer = FakeRTLAgent(name="rtl_designer", response="module uart;")
-    verifier = FakeRTLAgent(name="rtl_verification", response="验证结论: PASS")
+    manager = FakeRTLManagerAgent(name="manager", response="摘要: 用户偏好 SystemVerilog")
+    architect = FakeRTLArchitectAgent(name="architect", response="架构方案")
+    designer = FakeRTLDesignerAgent(name="rtl_designer", response="module uart;")
+    verifier = FakeRTLVerificationAgent(name="rtl_verification", response="验证结论: PASS")
     agents = {
         "manager": manager,
         "architect": architect,
