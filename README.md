@@ -288,33 +288,42 @@ LangChainAgent/
 │   └── manager.py           # SessionManager：对外门面 & 会话调度（封装 Agent + Memory）
 ├── team/                    # 多 Agent 团队协作模块
 │   ├── base.py              # TeamAgent 轻量基类(工具模式挂错误纠错+workspace 中间件+超时;内建技能注入)
-│   ├── __init__.py          # 导出 ManagerAgent/WorkerAgent/TerminatorAgent
+│   ├── __init__.py          # 导出 ManagerAgent/WorkerAgent/TerminatorAgent/ArchiAgent
 │   ├── factory.py           # 团队 Agent 工厂函数
-│   ├── manager/             # Manager Agent（任务拆解）
+│   ├── interrupt.py         # run_team_turn_with_interrupt 中断转发(节点内 TeamAgent turn ↔ 外层 graph)
+│   ├── node_factory.py      # create_llm_node 通用 LLM 节点工厂(生成统一签名异步节点函数)
+│   ├── manager/             # Manager Agent(任务拆解;summarize_context_node 实例方法供 simple/rtl_graph 共用)
 │   │   ├── manager.py
-│   │   ├── agent_config.json
 │   │   └── AGENT.md
 │   ├── worker/              # Worker Agent（任务执行）
-│   │   ├── manager.py
-│   │   ├── agent_config.json
+│   │   ├── worker.py
 │   │   └── AGENT.md
-│   └── terminator/          # Terminator Agent（结果汇总）
-│       ├── terminator.py
-│       ├── agent_config.json
-│       └── AGENT.md
+│   ├── terminator/          # Terminator Agent（结果汇总）
+│   │   ├── terminator.py
+│   │   └── AGENT.md
+│   ├── architect/           # ArchiAgent(架构五阶段节点为类属性 create_llm_node 产物)
+│   │   ├── Architect.py
+│   │   └── AGENT.md
+│   ├── rtl_designer/        # DesignerAgent(spec/verilog 类属性节点 + file_check/output 实例方法)
+│   │   ├── rtl_designer.py
+│   │   └── AGENT.md
+│   ├── rtl_verification/    # VerificationAgent(plan/check 类属性节点 + sim_exec_check 实例方法)
+│   │   ├── rtl_verification.py
+│   │   └── AGENT.md
+│   ├── checker/             # 共享校验工具(parse_filelist/覆盖率包含判定/同步写文件,零依赖纯函数,非角色)
+│   │   ├── checker.py
+│   │   └── AGENT.md
+│   └── team_agents.json     # 团队角色统一 LLM 配置(default + 角色覆盖)
 ├── graph/                   # LangGraph 工作流编排
-│   ├── common/              # 工作流共享组件包：节点跟踪 + 中断转发 + 节点工厂 + 运行器 + 压缩 + 声明式注册 + 注册表
+│   ├── common/              # 工作流共享组件包：节点跟踪 + 运行器 + 压缩 + 声明式注册 + 注册表
 │   │   ├── node_tracking.py     # NodeTrackingHandler 节点级进度回调（含 TOKEN 级流式）
-│   │   ├── interrupt_forward.py # run_team_turn_with_interrupt 中断转发
-│   │   ├── node_factory.py      # create_llm_node 节点工厂
 │   │   ├── workflow_runner.py   # arun_compiled_workflow 通用运行器（跨轮次记忆压缩 + workspace_path 透传）
 │   │   ├── compaction_utils.py  # _build_compaction_middleware 压缩中间件构造
-│   │   ├── node_spec.py         # NodeSpec / register_nodes 声明式注册（可选 compaction_mw 节点级压缩）
+│   │   ├── node_spec.py         # NodeSpec / register_nodes 声明式注册（可选 compaction_mw 节点级压缩；支持 bound-method 节点）
 │   │   ├── schema.py            # compose_state_schema 动态组合工作流 State schema（底座通道 + 各角色 state_fields + extra_channels）
 │   │   └── registry.py          # WORKFLOWS / AGENT_REGISTRY / build_workflow 注册表与构建入口（runner 支持 workspace_path 参数）
-│   ├── simple.py            # 监督者模式工作流（Manager→Worker→Terminator，异步节点，worker_exec 接收 config 注入 workspace）
-│   ├── pipline.py           # 流水线模式工作流（异步节点，与 simple 同构，worker_exec 接收 config 注入 workspace）
-│   └── rtl_graph.py         # RTL 芯片设计流水线（Manager 提炼→Architect 架构→Designer 设计↔Verification 多轮验证→验证通过/达上限即经 designer_output 交付后终止(END)）
+│   ├── simple.py            # 监督者模式工作流（Manager→Worker→Terminator；纯编排：NodeSpec 表+边，节点实现归 team/ 各角色类）
+│   └── rtl_graph.py         # RTL 芯片设计流水线编排(NodeSpec 注册表+边+条件路由;13 个节点实现全部归属 team/ 各角色类)
 ├── tools/
 │   ├── __init__.py          # 本地工具注册
 │   ├── search.py            # 联网搜索工具(Tavily API)
@@ -352,7 +361,7 @@ LangChainAgent/
 │   ├── api/                 # API Server：健康检查、会话管理、SSE 流式聊天、命令执行
 │   ├── cli/                 # CLI 命令分发、workspace 命令、会话菜单预览
 │   ├── config/              # 运行时配置：默认值合并、路径解析、agent.md prompt 加载
-│   ├── graph/               # 工作流图：simple/pipline/rtl、工作流 memory/compaction/workspace 透传
+│   ├── graph/               # 工作流图：simple/rtl、工作流 memory/compaction/workspace 透传
 │   ├── llm/                 # LLM 客户端重试、异常信息提取、提供商模型(在线连通性，需 API Key)
 │   ├── memory/              # 记忆：AgentMemory、MemoryManager、ThreadMemoryStore、读写中间件
 │   ├── scheduler/           # 定时任务：TaskStore CRUD、原子抢占、执行器与调度引擎
@@ -379,12 +388,11 @@ LangChainAgent/
 | [agent/](agent/)                                                         | Agent 核心按职责拆分：`agent_core.py`（主类，构造/生命周期/共享工具方法）+ 6 个 Mixin（`session_mgmt`/`mcp_tools`/`graph_builder`/`streaming`/`interrupts`/`turn_runners`）+ `turn_types.py`（`AgentTurnResult`）+ 5 个中间件（`terminal_retry_cap_mw`/`tool_retry_cap_mw`/`tool_arg_validator_mw`/`tool_error_mw`/`workspace_mw`）+ `role_sw.py`（团队角色切换唯一实现） |
 | [agent/session_config_middleware.py](agent/session_config_middleware.py) | `SessionConfigMW` 按请求覆盖会话模型与角色 system prompt，`SessionModelFactory` 对模型配置做有界 LRU 缓存                                                                                                                                                                                                                                                                                      |
 | [session/](session/)                                                     | 三层架构 Session 层：`SessionConfig`（会话基础配置）/ `SessionContext`（单会话运行时上下文）/ `SessionStore`（per-session 瞬态状态）/ `SessionRegistry`（生命周期管理）/ `WorkspaceStore`（工作空间映射）/ `SessionManager`（对外门面 & 会话调度）                                                                                                                                     |
-| [team/](team/)                                                           | 多 Agent 团队协作：ManagerAgent（拆解）/ WorkerAgent（执行）/ TerminatorAgent（汇总）+ 工厂函数                                                                                                                                                                                                                                                                                                    |
+| [team/](team/)                                                           | 多 Agent 团队协作：角色类（Manager/Worker/Terminator/ArchiAgent/DesignerAgent/VerificationAgent）+ 工厂函数 + `node_factory.py`（`create_llm_node` 节点工厂）+ `interrupt.py`（`run_team_turn_with_interrupt` 中断转发）+ `checker/`（共享校验纯函数）。**工作流节点实现归属各角色类**：LLM 节点为类属性（`create_llm_node` 闭包，如 `ArchiAgent.plan_node`），代码型节点为实例方法（如 `DesignerAgent.designer_output_node`）                                                                                                                                                                    |
 | [skmng/](skmng/)                                                         | 技能管理统一包：`SkillManager`（扫描/匹配/渲染）+ `SkillInjector`（工作流节点注入器）+ `SkillInjectionMW`（agent 层中间件）+ `SkillOps`（Mixin）+ `core.py`（三来源合并核心）+ `protocols.py`（PromptInjector 协议）+ `read_skill` 工具                                                                                                                                              |
-| [graph/common/](graph/common/)                                           | 工作流共享组件包（子模块 `node_tracking` / `interrupt_forward` / `node_factory` / `workflow_runner` / `compaction_utils` / `node_spec` / `schema` / `registry`）：`NodeTrackingHandler` 节点级进度回调(含 TOKEN 级流式)、`arun_compiled_workflow` 跨轮次记忆压缩 + `workspace_path` 注入 `config.configurable`、`schema.compose_state_schema` 动态组合工作流 State schema、`register_nodes` 声明式节点注册（可选 `compaction_mw` 节点级压缩）                                                                                                                                                                                 |
-| [graph/simple.py](graph/simple.py)                                       | LangGraph 监督者模式工作流编排（Manager→Worker→Terminator，异步节点）；`worker_exec` 节点接收 LangGraph 注入的 config（含 `workspace_path`）透传 Worker                                                                                                                                                                                                                                      |
-| [graph/pipline.py](graph/pipline.py)                                     | LangGraph 流水线模式工作流编排（异步节点，与 simple 同构）；`worker_exec` 节点同样透传 workspace config                                                                                                                                                                                                                                                                                          |
-| [graph/rtl_graph.py](graph/rtl_graph.py)                                 | RTL 芯片设计流水线：Manager 提炼上下文→Architect 计划/设计/分析/评审/规格→Designer 规格+编码↔Verification 验证多轮交互（条件路由 + max_rounds 限轮）→验证通过/达上限即经 designer_output 交付后终止(END)                                                                                                                                                                                                                |
+| [graph/common/](graph/common/)                                           | 工作流共享组件包（子模块 `node_tracking` / `workflow_runner` / `compaction_utils` / `node_spec` / `schema` / `registry`）：`NodeTrackingHandler` 节点级进度回调(含 TOKEN 级流式)、`arun_compiled_workflow` 跨轮次记忆压缩 + `workspace_path` 注入 `config.configurable`、`schema.compose_state_schema` 动态组合工作流 State schema、`register_nodes` 声明式节点注册（可选 `compaction_mw` 节点级压缩；自动识别独立函数与角色 bound-method 两种节点形态）。注：`create_llm_node` 与 `run_team_turn_with_interrupt` 已迁至 `team/` 包（其 runtime 依赖本来就是 `team.base`）                                                                                                                                                                                 |
+| [graph/simple.py](graph/simple.py)                                       | LangGraph 监督者模式工作流编排（Manager→Worker→Terminator）；纯编排（NodeSpec 表 + 边），节点实现归 `ManagerAgent`（`summarize_context_node` 实例方法 + `plan_node` 类属性）/ `WorkerAgent.exec_node` / `TerminatorAgent.final_node`；`worker_exec` 节点接收 LangGraph 注入的 config（含 `workspace_path`）透传 Worker                                                                                                                                                                                                                                      |
+| [graph/rtl_graph.py](graph/rtl_graph.py)                                 | RTL 芯片设计流水线编排：Manager 提炼上下文→Architect 计划/设计/分析/评审/规格→Designer 规格+编码↔Verification 验证多轮交互（条件路由 + max_rounds 限轮）→验证通过/达上限即经 designer_output 交付后终止(END)。本文件只保留图编排（NodeSpec 表 + 边 + 条件路由），13 个节点实现全部归属 team/ 各角色类                                                                                                                                                                                                                |
 | [graph/common/registry.py](graph/common/registry.py)                     | 工作流/Agent 注册表：`register_workflow` / `register_agent` / `build_workflow`；runner 统一支持 `workspace_path` 透传                                                                                                                                                                                                                                                                      |
 | [tools/mcp_pool.py](tools/mcp_pool.py)                                   | `MCPPool`：per-server 连接管理 + 健康探测 + 自动重连，替代全量重载                                                                                                                                                                                                                                                                                                                               |
 | [tools/tool_wrapper.py](tools/tool_wrapper.py)                           | 工具超时包装：统一超时保护，超时返回 JSON 错误而非抛异常                                                                                                                                                                                                                                                                                                                                           |
@@ -2352,7 +2360,7 @@ Designer (designer_output:整理最终交付物) → END（终止）
 - **多轮交互**：`designer_verilog` → `designer_file_check` → `verification_check` → `sim_exec_check` 构成迭代环，由 `route_after_file_check` / `route_after_sim_check` 条件路由判定。`designer_file_check` 校验本轮产出 RTL 文件存在且非空；`sim_exec_check` 实际执行 Vivado 仿真并检查覆盖率（`scripts/syn_filelist.f` 全部 src 被 `scripts/sim_filelist.f` 包含且报告已生成），仿真+覆盖率通过即经 `designer_output` 交付后终止（END）；失败且轮次未达 `max_rounds`（默认 3）时携带验证反馈回到 Designer 重新编码；达上限强制经 `designer_output` 交付后终止（END），防止死循环。
 - **交付节点（零 LLM）**：`designer_output` 是**确定性机械拼装**节点，**不调用任何 LLM、不渲染模板、不做网络/磁盘 IO**——仅把 `task` / `design_spec` / `rtl_code` / `verification_report` / `output_files` 等 state 字段按固定小节拼装成 `final_answer`（空字段整段省略，全空时至少回退 `state["task"]`）。两条终态路径（`sim_exec_check` 通过、达 `max_rounds` 上限）以及 `designer_file_check` 达上限，均先经 `designer_output` 交付再 `→ END`，保证 `final_answer` 非空、跨轮次记忆沉淀与 DONE 事件内容可用。
 - **上下文衔接**：Architect 各阶段任务文本逐级拼接上游产物（计划→设计→分析→评审→规格），Designer/Verification 基于架构规格分工，多轮迭代时第二轮起注入上一轮验证报告反馈。
-- **角色注册**：`team/__init__.py` 未导入 `rtl_designer`/`rtl_verification`，由 `rtl_graph.py` 顶部显式导入触发 `@register_agent` 注册，与 `graph.common` 无循环导入。
+- **角色注册**：`team/__init__.py` 未导入 `rtl_designer`/`rtl_verification`，由 `rtl_graph.py` 顶部 from-import 三个角色类（`ArchiAgent`/`DesignerAgent`/`VerificationAgent`，NodeSpec 需引用其类属性节点）触发 `@register_agent` 注册，与 `graph.common` 无循环导入。**节点实现全部归属角色类**：LLM 节点为类属性（`create_llm_node` 闭包，经 `ArchiAgent.plan_node` 等类属性引用注册），代码型节点为实例方法（经 `agents[role].xxx_node` bound-method 引用注册，`register_nodes` 自动识别两种形态）。
 
 ### 团队角色
 
@@ -2366,7 +2374,7 @@ Designer (designer_output:整理最终交付物) → END（终止）
 
 > **RTL 团队角色模型配置**：`manager`/`architect`/`rtl_designer`/`rtl_verification` 均配置为云雾提供商 `qwen3.7-max`、`max_tokens=4096`。原因：云雾网关对 `max_completion_tokens` 参数的处理存在缺陷——思考型模型（`glm-5.2`/`qwen3.7-max`）的 reasoning token 会计入该预算，复杂设计任务（RTL 编码/验证方案）思考消耗远超 `max_tokens`，触发 `finish=length` 且 `content` 为空，导致工作流节点输出空字符串。`llm/llm_client.py` 中 `CloudmistChatOpenAI` 子类将 `max_completion_tokens` 还原为 `max_tokens` 规避该缺陷（仅 `provider="yunwu"` 生效），详见该文件类文档。
 
-> **固定技能注入**：`TeamAgent` 基类保留 `fixed_skills: ClassVar[list[str]] = []` 类属性，`skmng.core.build_skill_block` 支持把角色级固定技能合并进注入块。`VerificationAgent` 声明 `fixed_skills = ["vivado-2025.2"]`（验证环境始终使用 Vivado Xsim，与任务关键词无关，故无条件注入）；该固定技能经**节点路径**生效：`graph/common/node_factory.py::create_llm_node` 生成的节点在执行时读取 `agent.fixed_skills`，以 `fixed_skills=...` 传给 `injector.inject_into_prompt(...)`，最终在 `skmng.core.build_skill_block` 的三来源合并中注入。例外：`verification_check_node` 经 `create_llm_node(..., exclude_skills=("vivado-2025.2",))` **显式 opt-out**（该技能的 add_files 目录通配与 Xsim `sim_filelist.f` 流程冲突）；`exclude_skills` 在三来源合并后统一过滤，故单个节点可剔除角色的 fixed_skills。
+> **固定技能注入**：`TeamAgent` 基类保留 `fixed_skills: ClassVar[list[str]] = []` 类属性，`skmng.core.build_skill_block` 支持把角色级固定技能合并进注入块。`VerificationAgent` 声明 `fixed_skills = ["vivado-2025.2"]`（验证环境始终使用 Vivado Xsim，与任务关键词无关，故无条件注入）；该固定技能经**节点路径**生效：`team/node_factory.py::create_llm_node` 生成的节点在执行时读取 `agent.fixed_skills`，以 `fixed_skills=...` 传给 `injector.inject_into_prompt(...)`，最终在 `skmng.core.build_skill_block` 的三来源合并中注入。例外：`VerificationAgent.check_node` 经 `create_llm_node(..., exclude_skills=("vivado-2025.2",))` **显式 opt-out**（该技能的 add_files 目录通配与 Xsim `sim_filelist.f` 流程冲突）；`exclude_skills` 在三来源合并后统一过滤，故单个节点可剔除角色的 fixed_skills。
 
 > **RTL 角色 MCP 工具注入**：`ArchiAgent` / `DesignerAgent` / `VerificationAgent` 经 `@register_agent(..., mcp_tools=["write_file"])` 声明对 MCP filesystem `write_file` 工具的依赖。`build_workflow` 装配期由 `tools.mcp_loader.load_mcp_tools_by_name_sync` 同步拉取（遍历已启用 MCP server 按名筛选），拉取成功时角色切工具模式（自动挂载 `WorkspaceSecurityMW`，路径解析+逃逸校验与 Worker 一致），各自 workflow 节点的 prompt 引导 LLM 调用 `write_file` 把产出文档写入 workspace（architect 写 `arch_spec.md`、designer 写 `design_spec.md`/`rtl_code.sv`、verification 写 `verification_plan.md`/`verification_report.md`）；MCP 未配置或加载失败时静默降级为纯文本模式（仅输出正文，不写盘），不阻断工作流。声明工具名而非 server 名，解耦 server 配置变更。
 
@@ -2376,7 +2384,7 @@ Designer (designer_output:整理最终交付物) → END（终止）
 - **按需工具注入**:Manager/Terminator 纯 LLM 推理,Worker 注入工具列表后用 `create_agent` 构建轻量 ReAct 循环
 - **工具超时 + 错误纠错**:工具经 `tools.tool_wrapper.wrap_tools_with_timeout` 包裹超时保护(防卡死,默认 60 秒+工具级覆盖如 `ask_human` 600 秒);executor 挂载 `ToolExecutionErrorMW`(工具异常转 `ToolMessage(status="error")` + 反思指令,LLM 可读到报错修正重试)与 `WorkspaceSecurityMW`(workspace 路径解析 + 逃逸校验),与主 Agent 的工具执行质量对齐
 - **快速构建**:不加载 MCP Server、不创建 SQLite checkpointer
-- **内建技能注入**:持有 `SkillManager`(`skills_dir` 参数指定目录,默认 `.agents/skills`),`build_skill_block`/`inject_into_prompt` 转发 `skmng.core`(满足 `PromptInjector` 协议),三来源合并(角色级 `fixed_skills` 类属性 + 运行时 `active_names` + 自动匹配);`VerificationAgent` 声明 `fixed_skills = ["vivado-2025.2"]`,由 `create_llm_node` 读取并传参给注入器,实现角色级固定技能无条件注入;单节点可通过 `exclude_skills` opt-out(如 `verification_check_node` 排除 `"vivado-2025.2"` 因与 Xsim 流程冲突)。工作流节点可直接以角色实例为注入器,无需外部构造
+- **内建技能注入**:持有 `SkillManager`(`skills_dir` 参数指定目录,默认 `.agents/skills`),`build_skill_block`/`inject_into_prompt` 转发 `skmng.core`(满足 `PromptInjector` 协议),三来源合并(角色级 `fixed_skills` 类属性 + 运行时 `active_names` + 自动匹配);`VerificationAgent` 声明 `fixed_skills = ["vivado-2025.2"]`,由 `create_llm_node` 读取并传参给注入器,实现角色级固定技能无条件注入;单节点可通过 `exclude_skills` opt-out(如 `VerificationAgent.check_node` 排除 `"vivado-2025.2"` 因与 Xsim 流程冲突)。工作流节点可直接以角色实例为注入器,无需外部构造
 - **类型化执行结果**:`arun_structured` 返回 `AgentTurnResult`(completed / cancelled,复用 `agent/turn_types.py`),调用方可区分"正常完成"与"LLM 失败",工作流节点可据此重试/降级;`ainvoke`/`astream` 保持返回字符串契约不变
 - **运行时指标**:`metrics` 惰性收集器(与 `AgentCore.metrics` 同构)——LLM 调用 token 用量(流式事件与纯文本通道自动提取)、工具执行计数/失败/超时、turn 计数,经 `get_summary()` 汇总
 - **能力边界清晰**:规划/汇总角色不暴露危险工具(如 `run_shell`),Worker 才拥有工具执行能力
@@ -2387,8 +2395,8 @@ Designer (designer_output:整理最终交付物) → END（终止）
 
 工作流节点全面异步化,`TeamAgent` 提供 `arun_structured`/`aresume_structured`/`ainvoke`/`astream` 异步能力,节点经通用工厂统一调用 `TeamAgent` 方法并透传 LangGraph `config`(callbacks 通道)实现 TOKEN 级流式;同时具备技能注入与跨轮次记忆压缩能力:
 
-- **异步节点执行 + TOKEN 流式**:`simple.py` / `rtl_graph.py` 的业务节点(`manager_plan`/`worker_exec`/`terminator_final` 及 RTL 各节点)全部由 `graph/common/node_factory.py::create_llm_node` 工厂构建(节点内嵌 `summarize_context` 为手写节点,复用同一链路),执行路径统一为:`agent.get_template(template_name)` 取模板 → `agent.render_template(...)` 渲染 → 基础提示词前置(`llm.config.load_agent_rules` 按 `agent.tools` 判定) → `injector.inject_into_prompt(...)` 注入技能 → `run_team_turn_with_interrupt(agent, prompt, config)` 执行,并透传 LangGraph 注入的 `config: Optional[RunnableConfig]`。`run_team_turn_with_interrupt`(`graph/common/interrupt_forward.py`)内部调通用 `TeamAgent.arun_structured`;内层被 interrupt 时调外层 `langgraph.types.interrupt()` 暂停外层图,resume 后经 `TeamAgent.aresume_structured` 注入内层恢复,循环处理多次 interrupt。各角色类只是携带 `@register_agent` 元数据的薄注册桩。`TeamAgent`(`team/base.py`)提供 `arun_structured`/`aresume_structured`/`ainvoke`/`astream` 异步能力:`_astream_with_tools` 经 `agent_executor.astream_events(version="v2")` 过滤 `on_chat_model_stream`;`_astream_pure_text` 经 chat model `astream`。因同事件循环执行,callbacks 自然透传——`NodeTrackingHandler.on_chat_model_stream` 捕获 LLM token 增量转发为 `AgentEvent.token`,`WorkflowAdapter._on_token` 闭包补 `thread_id`/`role="assistant"`/`trace_id` 后注入事件流,实现节点执行期间的 TOKEN 级流式(空块自动过滤)。
-- **技能注入(SkillInjector)**:`build_simple_workflow` 接受 `skills_dir` / `auto_match_skills` 参数,构建时创建 `skmng.injector.SkillInjector`。节点渲染 prompt 后调用 `inject_into_prompt()` 把命中技能(`match_skills(task)`)的指引块追加到 prompt 末尾,已含技能块时跳过(防重复)。`skmng.core.build_skill_block` 的三来源合并(角色级 `fixed_skills` + 运行时 `active_names` + 自动匹配)完整生效:`SkillInjector.inject_into_prompt` 接受 `fixed_skills` 参数,节点经 `create_llm_node` 读取 `agent.fixed_skills` 传入(如 `VerificationAgent.fixed_skills = ["vivado-2025.2"]`,验证环境始终注入 Vivado Xsim 指引,与任务关键词无关);需要排除某技能时经 `exclude_skills` 传入(如 `graph/rtl_graph.py` 的 `verification_check_node` 排除 `"vivado-2025.2"`,因该技能的 add_files 目录通配与 Xsim `sim_filelist.f` 流程冲突,作为节点级 opt-out)。`TeamAgent` 亦内建同等能力(`build_skill_block` / `inject_into_prompt` 转发 `skmng.core`,满足 `PromptInjector` 协议)——节点可直接以角色实例为注入器,无需外部构造;`team/factory.py` 会把角色 `team/team_agents.json` 的 `skills_dir` / `auto_match_skills` / `tool_timeout` 透传给 TeamAgent。节点在 `create_llm_node` 内从 `state["active_skills"]` 读取手动加载技能并作为 `active_names` 传入(与 `fixed_skills` / `exclude_skills` 并列),使 `skill:<name>` 加载的技能经 workflow checkpoint per-thread 持久化后真正到达节点 prompt;`arun_compiled_workflow` / `arun_simple_workflow` / `arun_rtl_graph_workflow` / `arun_workflow_by_name` 均接受 `active_skills` 参数(仅非空时写入初始状态,不覆盖 checkpoint 已持久化的值)。`WorkflowAdapter`(`session/workflow_adapter.py`)提供 `list_skills` / `auto_match_skills` / `aload_skill` / `aclear_skills`,经 `graph.aget_state` / `graph.aupdate_state` 读写 workflow 会话 state,使 workflow 会话具备与主 Agent(`SkillOps`)同级的技能读写能力。
+- **异步节点执行 + TOKEN 流式**:`simple.py` / `rtl_graph.py` 的业务节点(`manager_plan`/`worker_exec`/`terminator_final` 及 RTL 各节点)全部由 `team/node_factory.py::create_llm_node` 工厂构建(手写节点如 `ManagerAgent.summarize_context_node` 复用同一链路),执行路径统一为:`agent.get_template(template_name)` 取模板 → `agent.render_template(...)` 渲染 → 基础提示词前置(`llm.config.load_agent_rules` 按 `agent.tools` 判定) → `injector.inject_into_prompt(...)` 注入技能 → `run_team_turn_with_interrupt(agent, prompt, config)` 执行,并透传 LangGraph 注入的 `config: Optional[RunnableConfig]`。`run_team_turn_with_interrupt`(`team/interrupt.py`)内部调通用 `TeamAgent.arun_structured`;内层被 interrupt 时调外层 `langgraph.types.interrupt()` 暂停外层图,resume 后经 `TeamAgent.aresume_structured` 注入内层恢复,循环处理多次 interrupt。**节点实现归属各角色类**:两个内置工作流的业务节点全部以类属性(LLM 节点,`create_llm_node` 闭包)或实例方法(代码型节点)形式定义在 team/ 角色类中,graph 文件只保留编排(NodeSpec 表 + 边 + 条件路由)。`TeamAgent`(`team/base.py`)提供 `arun_structured`/`aresume_structured`/`ainvoke`/`astream` 异步能力:`_astream_with_tools` 经 `agent_executor.astream_events(version="v2")` 过滤 `on_chat_model_stream`;`_astream_pure_text` 经 chat model `astream`。因同事件循环执行,callbacks 自然透传——`NodeTrackingHandler.on_chat_model_stream` 捕获 LLM token 增量转发为 `AgentEvent.token`,`WorkflowAdapter._on_token` 闭包补 `thread_id`/`role="assistant"`/`trace_id` 后注入事件流,实现节点执行期间的 TOKEN 级流式(空块自动过滤)。
+- **技能注入(SkillInjector)**:`build_simple_workflow` 接受 `skills_dir` / `auto_match_skills` 参数,构建时创建 `skmng.injector.SkillInjector`。节点渲染 prompt 后调用 `inject_into_prompt()` 把命中技能(`match_skills(task)`)的指引块追加到 prompt 末尾,已含技能块时跳过(防重复)。`skmng.core.build_skill_block` 的三来源合并(角色级 `fixed_skills` + 运行时 `active_names` + 自动匹配)完整生效:`SkillInjector.inject_into_prompt` 接受 `fixed_skills` 参数,节点经 `create_llm_node` 读取 `agent.fixed_skills` 传入(如 `VerificationAgent.fixed_skills = ["vivado-2025.2"]`,验证环境始终注入 Vivado Xsim 指引,与任务关键词无关);需要排除某技能时经 `exclude_skills` 传入(如 `VerificationAgent.check_node` 排除 `"vivado-2025.2"`,因该技能的 add_files 目录通配与 Xsim `sim_filelist.f` 流程冲突,作为节点级 opt-out)。`TeamAgent` 亦内建同等能力(`build_skill_block` / `inject_into_prompt` 转发 `skmng.core`,满足 `PromptInjector` 协议)——节点可直接以角色实例为注入器,无需外部构造;`team/factory.py` 会把角色 `team/team_agents.json` 的 `skills_dir` / `auto_match_skills` / `tool_timeout` 透传给 TeamAgent。节点在 `create_llm_node` 内从 `state["active_skills"]` 读取手动加载技能并作为 `active_names` 传入(与 `fixed_skills` / `exclude_skills` 并列),使 `skill:<name>` 加载的技能经 workflow checkpoint per-thread 持久化后真正到达节点 prompt;`arun_compiled_workflow` / `arun_simple_workflow` / `arun_rtl_graph_workflow` / `arun_workflow_by_name` 均接受 `active_skills` 参数(仅非空时写入初始状态,不覆盖 checkpoint 已持久化的值)。`WorkflowAdapter`(`session/workflow_adapter.py`)提供 `list_skills` / `auto_match_skills` / `aload_skill` / `aclear_skills`,经 `graph.aget_state` / `graph.aupdate_state` 读写 workflow 会话 state,使 workflow 会话具备与主 Agent(`SkillOps`)同级的技能读写能力。
 - **消息通道压缩(compaction)**:工作流 State schema 已不再手写固定的 `WorkflowState` / `RTLGraphState` TypedDict,改由 `graph/common/schema.py::compose_state_schema(agents, extra_channels)` 在构建期动态组合(底座 `messages`/`task`/`raw_context`/`active_skills` + 各角色 `state_fields` 声明 + 工作流级 `extra_channels`)。`messages`(LangGraph `add_messages` 通道)仍为底座通道,每个业务节点产出追加一条 `AIMessage`;工作流级 `summary` 通道已移除,节点级压缩仅作用于 `messages` 通道。`build_*_workflow` 接受 `compaction_config` 参数,经 `graph/common/` 的 `_build_compaction_middleware` 构造中间件,再由 `register_nodes` 以可选 `compaction_mw` 形参对节点统一包装:节点返回后调用 `arun_compaction`(**非 force**,仅预估 token > `max_context_tokens`(默认 100000)时触发,`existing_summary=""`)把历史 `messages` 压缩为裁剪后的消息序列(仅合并回 `messages`,不再写 `summary`),防止长会话撑爆上下文。`compaction_config=None` 且 agent 无 LLM 时静默禁用。
 - **跨轮次上下文延续**:统一入口(CLI/API)经 `WorkflowAdapter`(`session/workflow_adapter.py`)执行——运行前从 workflow 专属会话的 checkpoint `messages` 通道读取历史节点产出(预览最多 5 条、每条截断 200 字符,拼为 `【历史执行记录】` 块),叠加 `MemoryManager.recall_text` 的长期记忆,合并注入 `raw_context`,实现多轮运行间的上下文延续。
 
@@ -2409,7 +2417,7 @@ Designer (designer_output:整理最终交付物) → END（终止）
 工作流经统一 `SessionManager` 门面(`workflow_sm`,绑定 `WorkflowAdapter`)执行,记忆闭环由门面自动承载:
 
 1. **记忆提取**:`WorkflowAdapter._build_raw_context` 执行前从 workflow 专属会话的 checkpoint `messages` 通道读取历史节点产出(预览最多 5 条、每条 200 字符),叠加 `MemoryManager.recall_text` 的长期记忆,合并注入 `raw_context`(超长自动截断)。
-2. **Manager 总结分发**:工作流首个节点 `summarize` 调用 `ManagerAgent.summarize_context` 把原始记忆提炼成上下文摘要,存入 `context_summary` 通道（由 `ManagerAgent.state_fields` 声明）。下游仅 `manager_plan` 与 `terminator_final` 节点注入该摘要,`worker_exec` 不注入(靠 plan 承接记忆)。
+2. **Manager 总结分发**:工作流首个节点 `summarize` 调用 `ManagerAgent.summarize_context_node` 把原始记忆提炼成上下文摘要,存入 `context_summary` 通道（由 `ManagerAgent.state_fields` 声明）。下游仅 `manager_plan` 与 `terminator_final` 节点注入该摘要,`worker_exec` 不注入(靠 plan 承接记忆)。
 3. **写回闭环**:`workflow_sm.arun_stream` 内部自动执行——运行前 `submit_user_message(task, important=True)` 把任务写入长期记忆;结束后消费 DONE 事件(`consume_event`)沉淀最终答案,无需命令层手工写回。
 
 ### 工作流提示词外置
@@ -2522,7 +2530,10 @@ from graph.common import register_agent
 from team.base import TeamAgent
 from tools import all_tools
 
-# 角色类只是携带 @register_agent 元数据的薄注册桩;
+# 角色类承载 @register_agent 元数据 + 本角色的工作流节点实现:
+# LLM 节点写成类属性(create_llm_node 闭包,如 ArchiAgent.plan_node),
+# 代码型节点写成实例方法(async def xxx_node(self, state, injector=None, config=None),
+# 如 DesignerAgent.designer_output_node);
 # 工作流提示词写在 AGENT.md 的 ## workflow:<名称> 小节,无需 default_templates
 @register_agent("my_agent", tools=all_tools)
 class MyAgent(TeamAgent):
@@ -2558,7 +2569,7 @@ class MyAgent(TeamAgent):
 
 **方式 A — 模块自注册（推荐,内置工作流采用）:**
 
-在 `graph/` 下新建工作流文件,实现 `build_xxx_workflow(agents)` 构建函数与 `run_xxx_workflow` 运行器,文件末尾调用 `register_workflow` 完成自注册（参照 `graph/simple.py` 与 `graph/pipline.py`）:
+在 `graph/` 下新建工作流文件,实现 `build_xxx_workflow(agents)` 构建函数与 `run_xxx_workflow` 运行器,文件末尾调用 `register_workflow` 完成自注册（参照 `graph/simple.py` 与 `graph/rtl_graph.py`）:
 
 ```python
 # graph/my_workflow.py
@@ -2578,7 +2589,11 @@ def build_my_workflow(agents: dict) -> StateGraph:
     # 自定义工作流通道经 extra_channels 声明，角色类必须声明 state_fields ClassVar
     builder = StateGraph(compose_state_schema(agents, extra_channels={}))
     # 声明式注册:NodeSpec(name, fn, role) 三步合一
-    # 节点函数第二参数统一为 agent: TeamAgent(register_nodes 内部 partial 绑定)
+    # 节点函数两种形态(register_nodes 自动识别):
+    #   a) 独立函数 async def fn(state, agent, injector=None, config=None)
+    #      —— partial 补绑 agent=agents[role] + injector
+    #   b) 角色实例的 bound method agent.xxx_node(self 即 agent)
+    #      —— 只补绑 injector;NodeSpec 经 agents["my_agent"].xxx_node 取引用
     register_nodes(
         builder, agents, injector, compaction_mw,
         [NodeSpec("step1", step1_node, role="my_agent")],
@@ -2601,7 +2616,7 @@ register_workflow(
 
 > **`register_nodes` 签名**：`register_nodes(builder, agents, injector, compaction_mw=None, specs=None)`。`compaction_mw` 为 `None` 时行为与未接线一致（仅对 `specs` 中每个节点做 `partial` 绑定后 `builder.add_node`）；非 `None` 时节点返回后由包装器调用 `arun_compaction(messages, existing_summary=...)` 做**节点级增量压缩**——**非 force**：仅当预估 token > `max_context_tokens`（默认 100000）时触发，并把压缩产生的 `messages`/`summary` 合并进节点返回值（`{**result, **update}`，`update["messages"]` 取代节点原 `messages`，不丢不重）。
 
-`graph/common/registry.py` 底部 `_load_builtin_workflows()` 在 registry 首次 import 时加载 `graph.simple` / `graph.pipline`,触发其自注册;新增内置工作流时在该函数中补充 import 即可。
+`graph/common/registry.py` 底部 `_load_builtin_workflows()` 在 registry 首次 import 时**自动扫描 `graph/` 目录下所有 .py 文件**（排除 `__init__.py` 与 `common/` 包）并 import,触发各模块的 `register_workflow` 自注册;新增内置工作流时在 `graph/` 下新建模块即可,无需改注册表代码。
 
 **方式 B — 动态注册（运行时添加,无需改源码,适合插件式/条件式工作流）:**
 
@@ -2986,7 +3001,7 @@ Agent 的核心系统提示词（行为规则）位于独立的 [agent/AGENT.md]
 
 > **注意**：`agent/AGENT.md` 只承载主 Agent 的行为规则小节，**不含** `## workflow:*` 工作流模板；那些小节位于各角色自己的 `team/<角色>/AGENT.md`。构建 TeamAgent 时（`team/factory.py`）只需传该角色的 `prompt_file`，`TeamAgent.__init__` 会自动经 `parse_prompt_sections` 剥离 `## workflow:*` 小节并解析出 system prompt，避免模板内容混入（详见「工作流提示词外置」）。
 
-> **工作流节点的提示词继承**：`agent/AGENT.md` 中的规则按**角色是否持有工具**分为两个小节，由 `llm.config.load_agent_rules` 按需提取，`graph/common/node_factory.py` 的 `create_llm_node` 生成的节点会把它前置到节点模板之前（在技能注入之前）：
+> **工作流节点的提示词继承**：`agent/AGENT.md` 中的规则按**角色是否持有工具**分为两个小节，由 `llm.config.load_agent_rules` 按需提取，`team/node_factory.py` 的 `create_llm_node` 生成的节点会把它前置到节点模板之前（在技能注入之前）：
 >
 > | 小节 | 内容 | 继承范围 |
 > | --- | --- | --- |
