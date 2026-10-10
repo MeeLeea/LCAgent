@@ -49,11 +49,10 @@ from langgraph.graph import END, START, StateGraph
 
 from graph.common import (
     NodeSpec,
-    compose_state_schema,
     register_nodes,
     register_workflow,
 )
-from skmng.injector import SkillInjector
+from graph.common.builder_utils import build_graph_scaffold
 
 # 角色类的 from-import 同时触发其模块顶部 @register_agent 装饰器完成注册
 # (team/__init__.py 未导入 rtl_designer / rtl_verification;NodeSpec 亦引用类属性)
@@ -129,25 +128,21 @@ def build_rtl_graph_workflow(
     rtl_designer = agents["rtl_designer"]
     rtl_verification = agents["rtl_verification"]
 
-    # 技能注入器:节点渲染 prompt 时追加匹配的技能指引块
-    injector = SkillInjector(
+    # 基础 setup(技能注入器 + State schema 组合)收敛为公共构图辅助;
+    # RTL 额外声明编排通道(round/max_rounds 等),经 extra_channels 透传 compose_state_schema
+    builder, injector = build_graph_scaffold(
+        agents,
         skills_dir=skills_dir,
-        auto_match=auto_match_skills,
-    )
-
-    builder = StateGraph(
-        compose_state_schema(
-            agents,
-            extra_channels={
-                "round": int,
-                "max_rounds": int,
-                "final_answer": str,
-                "file_check_passed": bool,
-                "sim_check_passed": bool,
-                "sim_status": str,
-                "sim_log_path": str,
-            },
-        )
+        auto_match_skills=auto_match_skills,
+        extra_channels={
+            "round": int,
+            "max_rounds": int,
+            "final_answer": str,
+            "file_check_passed": bool,
+            "sim_check_passed": bool,
+            "sim_status": str,
+            "sim_log_path": str,
+        },
     )
 
     # 添加节点(声明式 NodeSpec 表:partial 绑定 + add_node 两步合一)
