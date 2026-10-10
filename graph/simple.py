@@ -30,14 +30,10 @@ workspace 隔离说明：
 """
 from __future__ import annotations
 
-from collections.abc import Sequence
-
 from langgraph.graph import END, START, StateGraph
 
 from graph.common import (
-    NodeCallback,
     NodeSpec,
-    arun_compiled_workflow,
     compose_state_schema,
     register_nodes,
     register_workflow,
@@ -110,70 +106,21 @@ def build_simple_workflow(
     return builder.compile(checkpointer=checkpointer)
 
 
-# 4. 运行工作流
-async def arun_simple_workflow(
-    graph: StateGraph,
-    task: str,
-    raw_context: str = "",
-    thread_id: str | None = None,
-    workspace_path: str | None = None,
-    on_node_start: NodeCallback | None = None,
-    on_node_end: NodeCallback | None = None,
-    on_node_error: NodeCallback | None = None,
-    max_history_chars: int = 6000,
-    memory=None,
-    memory_thread_id: str | None = None,
-    is_run_mode: bool = False,
-    active_skills: Sequence[str] = (),
-) -> dict:
-    """
-    运行监督者工作流（异步）
-
-    Args:
-        graph: 编译好的工作流图
-        task: 用户任务
-        raw_context: 原始记忆文本(当前会话+长期记忆),为空则不注入记忆
-        thread_id: 会话线程 ID。为 None 时自动生成；传入显式值时配合
-            checkpointer 编译的图可实现状态持久化。
-        workspace_path: 会话绑定的工作空间绝对路径。为 None 时工作流内
-            Worker 工具调用不做 workspace 隔离（兼容旧场景）。
-        on_node_start: 节点开始回调,接收节点名(用于运行进度跟踪)
-        on_node_end: 节点结束回调,接收节点名
-        on_node_error: 节点异常回调,接收节点名
-        max_history_chars: 跨轮次记忆摘要最大字符数(超长截断)
-        memory: MemoryManager 实例（长期记忆召回与结果沉淀）；None 禁用
-        memory_thread_id: 长期记忆使用的会话线程 ID
-        is_run_mode: 是否运行模式（决定 DONE 事件是否标记为重要记忆）
-        active_skills: 显式注入的手动加载技能名(仅非空时写入初始状态,
-            不覆盖 checkpoint 已持久化的值)
-
-    Returns:
-        包含 final_answer 的结果字典
-    """
-    return await arun_compiled_workflow(
-        graph,
-        task,
-        initial_fields={"context_summary": "", "plan": "", "worker_result": "", "final_answer": ""},
-        raw_context=raw_context,
-        thread_id=thread_id,
-        workspace_path=workspace_path,
-        on_node_start=on_node_start,
-        on_node_end=on_node_end,
-        on_node_error=on_node_error,
-        max_history_chars=max_history_chars,
-        memory=memory,
-        memory_thread_id=memory_thread_id,
-        is_run_mode=is_run_mode,
-        active_skills=active_skills,
-    )
-
-
+# 4. 工作流注册
 # 注: import 置于模块顶部、调用置于文件末尾——register_workflow 与 WORKFLOWS
 # 在 graph.registry 文件前部定义,先于本模块被 import 时执行,循环导入安全。
+# 运行调度统一经 graph.common.arun_compiled_workflow(arun_workflow_by_name 路由),
+# 不再单独定义 arun_*_workflow 透传运行器;本工作流特有的初始状态字段
+# 经 initial_fields 声明(见 arun_compiled_workflow 的 initial_fields 参数)。
 register_workflow(
     "simple",
     builder=build_simple_workflow,
-    runner=arun_simple_workflow,
     roles=["manager", "worker", "terminator"],
     description="监督者模式工作流(Manager 拆解→Worker 执行→Terminator 汇总)",
+    initial_fields={
+        "context_summary": "",
+        "plan": "",
+        "worker_result": "",
+        "final_answer": "",
+    },
 )

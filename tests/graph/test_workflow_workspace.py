@@ -19,7 +19,7 @@ from unittest.mock import MagicMock
 
 from agent.turn_types import AgentTurnResult
 from agent.workspace_mw import WorkspaceSecurityMW
-from graph.simple import arun_compiled_workflow
+from graph.common.workflow_runner import arun_compiled_workflow
 from team.base import TeamAgent
 from team.worker.worker import WorkerAgent
 

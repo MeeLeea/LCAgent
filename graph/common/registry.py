@@ -9,10 +9,13 @@
   - 动态工作流: 任意运行时代码调用 register_workflow
 
 工作流规格字段:
-  - builder:     构建函数 build_xxx(agents: dict) -> 编译好的 StateGraph
-  - runner:      自定义异步运行器,缺失时回退到 graph.simple.arun_simple_workflow
-  - roles:       该工作流依赖的角色列表,缺失时构建全部已注册角色
-  - description: 工作流描述,用于 CLI 列表展示
+  - builder:        构建函数 build_xxx(agents: dict) -> 编译好的 StateGraph
+  - initial_fields: 工作流特有的初始状态字段模板(见 arun_compiled_workflow 的
+                    initial_fields 参数);arun_workflow_by_name 统一经
+                    arun_compiled_workflow 调度时透传。此前两内置工作流各自
+                    arun_*_workflow 逐字重复的透传运行器已合并,差异只剩本字段。
+  - roles:          该工作流依赖的角色列表,缺失时构建全部已注册角色
+  - description:    工作流描述,用于 CLI 列表展示
 """
 from __future__ import annotations
 
@@ -74,11 +77,23 @@ def register_workflow(
     runner: Callable | None = None,
     roles: list[str] | None = None,
     description: str = "",
+    initial_fields: dict | None = None,
 ) -> None:
-    """动态注册工作流(工作流唯一注册入口)。"""
+    """动态注册工作流(工作流唯一注册入口)。
+
+    Args:
+        name: 工作流名称(CLI 以 ``workflow:<name> <任务>`` 调用)
+        builder: 构建函数 ``build_xxx(agents: dict) -> StateGraph``
+        runner: 已废弃(保留以兼容既有动态注册调用方)。调度统一经
+            ``arun_compiled_workflow``,不再回退到任何特定工作流函数。
+        roles: 声明依赖角色列表,仅构建这些角色;缺失时构建全部已注册角色
+        description: 工作流描述,CLI ``workflow`` 列表展示用
+        initial_fields: 工作流特有的初始状态字段模板。经
+            ``arun_workflow_by_name`` 调度时透传给 ``arun_compiled_workflow``。
+    """
     WORKFLOWS[name] = {
         "builder": builder,
-        "runner": runner,
+        "initial_fields": initial_fields or {},
         "roles": roles,
         "description": description,
     }
@@ -89,15 +104,10 @@ def _get_workflow_spec(name: str) -> dict:
     entry = WORKFLOWS[name]
     return {
         "builder": entry["builder"],
-        "runner": entry.get("runner"),
+        "initial_fields": entry.get("initial_fields") or {},
         "roles": entry.get("roles"),
         "description": entry.get("description", ""),
     }
-
-
-def get_workflow_runner(name: str) -> Callable | None:
-    """获取工作流的异步运行器函数,缺失返回 None。"""
-    return _get_workflow_spec(name)["runner"]
 
 
 def list_workflows() -> list[tuple[str, str]]:
@@ -238,16 +248,21 @@ async def arun_workflow_by_name(
     """按名称构建并异步运行工作流(不依赖 CLI 上下文)。
 
     供 scheduler/executor 等非 CLI 场景调用。
+
+    统一经 ``arun_compiled_workflow`` 调度:各工作流差异的工作流级
+    ``initial_fields``(含 rtl 的 max_rounds 等)已上移进 WORKFLOWS 注册条目,
+    此处不再回退到任何特定工作流运行函数。
     """
+    from graph.common.workflow_runner import arun_compiled_workflow
+
     graph, _agents = build_workflow(workflow_name, checkpointer=checkpointer)
 
-    runner = get_workflow_runner(workflow_name)
-    if runner is None:
-        from graph.simple import arun_simple_workflow as runner
+    spec = _get_workflow_spec(workflow_name)
 
-    return await runner(
+    return await arun_compiled_workflow(
         graph,
         task,
+        initial_fields=spec["initial_fields"],
         raw_context="",
         thread_id=thread_id,
         workspace_path=workspace_path,

@@ -16,8 +16,8 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 from agent.turn_types import AgentTurnResult
+from graph.common.workflow_runner import arun_compiled_workflow
 from graph.rtl_graph import (
-    arun_rtl_graph_workflow,
     build_rtl_graph_workflow,
     route_after_file_check,
     route_after_sim_check,
@@ -28,6 +28,28 @@ from team.base import TeamAgent
 from team.manager.manager import ManagerAgent
 from team.rtl_designer.rtl_designer import DesignerAgent
 from team.rtl_verification.rtl_verification import VerificationAgent
+
+# rtl_graph 工作流特有的初始状态字段(原本在已删除的 arun_rtl_graph_workflow 内部,
+# 现已上移进 WORKFLOWS["rtl_graph"] 注册条目;测试持图对象故直接内联传给
+# arun_compiled_workflow,以保留图对象复用语义)
+RTL_INITIAL_FIELDS: dict[str, Any] = {
+    "context_summary": "",
+    "arch_plan": "",
+    "arch_design": "",
+    "arch_analysis": "",
+    "arch_review": "",
+    "arch_spec": "",
+    "design_spec": "",
+    "verification_plan": "",
+    "rtl_code": "",
+    "verification_report": "",
+    "round": 0,
+    "max_rounds": 3,
+    "final_answer": "",
+    "output_files": [],
+    "file_check_passed": False,
+    "sim_check_passed": False,
+}
 
 # 默认模板(与各角色 AGENT.md 的 ## workflow:* 小节一致,供 FakeRTLAgent.get_template 兜底)
 DEFAULT_TEMPLATES: dict[str, str] = {
@@ -472,7 +494,7 @@ def test_run_rtl_graph_pass_once(tmp_path, monkeypatch):
     ws = _make_workspace(tmp_path)
     _patch_vivado(monkeypatch, [0])
 
-    result = asyncio.run(arun_rtl_graph_workflow(graph, "设计一个 UART 模块", workspace_path=ws))
+    result = asyncio.run(arun_compiled_workflow(graph, "设计一个 UART 模块", initial_fields=RTL_INITIAL_FIELDS, workspace_path=ws))
 
     assert result["round"] == 1
     assert result["arch_plan"] == "架构: 单核 UART"
@@ -514,7 +536,7 @@ def test_run_rtl_graph_multi_round_iteration(tmp_path, monkeypatch):
     # 仿真第一次失败(退出码 1),第二次成功(退出码 0)→ 路由据此迭代两轮
     _patch_vivado(monkeypatch, [1, 0])
 
-    result = asyncio.run(arun_rtl_graph_workflow(graph, "设计 UART", workspace_path=ws))
+    result = asyncio.run(arun_compiled_workflow(graph, "设计 UART", initial_fields=RTL_INITIAL_FIELDS, workspace_path=ws))
 
     assert result["round"] == 2
     # designer 的 verilog 类节点(designer_verilog)被调 2 次;
@@ -550,7 +572,7 @@ def test_run_rtl_graph_forced_output_at_max_rounds(tmp_path, monkeypatch):
     # 仿真三次均失败(退出码 1)→ 达 max_rounds 后强制交付
     _patch_vivado(monkeypatch, [1, 1, 1])
 
-    result = asyncio.run(arun_rtl_graph_workflow(graph, "设计 UART", workspace_path=ws))
+    result = asyncio.run(arun_compiled_workflow(graph, "设计 UART", initial_fields=RTL_INITIAL_FIELDS, workspace_path=ws))
 
     # 3 次迭代后强制交付,round 达上限
     assert result["round"] == 3
@@ -580,9 +602,10 @@ def test_run_rtl_graph_with_context_memory(tmp_path, monkeypatch):
     _patch_vivado(monkeypatch, [0])
 
     result = asyncio.run(
-        arun_rtl_graph_workflow(
+        arun_compiled_workflow(
             graph,
             "设计 UART",
+            initial_fields=RTL_INITIAL_FIELDS,
             raw_context="之前聊过偏好 SystemVerilog",
             workspace_path=ws,
         )
@@ -607,7 +630,7 @@ def test_rtl_graph_registered():
     assert "rtl_graph" in WORKFLOWS
     spec = WORKFLOWS["rtl_graph"]
     assert callable(spec["builder"])
-    assert spec["runner"] is not None
+    assert isinstance(spec["initial_fields"], dict)
     assert spec["roles"] == ["manager", "architect", "rtl_designer", "rtl_verification"]
 
 

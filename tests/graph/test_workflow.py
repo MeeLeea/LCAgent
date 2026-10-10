@@ -13,14 +13,24 @@ import pytest
 
 from agent.turn_types import AgentTurnResult
 from cli.commands.workflow import workflow_command
+from graph.common.workflow_runner import arun_compiled_workflow
 from graph.simple import (
-    arun_simple_workflow,
     build_simple_workflow,
 )
 from team.base import TeamAgent
 from team.manager.manager import ManagerAgent
 from team.terminator.terminator import TerminatorAgent
 from team.worker.worker import WorkerAgent
+
+# simple 工作流特有的初始状态字段(原本在已删除的 arun_simple_workflow 内部,
+# 现已上移进 WORKFLOWS["simple"] 注册条目;测试持图对象故直接内联传给
+# arun_compiled_workflow,以保留图对象复用语义)
+SIMPLE_INITIAL_FIELDS: dict[str, str] = {
+    "context_summary": "",
+    "plan": "",
+    "worker_result": "",
+    "final_answer": "",
+}
 
 # 默认模板(与各角色 AGENT.md 的 ## workflow:* 小节一致,供 FakeAgent 兜底)
 DEFAULT_TEMPLATES: dict[str, str] = {
@@ -399,7 +409,7 @@ def test_run_simple_workflow():
     terminator = FakeTerminatorAgent(name="terminator", response="最终答案: 全部完成")
     
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
-    result = asyncio.run(arun_simple_workflow(graph, "测试任务"))
+    result = asyncio.run(arun_compiled_workflow(graph, "测试任务", initial_fields=SIMPLE_INITIAL_FIELDS))
     
     # 验证最终状态
     assert result["task"] == "测试任务"
@@ -425,7 +435,7 @@ def test_workflow_registry():
     # register_workflow 注册的是规格字典,不是裸函数
     assert isinstance(spec, dict)
     assert callable(spec["builder"])
-    assert spec["runner"] is not None
+    assert isinstance(spec["initial_fields"], dict)
 
 
 def test_build_workflow_unknown_name():
@@ -755,7 +765,7 @@ def test_workflow_thread_isolation():
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
     
     # 第一次运行
-    result1 = asyncio.run(arun_simple_workflow(graph, "任务1"))
+    result1 = asyncio.run(arun_compiled_workflow(graph, "任务1", initial_fields=SIMPLE_INITIAL_FIELDS))
     
     # 第二次运行(重置 agent 调用记录)
     manager.calls.clear()
@@ -765,7 +775,7 @@ def test_workflow_thread_isolation():
     worker.response = "结果2"
     terminator.response = "答案2"
     
-    result2 = asyncio.run(arun_simple_workflow(graph, "任务2"))
+    result2 = asyncio.run(arun_compiled_workflow(graph, "任务2", initial_fields=SIMPLE_INITIAL_FIELDS))
     
     # 验证两次运行结果独立
     assert result1["task"] == "任务1"
@@ -790,7 +800,7 @@ def test_run_simple_workflow_with_memory():
     terminator = FakeTerminatorAgent(name="terminator", response="最终答案: 完成")
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
 
-    result = asyncio.run(arun_simple_workflow(graph, "测试任务", raw_context="用户: 之前聊过偏好中文"))
+    result = asyncio.run(arun_compiled_workflow(graph, "测试任务", initial_fields=SIMPLE_INITIAL_FIELDS, raw_context="用户: 之前聊过偏好中文"))
 
     # manager 两次调用:summarize + plan(均经 arun_structured)
     assert manager.calls[0][0] == "arun_structured"
@@ -968,9 +978,10 @@ def test_run_simple_workflow_node_callbacks():
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
 
     events: list[tuple[str, str]] = []
-    asyncio.run(arun_simple_workflow(
+    asyncio.run(arun_compiled_workflow(
         graph,
         "测试任务",
+        initial_fields=SIMPLE_INITIAL_FIELDS,
         on_node_start=lambda e: events.append(("start", e.node)),
         on_node_end=lambda e: events.append(("end", e.node)),
     ))
@@ -991,7 +1002,7 @@ def test_run_simple_workflow_no_callbacks_still_works():
     terminator = FakeTerminatorAgent(name="terminator", response="答案")
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
 
-    result = asyncio.run(arun_simple_workflow(graph, "测试任务"))
+    result = asyncio.run(arun_compiled_workflow(graph, "测试任务", initial_fields=SIMPLE_INITIAL_FIELDS))
     assert result["final_answer"] == "答案"
 
 
@@ -1277,7 +1288,7 @@ def test_workflow_cross_round_compression():
     )
 
     # 第一轮:无历史,不注入
-    result1 = asyncio.run(arun_simple_workflow(graph, "第一轮任务", thread_id="wf-t1"))
+    result1 = asyncio.run(arun_compiled_workflow(graph, "第一轮任务", initial_fields=SIMPLE_INITIAL_FIELDS, thread_id="wf-t1"))
     assert result1["final_answer"] == "最终答案: 全部完成"
     # summarize 节点第一轮 raw_context 为空 → 短路不调 helper;
     # manager 只剩 manager_plan 一次调用(经 arun_structured)
@@ -1292,7 +1303,7 @@ def test_workflow_cross_round_compression():
     worker.response = "结果2"
     terminator.response = "答案2"
 
-    result2 = asyncio.run(arun_simple_workflow(graph, "第二轮任务", thread_id="wf-t1"))
+    result2 = asyncio.run(arun_compiled_workflow(graph, "第二轮任务", initial_fields=SIMPLE_INITIAL_FIELDS, thread_id="wf-t1"))
     assert result2["final_answer"] == "答案2"
 
     # summarize 节点收到上一轮工作流记录(经 arun_structured)
@@ -1316,11 +1327,11 @@ def test_workflow_cross_round_compression_truncation():
         checkpointer=checkpointer,
     )
 
-    asyncio.run(arun_simple_workflow(graph, "长内容任务 " + "X" * 500, thread_id="wf-t2"))
+    asyncio.run(arun_compiled_workflow(graph, "长内容任务 " + "X" * 500, initial_fields=SIMPLE_INITIAL_FIELDS, thread_id="wf-t2"))
 
     manager.calls.clear()
     result2 = asyncio.run(
-        arun_simple_workflow(graph, "第二轮", thread_id="wf-t2", max_history_chars=100)
+        arun_compiled_workflow(graph, "第二轮", initial_fields=SIMPLE_INITIAL_FIELDS, thread_id="wf-t2", max_history_chars=100)
     )
     assert result2["final_answer"] == "答案"
     summary_text = manager.calls[0][1]
@@ -1336,7 +1347,7 @@ def test_workflow_cross_round_no_checkpointer():
 
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
 
-    result = asyncio.run(arun_simple_workflow(graph, "任务", thread_id="wf-t3"))
+    result = asyncio.run(arun_compiled_workflow(graph, "任务", initial_fields=SIMPLE_INITIAL_FIELDS, thread_id="wf-t3"))
     assert result["final_answer"] == "答案"
     # 无 checkpointer → 无历史,summarize 节点 raw 为空 → 短路不调 helper;
     # manager.calls[0] 是 manager_plan 节点调用,prompt 含 manager_plan 模板内容
