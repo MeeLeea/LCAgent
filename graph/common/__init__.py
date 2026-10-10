@@ -48,7 +48,6 @@ from graph.common.schema import compose_state_schema
 
 # 通用运行器
 from graph.common.workflow_runner import (
-    _aget_previous_workflow_summary,
     arun_compiled_workflow,
 )
 
@@ -63,7 +62,6 @@ __all__ = [
     "NodeCallback",
     "NodeSpec",
     "NodeTrackingHandler",
-    "_aget_previous_workflow_summary",
     "_build_compaction_middleware",
     "_extract_node_output",
     "arun_compiled_workflow",
