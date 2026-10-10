@@ -26,6 +26,7 @@ from graph.common.node_spec import NodeSpec, register_nodes
 from graph.common.node_tracking import (
     NodeCallback,
     NodeTrackingHandler,
+    build_tracking_callbacks,
 )
 
 # 注册表
@@ -61,6 +62,7 @@ __all__ = [
     "_build_compaction_middleware",
     "arun_compiled_workflow",
     "arun_workflow_by_name",
+    "build_tracking_callbacks",
     "build_workflow",
     "compose_state_schema",
     "list_workflows",

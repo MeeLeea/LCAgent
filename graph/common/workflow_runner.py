@@ -13,7 +13,7 @@ from typing import Any
 
 from langgraph.graph import StateGraph
 
-from graph.common.node_tracking import NodeCallback, NodeTrackingHandler
+from graph.common.node_tracking import NodeCallback, build_tracking_callbacks
 from utils.events import AgentEvent
 from utils.logging_config import TraceContext
 
@@ -127,17 +127,12 @@ async def _arun_with_trace(
         initial_state.update(initial_fields)
 
     if on_node_start or on_node_end or on_node_error:
-        known_nodes = {
-            n.id for n in graph.get_graph().nodes.values() if not n.id.startswith("__")
-        }
-        config["callbacks"] = [
-            NodeTrackingHandler(
-                known_nodes,
-                on_node_start=on_node_start,
-                on_node_end=on_node_end,
-                on_node_error=on_node_error,
-            )
-        ]
+        config["callbacks"] = build_tracking_callbacks(
+            graph,
+            on_node_start=on_node_start,
+            on_node_end=on_node_end,
+            on_node_error=on_node_error,
+        )
 
     result = await graph.ainvoke(initial_state, config=config)
 

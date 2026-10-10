@@ -12,12 +12,42 @@ from typing import Any
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage
+from langgraph.graph import StateGraph
 
 from utils.events import AgentEvent
 
 logger = logging.getLogger(__name__)
 
 NodeCallback = Callable[[AgentEvent], None]
+
+
+def build_tracking_callbacks(
+    graph: StateGraph,
+    *,
+    on_node_start: NodeCallback | None = None,
+    on_node_end: NodeCallback | None = None,
+    on_node_error: NodeCallback | None = None,
+    on_token: NodeCallback | None = None,
+) -> list[NodeTrackingHandler]:
+    """构造节点级进度跟踪回调处理器列表（可直接挂到 ``config["callbacks"]``）。
+
+    从编译图推导 known_nodes（排除 ``__`` 开头的内部哨兵/分支节点，子图与内部
+    agent 节点不在其中会被过滤），统一封装 ``NodeTrackingHandler`` 的构造细节，
+    供 workflow_runner 与 workflow_adapter 复用。on_token 仅在需要 TOKEN 级流式的
+    调用方（如 workflow_adapter）传入，其余业务节点回调按需透传。
+    """
+    known_nodes = {
+        n.id for n in graph.get_graph().nodes.values() if not n.id.startswith("__")
+    }
+    return [
+        NodeTrackingHandler(
+            known_nodes,
+            on_node_start=on_node_start,
+            on_node_end=on_node_end,
+            on_node_error=on_node_error,
+            on_token=on_token,
+        )
+    ]
 
 
 def _extract_node_output(output: Any) -> str:

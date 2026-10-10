@@ -47,7 +47,7 @@ from langchain_core.messages import AIMessage
 from langgraph.types import Command
 
 from agent.compaction import CompactionConfig
-from graph.common import NodeTrackingHandler, _build_compaction_middleware
+from graph.common import _build_compaction_middleware, build_tracking_callbacks
 from llm.message_utils import build_interrupt_event
 from memory.manager import MemoryManager
 from session.registry import SessionRegistry
@@ -407,10 +407,6 @@ class WorkflowAdapter:
         node_queue: asyncio.Queue[AgentEvent] = asyncio.Queue()
 
         # 4. NodeTrackingHandler：节点事件 + LLM token 增量入队
-        known_nodes = {
-            n.id for n in graph.get_graph().nodes.values() if not n.id.startswith("__")
-        }
-
         def _on_token(ev: AgentEvent) -> None:
             """LLM token 增量 → TOKEN 事件入队（补充会话元数据）。"""
             node_queue.put_nowait(
@@ -424,15 +420,13 @@ class WorkflowAdapter:
 
         config: dict[str, Any] = {
             "configurable": configurable,
-            "callbacks": [
-                NodeTrackingHandler(
-                    known_nodes,
-                    on_node_start=node_queue.put_nowait,
-                    on_node_end=node_queue.put_nowait,
-                    on_node_error=node_queue.put_nowait,
-                    on_token=_on_token,
-                )
-            ],
+            "callbacks": build_tracking_callbacks(
+                graph,
+                on_node_start=node_queue.put_nowait,
+                on_node_end=node_queue.put_nowait,
+                on_node_error=node_queue.put_nowait,
+                on_token=_on_token,
+            ),
         }
 
         return self._WorkflowRuntime(
