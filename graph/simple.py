@@ -23,10 +23,10 @@ workspace 隔离说明：
     State schema 由 ``compose_state_schema(agents)`` 动态组合（底座含 task /
     raw_context / messages(add_messages reducer) / active_skills;各角色经
     ``state_fields`` 声明自身产出通道,如 Manager 的 context_summary/plan）。
-    每个节点把自身产出追加为 AIMessage; ``messages`` 的压缩由 registers_nodes
-    的可选 ``compaction_mw`` 包装在节点返回后调用 ``arun_compaction`` 完成
-    （非 force：仅当预估 token > ``max_context_tokens``，默认 100000 时触发）。
-    底座不再含工作流级 ``summary`` 通道。
+    每个节点把自身产出追加为 AIMessage; ``messages`` 的压缩统一由
+    LCAgentCompactionMiddleware.before_model 中间件在模型调用前自动触发
+    （见 agent/compaction.py），节点级压缩已移除。底座不含工作流级
+    ``summary`` 通道。
 """
 from __future__ import annotations
 
@@ -34,11 +34,9 @@ from collections.abc import Sequence
 
 from langgraph.graph import END, START, StateGraph
 
-from agent.compaction import CompactionConfig
 from graph.common import (
     NodeCallback,
     NodeSpec,
-    _build_compaction_middleware,
     arun_compiled_workflow,
     compose_state_schema,
     register_nodes,
@@ -61,7 +59,6 @@ def build_simple_workflow(
     checkpointer=None,
     skills_dir: str | None = None,
     auto_match_skills: bool = True,
-    compaction_config: CompactionConfig | None = None,
 ) -> StateGraph:
     """
     构建监督者模式工作流
@@ -73,8 +70,6 @@ def build_simple_workflow(
             工作流状态按 thread_id 保存/恢复；为 None 时无持久化（测试/临时运行）。
         skills_dir: 技能目录路径,为 None 时使用默认目录(.agents/skills)
         auto_match_skills: 是否在节点渲染 prompt 时按任务自动匹配注入技能
-        compaction_config: 消息通道压缩配置。为 None 时使用默认配置
-            （阈值 50）；agent 无 llm 时自动禁用压缩（如测试 Fake）。
 
     Returns:
         编译好的 LangGraph StateGraph
@@ -87,12 +82,9 @@ def build_simple_workflow(
         auto_match=auto_match_skills,
     )
 
-    # compaction 中间件:消息通道超阈值时节点级增量压缩(agent 无 llm 时禁用)
-    compaction_mw = _build_compaction_middleware(manager, compaction_config)
-
     builder = StateGraph(compose_state_schema(agents))
 
-    # 添加节点(声明式 NodeSpec 表:partial 绑定 + compaction 包装 + add_node 三步合一)
+    # 添加节点(声明式 NodeSpec 表:partial 绑定 + add_node 两步合一)
     # 注意:register_nodes 内部用 functools.partial 绑定 agent 实例;提示词模板由节点内懒加载
     # partial 保留 async 函数的 coroutine 特征(LangGraph 据此判定节点为异步并 await),
     # lambda 会返回未 await 的 coroutine 导致 InvalidUpdateError
@@ -100,7 +92,6 @@ def build_simple_workflow(
         builder,
         agents,
         injector,
-        compaction_mw,
         [
             NodeSpec("summarize", manager.summarize_context_node, role="manager"),
             NodeSpec("manager_plan", ManagerAgent.plan_node, role="manager"),

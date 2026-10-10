@@ -48,11 +48,9 @@ from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 
-from agent.compaction import CompactionConfig
 from graph.common import (
     NodeCallback,
     NodeSpec,
-    _build_compaction_middleware,
     arun_compiled_workflow,
     compose_state_schema,
     register_nodes,
@@ -114,7 +112,6 @@ def build_rtl_graph_workflow(
     skills_dir: str | None = None,
     auto_match_skills: bool = True,
     max_rounds: int = 3,
-    compaction_config: CompactionConfig | None = None,
 ) -> StateGraph:
     """
     构建 RTL 芯片设计流水线工作流
@@ -127,8 +124,6 @@ def build_rtl_graph_workflow(
         skills_dir: 技能目录路径,为 None 时使用默认目录(.agents/skills)
         auto_match_skills: 是否在节点渲染 prompt 时按任务自动匹配注入技能
         max_rounds: 设计-验证多轮迭代最大轮次,超限强制进入交付节点
-        compaction_config: 消息通道压缩配置。为 None 时使用默认配置
-            （阈值 50）；agent 无 llm 时自动禁用压缩（如测试 Fake）。
 
     Returns:
         编译好的 LangGraph StateGraph
@@ -142,9 +137,6 @@ def build_rtl_graph_workflow(
         skills_dir=skills_dir,
         auto_match=auto_match_skills,
     )
-
-    # compaction 中间件:消息通道超阈值时节点级增量压缩(agent 无 llm 时禁用)
-    compaction_mw = _build_compaction_middleware(manager, compaction_config)
 
     builder = StateGraph(
         compose_state_schema(
@@ -161,7 +153,7 @@ def build_rtl_graph_workflow(
         )
     )
 
-    # 添加节点(声明式 NodeSpec 表:partial 绑定 + compaction 包装 + add_node 三步合一)
+    # 添加节点(声明式 NodeSpec 表:partial 绑定 + add_node 两步合一)
     # 注意:register_nodes 内部用 functools.partial 绑定 agent 实例;提示词模板由节点内懒加载
     # partial 保留 async 函数的 coroutine 特征(LangGraph 据此判定节点为异步并 await),
     # lambda 会返回未 await 的 coroutine 导致 InvalidUpdateError
@@ -169,7 +161,6 @@ def build_rtl_graph_workflow(
         builder,
         agents,
         injector,
-        compaction_mw,
         [
             NodeSpec("summarize", manager.summarize_context_node, role="manager"),
             NodeSpec("architect_plan", ArchiAgent.plan_node, role="architect"),
