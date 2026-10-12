@@ -15,7 +15,7 @@ import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, RemoveMessage
 from langgraph.errors import GraphBubbleUp
 
 from llm.llm_client import RETRY_ATTEMPTS, RETRY_MAX_DELAY, should_retry
@@ -351,6 +351,28 @@ class Streaming:
                     return
                 await asyncio.sleep(min(RETRY_MAX_DELAY, 2**attempt))
 
+    async def _aremove_empty_final_ai(
+        self,
+        config: dict[str, Any],
+        msg: AIMessage,
+    ) -> None:
+        """把空最终 AIMessage 从 checkpoint 中移除，避免污染后续轮次上下文。
+
+        空消息（network_error 断流 / reasoning 耗尽 length）在模型节点结束的
+        superstep 已随图自动落库；若保留，retry 时历史中会留下一条"什么都没说"
+        的 AI 轮次，模型易被残缺上下文带偏。删除失败不阻塞 ERROR 事件发出。
+        """
+        msg_id = getattr(msg, "id", None)
+        if not msg_id:
+            return
+        try:
+            await self.agent_executor.aupdate_state(
+                config,
+                {"messages": [RemoveMessage(id=msg_id)]},
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError) as error:
+            logger.warning("清理空最终回答消息失败: %s", error, exc_info=True)
+
     async def arun_events(
         self,
         message: str,
@@ -430,9 +452,11 @@ class Streaming:
 
             # 空最终回答检测：reasoning token 耗尽 / finish_reason=length 时
             # 模型可能返回空 AIMessage，静默 yield 空 DONE 会让前端显示空白。
-            # 发 ERROR 事件明确提示原因，而非静默空白（interrupt/cancelled 优先）。
+            # 先把空消息从 checkpoint 移除（避免污染 retry 上下文），
+            # 再发 ERROR 事件明确提示原因（interrupt/cancelled 优先）。
             _reason = final_answer_is_empty(_ai_holder[0]) if _ai_holder else None
             if _reason:
+                await self._aremove_empty_final_ai(config, _ai_holder[0])
                 yield AgentEvent.error(_reason, thread_id=tid, trace_id=trace_id)
                 return
 
@@ -508,9 +532,11 @@ class Streaming:
 
             # 空最终回答检测：reasoning token 耗尽 / finish_reason=length 时
             # 模型可能返回空 AIMessage，发 ERROR 明确提示而非静默空白
-            # （interrupt/cancelled 优先）。
+            # （interrupt/cancelled 优先）；发 ERROR 前先把空消息从 checkpoint
+            # 移除，避免污染 resume 后的上下文。
             _reason = final_answer_is_empty(_ai_holder[0]) if _ai_holder else None
             if _reason:
+                await self._aremove_empty_final_ai(config, _ai_holder[0])
                 yield AgentEvent.error(_reason, thread_id=tid, trace_id=trace_id)
                 return
 
