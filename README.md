@@ -1903,12 +1903,19 @@ with TraceContext(trace_id="req-123", thread_id="thread-abc"):
 
 #### 空最终回答检测（Empty Final Answer）
 
-思考型模型（如 `deepseek-v4.1-flash`）的 **reasoning token 计入 `max_tokens`**。当输出预算被推理 token 耗尽时，网关返回 `finish_reason=length` 且 `content` 为空的 `AIMessage`。若流式层静默产出空的 `DONE`，Web UI 会显示一片空白且无任何提示。
+模型可能返回**空 `AIMessage`**（无内容、无工具调用）的两类典型场景：
 
-[`agent/streaming.py`](agent/streaming.py) 的 `arun_events` / `aresume_events` 现在会记录最后一次 `on_chat_model_end` 的 `AIMessage`，在流结束且未被 interrupt / cancelled 接管时调用 [`llm/message_utils.py`](llm/message_utils.py) 的 `final_answer_is_empty()` 检测：
+- **推理 token 耗尽预算**：思考型模型（如 `deepseek-v4.1-flash`）的 reasoning token 计入 `max_tokens`，预算在推理阶段耗尽时网关返回 `finish_reason=length` 且 `content` 为空；
+- **上游断流 / 网关异常**：如云雾网关返回非标准 `finish_reason=network_error`，与 `max_tokens` 无关，直接重试即可。
 
-- 终态 `AIMessage` 既无内容、也无 `tool_calls`（不在工具循环中）→ 发 `ERROR` 事件（携带 `finish_reason`），前端明确提示「输出预算可能被推理 token 耗尽，请提高 max_tokens 后重试」，而非静默空白。
+若流式层静默产出空的 `DONE`，Web UI 会显示一片空白且无任何提示；且空 `AIMessage` 在模型节点结束的 superstep 已随图**自动写入 checkpoint**——若保留，retry 时历史中会留下一条"什么都没说"的 AI 轮次，残缺上下文易把模型带偏。
+
+[`agent/streaming.py`](agent/streaming.py) 的 `arun_events` / `aresume_events` 记录最后一次 `on_chat_model_end` 的 `AIMessage`，在流结束且未被 interrupt / cancelled 接管时调用 [`llm/message_utils.py`](llm/message_utils.py) 的 `final_answer_is_empty()` 检测：
+
+- 终态 `AIMessage` 既无内容、也无 `tool_calls`（不在工具循环中）→ 先经 `aupdate_state` + `RemoveMessage` 把空消息**从 checkpoint 移除**（保持 retry 上下文干净；删除失败仅记 warning，不阻塞提示），再发 `ERROR` 事件（携带 `finish_reason`）。提示文案按 `finish_reason` 分支：`length` → 「输出预算可能被推理 token 耗尽，请提高 max_tokens 后重试」；`network_error` 等其他值 → 「可能是网络中断或网关异常，请直接重试」，不再误导调整 `max_tokens`。
 - 有内容或仍在工具循环中 → 照常发 `DONE`，行为不变。
+
+与 `StreamStallRetryMixin` 的分工：流中途零字节超时（`StreamChunkTimeoutError`）且尚未交付任何 chunk → 流层透明重启；上游**正常结束流但 content 为空**（`length` / `network_error`）不经超时路径，由本检测兜底。
 
 ### 终端命令超时重试与分类（Terminal Timeout Retry）
 
