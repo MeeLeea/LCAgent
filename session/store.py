@@ -195,6 +195,36 @@ class SessionStore:
         """幂等删除会话配置。"""
         await self._safe_delete(_ns(session_id, STORE_KIND), "current")
 
+    # ============ display（自定义展示名） ============
+
+    async def aget_title(self, session_id: str) -> str | None:
+        """读取会话自定义展示名（重命名）；未设置时返回 None。"""
+        item = await self._store.aget(_ns(session_id, "display"), key="title")
+        if item is None:
+            return None
+        return item.value.get("title")
+
+    async def aset_title(self, session_id: str, title: str) -> None:
+        """写入会话自定义展示名。"""
+        await self._store.aput(
+            _ns(session_id, "display"), key="title", value={"title": title}
+        )
+
+    async def adelete_title(self, session_id: str) -> None:
+        """幂等清除会话自定义展示名（回落到消息预览）。"""
+        await self._safe_delete(_ns(session_id, "display"), "title")
+
+    async def aget_titles(self, session_ids: Sequence[str]) -> dict[str, str]:
+        """批量读取自定义展示名，省略未设置的会话。"""
+        titles = await asyncio.gather(
+            *(self.aget_title(session_id) for session_id in session_ids)
+        )
+        return {
+            session_id: title
+            for session_id, title in zip(session_ids, titles, strict=True)
+            if title is not None
+        }
+
     # ============ 会话级清理 ============
 
     async def adelete_session(self, session_id: str) -> None:
@@ -202,6 +232,7 @@ class SessionStore:
         await self.aclear_history(session_id)
         await self.aclear_interrupt(session_id)
         await self.adelete_session_config(session_id)
+        await self.adelete_title(session_id)
 
     # ============ 内部辅助 ============
 

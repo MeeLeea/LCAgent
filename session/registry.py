@@ -343,6 +343,33 @@ class SessionRegistry:
             raise SessionConfigError(f"会话 {session_id!r} 尚未有配置")
         return await self._store.aupdate_session_config(session_id, patch)
 
+    # ============ 展示名（重命名） ============
+
+    async def aget_title(self, session_id: str) -> str | None:
+        """读取会话自定义展示名；未设置返回 None（展示时回落消息预览）。"""
+        return await self._store.aget_title(session_id)
+
+    async def aget_titles(self, session_ids: Sequence[str]) -> dict[str, str]:
+        """批量读取会话自定义展示名，省略未设置的会话。"""
+        return await self._store.aget_titles(session_ids)
+
+    async def aset_title(self, session_id: str, title: str) -> str | None:
+        """设置/清除会话自定义展示名。
+
+        Args:
+            session_id: 目标会话 ID
+            title: 新展示名。strip 后为空表示清除自定义名（回落消息预览）
+
+        Returns:
+            生效的展示名；清除时返回 None
+        """
+        stripped = title.strip()
+        if stripped:
+            await self._store.aset_title(session_id, stripped)
+            return stripped
+        await self._store.adelete_title(session_id)
+        return None
+
     async def awarm_workspace(self, session_id: str) -> str | None:
         """从 DB 加载指定 session 的 workspace 到缓存。
 
@@ -506,6 +533,134 @@ class SessionRegistry:
                 remaining[0] if remaining else self.generate_session_id()
             )
         return deleted
+
+    # ============ 会话分叉 ============
+
+    async def afork_session(self, session_id: str) -> str | None:
+        """分叉会话：完整复制当前会话生成新会话，原会话保持不变。
+
+        复制内容：
+        - checkpoint 全量历史（checkpoints + writes，含消息与图状态、祖先链）
+        - session 配置（provider / model / role 等 SessionConfig）
+        - workspace 绑定
+        - 自定义展示名（title）
+        - 执行历史（execution_history + tool_call_id 去重集合）
+
+        不复制：pending_interrupts（瞬态中断状态）。
+
+        Args:
+            session_id: 源会话 ID
+
+        Returns:
+            新会话 ID；源会话不存在或复制失败时返回 None
+        """
+        # SQLite 模式查表判断源会话存在；内存模式（async_conn=None，会话列表
+        # 恒为空）由 _acopy_checkpoints 内 aget_tuple 探测兜底
+        if self._async_conn is not None:
+            stored = await self.astored_session_ids(all_types=True)
+            if session_id not in stored:
+                return None
+
+        # 保留工作流语义：工作流会话分叉后新 ID 仍带 workflow-{name} 前缀
+        workflow_name = (
+            self.workflow_name_of(session_id)
+            if self.is_workflow_session(session_id)
+            else None
+        )
+        new_sid = self.generate_session_id(workflow_name)
+
+        if not await self._acopy_checkpoints(session_id, new_sid):
+            logger.error("分叉会话失败：checkpoint 复制失败 [%s]", session_id)
+            return None
+
+        # 复制 session 配置
+        config = await self._store.aget_session_config(session_id)
+        if config is not None:
+            await self._store.aset_session_config(new_sid, config)
+
+        # 复制 workspace 绑定（缓存 + DB 双写）
+        workspace = await self._workspace_store.aget(session_id)
+        if workspace is not None:
+            await self._workspace_store.aset(new_sid, workspace)
+
+        # 复制自定义展示名
+        title = await self._store.aget_title(session_id)
+        if title is not None:
+            await self._store.aset_title(new_sid, title)
+
+        # 复制执行历史与 tool_call_id 去重集合
+        history = await self._store.aget_history(session_id)
+        if history:
+            await self._store.aextend_history(new_sid, history)
+        call_ids = await self._store.aget_recorded_call_ids(session_id)
+        if call_ids:
+            await self._store.aadd_recorded_call_ids(new_sid, call_ids)
+
+        logger.info("分叉会话: %s -> %s", session_id, new_sid)
+        return new_sid
+
+    async def _acopy_checkpoints(self, src: str, dst: str) -> bool:
+        """复制 checkpointer 中 src 会话的全部数据到 dst。
+
+        SQLite 模式：SQL 层整表复制 checkpoints + writes，保留完整 checkpoint
+        祖先链与 pending writes（含 HITL 中断现场）。
+        内存模式（async_conn=None，如 MemorySaver 测试场景）：通过 checkpointer
+        API 仅复制最新快照（祖先链不可用，属预期降级）。
+
+        Returns:
+            True=至少复制了一行 checkpoint；False=无数据或复制失败
+        """
+        if self._async_conn is not None:
+            try:
+                cursor = await self._async_conn.execute(
+                    "INSERT INTO checkpoints (thread_id, checkpoint_ns, checkpoint_id, "
+                    "parent_checkpoint_id, type, checkpoint, metadata) "
+                    "SELECT ?, checkpoint_ns, checkpoint_id, parent_checkpoint_id, "
+                    "type, checkpoint, metadata FROM checkpoints WHERE thread_id = ?",
+                    (dst, src),
+                )
+                rowcount = cursor.rowcount
+                await cursor.close()
+                if rowcount:
+                    # writes 表随 checkpoints 一同复制；旧库无该表时静默跳过
+                    try:
+                        cursor = await self._async_conn.execute(
+                            "INSERT INTO writes (thread_id, checkpoint_ns, checkpoint_id, "
+                            "task_id, idx, channel, type, value) "
+                            "SELECT ?, checkpoint_ns, checkpoint_id, task_id, idx, "
+                            "channel, type, value FROM writes WHERE thread_id = ?",
+                            (dst, src),
+                        )
+                        await cursor.close()
+                    except sqlite3.OperationalError as error:
+                        if "no such table" not in str(error).lower():
+                            raise
+                await self._async_conn.commit()
+                return rowcount > 0
+            except sqlite3.OperationalError as error:
+                if "no such table" in str(error).lower():
+                    return False
+                logger.error("分叉会话复制 checkpoint 失败: %s", error)
+                return False
+
+        # 内存模式兜底：仅复制最新 checkpoint 快照
+        aget_tuple = getattr(self._checkpointer, "aget_tuple", None)
+        aput = getattr(self._checkpointer, "aput", None)
+        if not callable(aget_tuple) or not callable(aput):
+            return False
+        tup = await aget_tuple({"configurable": {"thread_id": src}})
+        if tup is None or tup.checkpoint is None:
+            return False
+        # new_versions 必须带上 checkpoint 的全部 channel 版本，
+        # 否则 checkpointer 只会写入 new_versions 中列出的 channel（消息丢失）
+        versions = dict(tup.checkpoint.get("channel_versions", {}))
+        await aput(
+            {"configurable": {"thread_id": dst, "checkpoint_ns": ""}},
+            tup.checkpoint,
+            tup.metadata,
+            versions,
+        )
+        return True
 
     # ============ 消息获取（操作 checkpointer） ============
 

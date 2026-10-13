@@ -415,8 +415,12 @@ def serialize_messages(messages: list[Any]) -> list[dict[str, Any]]:
     return out
 
 
-async def thread_summary(thread_id: str, session_config: SessionConfig | None = None) -> dict[str, Any]:
-    """单个会话的摘要信息（消息数 + 预览 + 会话类型）。"""
+async def thread_summary(
+    thread_id: str,
+    session_config: SessionConfig | None = None,
+    title: str | None = None,
+) -> dict[str, Any]:
+    """单个会话的摘要信息（消息数 + 预览 + 会话类型 + 自定义展示名）。"""
     msgs = await agent.session.aget_messages(session_id=thread_id) if agent else []
     preview = ""
     for m in msgs:
@@ -429,6 +433,7 @@ async def thread_summary(thread_id: str, session_config: SessionConfig | None = 
         "thread_id": thread_id,
         "message_count": len(msgs),
         "preview": preview,
+        "title": title,
         "type": "chat",
         "session_config": session_config.to_dict() if session_config else None,
     }
@@ -451,6 +456,11 @@ class CreateThreadRequest(BaseModel):
     type: str | None = "chat"
     workflow_name: str | None = None
     workspace_path: str | None = None
+
+
+class RenameThreadRequest(BaseModel):
+    """会话重命名请求；title 为空白时清除自定义名（回落消息预览）。"""
+    title: str
 
 
 class ResumeRequest(BaseModel):
@@ -803,12 +813,16 @@ async def list_threads():
     """列出所有会话（按消息数倒序，便于最近活跃的靠前）。"""
     ids = await agent.session.alist_sessions() if agent else []
     configs = {}
+    titles: dict[str, str] = {}
     if agent:
         getter = getattr(agent.session, "aget_session_configs", None)
         if getter is not None:
             value = getter(ids)
             configs = await value if hasattr(value, "__await__") else value
-    summaries = [await thread_summary(tid, configs.get(tid)) for tid in ids]
+        titles = await agent.session.aget_titles(ids)
+    summaries = [
+        await thread_summary(tid, configs.get(tid), titles.get(tid)) for tid in ids
+    ]
     summaries.sort(key=lambda x: x["message_count"], reverse=True)
     return {"threads": summaries, "current": agent.session.current_session_id if agent else None}
 
@@ -845,6 +859,36 @@ async def delete_thread(thread_id: str):
         logger.warning("删除失败: %s", thread_id)
         raise HTTPException(status_code=404, detail="会话不存在或删除失败")
     return {"deleted": True, "thread_id": thread_id}
+
+
+@app.patch("/api/threads/{thread_id}")
+async def rename_thread(thread_id: str, req: RenameThreadRequest):
+    """重命名会话：修改展示名（不影响消息内容）。
+
+    title 为空白时清除自定义名，前端展示回落到消息预览。
+    """
+    title = req.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="会话名不能为空")
+    if len(title) > 200:
+        raise HTTPException(status_code=400, detail="会话名过长（最多 200 字符）")
+    stored = await agent.session.astored_session_ids(all_types=True)
+    if thread_id not in stored and thread_id != agent.session.current_session_id:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    effective = await agent.session.aset_title(thread_id, title)
+    logger.info("重命名会话: %s -> %r", thread_id, effective)
+    return {"thread_id": thread_id, "title": effective}
+
+
+@app.post("/api/threads/{thread_id}/fork")
+async def fork_thread(thread_id: str):
+    """分叉会话：完整复制会话历史与配置，生成新会话（原会话保持不变）。"""
+    async with chat_lock:
+        new_tid = await agent.session.afork_session(thread_id)
+    if not new_tid:
+        raise HTTPException(status_code=404, detail="会话不存在或无可复制内容")
+    logger.info("分叉会话: %s -> %s", thread_id, new_tid)
+    return {"thread_id": new_tid, "source_thread_id": thread_id}
 
 
 @app.get("/api/threads/{thread_id}/messages")
