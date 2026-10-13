@@ -10,6 +10,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from team.base import TeamAgent
 from team.factory import build_team_agent
 
@@ -155,25 +157,13 @@ def test_team_agent_class_attr_still_applies(tmp_path, monkeypatch):
     assert agent.stream_chunk_timeout == TeamAgent.stream_chunk_timeout  # 300.0
 
 
-def test_fallback_to_old_config_when_unified_missing(tmp_path):
-    """当统一配置不存在时，回退读取旧 team/<role>/agent_config.json（兼容性）"""
-    base = tmp_path / "proj"
-    # 创建旧格式配置
-    role_dir = base / "team" / "legacy_role"
-    role_dir.mkdir(parents=True)
-    (role_dir / "agent_config.json").write_text(json.dumps({
-        "name": "legacy_role",
-        "provider": "zhipu",
-        "model": "glm-4-flash",
-        "temperature": 0.5,
-        "max_tokens": 2048,
-        "max_iterations": 10,
-        "agent_prompt_file": "team/legacy_role/AGENT.md"
-    }), encoding="utf-8")
-    (role_dir / "AGENT.md").write_text("# Legacy Role\n", encoding="utf-8")
-    
-    # 不创建 team_agents.json
-    agent = build_team_agent(_DummyAgent, "legacy_role", str(base))
-    assert agent.kwargs["temperature"] == 0.5
-    assert agent.kwargs["max_tokens"] == 2048
-    assert agent.kwargs["provider"] == "zhipu"
+def test_missing_role_config_raises_key_error(tmp_path):
+    """统一配置无该角色条目时，build_team_agent 因缺少 name 键抛 KeyError"""
+    base = _make_team_agents_config(
+        tmp_path,
+        default_cfg={"provider": "zhipu", "model": "glm-4-flash", "max_iterations": 10},
+        role_cfg={},
+    )
+    _make_role_prompt(tmp_path, "ghost_role")
+    with pytest.raises(KeyError):
+        build_team_agent(_DummyAgent, "ghost_role", str(base))

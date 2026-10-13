@@ -301,7 +301,9 @@ def load_team_agent_config(agent_name: str, base_dir: str) -> dict[str, Any]:
 
 def load_team_agent_role_entry(agent_name: str, base_dir: str) -> dict[str, Any]:
     """只取 team_agents.json 中 agent_name 自身的条目（不合并 default）。
-    兼容旧格式：角色无统一配置条目时回退到 team/<role>/agent_config.json。"""
+
+    文件缺失/损坏或角色无条目时返回空字典。
+    """
     team_config_path = os.path.join(base_dir, "team", "team_agents.json")
     if os.path.exists(team_config_path):
         try:
@@ -311,9 +313,7 @@ def load_team_agent_role_entry(agent_name: str, base_dir: str) -> dict[str, Any]
                 return dict(team_config[agent_name])
         except (OSError, json.JSONDecodeError):
             pass
-    # Legacy fallback
-    old_path = os.path.join(base_dir, "team", agent_name, "agent_config.json")
-    return load_agent_config(old_path) if os.path.exists(old_path) else {}
+    return {}
 
 
 def resolve_path(path: str, base_dir: str) -> str:

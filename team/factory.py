@@ -3,12 +3,11 @@ Team Agent 工厂函数 - 统一构建团队 Agent
 """
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from langchain_core.tools import BaseTool
 
-from llm.config import load_agent_config, load_team_agent_config, resolve_path
+from llm.config import load_team_agent_config, resolve_path
 from team.base import TeamAgent
 
 
@@ -35,13 +34,8 @@ def build_team_agent(
     Returns:
         初始化好的 Agent 实例
     """
-    # 优先从统一配置加载
+    # 统一配置加载（唯一来源：team/team_agents.json）
     config = load_team_agent_config(agent_name, base_dir)
-    
-    # 兼容回退：统一配置无该角色时，读取旧 agent_config.json
-    if not config:
-        config_path = os.path.join(base_dir, "team", agent_name, "agent_config.json")
-        config = load_agent_config(config_path)
     
     # 应用覆盖参数
     config.update(overrides)

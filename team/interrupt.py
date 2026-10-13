@@ -9,7 +9,6 @@ run_team_turn_with_interrupt 在工作流节点中调用 TeamAgent.arun_structur
 """
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 
 from langgraph.types import interrupt
@@ -18,8 +17,6 @@ from team.base import TASK_ERROR_PREFIX
 
 if TYPE_CHECKING:
     from team.base import TeamAgent
-
-logger = logging.getLogger(__name__)
 
 
 async def run_team_turn_with_interrupt(
