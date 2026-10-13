@@ -57,6 +57,7 @@ def mock_agent():
     agent.session.new_session = MagicMock(return_value="new-thread-456")
     agent.session.new_workflow_session = MagicMock(return_value="server-workflow-simple-abc12345")
     agent.session.alist_sessions = AsyncMock(return_value=["thread-1", "thread-2"])
+    agent.session.aget_titles = AsyncMock(return_value={})
     agent.session.adelete_session = AsyncMock(return_value=True)
     agent.session.aget_messages = AsyncMock(return_value=[])
     agent.session.is_workflow_session = MagicMock(return_value=False)

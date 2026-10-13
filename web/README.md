@@ -148,8 +148,16 @@ npm run preview
 
 - `GET /api/workflows`：列出可用工作流名称。
 - `POST /api/threads`：`{"type": "workflow", "workflow_name": "simple"}` 创建专属工作流会话；缺省时创建普通会话。
-- `GET /api/threads`：会话摘要带 `type`（`chat`/`workflow`），工作流会话额外带 `workflow_name`。
+- `GET /api/threads`：会话摘要带 `type`（`chat`/`workflow`），工作流会话额外带 `workflow_name`；`title` 为自定义展示名（未重命名时为 `null`，展示回落 `preview`）。
 - `POST /api/chat`：在 `type=workflow` 的会话中发送不以 `/` 开头的消息时，自动包装为 `/workflow:{workflow_name} <消息>` 执行。
+
+### 会话操作菜单（重命名 / 分叉 / 删除）
+
+会话列表项悬浮时右侧显示「···」按钮，点击展开操作菜单：
+
+- **重命名**：就地内联编辑展示名（Enter/失焦提交，Esc 取消，清空提交=恢复默认预览名）。后端 `PATCH /api/threads/{id}`，body `{"title": "新名字"}`；展示名持久化在 LangGraph Store（`lcagent.sessions/{sid}/display` 命名空间），空 `title` 清除自定义名。
+- **分叉**：完整复制当前会话生成新会话并自动切换过去。后端 `POST /api/threads/{id}/fork`，复制内容包括 checkpoint 全量历史（checkpoints + writes 表，含祖先链与中断现场）、会话配置（provider/model/role 等）、workspace 绑定、自定义展示名与执行历史；工作流会话分叉后新 ID 保留 `workflow-{name}` 前缀。
+- **删除**：同原删除功能（`DELETE /api/threads/{id}`），会话数据与展示名一并清理。
 
 ## Tauri 桌面应用
 

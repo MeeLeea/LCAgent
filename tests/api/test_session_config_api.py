@@ -156,6 +156,7 @@ def test_list_threads_uses_one_batched_config_query(client, mock_agent) -> None:
         "thread-2": SessionConfig(provider="zhipu", model="glm-4-flash"),
     }
     mock_agent.session.aget_session_configs = AsyncMock(return_value=configs)
+    mock_agent.session.aget_titles = AsyncMock(return_value={})
     with patch("api.server.load_providers", return_value=_providers()):
         response = client.get("/api/threads")
 
