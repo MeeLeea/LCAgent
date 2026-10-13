@@ -127,6 +127,10 @@ interface AppState {
   newThread: () => Promise<void>
   newWorkflowThread: (workflowName: string) => Promise<void>
   deleteThread: (id: string) => Promise<void>
+  /** 重命名会话（修改展示名；空字符串清除自定义名回落消息预览） */
+  renameThread: (id: string, title: string) => Promise<void>
+  /** 分叉会话：完整复制当前会话生成新会话并切换过去 */
+  forkThread: (id: string) => Promise<void>
   /** 页面刷新后重连进行中的流式执行：重放错过的事件并继续实时接收 */
   reattachStream: (threadId: string) => Promise<void>
 
@@ -915,6 +919,26 @@ export const useStore = create<AppState>((set, get) => ({
         return patch
       })
       await get().fetchThreads()
+    } catch (e) {
+      console.error(e)
+    }
+  },
+
+  renameThread: async (id, title) => {
+    try {
+      await api.renameThread(id, title)
+      await get().fetchThreads()
+    } catch (e) {
+      console.error(e)
+    }
+  },
+
+  forkThread: async (id) => {
+    try {
+      const r = await api.forkThread(id)
+      await get().fetchThreads()
+      // 分叉后切换到新会话，便于基于分叉继续对话
+      await get().selectThread(r.thread_id)
     } catch (e) {
       console.error(e)
     }

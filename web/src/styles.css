@@ -463,7 +463,8 @@ button {
   color: var(--text-faint);
 }
 
-.thread-delete {
+/* 会话操作按钮（悬浮显示，点击展开菜单） */
+.thread-menu-btn {
   opacity: 0;
   position: absolute;
   right: 8px;
@@ -475,12 +476,65 @@ button {
   background: var(--bg-elevated);
 }
 
-.thread-item:hover .thread-delete {
+.thread-item:hover .thread-menu-btn,
+.thread-item .thread-menu-btn:focus-visible {
   opacity: 1;
 }
 
-.thread-delete:hover {
+.thread-menu-btn:hover {
+  color: var(--accent);
+}
+
+/* 会话操作菜单（重命名 / 分叉 / 删除） */
+.thread-menu {
+  position: absolute;
+  right: 6px;
+  top: calc(100% - 4px);
+  z-index: 30;
+  min-width: 112px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.22);
+}
+
+.thread-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 9px;
+  font-size: 12px;
+  color: var(--text);
+  border-radius: 5px;
+  text-align: left;
+}
+
+.thread-menu-item:hover {
+  background: var(--bg-hover);
+}
+
+.thread-menu-item.danger {
   color: var(--danger);
+}
+
+.thread-menu-item.danger:hover {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+
+/* 内联重命名输入框 */
+.thread-rename-input {
+  width: 100%;
+  font-size: 13px;
+  padding: 2px 6px;
+  border: 1px solid var(--accent);
+  border-radius: 5px;
+  background: var(--bg-elevated);
+  color: var(--text);
+  outline: none;
 }
 
 .sidebar-footer {

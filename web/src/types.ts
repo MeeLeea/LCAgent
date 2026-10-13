@@ -42,6 +42,8 @@ export interface ThreadSummary {
   thread_id: string
   message_count: number
   preview: string
+  /** 自定义展示名（重命名）；null=未设置，展示时回落 preview */
+  title?: string | null
   /** 会话类型：chat=普通对话，workflow=专属工作流会话 */
   type?: 'chat' | 'workflow'
   /** 工作流会话绑定的工作流名称（仅 type=workflow 时存在） */

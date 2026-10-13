@@ -181,6 +181,22 @@ export const api = {
     }),
   deleteThread: (thread_id: string) =>
     jsonFetch(`${BASE}/threads/${encodeURIComponent(thread_id)}`, { method: 'DELETE' }),
+  /** 重命名会话（修改展示名；空字符串清除自定义名，回落消息预览） */
+  renameThread: (thread_id: string, title: string) =>
+    jsonFetch<{ thread_id: string; title: string | null }>(
+      `${BASE}/threads/${encodeURIComponent(thread_id)}`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title }),
+      },
+    ),
+  /** 分叉会话：完整复制会话历史与配置，返回新会话 ID */
+  forkThread: (thread_id: string) =>
+    jsonFetch<{ thread_id: string; source_thread_id: string }>(
+      `${BASE}/threads/${encodeURIComponent(thread_id)}/fork`,
+      { method: 'POST' },
+    ),
   getMessages: (thread_id: string) =>
     jsonFetch<{ thread_id: string; messages: RawMessage[] }>(
       `${BASE}/threads/${encodeURIComponent(thread_id)}/messages`,
