@@ -292,7 +292,7 @@ LangChainAgent/
 │   └── manager.py           # SessionManager：对外门面 & 会话调度（封装 Agent + Memory）
 ├── team/                    # 多 Agent 团队协作模块
 │   ├── base.py              # TeamAgent 轻量基类(工具模式挂错误纠错+workspace 中间件+超时;内建技能注入)
-│   ├── __init__.py          # 导出 ManagerAgent/WorkerAgent/TerminatorAgent/ArchiAgent
+│   ├── __init__.py          # 导出 ManagerAgent/WorkerAgent/TerminatorAgent（ArchiAgent 仅随包导入触发注册，不在 __all__）
 │   ├── factory.py           # 团队 Agent 工厂函数
 │   ├── interrupt.py         # run_team_turn_with_interrupt 中断转发(节点内 TeamAgent turn ↔ 外层 graph)
 │   ├── node_factory.py      # create_llm_node 通用 LLM 节点工厂(生成统一签名异步节点函数)
@@ -316,7 +316,7 @@ LangChainAgent/
 │   │   └── AGENT.md
 │   ├── checker/             # 共享校验工具(parse_filelist/覆盖率包含判定/同步写文件,零依赖纯函数,非角色)
 │   │   ├── checker.py
-│   │   └── AGENT.md
+│   │   └── AGENT.md         # 说明文档（标注非角色，不被加载）
 │   └── team_agents.json     # 团队角色统一 LLM 配置(default + 角色覆盖)
 ├── graph/                   # LangGraph 工作流编排
 │   ├── common/              # 工作流共享组件包：节点跟踪 + 运行器 + 压缩 + 声明式注册 + 注册表
