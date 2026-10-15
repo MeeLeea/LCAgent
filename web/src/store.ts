@@ -8,6 +8,8 @@ import type {
   SessionConfig,
   RawMessage,
   StreamEvent,
+  StreamFailure,
+  StreamStatus,
   ThreadSummary,
   WorkflowInfo,
 } from './types'
@@ -112,6 +114,10 @@ interface AppState {
   pendingInterrupts: Record<string, InterruptInfo>
   /** 当前线程的挂起中断（展示用，随 selectThread 同步） */
   pendingInterrupt: InterruptInfo | null
+  /** 各线程的工作流失败记录（error 事件后从后端同步 / 刷新后从 stream-status 还原） */
+  failedNodes: Record<string, StreamFailure>
+  /** 当前线程的失败节点（展示用，随 selectThread 同步；供失败横幅与断点重试） */
+  failedNode: StreamFailure | null
 
   // 连接状态
   connectionStatus: 'connected' | 'disconnected' | 'checking'
@@ -141,6 +147,8 @@ interface AppState {
   /** 编辑某条 user 消息后重发：截断到该消息（含）并重新发送 */
   editAndResend: (index: number, newText: string) => void
   resume: (payload: Record<string, unknown>) => void
+  /** 从失败断点重试当前工作流会话：后端基于 checkpoint 仅重跑失败节点 */
+  retryCurrentThread: () => void
   stopStreaming: () => void
   /** 清空当前会话的前端消息显示（不删后端历史） */
   clearMessages: () => void
@@ -252,6 +260,37 @@ function markStreaming(get: StoreGet, set: StoreSet, threadId: string, streaming
     else delete streamingThreads[threadId]
     return { streamingThreads }
   })
+}
+
+/** 同步某线程的失败记录到 failedNodes；若该线程为当前线程，同步 failedNode 供横幅展示 */
+function syncFailureRecord(
+  get: StoreGet,
+  set: StoreSet,
+  threadId: string,
+  failure: StreamFailure | null,
+) {
+  set((s) => {
+    const failedNodes = { ...s.failedNodes }
+    if (failure) failedNodes[threadId] = failure
+    else delete failedNodes[threadId]
+    const patch: Partial<AppState> = { failedNodes }
+    if (normKey(s.currentThreadId) === threadId) patch.failedNode = failure
+    return patch
+  })
+}
+
+/**
+ * 从后端 stream-status 拉取并同步失败记录（流以 error/cancelled 终止后调用）。
+ * 横幅数据以后端 Store 记录为唯一事实源；查询期间用户若已发起新一轮执行
+ * （重试/发消息），放弃过期结果，避免横幅在重试过程中闪烁复活。
+ */
+function refreshFailureRecord(get: StoreGet, set: StoreSet, threadId: string) {
+  api.getStreamStatus(threadId)
+    .then((st) => {
+      if (get().streamingThreads[threadId]) return
+      syncFailureRecord(get, set, threadId, st.failure ?? null)
+    })
+    .catch(() => {})
 }
 
 /**
@@ -427,6 +466,8 @@ function handleStreamEvent(
       commitThreadMessages(get, set, threadId, arr)
       break
     case 'interrupt': {
+      // 后端发出 INTERRUPT 前已清失败记录（失败场景被中断场景取代），前端同步清横幅
+      syncFailureRecord(get, set, threadId, null)
       if (!streamLast || streamLast.role !== 'assistant') return threadId
       arr[streamIdx] = { ...streamLast, streaming: false, interrupted: true }
       const info: InterruptInfo = { prompt: ev.prompt, choices: ev.choices, items: ev.items }
@@ -441,6 +482,8 @@ function handleStreamEvent(
       break
     }
     case 'cancelled':
+      // 取消不等于失败：从后端同步权威状态（如重试中途取消，旧失败断点仍在，横幅应复原）
+      refreshFailureRecord(get, set, threadId)
       if (!streamLast || streamLast.role !== 'assistant') return threadId
       arr[streamIdx] = {
         ...fillMissingToolResults(streamLast),
@@ -460,6 +503,8 @@ function handleStreamEvent(
       get().fetchThreads()
       break
     case 'error':
+      // 流以错误结束：从后端拉取最新失败记录（节点名+异常详情），驱动失败横幅展示
+      refreshFailureRecord(get, set, threadId)
       if (!streamLast || streamLast.role !== 'assistant') return threadId
       // 避免重复追加多条错误
       if (!streamLast.error) {
@@ -512,6 +557,8 @@ function handleStreamEvent(
       break
     }
     case 'done': {
+      // 运行成功：清除失败横幅（后端 DONE 前已清 Store 记录，含重试成功场景）
+      syncFailureRecord(get, set, threadId, null)
       if (!streamLast || streamLast.role !== 'assistant') return threadId
       arr[streamIdx] = { ...fillMissingToolResults(streamLast), streaming: false }
       commitThreadMessages(get, set, threadId, arr)
@@ -608,6 +655,8 @@ export const useStore = create<AppState>((set, get) => ({
   streamingThreads: {},
   pendingInterrupts: {},
   pendingInterrupt: null,
+  failedNodes: {},
+  failedNode: null,
   connectionStatus: 'checking',
 
   checkConnection: async () => {
@@ -634,7 +683,7 @@ export const useStore = create<AppState>((set, get) => ({
         await get().selectThread(first.thread_id)
       }
     } else {
-      set({ currentThreadId: null, messages: [], pendingInterrupt: null })
+      set({ currentThreadId: null, messages: [], pendingInterrupt: null, failedNode: null })
     }
   },
 
@@ -738,6 +787,7 @@ export const useStore = create<AppState>((set, get) => ({
     set((s) => ({
       currentThreadId: id,
       pendingInterrupt: s.pendingInterrupts[id] ?? null,
+      failedNode: s.failedNodes[id] ?? null,
     }))
     // 同步工作流显示：从 thread_id 反解工作流名称并加载对应图结构
     const wfName = workflowNameOf(id)
@@ -787,12 +837,14 @@ export const useStore = create<AppState>((set, get) => ({
     if (get().streamingThreads[threadId]) return
     if (abortFns[threadId]) return
 
-    let status: { streaming: boolean }
+    let status: StreamStatus
     try {
       status = await api.getStreamStatus(threadId)
     } catch {
       return
     }
+    // 同步失败记录：页面刷新后据此还原失败横幅（含非流式中的失败断点）
+    syncFailureRecord(get, set, threadId, status.failure ?? null)
     if (!status.streaming) return
     // 查询期间用户可能已切换线程或发起新消息，二次确认
     if (get().streamingThreads[threadId] || abortFns[threadId]) return
@@ -860,6 +912,7 @@ export const useStore = create<AppState>((set, get) => ({
         currentThreadId: r.thread_id,
         messages: [],
         pendingInterrupt: null,
+        failedNode: null,
         workspace: null,
         messagesByThread: { ...s.messagesByThread, [r.thread_id]: [] },
       }))
@@ -877,6 +930,7 @@ export const useStore = create<AppState>((set, get) => ({
         currentThreadId: r.thread_id,
         messages: [],
         pendingInterrupt: null,
+        failedNode: null,
         workspace: null,
         messagesByThread: { ...s.messagesByThread, [r.thread_id]: [] },
       }))
@@ -903,18 +957,22 @@ export const useStore = create<AppState>((set, get) => ({
         delete streamingThreads[id]
         const pendingInterrupts = { ...s.pendingInterrupts }
         delete pendingInterrupts[id]
+        const failedNodes = { ...s.failedNodes }
+        delete failedNodes[id]
         const sessionConfigs = { ...s.sessionConfigs }
         delete sessionConfigs[id]
         const patch: Partial<AppState> = {
           messagesByThread,
           streamingThreads,
           pendingInterrupts,
+          failedNodes,
           sessionConfigs,
         }
         if (s.currentThreadId === id) {
           patch.currentThreadId = null
           patch.messages = []
           patch.pendingInterrupt = null
+          patch.failedNode = null
         }
         return patch
       })
@@ -970,6 +1028,9 @@ export const useStore = create<AppState>((set, get) => ({
     const arr = [...get().messages, userMsg, assistantMsg]
     commitThreadMessages(get, set, key, arr)
     markStreaming(get, set, key, true)
+
+    // 新一轮执行开跑：清除上一轮失败横幅（后端同样在新任务开跑前清失败记录）
+    syncFailureRecord(get, set, key, null)
 
     // 清除上一轮的终止标记：finish() 会将 key 加入 terminatedThreads 且永不删除，
     // 若不清理，后续 handleStreamEvent 的 early return 会丢弃所有事件（需刷新才恢复）
@@ -1087,6 +1148,40 @@ export const useStore = create<AppState>((set, get) => ({
     armWatchdog(threadId, watchdogHandler)
 
     abortFns[threadId] = api.streamResume({ payload, thread_id: threadId }, (ev) => {
+      if (!terminatedThreads.has(threadId)) armWatchdog(threadId, watchdogHandler)
+      handleStreamEvent(get, set, threadId, ev, { finish })
+    })
+  },
+
+  retryCurrentThread: () => {
+    const threadId = get().currentThreadId
+    if (threadId === null) return
+    if (get().streamingThreads[threadId]) return
+    console.log('[前端] 从失败节点重试:', threadId)
+    const assistantMsg: ChatMessage = {
+      id: nextId(),
+      role: 'assistant',
+      content: '',
+      toolCalls: [],
+      toolResults: [],
+      streaming: true,
+      timestamp: Date.now(),
+    }
+    const arr = [...get().messages, assistantMsg]
+    commitThreadMessages(get, set, threadId, arr)
+    markStreaming(get, set, threadId, true)
+
+    // 立即清除失败横幅：重试若再次失败由 error 事件重新同步，成功则由 done 清理
+    syncFailureRecord(get, set, threadId, null)
+
+    // 清除上一轮的终止标记，确保重试流的事件不被阻塞
+    terminatedThreads.delete(threadId)
+
+    const finish = makeFinish(get, set, threadId)
+    const watchdogHandler = makeWatchdogHandler(get, set, threadId, finish)
+    armWatchdog(threadId, watchdogHandler)
+
+    abortFns[threadId] = api.streamRetry({ thread_id: threadId }, (ev) => {
       if (!terminatedThreads.has(threadId)) armWatchdog(threadId, watchdogHandler)
       handleStreamEvent(get, set, threadId, ev, { finish })
     })

@@ -1,5 +1,5 @@
 // API 客户端：REST 请求 + SSE 流式解析
-import type { ProvidersInfo, ThreadSummary, RawMessage, StreamEvent, WorkflowInfo, MetricsSummary, CompactResult, MemorySummary, CompressResult, SafetyConfig, SkillInfo, ExportResult, WorkspaceInfo, BrowseResult, SessionConfigPatch, SessionConfigResponse } from './types'
+import type { ProvidersInfo, ThreadSummary, RawMessage, StreamEvent, StreamStatus, WorkflowInfo, MetricsSummary, CompactResult, MemorySummary, CompressResult, SafetyConfig, SkillInfo, ExportResult, WorkspaceInfo, BrowseResult, SessionConfigPatch, SessionConfigResponse } from './types'
 
 // Vite 构建期从 config/server_config.json 注入的后端地址（Tauri 模式使用）
 declare const __SERVER_HOST__: string
@@ -216,9 +216,18 @@ export const api = {
     onEvent: (ev: StreamEvent) => void,
   ): (() => void) => streamRequest(`${BASE}/chat/resume`, body, onEvent),
 
-  /** 查询线程是否有正在进行的流式生成（页面刷新后据此决定是否 attach） */
+  /**
+   * 从失败断点重试工作流会话（POST /api/chat/retry，SSE）。
+   * 后端从 checkpointer 的 pending task 仅重跑失败节点，已成功节点不重跑。
+   */
+  streamRetry: (
+    body: { thread_id?: string | null },
+    onEvent: (ev: StreamEvent) => void,
+  ): (() => void) => streamRequest(`${BASE}/chat/retry`, body, onEvent),
+
+  /** 查询线程流式状态与最近失败记录（页面刷新后据此还原失败横幅/重连） */
   getStreamStatus: (thread_id: string) =>
-    jsonFetch<{ thread_id: string; streaming: boolean }>(
+    jsonFetch<StreamStatus>(
       `${BASE}/threads/${encodeURIComponent(thread_id)}/stream-status`,
     ),
 

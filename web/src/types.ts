@@ -244,6 +244,24 @@ export interface BrowseResult {
   is_root: boolean
 }
 
+/** 工作流节点失败记录（后端 SessionStore 持久化，供断点重试横幅展示） */
+export interface StreamFailure {
+  /** 失败节点名（失败发生在节点外时为空字符串） */
+  node: string
+  /** 异常信息摘要 */
+  error: string
+  /** 记录时间戳（Unix 秒） */
+  ts: number
+}
+
+/** 线程流式状态（GET /api/threads/{id}/stream-status） */
+export interface StreamStatus {
+  thread_id: string
+  streaming: boolean
+  /** 最近一次工作流失败记录（无则 null；chat 会话恒为 null） */
+  failure: StreamFailure | null
+}
+
 /** SSE 事件联合类型 */
 export type StreamEvent =
   | { type: 'thread_created'; thread_id: string }
