@@ -100,18 +100,79 @@ def test_delete_session_clears_all_state():
         await store.aadd_recorded_call_ids("s1", {"call-x"})
         await store.aset_interrupt_mode("s1", "run")
         await store.aset_session_config("s1", SessionConfig(provider="p1"))
+        await store.aset_failure("s1", node="worker_exec", error="LLM 503")
         await store.adelete_session("s1")
         h = await store.aget_history("s1")
         ids = await store.aget_recorded_call_ids("s1")
         m = await store.aget_interrupt_mode("s1")
         config = await store.aget_session_config("s1")
-        return h, ids, m, config
+        failure = await store.aget_failure("s1")
+        return h, ids, m, config, failure
 
-    h, ids, m, config = asyncio.run(run())
+    h, ids, m, config, failure = asyncio.run(run())
     assert h == []
     assert ids == set()
     assert m is None
     assert config is None
+    assert failure is None
+
+
+def test_failure_set_get_roundtrip():
+    """失败记录写入后可读回完整结构（node/error/ts）。"""
+    store = SessionStore()
+
+    async def run():
+        await store.aset_failure("wf-1", node="worker_exec", error="ConnectionError: 503")
+        return await store.aget_failure("wf-1")
+
+    failure = asyncio.run(run())
+    assert failure is not None
+    assert failure["node"] == "worker_exec"
+    assert "503" in failure["error"]
+    assert isinstance(failure["ts"], float)
+
+
+def test_failure_overwrite_keeps_only_latest():
+    """同会话再次失败时覆盖旧记录（每会话仅保留最新一条）。"""
+    store = SessionStore()
+
+    async def run():
+        await store.aset_failure("wf-1", node="node_a", error="第一次失败")
+        await store.aset_failure("wf-1", node="node_b", error="第二次失败")
+        return await store.aget_failure("wf-1")
+
+    failure = asyncio.run(run())
+    assert failure["node"] == "node_b"
+    assert failure["error"] == "第二次失败"
+
+
+def test_failure_clear_is_idempotent_and_isolated():
+    """清除幂等（无记录不报错）；per-session 隔离（清 s1 不影响 s2）。"""
+    store = SessionStore()
+
+    async def run():
+        await store.aset_failure("s1", node="n1", error="e1")
+        await store.aset_failure("s2", node="n2", error="e2")
+        await store.aclear_failure("s1")
+        f1 = await store.aget_failure("s1")
+        f2 = await store.aget_failure("s2")
+        await store.aclear_failure("s1")  # 幂等：再次清除不报错
+        return f1, f2
+
+    f1, f2 = asyncio.run(run())
+    assert f1 is None
+    assert f2 is not None
+    assert f2["node"] == "n2"
+
+
+def test_failure_default_none_for_unknown_session():
+    """从未写入失败记录的会话读取返回 None。"""
+    store = SessionStore()
+
+    async def run():
+        return await store.aget_failure("never")
+
+    assert asyncio.run(run()) is None
 
 
 def test_session_config_namespace_isolated_from_history_and_interrupts():

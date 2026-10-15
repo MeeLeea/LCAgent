@@ -8,6 +8,9 @@
 - 非 workflow 会话拒绝执行（ValueError）
 - 执行前 raw_context 注入：长期记忆 recall + checkpoint 历史消息
 - aresume_events：用 Command(resume=payload) 恢复 + DONE/INTERRUPT 终止事件
+- 图级自动重试：瞬时异常（should_retry）退避后 ainvoke(None) 从失败节点续跑；
+  非瞬时异常一次即写失败记录 + ERROR
+- aretry_events：前置 aget_state 校验断点（next 为空 → ERROR；有断点 → 续跑 DONE）
 - aget_execution_history / aclear_history（复用 SessionStore）
 - manually_compact（无消息/非 workflow 会话/正常压缩）
 - aclose 幂等
@@ -139,18 +142,90 @@ class FakeGraphResume(FakeGraph):
         return await super().ainvoke(state, config)
 
 
+class FakeGraphFailOnce(FakeGraph):
+    """首次 ainvoke 抛瞬时异常（503），第二次成功。
+
+    验证图级自动重试：第二次 ainvoke 应收到 None（从 checkpoint 续跑失败
+    节点），事件流含两轮 NODE_START（节点红→running→绿）。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(result={"final_answer": "重试后完成"})
+        self.invoke_inputs: list = []
+        self._failed = False
+
+    async def ainvoke(self, state, config):
+        self.invoke_inputs.append(state)
+        self.last_config = config
+        if not self._failed:
+            self._failed = True
+            handler = config["callbacks"][0]
+            handler.on_chain_start(
+                {}, {}, run_id="r1", metadata={"langgraph_node": "node_a"}
+            )
+            handler.on_chain_error(RuntimeError("r1"), run_id="r1")
+            raise ConnectionError("Error code: 503")
+        return await super().ainvoke(state, config)
+
+
+class FakeGraphFailAlways(FakeGraph):
+    """每次 ainvoke 都抛非瞬时异常（业务错误，should_retry=False）。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.invoke_count = 0
+
+    async def ainvoke(self, state, config):
+        self.invoke_count += 1
+        self.last_config = config
+        handler = config["callbacks"][0]
+        handler.on_chain_start(
+            {}, {}, run_id="r1", metadata={"langgraph_node": "node_a"}
+        )
+        handler.on_chain_error(RuntimeError("r1"), run_id="r1")
+        raise ValueError("业务逻辑错误")
+
+
+class FakeGraphRetryable(FakeGraph):
+    """带 aget_state 的图（next 元组控制 aretry_events 的断点校验）。"""
+
+    def __init__(self, next_nodes: tuple[str, ...] = ("node_a",)) -> None:
+        super().__init__(result={"final_answer": "重试后完成"})
+        self.next_nodes = next_nodes
+        self.received_input: object | None = None
+        self.state_reads: list = []
+
+    async def aget_state(self, config):
+        self.state_reads.append(config)
+        return types.SimpleNamespace(values={}, next=self.next_nodes)
+
+    async def ainvoke(self, state, config):
+        self.received_input = state
+        return await super().ainvoke(state, config)
+
+
 class FakeStore:
-    """模拟 SessionStore（执行历史按会话隔离）。"""
+    """模拟 SessionStore（执行历史 + 失败记录按会话隔离）。"""
 
     def __init__(self) -> None:
         self.history: list = []
         self.cleared: list[str] = []
+        self.failures: dict[str, dict] = {}
 
     async def aget_history(self, sid: str) -> list:
         return self.history
 
     async def aclear_history(self, sid: str) -> None:
         self.cleared.append(sid)
+
+    async def aget_failure(self, sid: str) -> dict | None:
+        return self.failures.get(sid)
+
+    async def aset_failure(self, sid: str, node: str = "", error: str = "") -> None:
+        self.failures[sid] = {"node": node, "error": error, "ts": 1.0}
+
+    async def aclear_failure(self, sid: str) -> None:
+        self.failures.pop(sid, None)
 
 
 class FakeMemory:
@@ -209,6 +284,18 @@ def _collect_resume(adapter, payload, thread_id=None) -> list:
 
     async def _run():
         async for ev in adapter.aresume_events(payload, thread_id=thread_id):
+            events.append(ev)
+
+    asyncio.run(_run())
+    return events
+
+
+def _collect_retry(adapter, thread_id=None) -> list:
+    """收集 aretry_events 事件流。"""
+    events = []
+
+    async def _run():
+        async for ev in adapter.aretry_events(thread_id=thread_id):
             events.append(ev)
 
     asyncio.run(_run())
@@ -598,6 +685,187 @@ def test_aresume_events_non_workflow_session_raises(monkeypatch):
         assert "不是 workflow 会话" in str(error)
     else:
         raise AssertionError("应抛出 ValueError")
+
+
+# ────────────── 图级自动重试（瞬时异常）+ 失败记录落库 ──────────────
+
+
+def test_arun_events_auto_retries_transient_error(monkeypatch):
+    """瞬时异常（503）→ 退避后 ainvoke(None) 从失败节点续跑 → DONE + 清失败记录。
+
+    验证：
+    - 第二次 ainvoke 收到 None（LangGraph 从 checkpoint pending task 续跑语义）
+    - 事件流含两轮 NODE_START（节点红→running→绿）与一个 NODE_ERROR
+    - 重试成功后失败记录被清除
+    """
+    # 压缩退避时长，避免测试真实等待指数退避
+    monkeypatch.setattr("session.workflow_adapter.RETRY_MAX_DELAY", 0.01)
+    fake_graph = FakeGraphFailOnce()
+    monkeypatch.setattr(
+        "graph.common.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
+    reg = _make_registry()
+    adapter = _make_adapter(reg)
+
+    events = _collect(adapter, thread_id="workflow-simple-thread-1")
+
+    # 第二次 ainvoke 收到 None（从失败节点续跑），首次收到 initial_state
+    assert fake_graph.invoke_inputs[0]["task"] == "测试任务"
+    assert fake_graph.invoke_inputs[1] is None
+    # 事件流：首轮 NODE_START/NODE_ERROR，次轮 NODE_START/NODE_END/DONE
+    assert [ev.event_type for ev in events] == [
+        EventType.NODE_START,
+        EventType.NODE_ERROR,
+        EventType.NODE_START,
+        EventType.NODE_END,
+        EventType.DONE,
+    ]
+    assert all(ev.node == "node_a" for ev in events[:4])
+    assert events[-1].content == "重试后完成"
+    # 重试成功后失败记录被清除
+    assert "workflow-simple-thread-1" not in reg._store.failures
+
+
+def test_arun_events_non_retryable_error_writes_failure(monkeypatch):
+    """非瞬时异常（ValueError）不自动重试：一次即写失败记录 + ERROR 事件。"""
+    fake_graph = FakeGraphFailAlways()
+    monkeypatch.setattr(
+        "graph.common.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
+    reg = _make_registry()
+    adapter = _make_adapter(reg)
+
+    events = _collect(adapter, thread_id="workflow-simple-thread-1")
+
+    # 业务错误不自动重试（ainvoke 仅 1 次）
+    assert fake_graph.invoke_count == 1
+    # 事件流：NODE_START → NODE_ERROR → ERROR
+    assert [ev.event_type for ev in events] == [
+        EventType.NODE_START,
+        EventType.NODE_ERROR,
+        EventType.ERROR,
+    ]
+    error_ev = events[-1]
+    assert "业务逻辑错误" in error_ev.content
+    assert error_ev.thread_id == "workflow-simple-thread-1"
+    # 失败记录落库：节点名取自 NODE_ERROR 事件
+    failure = reg._store.failures["workflow-simple-thread-1"]
+    assert failure["node"] == "node_a"
+    assert "业务逻辑错误" in failure["error"]
+
+
+def test_arun_events_clears_stale_failure_before_run(monkeypatch):
+    """arun_events 开跑前清除上一轮遗留的失败记录（stale 断点不再有意义）。"""
+    fake_graph = FakeGraph()
+    monkeypatch.setattr(
+        "graph.common.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
+    reg = _make_registry()
+    reg._store.failures["workflow-simple-thread-1"] = {
+        "node": "worker_exec",
+        "error": "旧失败",
+        "ts": 1.0,
+    }
+    adapter = _make_adapter(reg)
+
+    events = _collect(adapter, thread_id="workflow-simple-thread-1")
+
+    assert events[-1].event_type == EventType.DONE
+    assert "workflow-simple-thread-1" not in reg._store.failures
+
+
+# ────────────── aretry_events：手动断点重试 ──────────────
+
+
+def test_aretry_events_resumes_from_breakpoint(monkeypatch):
+    """有断点（next 非空）→ ainvoke(None) 续跑 → DONE + 清失败记录。"""
+    fake_graph = FakeGraphRetryable(next_nodes=("node_a",))
+    monkeypatch.setattr(
+        "graph.common.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
+    reg = _make_registry()
+    reg._store.failures["workflow-simple-thread-1"] = {
+        "node": "node_a",
+        "error": "上次失败",
+        "ts": 1.0,
+    }
+    adapter = _make_adapter(reg)
+
+    events = _collect_retry(adapter, thread_id="workflow-simple-thread-1")
+
+    # 前置校验读了 aget_state；ainvoke 收到 None（从失败节点续跑）
+    assert len(fake_graph.state_reads) == 1
+    assert fake_graph.received_input is None
+    # 事件流：NODE_START → NODE_END → DONE
+    assert [ev.event_type for ev in events] == [
+        EventType.NODE_START,
+        EventType.NODE_END,
+        EventType.DONE,
+    ]
+    assert events[-1].content == "重试后完成"
+    assert events[-1].is_important is False  # 重试非执行模式
+    # 重试成功后失败记录被清除
+    assert "workflow-simple-thread-1" not in reg._store.failures
+
+
+def test_aretry_events_no_breakpoint_yields_error(monkeypatch):
+    """无断点（next 为空，图已跑完/从未执行）→ yield ERROR，不调 ainvoke。"""
+    fake_graph = FakeGraphRetryable(next_nodes=())
+    monkeypatch.setattr(
+        "graph.common.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
+    adapter = _make_adapter()
+
+    events = _collect_retry(adapter, thread_id="workflow-simple-thread-1")
+
+    assert len(events) == 1
+    assert events[0].event_type == EventType.ERROR
+    assert "无可恢复的失败断点" in events[0].content
+    assert fake_graph.received_input is None  # 未调用 ainvoke
+
+
+def test_aretry_events_non_workflow_session_raises():
+    """非 workflow 会话 aretry_events 抛 ValueError（与 arun_events 一致）。"""
+    reg = _make_registry(workflow_name=None)
+    adapter = _make_adapter(reg)
+
+    try:
+        _collect_retry(adapter)
+    except ValueError as error:
+        assert "不是 workflow 会话" in str(error)
+    else:
+        raise AssertionError("应抛出 ValueError")
+
+
+def test_aget_failure_record_reads_store():
+    """aget_failure_record 委托 SessionStore 读取失败记录。"""
+    reg = _make_registry()
+    reg._store.failures["workflow-simple-thread-1"] = {
+        "node": "worker_exec",
+        "error": "ConnectionError",
+        "ts": 1.0,
+    }
+    adapter = _make_adapter(reg)
+
+    failure = asyncio.run(adapter.aget_failure_record("workflow-simple-thread-1"))
+
+    assert failure == {"node": "worker_exec", "error": "ConnectionError", "ts": 1.0}
+    # 无记录时返回 None
+    assert asyncio.run(adapter.aget_failure_record("workflow-simple-thread-9")) is None
+
+
+def test_aget_failure_record_without_store_returns_none():
+    """registry 无 _store 时静默返回 None（不抛异常）。"""
+    reg = _make_registry()
+    reg._store = None
+    adapter = _make_adapter(reg)
+
+    assert asyncio.run(adapter.aget_failure_record()) is None
 
 
 def test_aget_execution_history_reuses_store():
