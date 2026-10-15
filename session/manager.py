@@ -28,6 +28,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from memory.manager import MemoryManager
+from utils.events import AgentEvent
 
 from .config import SessionConfig, SessionConfigPatch
 from .registry import SessionRegistry
@@ -160,6 +161,49 @@ class SessionManager:
                 yield event.to_sse_dict()
                 if self._memory is not None and event.is_memory_worthy:
                     await self._memory.consume_event(event)
+
+    async def aretry_stream(
+        self,
+        *,
+        thread_id: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """流式从失败断点重试 — 事件格式同 achat_stream。
+
+        仅 WorkflowAdapter 实现 aretry_events；chat 链路（AgentCore）无此
+        接口时优雅降级为 error 事件（不抛异常，保持 SSE 协议不变）。
+
+        Args:
+            thread_id: 目标会话线程 ID（为 None 时使用当前会话）
+        """
+        tid = self._resolve_thread_id(thread_id)
+        aretry = getattr(self._agent, "aretry_events", None)
+        if aretry is None:
+            yield AgentEvent.error(
+                content="当前会话类型不支持从失败节点重试",
+                thread_id=tid,
+            ).to_sse_dict()
+            return
+
+        lock = await self._get_thread_lock(tid)
+        async with lock:
+            async for event in aretry(thread_id=tid):
+                yield event.to_sse_dict()
+                if self._memory is not None and event.is_memory_worthy:
+                    await self._memory.consume_event(event)
+
+    async def aget_failure(
+        self, thread_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """读取会话最近一次工作流失败记录（无则 None）。
+
+        供 stream-status 端点查询：前端刷新后据此还原失败节点红态。
+        chat 链路（AgentCore）无 aget_failure_record 接口时返回 None。
+        """
+        aget = getattr(self._agent, "aget_failure_record", None)
+        if aget is None:
+            return None
+        tid = self._resolve_thread_id(thread_id)
+        return await aget(tid)
 
     async def arun_stream(
         self,

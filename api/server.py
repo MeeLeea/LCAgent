@@ -468,6 +468,10 @@ class ResumeRequest(BaseModel):
     thread_id: str | None = None
 
 
+class RetryRequest(BaseModel):
+    thread_id: str | None = None
+
+
 class SwitchProviderRequest(BaseModel):
     provider: str
     thread_id: str | None = None
@@ -1432,10 +1436,85 @@ async def chat_resume(req: ResumeRequest, request: Request):
     )
 
 
+@app.post("/api/chat/retry")
+async def chat_retry(req: RetryRequest, request: Request):
+    """SSE 流式从失败断点重试（仅 workflow 会话支持，重跑失败节点）。
+
+    事件协议与 /api/chat/resume 一致：NODE_START/NODE_END/NODE_ERROR →
+    DONE / ERROR。失败断点校验（checkpoint 是否有待执行节点）在
+    WorkflowAdapter.aretry_events 前置完成，无断点时返回 error 事件。
+    """
+
+    async def event_stream():
+        # 重试必须带 thread_id（前端从失败记录已知线程）；缺失时回退当前会话
+        tid = req.thread_id or agent.session.current_session_id
+
+        # 路由判定：仅 workflow 会话支持断点重试（chat 链路无此能力）
+        if not (agent and agent.session.is_workflow_session(tid)):
+            yield _sse({"type": "error", "content": "仅工作流会话支持从失败节点重试"})
+            return
+
+        logger.info("失败断点重试 [%s]", tid)
+        async with _thread_lock(tid):
+            cancel_event = _cancel_event_for(tid)
+            detach = _DetachState()
+            stream = _ActiveStream()
+            _active_streams[tid] = stream
+
+            async def source() -> AsyncIterator[dict[str, Any]]:
+                async for ev_dict in workflow_sm.aretry_stream(thread_id=tid):
+                    await stream.publish(ev_dict)
+                    yield ev_dict
+
+            try:
+                async for sse in _forward_stream_with_cancel(
+                    source(),
+                    cancel_event,
+                    request,
+                    tid,
+                    enrich_done=False,
+                    stream=stream,
+                    detach=detach,
+                ):
+                    yield sse
+            except Exception as e:
+                logger.error("失败重试异常 [%s]: %s", tid, e)
+                yield _sse({"type": "error", "content": f"内部错误: {e}"})
+            finally:
+                if not detach.detached:
+                    await stream.finish()
+                    if _active_streams.get(tid) is stream:
+                        _active_streams.pop(tid, None)
+                # 流因停止信号取消结束时，清理该会话待处理的记忆沉淀（同 /api/chat）
+                if cancel_event.is_set():
+                    await _cancel_pending_memory(tid)
+                # 已转移后台时 cancel_event 由 _detached_stream_cleanup 清理
+                if not detach.detached and _cancel_events.get(tid) is cancel_event:
+                    _cancel_events.pop(tid, None)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.get("/api/threads/{thread_id}/stream-status")
 async def thread_stream_status(thread_id: str):
-    """查询指定线程是否有正在进行的流式生成（前端刷新后据此决定是否 attach）。"""
-    return {"thread_id": thread_id, "streaming": thread_id in _active_streams}
+    """查询线程流式状态 + 最近一次工作流失败记录。
+
+    - streaming: 是否有正在进行的流（前端刷新后据此决定是否 attach）
+    - failure: workflow 会话的最近失败记录 {"node", "error", "ts"}（无则 None），
+      前端据此还原失败节点红态与重试入口
+    """
+    failure = None
+    if workflow_sm is not None and agent and agent.session.is_workflow_session(thread_id):
+        failure = await workflow_sm.aget_failure(thread_id)
+    return {
+        "thread_id": thread_id,
+        "streaming": thread_id in _active_streams,
+        "failure": failure,
+    }
 
 
 @app.get("/api/chat/attach/{thread_id}")
