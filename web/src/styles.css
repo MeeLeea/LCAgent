@@ -1990,6 +1990,52 @@ tool-group,
   color: var(--danger);
 }
 
+/* 失败横幅：失败节点名 + 错误摘要 + 断点重试按钮 */
+.workflow-failure-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+  padding: 10px 14px;
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+  border-radius: 10px;
+}
+
+.workflow-failure-icon {
+  flex: none;
+  color: var(--danger);
+}
+
+.workflow-failure-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.workflow-failure-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--danger);
+}
+
+.workflow-failure-detail {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.workflow-retry-btn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .spin {
   animation: spin 1s linear infinite;
 }
