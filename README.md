@@ -1183,7 +1183,7 @@ HTTP API（[api/server.py](api/server.py)）同样暴露三个 RESTful 端点，
 
 `AgentCore.session_manager`（懒初始化）是上层流量的统一入口，封装 Agent + Memory：
 
-- **流式接口**：`achat_stream` / `aresume_stream` / `arun_stream`，产出 SSE 事件（`token` / `tool_call` / `tool_result` / `interrupt` / `cancelled` / `error` / `done` / `workflow_node` / `workflow_status`）。其中 `workflow_node`（NODE_START/END/ERROR → status `running`/`done`/`error`）在 `done` 时携带该节点产出 `content`，前端在会话窗口渲染节点结果块
+- **流式接口**：`achat_stream` / `aresume_stream` / `arun_stream` / `aretry_stream`，产出 SSE 事件（`token` / `tool_call` / `tool_result` / `interrupt` / `cancelled` / `error` / `done` / `workflow_node` / `workflow_status`）。其中 `workflow_node`（NODE_START/END/ERROR → status `running`/`done`/`error`）在 `done` 时携带该节点产出 `content`，前端在会话窗口渲染节点结果块；`aretry_stream`（workflow 链路）从失败断点续跑，chat 链路无此接口时优雅降级为 `error` 事件
   - **HTTP 层断流重连**：`/api/chat`（普通对话路径）与 `/api/chat/resume` 注册 per-thread `_ActiveStream`（事件日志 + 多订阅者）。客户端断开（Starlette 检测 `http.disconnect` 取消响应任务，由 `_forward_stream_with_cancel` 捕获 `CancelledError`/`GeneratorExit` 识别）后执行转移 `_detached_stream_cleanup` 后台任务继续持有会话锁直到完成，checkpoint 保存完整消息；`GET /api/threads/{thread_id}/stream-status` 查询进行中流，`GET /api/chat/attach/{thread_id}` 先重放事件日志再实时续传（无活跃流时返回 `attach_expired`，前端回退历史加载）
   - **`tool_call` / `tool_result` id 一致性**：LangChain 的 `on_tool_start` / `on_tool_end` 事件 data 不含 `tool_call_id`，`agent_core._arun_graph_events` 借助 `on_chat_model_end` 的 `AIMessage.tool_calls` 与事件 `run_id` 建立桥接，保证两个事件的 `id` 一致（兜底回退到事件 `name`），前端按 `id` 关联工具卡片与其结果
 - **非流式接口**：`achat` / `aresume` / `arun`，收集全部 token 为最终文本
@@ -1201,6 +1201,33 @@ HTTP API（[api/server.py](api/server.py)）同样暴露三个 RESTful 端点，
 
 > ⚠️ **初始化顺序**：首次访问 `session_manager` 前必须先调用 `set_memory_manager()` 注入 MemoryManager，否则 SessionManager 将在**无记忆功能**下初始化（重试会抛 `RuntimeError`）。
 
+### Workflow 节点失败：现场保存 + 失败记录 + 断点重试
+
+workflow 链路（`session/workflow_adapter.py`）对节点异常（LLM 调用失败 / 基础设施错误等图级异常）提供三层恢复机制：
+
+**1. 现场保存（checkpointer 自动承载）**：节点异常时该 superstep 不提交，checkpointer 停留在上一成功 superstep 末——失败节点保留为 pending task（`graph.aget_state(config).next == (失败节点,)`），之前所有成功节点的产出（messages / plan 等）不丢，跨进程重启依然有效。
+
+**2. 失败记录持久化（SessionStore `failures` kind）**：图级失败（自动重试耗尽或非瞬时错误）时把失败详情写入 Store，供重启后展示与诊断：
+
+| 方法                              | 说明                                                                    |
+| --------------------------------- | ----------------------------------------------------------------------- |
+| `aset_failure(sid, node, error)`  | 覆盖写入 `{"node": 失败节点名, "error": 异常信息, "ts": 时间戳}`        |
+| `aget_failure(sid)`               | 读取最近一条失败记录（无则 `None`）                                     |
+| `aclear_failure(sid)`             | 清除记录（重试成功 / 新任务开跑时自动调用；`adelete_session` 连带清理） |
+
+节点名取自事件流中最后一个 `NODE_ERROR` 事件（`NodeTrackingHandler.on_chain_error`）；失败位置本身以 checkpointer 的 pending task 为唯一事实源，Store 记录仅补充异常详情（避免双份事实源漂移）。
+
+**3. 断点重试（两层）**：
+
+- **图级自动重试**：瞬时错误（`llm_client.should_retry` 判定：429/5xx/连接超时/网关过载；`StreamChunkTimeoutError` 除外，避免与流层重试叠加）时指数退避后 `ainvoke(None, config)` 从失败节点续跑（最多 `RETRY_ATTEMPTS=3` 次含首次）。事件泵跨尝试共用队列，第二轮 `NODE_START` 让前端节点自然呈现"红→running→绿"。业务逻辑错误（如 `ValueError`）不自动重试，一次即落库 + ERROR 终止。
+- **手动重试**：`aretry_events(thread_id)`（Adapter）→ `aretry_stream`（SessionManager 门面）→ `POST /api/chat/retry`（body `{"thread_id"}`，SSE 事件协议与 `/api/chat/resume` 一致；仅 workflow 会话支持）。前置 `aget_state` 校验断点：`next` 为空（图已跑完/从未执行）时返回 `error` 事件，不空转。
+
+**状态迁移**：图级失败 → 写记录；重试成功 / 转 INTERRUPT / 新任务开跑（`arun_events`）→ 清记录；再次失败 → 覆盖更新。
+
+**前端刷新还原**：`GET /api/threads/{thread_id}/stream-status` 响应体新增 `failure` 字段（workflow 会话返回上述记录或 `null`），前端据此还原失败节点红态与"从失败节点重试"入口。
+
+回归守护：`tests/session/test_workflow_adapter.py`（FakeGraph 重试/落库/断点校验）、`tests/session/test_session_store.py`（failures 存取）、`tests/graph/test_workflow_failure_recovery_integration.py`（真实 StateGraph + MemorySaver 验证 ainvoke(None) 仅重跑失败节点、已完结图不空转）。
+
 ### 与 CLI 的关系
 
 | 命令                                            | 作用                                                                                   |
@@ -1211,7 +1238,7 @@ HTTP API（[api/server.py](api/server.py)）同样暴露三个 RESTful 端点，
 | `export[:<thread_id>] [text\|markdown] [路径]` | 导出对话为可读文本（默认 text 格式，存`exports/`；markdown 用 .md 后缀）             |
 | `workspace <路径>` / `workspace:clear`      | 绑定/清除当前会话工作空间                                                              |
 
-> **存储位置**：会话历史在 `data/checkpoints_async.sqlite` 的 `checkpoints` / `writes` 表（按 `thread_id` 隔离）；工作空间映射在 `session_workspaces` 表；执行历史与挂起中断写入 LangGraph Store（瞬态，随会话删除清理）。详见[记忆系统 → 文件位置](#文件位置)。
+> **存储位置**：会话历史在 `data/checkpoints_async.sqlite` 的 `checkpoints` / `writes` 表（按 `thread_id` 隔离）；工作空间映射在 `session_workspaces` 表；执行历史、挂起中断与最近失败记录写入 LangGraph Store（瞬态，随会话删除清理）。详见[记忆系统 → 文件位置](#文件位置)。
 
 ---
 
