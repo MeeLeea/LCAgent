@@ -15,7 +15,7 @@ import os
 from collections.abc import AsyncIterator, Sequence
 from typing import Any, ClassVar
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import BaseTool
 from langgraph.types import Command, Interrupt
 
@@ -551,6 +551,68 @@ class TeamAgent:
                 return AgentTurnResult.interrupted(interrupts)
         return turn
 
+    async def _arepair_orphan_tool_calls(self, run_config: dict) -> None:
+        """修复内层 checkpoint 的孤儿 tool_call(补齐未完成工具的取消结果)。
+
+        对照 agent/interrupts.py:_arepair_rejected_tool_calls 的同构移植。
+        TeamAgent 的内层 thread_id(``team:{name}:{tid}``)跨 turn 复用,
+        上次 turn 因用户拒绝危险命令/执行异常/中途取消结束时,checkpoint
+        中残留 AIMessage(tool_calls) 而无对应 ToolMessage;下次开跑直接把
+        非法消息序列发给 LLM 会触发 OpenAI 400
+        ("tool_call_ids did not have response messages")。
+
+        有 pending interrupts 时跳过:属工具内 confirm 的合法暂停,
+        等 resume 后由工具正常写入 ToolMessage,此时抢先补写会产生
+        同一 tool_call_id 的重复 ToolMessage,干扰中断恢复语义。
+
+        Args:
+            run_config: 内层 run config(含 thread_id,由 _build_run_config 构造)
+        """
+        if self.agent_executor is None or getattr(self, "_checkpointer", None) is None:
+            return
+        try:
+            state = await self.agent_executor.aget_state(run_config)
+        except (AttributeError, RuntimeError, TypeError, ValueError) as e:
+            if self.verbose:
+                logger.warning("[%s] 读取 checkpoint 状态失败: %s", self.name, e)
+            return
+        if state is None:
+            return
+        # pending interrupt 属合法暂停,不修复(见 docstring)
+        if any(
+            intr
+            for task in getattr(state, "tasks", []) or []
+            for intr in getattr(task, "interrupts", []) or []
+        ):
+            return
+        messages = list(getattr(state, "values", {}).get("messages", []))
+        answered_ids = {
+            m.tool_call_id for m in messages if isinstance(m, ToolMessage)
+        }
+        repairs: list[ToolMessage] = []
+        for message in messages:
+            if not isinstance(message, AIMessage):
+                continue
+            for tool_call in message.tool_calls:
+                call_id = tool_call.get("id")
+                if not isinstance(call_id, str) or call_id in answered_ids:
+                    continue
+                repairs.append(
+                    ToolMessage(
+                        content="工具调用未完成(用户拒绝或上次执行中断),已跳过。",
+                        name=tool_call.get("name"),
+                        tool_call_id=call_id,
+                        status="error",
+                    )
+                )
+                answered_ids.add(call_id)
+        if not repairs:
+            return
+        try:
+            await self.agent_executor.aupdate_state(run_config, {"messages": repairs})
+        except (AttributeError, RuntimeError, TypeError, ValueError) as e:
+            logger.warning("[%s] 修复 checkpoint 状态失败: %s", self.name, e)
+
     async def _aget_pending_interrupts(self, config: dict) -> list[Interrupt]:
         """流后读取 checkpoint 的 pending interrupts(对照 streaming.py:322-326)
 
@@ -650,6 +712,9 @@ class TeamAgent:
         
         recorded_msg_ids: set[str] = set()
         run_config = self._build_run_config(config)
+        # 防御性修复:上次 turn 拒绝/异常/取消残留的孤儿 tool_call 会让本次
+        # LLM 调用直接 400,开跑前补齐取消结果(无 pending interrupts 时才执行)
+        await self._arepair_orphan_tool_calls(run_config)
         try:
             async for ev in self.agent_executor.astream_events(
                 {"messages": [HumanMessage(content=task)]},
@@ -694,10 +759,11 @@ class TeamAgent:
                         success=False,
                     )
         except UserRejectedCommandError:
-            # 用户拒绝危险命令:不混入通用"任务执行失败"语义,
-            # re-raise 给上层(arun_structured)单独识别为 cancelled,
-            # 与 agent/turn_runners.py 的 _ahandle_rejected_command 同构
-            # (TeamAgent 无 SessionStore/checkpoint,故不修复 checkpoint 状态)
+            # 用户拒绝危险命令:立即修复 checkpoint 孤儿 tool_call(对齐
+            # AgentCore _ahandle_rejected_command,虽下次开跑前有防御性
+            # 修复,但当次修复保证拒绝后状态即时干净),再 re-raise 给
+            # 上层(arun_structured)单独识别为 cancelled
+            await self._arepair_orphan_tool_calls(run_config)
             raise
         except Exception as e:
             error_msg = f"{TASK_ERROR_PREFIX}: {e!s}"
