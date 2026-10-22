@@ -18,8 +18,8 @@ from typing import Any
 from unittest.mock import MagicMock
 
 from agent.turn_types import AgentTurnResult
-from agent.workspace_mw import WorkspaceSecurityMW
 from graph.common.workflow_runner import arun_compiled_workflow
+from midware.workspace_mw import WorkspaceSecurityMW
 from team.base import TeamAgent
 from team.worker.worker import WorkerAgent
 

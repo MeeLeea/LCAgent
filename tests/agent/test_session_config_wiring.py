@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from langgraph.checkpoint.memory import MemorySaver
 
 from agent.agent_core import AgentCore
-from agent.session_config_middleware import SessionConfigMW
+from midware.session_config_middleware import SessionConfigMW
 from session import SessionRegistry, SessionStore
 from session.config import SessionConfig
 

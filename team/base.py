@@ -331,12 +331,12 @@ class TeamAgent:
         """创建轻量工具 agent(仅当有 tools 时调用)"""
         from langchain.agents import create_agent
 
-        # 延迟导入避免循环依赖(agent.workspace_mw 顶层仅依赖 langchain,
-        # 且 agent_core 早已在顶层导入该模块,此处只是保险)
-        from agent.terminal_retry_cap_mw import TerminalRetryCapMW
-        from agent.tool_error_mw import ToolExecutionErrorMW
-        from agent.tool_retry_cap_mw import ToolRetryCapMW
-        from agent.workspace_mw import WorkspaceSecurityMW
+        # 延迟导入避免循环依赖(midware.workspace_mw 顶层仅依赖 langchain,
+        # 且 graph_builder 早已在顶层导入该模块,此处只是保险)
+        from midware.terminal_retry_cap_mw import TerminalRetryCapMW
+        from midware.tool_error_mw import ToolExecutionErrorMW
+        from midware.tool_retry_cap_mw import ToolRetryCapMW
+        from midware.workspace_mw import WorkspaceSecurityMW
         from tools.tool_wrapper import wrap_tools_with_timeout
 
         chat_model = self.llm.get_chat_model()
@@ -705,7 +705,7 @@ class TeamAgent:
         - on_chat_model_end → 记录 LLM 调用(token 用量,msg id 去重)
         - on_tool_end / on_tool_error → 记录工具执行(失败/超时)
         """
-        from agent.terminal_retry_cap_mw import is_timeout_content
+        from midware.terminal_retry_cap_mw import is_timeout_content
 
         if self.verbose:
             logger.info("[%s] 执行任务(工具模式·异步): %s", self.name, task[:100])

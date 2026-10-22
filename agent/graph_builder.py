@@ -16,20 +16,19 @@ import logging
 from langchain.agents import create_agent
 
 from llm.llm_client import LLMClient
-from skmng.middleware import SkillInjectionMW
-from tools.tool_wrapper import wrap_tools_with_timeout
-
-from .compaction import LCAgentCompactionMiddleware, LCAgentState
-from .session_config_middleware import (
+from midware.compaction import LCAgentCompactionMiddleware, LCAgentState
+from midware.session_config_middleware import (
     SessionConfigMW,
     SessionModelFactory,
     build_session_model_resolver,
 )
-from .terminal_retry_cap_mw import TerminalRetryCapMW
-from .tool_arg_validator_mw import ToolArgValidatorMW
-from .tool_error_mw import ToolExecutionErrorMW
-from .tool_retry_cap_mw import ToolRetryCapMW
-from .workspace_mw import WorkspaceSecurityMW
+from midware.terminal_retry_cap_mw import TerminalRetryCapMW
+from midware.tool_arg_validator_mw import ToolArgValidatorMW
+from midware.tool_error_mw import ToolExecutionErrorMW
+from midware.tool_retry_cap_mw import ToolRetryCapMW
+from midware.workspace_mw import WorkspaceSecurityMW
+from skmng.middleware import SkillInjectionMW
+from tools.tool_wrapper import wrap_tools_with_timeout
 
 logger = logging.getLogger(__name__)
 

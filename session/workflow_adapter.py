@@ -52,11 +52,11 @@ from typing import Any
 from langchain_core.messages import AIMessage
 from langgraph.types import Command
 
-from agent.compaction import CompactionConfig
 from graph.common import _build_compaction_middleware, build_tracking_callbacks
 from llm.llm_client import RETRY_ATTEMPTS, RETRY_MAX_DELAY, should_retry
 from llm.message_utils import build_interrupt_event
 from memory.manager import MemoryManager
+from midware.compaction import CompactionConfig
 from session.registry import SessionRegistry
 from skmng.manager import SkillManager, default_skills_dir
 from utils.events import AgentEvent, EventType

@@ -5,7 +5,7 @@ import pytest
 from langchain.agents.middleware.types import ModelRequest
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from agent.session_config_middleware import SessionConfigMW, SessionModelFactory
+from midware.session_config_middleware import SessionConfigMW, SessionModelFactory
 from session.config import SessionConfig
 
 

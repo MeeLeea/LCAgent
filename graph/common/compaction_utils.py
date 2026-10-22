@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from agent.compaction import CompactionConfig, LCAgentCompactionMiddleware
+from midware.compaction import CompactionConfig, LCAgentCompactionMiddleware
 
 logger = logging.getLogger(__name__)
 

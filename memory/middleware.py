@@ -85,7 +85,7 @@ _LESSON_MAX_CHARS = 300
 def _is_tool_failure(content: str) -> bool:
     """检测 TOOL_RESULT 内容是否表示工具执行失败/超时。
 
-    与 ``agent.terminal_retry_cap_mw.is_timeout_content`` 逻辑一致，
+    与 ``midware.terminal_retry_cap_mw.is_timeout_content`` 逻辑一致，
     额外补充工具执行失败标记。memory 层独立实现以避免跨层引用。
     含控制流 / HITL 标记的内容不算失败（见 ``_CONTROL_FLOW_MARKERS``）。
     """

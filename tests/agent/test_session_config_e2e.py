@@ -32,9 +32,9 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import Field
 
-from agent.session_config_middleware import SessionConfigMW
 from agent.streaming import Streaming
 from agent.turn_runners import TurnRunners
+from midware.session_config_middleware import SessionConfigMW
 from session.config import SessionConfig
 
 

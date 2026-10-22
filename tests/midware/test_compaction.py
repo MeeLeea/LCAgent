@@ -17,7 +17,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from agent.compaction import (
+from midware.compaction import (
     CompactionConfig,
     LCAgentCompactionMiddleware,
     LCAgentState,
