@@ -1162,6 +1162,22 @@ HTTP API（[api/server.py](api/server.py)）同样暴露三个 RESTful 端点，
 | `POST`   | `/api/threads/{thread_id}/workspace` | `workspace <路径>` | 设置/修改绑定，body`{"path": "..."}`；路径非法返回 400 |
 | `DELETE` | `/api/threads/{thread_id}/workspace` | `workspace:clear`  | 清除绑定，返回`{"cleared": true/false}`                |
 
+### 删除会话内某一轮对话（turn）
+
+除删除整个会话（`DELETE /api/threads/{thread_id}`，CLI `thread:delete <id>`）外，还支持按**轮**删除会话内的某一次对话（一条用户消息 + AI 回复及其完整工具调用链），供 Web 前端在消息气泡上发起：
+
+| 方法      | 路径                                            | 说明                                                                                                                                                                    |
+| --------- | ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DELETE` | `/api/threads/{thread_id}/turns/{turn_index}` | 删除第 `turn_index` 轮（0-based，按 `HumanMessage`（user 回合）计数，与会话窗口中用户消息的顺序一致）。返回 `{"deleted", "thread_id", "turn_index", "removed_messages"}` |
+
+实现要点（[session/manager.py](session/manager.py) 的 `SessionManager.adelete_turn`）：
+
+- 轮以 `HumanMessage` 为锚点：第 N 条 `HumanMessage` 起、到下一条 `HumanMessage`（不含）为止的连续消息块整块删除，不破坏 `AIMessage(tool_calls)` 与 `ToolMessage` 的配对完整性（避免孤儿 tool_call 触发 OpenAI 400）；
+- 经编译图 `aupdate_state` + `RemoveMessage` 按消息 id 移除（与 `agent/streaming.py` 清理空最终回答同机制），在 per-thread 锁内执行，与流式执行互斥；
+- 该会话正在流式执行时 HTTP 层返回 **409**，轮序号越界返回 **404**；
+- 只删 checkpoint 消息历史，**不清理**已沉淀的长期记忆 facts（facts 无法归属单轮，与 `adelete_session` 语义不同）；
+- 压缩摘要（`compact` 产出的 `HumanMessage`）也会被计为一轮，删除属用户主动行为。
+
 ### 会话基础配置的 HTTP API
 
 会话基础配置（provider / model / 角色）也可通过 RESTful 端点读写，供 Web 前端在切换会话时恢复该会话的配置：
@@ -1191,7 +1207,7 @@ HTTP API（[api/server.py](api/server.py)）同样暴露三个 RESTful 端点，
   - **HTTP 层断流重连**：`/api/chat`（普通对话路径）与 `/api/chat/resume` 注册 per-thread `_ActiveStream`（事件日志 + 多订阅者）。客户端断开（Starlette 检测 `http.disconnect` 取消响应任务，由 `_forward_stream_with_cancel` 捕获 `CancelledError`/`GeneratorExit` 识别）后执行转移 `_detached_stream_cleanup` 后台任务继续持有会话锁直到完成，checkpoint 保存完整消息；`GET /api/threads/{thread_id}/stream-status` 查询进行中流，`GET /api/chat/attach/{thread_id}` 先重放事件日志再实时续传（无活跃流时返回 `attach_expired`，前端回退历史加载）
   - **`tool_call` / `tool_result` id 一致性**：LangChain 的 `on_tool_start` / `on_tool_end` 事件 data 不含 `tool_call_id`，`agent_core._arun_graph_events` 借助 `on_chat_model_end` 的 `AIMessage.tool_calls` 与事件 `run_id` 建立桥接，保证两个事件的 `id` 一致（兜底回退到事件 `name`），前端按 `id` 关联工具卡片与其结果
 - **非流式接口**：`achat` / `aresume` / `arun`，收集全部 token 为最终文本
-- **会话管理委托**：`new_session` / `new_workflow_session` / `set_current_session` / `current_session_id` / `alist_sessions` / `aswitch_session` / `adelete_session` / `aget_messages` / `aexport_session` / `asummarize`
+- **会话管理委托**：`new_session` / `new_workflow_session` / `set_current_session` / `current_session_id` / `alist_sessions` / `aswitch_session` / `adelete_session` / `adelete_turn`（删除会话内某一轮） / `aget_messages` / `aexport_session` / `asummarize`
 - **会话基础配置**：`aget_session_config(thread_id)` / `aupdate_session_config(patch, thread_id)`（均在 per-thread 锁内执行，转发 `SessionRegistry`）
 - **记忆管理委托**：`aget_memory_summary` / `acompress_memory` / `aclear_long_term_memory` / `aclear_agent_memory` / `arecall_agent_memory`
 - **执行历史**：`aget_execution_history` / `aclear_history`
