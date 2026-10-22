@@ -6,7 +6,7 @@
     "verbose": true,
     "tool_timeout": 120,
     "temperature": 0.7,
-    "max_tokens": 4096,
+    "max_tokens": 8192,
     "stream_chunk_timeout": 300.0,
     "provider": "zhipu",
     "model": "glm-4-flash"
@@ -38,15 +38,15 @@
   "worker": {
     "name": "worker",
     "agent_prompt_file": "team/worker/AGENT.md",
-    "provider": "zhipu",
-    "model": "glm-4.7-flash",
+    "provider": "bingxing",
+    "model": "Kimi-K3",
     "temperature": 0.3
   },
   "terminator": {
     "name": "terminator",
     "agent_prompt_file": "team/terminator/AGENT.md",
-    "provider": "zhipu",
-    "model": "glm-4.7-flash",
+    "provider": "bingxing",
+    "model": "Kimi-K2.7",
     "max_tokens": 2048
   }
 }
