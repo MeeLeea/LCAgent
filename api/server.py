@@ -865,6 +865,32 @@ async def delete_thread(thread_id: str):
     return {"deleted": True, "thread_id": thread_id}
 
 
+@app.delete("/api/threads/{thread_id}/turns/{turn_index}")
+async def delete_thread_turn(thread_id: str, turn_index: int):
+    """删除会话内某一轮对话（用户消息 + AI 回复及工具调用链）。
+
+    轮序号按 HumanMessage（user 回合）计数，与会话窗口中的用户消息顺序一致。
+    该会话正在流式执行时返回 409，避免与 checkpoint 写入竞态。
+    """
+    lock = _thread_lock(thread_id)
+    if lock.locked():
+        raise HTTPException(status_code=409, detail="该会话正在执行，请稍后再试")
+    async with lock:
+        try:
+            removed = await agent.session_manager.adelete_turn(thread_id, turn_index)
+        except ValueError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+    logger.info(
+        "删除会话轮次: %s turn=%d removed=%d", thread_id, turn_index, removed
+    )
+    return {
+        "deleted": True,
+        "thread_id": thread_id,
+        "turn_index": turn_index,
+        "removed_messages": removed,
+    }
+
+
 @app.patch("/api/threads/{thread_id}")
 async def rename_thread(thread_id: str, req: RenameThreadRequest):
     """重命名会话：修改展示名（不影响消息内容）。
