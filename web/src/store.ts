@@ -146,6 +146,8 @@ interface AppState {
   regenerate: () => void
   /** 编辑某条 user 消息后重发：截断到该消息（含）并重新发送 */
   editAndResend: (index: number, newText: string) => void
+  /** 删除某一轮对话（后端 checkpoint 真删；index 为该 user 消息在 messages 中的下标） */
+  deleteTurn: (index: number) => Promise<void>
   resume: (payload: Record<string, unknown>) => void
   /** 从失败断点重试当前工作流会话：后端基于 checkpoint 仅重跑失败节点 */
   retryCurrentThread: () => void
@@ -1110,6 +1112,52 @@ export const useStore = create<AppState>((set, get) => ({
     set({ messages: truncated })
     commitThreadMessages(get, set, threadId, truncated)
     void get().sendMessage(newText)
+  },
+
+  deleteTurn: async (index) => {
+    const threadId = get().currentThreadId
+    if (threadId === null) return
+    if (get().streamingThreads[threadId]) return
+    const msgs = [...get().messages]
+    if (index < 0 || index >= msgs.length || msgs[index].role !== 'user') return
+    // 计算该 user 消息的回合序号（与后端按 HumanMessage 划轮一致）
+    let turnIndex = -1
+    for (let i = 0; i <= index; i++) {
+      if (msgs[i].role === 'user') turnIndex++
+    }
+    // 该轮范围：[index, 下一条 user 消息)
+    let end = msgs.length
+    for (let i = index + 1; i < msgs.length; i++) {
+      if (msgs[i].role === 'user') {
+        end = i
+        break
+      }
+    }
+    try {
+      await api.deleteTurn(threadId, turnIndex)
+      const remaining = msgs.slice(0, index).concat(msgs.slice(end))
+      commitThreadMessages(get, set, threadId, remaining)
+      // 删除的是最后一轮且残留挂起中断卡片（HITL 暂停的轮被删）→ 一并清理
+      if (end === msgs.length) {
+        set((s) => {
+          const pendingInterrupts = { ...s.pendingInterrupts }
+          delete pendingInterrupts[threadId]
+          const patch: Partial<AppState> = { pendingInterrupts }
+          if (normKey(s.currentThreadId) === threadId) patch.pendingInterrupt = null
+          return patch
+        })
+      }
+      void get().fetchThreads()
+    } catch (e) {
+      console.error('[前端] 删除轮次失败:', e)
+      // 本地状态可能与后端不一致（如后端轮数与前端不符），重载历史对齐
+      try {
+        const r = await api.getMessages(threadId)
+        commitThreadMessages(get, set, threadId, rawToMessages(r.messages))
+      } catch {
+        /* ignore */
+      }
+    }
   },
 
   resume: (payload) => {

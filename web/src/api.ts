@@ -181,6 +181,16 @@ export const api = {
     }),
   deleteThread: (thread_id: string) =>
     jsonFetch(`${BASE}/threads/${encodeURIComponent(thread_id)}`, { method: 'DELETE' }),
+  /**
+   * 删除会话内某一轮对话（用户消息 + AI 回复及工具调用链）。
+   * turnIndex 按 user 回合顺序计数（0-based），与会话窗口展示一致；
+   * 该会话正在流式执行时后端返回 409。
+   */
+  deleteTurn: (thread_id: string, turnIndex: number) =>
+    jsonFetch<{ deleted: boolean; thread_id: string; turn_index: number; removed_messages: number }>(
+      `${BASE}/threads/${encodeURIComponent(thread_id)}/turns/${turnIndex}`,
+      { method: 'DELETE' },
+    ),
   /** 重命名会话（修改展示名；空字符串清除自定义名，回落消息预览） */
   renameThread: (thread_id: string, title: string) =>
     jsonFetch<{ thread_id: string; title: string | null }>(

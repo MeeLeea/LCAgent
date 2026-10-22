@@ -204,6 +204,13 @@ export function ChatView() {
     [editAndResend],
   )
 
+  // 删除某一轮（仅 user 消息提供入口，流式执行中禁用）
+  const deleteTurn = useStore((s) => s.deleteTurn)
+  const handleDelete = useCallback(
+    (index: number) => () => void deleteTurn(index),
+    [deleteTurn],
+  )
+
   // 统计：消息数、工具调用数
   const toolCallCount = messages.reduce(
     (sum, m) => sum + (m.toolCalls?.length ?? 0),
@@ -280,6 +287,7 @@ export function ChatView() {
               message={m}
               onRegenerate={i === lastAssistantIdx && !isStreaming ? regenerate : undefined}
               onEdit={m.role === 'user' && !isStreaming ? handleEdit(i) : undefined}
+              onDelete={m.role === 'user' && !isStreaming ? handleDelete(i) : undefined}
             />
           ))}
           <InterruptCard />
