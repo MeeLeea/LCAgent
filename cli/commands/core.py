@@ -64,6 +64,7 @@ _HELP_LINES = [
     "  - 输入 'info' 查看当前模型信息 + 记忆状态",
     "  - 输入 'tools' 查看可用工具",
     "  - 输入 'clear [long|short|agent|all]' 清理记忆(默认 long; agent 清 agent 级跨会话记忆)",
+    "  - 输入 'session memory' 查看当前会话(thread 级)长期记忆",
     "  - 输入 'agent memory' 查看 agent 级(跨会话共享)长期记忆",
     "  - 输入 'compress' 压缩长期记忆(LLM摘要后替换原内容)",
     "  - 输入 'compress agent' 压缩 agent 级长期记忆(跨会话共享; 默认 compress 压缩 thread 级)",

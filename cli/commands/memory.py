@@ -185,6 +185,16 @@ async def compress_agent_memory(context: CommandContext) -> CommandOutcome:
     return HANDLED
 
 
+async def show_thread_memory(context: CommandContext) -> CommandOutcome:
+    """召回并展示当前会话（thread 级）长期记忆。"""
+    text = await context.agent.session_manager.arecall_memory()
+    if not text:
+        context.print("\n暂无会话级长期记忆")
+    else:
+        context.print("\n" + text.rstrip("\n"))
+    return HANDLED
+
+
 async def show_agent_memory(context: CommandContext) -> CommandOutcome:
     """召回并展示 agent 级（跨会话共享）长期记忆。"""
     text = await context.agent.session_manager.arecall_agent_memory()
