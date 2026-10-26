@@ -494,6 +494,18 @@ class SessionManager:
             return 0
         return await self._memory.clear_agent_facts()
 
+    async def arecall_memory(self, session_id: str | None = None, limit: int | None = None) -> str:
+        """召回当前（或指定）会话的 thread 级长期记忆并格式化为文本片段。
+
+        与 :meth:`arecall_agent_memory` 对应：本方法只读取 thread 级
+        namespace（``conv`` / ``business``，会话隔离），agent 级
+        （跨会话共享）记忆请用 :meth:`arecall_agent_memory`。
+        """
+        if self._memory is None:
+            return ""
+        sid = self._resolve_thread_id(session_id)
+        return await self._memory.recall_text(sid, limit)
+
     async def arecall_agent_memory(self, limit: int | None = None) -> str:
         """召回 agent 级长期记忆并格式化为文本片段。"""
         if self._memory is None:

@@ -27,8 +27,12 @@ class _FakeRegistry:
 class _FakeAgent:
     """最小 AgentCore mock，提供 SessionManager 所需的 session 引用。"""
 
-    def __init__(self, registry: _FakeRegistry) -> None:
+    def __init__(self, registry: _FakeRegistry, current_sid: str = "t1") -> None:
         self.session = registry
+        self._sid = current_sid
+
+    def _current_sid(self, thread_id: str | None) -> str:
+        return thread_id or self._sid
 
 
 def _make_manager() -> MemoryManager:
@@ -87,5 +91,39 @@ def test_adelete_session_without_memory_still_deletes():
         result = await sm.adelete_session("t1")
         assert result is True
         assert reg.deleted == "t1"
+
+    asyncio.run(run())
+
+
+def test_arecall_memory_returns_thread_level_text_only():
+    """arecall_memory 应只召回 thread 级记忆（agent 级不混入）。"""
+    async def run() -> None:
+        mgr = _make_manager()
+        await mgr.store.save_fact("t1", ThreadFactItem(content="thread-fact"))
+        await mgr.store.save_agent_fact(
+            ThreadFactItem(content="global-fact", category="user_fact")
+        )
+
+        sm = SessionManager(agent=_FakeAgent(_FakeRegistry(), current_sid="t1"), memory=mgr)
+
+        text = await sm.arecall_memory()
+        assert text.startswith("【长期记忆】")
+        assert "thread-fact" in text
+        assert "global-fact" not in text
+
+        # 显式指定 session_id 时按指定会话召回
+        await mgr.store.save_fact("t2", ThreadFactItem(content="other-thread"))
+        text_t2 = await sm.arecall_memory(session_id="t2")
+        assert "other-thread" in text_t2
+        assert "thread-fact" not in text_t2
+
+    asyncio.run(run())
+
+
+def test_arecall_memory_without_memory_returns_empty():
+    """记忆未注入（memory=None）时应返回空字符串。"""
+    async def run() -> None:
+        sm = SessionManager(agent=_FakeAgent(_FakeRegistry()), memory=None)
+        assert await sm.arecall_memory() == ""
 
     asyncio.run(run())
