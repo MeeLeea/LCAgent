@@ -823,6 +823,7 @@ CHECKPOINT_FILE = os.path.join(BASE_DIR, "data", "checkpoints_async.sqlite")
 | `clear short`                   | 清空当前会话(开启新 thread 替代删除)                                       |
 | `clear agent` 或 `clear 全局` | 清空 agent 级（跨会话共享）长期记忆（`MemoryManager.clear_agent_facts`） |
 | `clear all`                     | 全部清空（长期 facts + agent 级 + 新会话）                                 |
+| `session memory`                | 召回并展示当前会话（thread 级）长期记忆（`conv` / `business`，会话隔离）|
 | `agent memory`                  | 召回并展示 agent 级长期记忆（跨会话共享的`user_fact` / `lesson`）      |
 | `compress` 或 `压缩`          | 压缩当前 thread 级长期记忆(LLM 摘要后替换单个摘要 fact；默认作用域为 thread) |
 | `compress agent` 或 `压缩 agent` | 压缩 agent 级（跨会话共享）长期记忆(LLM 摘要后替换单个摘要 fact；别名 `compress:agent`) |
@@ -1046,6 +1047,7 @@ ThreadMemoryStore.replace_agent_facts_with_summary(summary)
 | `await acompress_agent_memory()`  | 压缩 agent 级（跨会话共享）长期记忆（阻塞 LLM 调用放入`asyncio.to_thread`，仅作用于 agent 级）                                               |
 | `await aclear_long_term_memory()` | 清空当前线程长期记忆（仅 thread 级；agent 级用`aclear_agent_memory` 或 `MemoryManager.clear_agent_facts`）                                   |
 | `await aclear_agent_memory()`     | 清空 agent 级（跨会话共享）长期记忆，返回清除数量                                                                                                |
+| `await arecall_memory(session_id=None, limit=None)` | 召回当前（或指定）会话的 thread 级长期记忆并格式化为文本片段（`【长期记忆】` 块）                                                              |
 | `await arecall_agent_memory()`    | 召回 agent 级长期记忆并格式化为文本片段（`【长期记忆】` 块）                                                                                   |
 
 ---
@@ -1209,7 +1211,7 @@ HTTP API（[api/server.py](api/server.py)）同样暴露三个 RESTful 端点，
 - **非流式接口**：`achat` / `aresume` / `arun`，收集全部 token 为最终文本
 - **会话管理委托**：`new_session` / `new_workflow_session` / `set_current_session` / `current_session_id` / `alist_sessions` / `aswitch_session` / `adelete_session` / `adelete_turn`（删除会话内某一轮） / `aget_messages` / `aexport_session` / `asummarize`
 - **会话基础配置**：`aget_session_config(thread_id)` / `aupdate_session_config(patch, thread_id)`（均在 per-thread 锁内执行，转发 `SessionRegistry`）
-- **记忆管理委托**：`aget_memory_summary` / `acompress_memory` / `aclear_long_term_memory` / `aclear_agent_memory` / `arecall_agent_memory`
+- **记忆管理委托**：`aget_memory_summary` / `acompress_memory` / `aclear_long_term_memory` / `aclear_agent_memory` / `arecall_memory` / `arecall_agent_memory`
 - **执行历史**：`aget_execution_history` / `aclear_history`
 - **上下文压缩**：`manually_compact(force, thread_id)`
 - **生命周期**：`aclose()`（刷新记忆 buffer + 释放 Agent 资源）
@@ -2335,6 +2337,7 @@ output = chat_until_completion(agent, "需要人工选择时请先问我")
 | `info`                                        | 查看当前模型和记忆状态(含 thread_id、会话数)                                 |
 | `tools`                                       | 查看可用工具列表（含 MCP 工具）                                              |
 | `clear [long\|short\|agent\|all]`                | 清理记忆（默认 long；agent 清 agent 级跨会话记忆）                           |
+| `session memory`                             | 召回并展示当前会话(thread 级)长期记忆                                       |
 | `agent memory`                                | 召回并展示 agent 级（跨会话共享）长期记忆                                    |
 | `compress` 或 `压缩`                        | 压缩当前会话(thread 级)长期记忆（LLM 摘要后替换原内容；默认作用域为 thread） |
 | `compress agent` 或 `压缩 agent`             | 压缩 agent 级（跨会话共享）长期记忆（LLM 摘要后替换原内容；别名 `compress:agent`） |
