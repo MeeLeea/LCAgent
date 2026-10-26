@@ -64,6 +64,10 @@ class FakeSessionManager:
         self.calls.append(("aclear_agent_memory", None))
         return 3
 
+    async def arecall_memory(self, session_id: str | None = None, limit: int | None = None) -> str:
+        self.calls.append(("arecall_memory", session_id))
+        return "【长期记忆】\n- [重要对话] 会话事实\n"
+
     async def arecall_agent_memory(self, limit: int | None = None) -> str:
         self.calls.append(("arecall_agent_memory", limit))
         return "【长期记忆】\n- [用户事实] 喜欢深色主题\n"
@@ -423,6 +427,17 @@ def test_dispatch_clear_agent_clears_agent_level_memory(harness: Harness) -> Non
     assert result.handled is True
     assert ("aclear_agent_memory", None) in harness.agent.session_manager.calls
     assert ("aclear_long_term_memory", None) not in harness.agent.session_manager.calls
+
+
+def test_dispatch_session_memory_recalls_thread_level_memory(harness: Harness) -> None:
+    # Given: thread-level memory recall returns formatted text.
+    # When: session memory is dispatched.
+    result = dispatch(harness, "session memory")
+    # Then: the recall text is printed and no LLM run is started.
+    assert result.handled is True
+    assert ("arecall_memory", None) in harness.agent.session_manager.calls
+    assert any("会话事实" in msg for msg in harness.printed)
+    assert harness.runners.calls == []
 
 
 def test_dispatch_agent_memory_recalls_agent_level_memory(harness: Harness) -> None:
