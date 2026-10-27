@@ -241,7 +241,7 @@ LangChainAgent/
 │   ├── lock_pool.py        # ThreadMemoryLockPool：per-thread 并发锁池
 │   ├── manager.py          # MemoryManager：统一门面（召回/消费/压缩/清理）
 │   ├── middleware.py       # 读写中间件（防抖 buffer + Fact 抽取 + prompt 注入）
-│   ├── models.py           # 数据模型与事件分类判定（MemoryCategory / ThreadFactItem，含 scope 字段）
+│   ├── models.py           # 数据模型与事件分类判定（MemoryCategory / ThreadFactItem，含 scope/topic_key/evidence/status 生命周期字段）
 │   └── store.py            # ThreadMemoryStore：Store 业务封装（agent 级 + thread 级两级 namespace）
 ├── llm/                    # LLM 客户端模块（从 agent/ 拆出，供主 Agent / 记忆链路共用）
 │   ├── __init__.py
@@ -481,7 +481,9 @@ Agent 有三种执行模式，对应三种不同的交互入口：
 │  │                        │  │    仅当前会话可见              │   │
 │  │                        │  │  • 写: 防抖→分类路由→LLM 抽取 │   │
 │  │                        │  │  • 读: 两级聚合注入 SystemMsg │   │
-│  │                        │  │  • 去重(agent 优先)+LRU 淘汰  │   │
+  │  │                        │  │  • 写: 防抖→抽取→去重→合并  │   │
+  │  │                        │  │  • 读: 状态过滤+主题收敛    │   │
+  │  │                        │  │  • 去重(agent优先)+LRU 淘汰  │   │
 │  └────────────────────────┘  └──────────────────────────────┘   │
 │                                                                  │
 │  基础设施: AgentMemory(checkpointer+Store) / MemoryContext(工厂)  │
@@ -496,20 +498,25 @@ Agent 有三种执行模式，对应三种不同的交互入口：
 ```
 写: SessionManager 消费 AgentEvent 流（submit_user_message / consume_event）
      → 非阻塞投递到 WriteMiddleware 防抖 buffer（30s 窗口）
-     → LLM Fact 抽取（content + category + confidence）
-     → 无效过滤 / 两级 existing 去重（agent 优先）
-     → 按 category 路由作用域：
-         • user_fact / lesson → agent namespace（跨会话共享）
-         • conv / business    → thread namespace（会话隔离）
-     → 分流批量写入 → 分流 LRU 淘汰
+     → LLM Fact 抽取（content + category + confidence + persistence + topic_key + evidence）
+     → 无效过滤 / 两级 existing 去重（agent 优先，content 精确比对）
+     → persistence 优先路由作用域（与 category 解耦）：
+         • persistence=global → agent namespace（跨会话共享；
+           confidence 低于 memory_confidence_floor 时降级 thread 级）
+         • persistence=session → thread namespace（会话隔离）
+         • persistence 缺失/非法 → 回退 category 旧路由（兼容）
+     → 同 topic_key 主题合并：既有 active 旧条目标记 superseded（取代而非追加）
+     → 分流批量写入 → 分流容量淘汰（superseded 优先，其后 active LRU）
          • agent 级超 200 条（memory_max_agent_facts）淘汰
          • thread 级超 60 条（memory_max_facts_per_thread）淘汰
 
 读: ThreadMemoryReadMiddleware.awrap_model_call（每个 model 调用前）
-     → 并行 query_agent_facts() + query_facts(thread_id)
+     → 并行 query_agent_facts() + query_facts(thread_id)（仅 status=active）
      → 合并 + content 精确去重（agent 优先，保留 agent 级版本）
+     → 同 topic_key 收敛为 create_time 最新一条（历史存量兜底）
      → 按 create_time 升序，截取 recall_limit（默认 20）条
-     → 格式化为文本，追加为 request.messages 末尾的 user 消息（【长期记忆】块）
+     → 格式化为文本（推断类附"（未实测）"、低置信附"（低置信）"标注），
+       追加为 request.messages 末尾的 user 消息（【长期记忆】块）
      → 非阻塞 touch 更新 last_used_at（按 scope 分发到两级 namespace）
 ```
 
@@ -521,11 +528,11 @@ Agent 有三种执行模式，对应三种不同的交互入口：
 | `MemoryContext`               | [memory/context.py](memory/context.py)           | 统一工厂：入口程序（main/api/scheduler）调用`acreate()` 组装全部组件，透传 `process_type` / `agent_key` / `max_agent_facts`，暴露 checkpointer / store / read_middleware / memory_manager                                                                                                                      |
 | `AgentMemory`                 | [memory/agent_memory.py](memory/agent_memory.py) | checkpointer（`AsyncSqliteSaver`）+ 长期记忆 Store（`AsyncSqliteStore`）基础设施；`process_type` 仅用于 thread_id 前缀（会话可见性），agent 级 namespace 由 `agent_key` 决定（默认跨进程共享）                                                                                                       |
 | `ThreadMemoryStore`           | [memory/store.py](memory/store.py)               | Store 业务封装：thread 级 facts 增/查/批量写/LRU 淘汰/摘要替换/会话级清空；agent 级方法族（`query_agent_facts` / `save_agent_facts_batch` / `count_agent_facts` / `clear_agent_facts` / `prune_agent_facts` / `touch_agent_fact` / `replace_agent_facts_with_summary`），构造参数含 `max_agent_facts` / `agent_key` |
-| `ThreadMemoryWriteMiddleware` | [memory/middleware.py](memory/middleware.py)     | 写服务：事件接收 + 防抖 buffer + Fact 抽取流水线（非 AgentMiddleware）；按`category` 路由到 agent / thread 两级作用域                                                                                                                                                                                |
-| `ThreadMemoryReadMiddleware`  | [memory/middleware.py](memory/middleware.py)     | 读中间件（AgentMiddleware）：`awrap_model_call` 并行读取两级 facts，合并去重（agent 优先）后注入为尾随 user 消息（不动 system message）                                                                                                                                                                                       |
+| `ThreadMemoryWriteMiddleware` | [memory/middleware.py](memory/middleware.py)     | 写服务：事件接收 + 防抖 buffer + Fact 抽取流水线（非 AgentMiddleware）；按`persistence` 优先（缺失回退 category）路由到 agent / thread 两级作用域；同 `topic_key` 主题合并（新条目取代旧条目）；低置信 global 降级 thread                                                                 |
+| `ThreadMemoryReadMiddleware`  | [memory/middleware.py](memory/middleware.py)     | 读中间件（AgentMiddleware）：`awrap_model_call` 并行读取两级 **active** facts，合并去重（agent 优先）+ 同 topic 收敛最新后注入为尾随 user 消息（推断/低置信附标注；不动 system message）                                                                                                               |
 | `ThreadMemoryLockPool`        | [memory/lock_pool.py](memory/lock_pool.py)       | per-thread`asyncio.Lock` 池：串行化同一 thread 的写入，不同 thread 并行                                                                                                                                                                                                                              |
-| `models.py`                   | [memory/models.py](memory/models.py)             | `MemoryCategory` / `ThreadFactItem`（含 `scope` 字段：`thread` / `agent`）/ `MemoryInputEvent` / `judge_long_term_memory` 分类判定                                                                                                                                                       |
-| `config.py`                   | [memory/config.py](memory/config.py)             | 运行时参数默认值（buffer 延迟 / 上限 / thread 级 fact 上限 / agent 级 fact 上限 / 召回条数）                                                                                                                                                                                                           |
+| `models.py`                   | [memory/models.py](memory/models.py)             | `MemoryCategory` / `ThreadFactItem`（含 `scope` / `topic_key` / `evidence` / `status` / `superseded_at` 生命周期字段）/ `MemoryInputEvent` / `judge_long_term_memory` 分类判定 / `normalize_topic_key` 主题键归一化                                                                                     |
+| `config.py`                   | [memory/config.py](memory/config.py)             | 运行时参数默认值（buffer 延迟 / 上限 / thread 级 fact 上限 / agent 级 fact 上限 / 召回条数 / agent 级写入置信度门槛 `memory_confidence_floor` / 低置信标注阈值 `memory_low_confidence_threshold`）                                                                                                     |
 
 > 除此之外还有一层 **Compaction 压缩中间件**（[midware/compaction.py](midware/compaction.py)）负责控制**单会话内的上下文长度**：每次 model 调用前按**预估 token**（字符数 /4 粗估）判断，超过 `max_context_tokens` 时 `before_model` 自动把旧消息增量摘要成 `state.summary`（随 checkpoint 持久化、per-thread 隔离）；同时**独立**于压缩触发条件地 Prune 过长的历史工具输出（保护最近 `keep_recent` 条消息），无需新开 thread。注意这与记忆系统的 `compress` 命令是两回事（前者压缩会话上下文，后者压缩长期记忆 facts）。详见[可观测性与可靠性 → 长上下文压缩中间件](#长上下文压缩中间件compaction)。
 
@@ -544,20 +551,26 @@ Agent 有三种执行模式，对应三种不同的交互入口：
 
 ```
 awrap_model_call
-   ↓ asyncio.gather(query_agent_facts(), query_facts(thread_id))
+   ↓ asyncio.gather(query_agent_facts(), query_facts(thread_id))（仅 status=active）
    ↓ 合并 + content 精确去重（agent 级优先，保留 agent 级版本）
-   ↓ 按 create_time 升序，截取 recall_limit（默认 20）条
-   ↓ 注入为尾随 user 消息（【长期记忆】块；system message 保持静态）
+   ↓ 同 topic_key 收敛为 create_time 最新一条（历史存量兜底）
+   ↓ 按 create_time 升序，截取 recall_limit（默认 20）条（主题收敛之后截取）
+   ↓ 注入为尾随 user 消息（【长期记忆】块；evidence=inferred 附"（未实测）"、
+     confidence 低于 memory_low_confidence_threshold 附"（低置信）"标注）
    ↓ 非阻塞 touch：agent 级调 touch_agent_fact，thread 级调 touch_fact
 ```
 
 **写入侧路由**（防抖 + LLM 抽取后）：
 
-- 抽取结果中 `category ∈ {user_fact, lesson}` → 组装 `scope="agent"` 的 `ThreadFactItem`，写入 agent namespace，触发 `prune_agent_facts()`；
-- 抽取结果中 `category ∈ {conv, business}` 或非法回退为 `conv` → 组装 `scope="thread"` 的 `ThreadFactItem`，写入 thread namespace，触发 `prune_facts(thread_id)`；
-- 去重基准同时读取两级 existing，按 `content` 精确比对，agent 级优先（避免同一条 fact 跨作用域重复）。
+- 抽取结果中 `persistence="global"`（或 persistence 缺失时 `category ∈ {user_fact, lesson}`）→ 组装 `scope="agent"` 的 `ThreadFactItem`，写入 agent namespace，触发 `prune_agent_facts()`；`confidence < memory_confidence_floor`（默认 0.7）的低置信 global 条目降级为 `scope="thread"` 写入 thread namespace，防止低置信内容污染跨会话共享空间；
+- 抽取结果中 `persistence="session"`（或 persistence 缺失时 `category ∈ {conv, business}` / 非法回退 `conv`）→ 组装 `scope="thread"` 的 `ThreadFactItem`，写入 thread namespace，触发 `prune_facts(thread_id)`；
+- **persistence 是 LLM 判定的"适用范围"**（会话局部环境状态 → session；跨会话普适契约/偏好 → global），与 category（内容性质）解耦，修复"一次性事件被误升为跨会话普适教训"；
+- 去重基准同时读取两级 existing，按 `content` 精确比对，agent 级优先（避免同一条 fact 跨作用域重复）；
+- **主题合并（topic_key）**：非空 `topic_key` 的写入条目与同 namespace 既有 active 条目同主题时，旧条目标记 `status="superseded"`（保留审计痕迹，读取注入时过滤），由新条目接管——同主题新旧版本不再并存自相矛盾；批内同 topic_key 多条时保留置信度最高者；`topic_key` 由 LLM 抽取输出、经 `normalize_topic_key` 确定性归一化（snake_case ≤50 字符），抽取 prompt 附带既有 topic_key 清单要求复用（防同主题键漂移）；为空时退化为追加（兼容旧数据）。
 
-> **写入路径**：事件筛选（`is_memory_worthy`：DONE / TOOL_RESULT 且 content 非空）→ 防抖 → `judge_long_term_memory` 确定性预判定（SKIP 丢弃 / 失败≥2 锁定 lesson 分类、内容走 LLM 蒸馏 / 其余交 LLM）→ LLM 抽取 → 按 `category` 路由到 agent / thread 作用域 → 去重 → 写入 → LRU 淘汰。
+> **写入路径**：事件筛选（`is_memory_worthy`：DONE / TOOL_RESULT 且 content 非空）→ 防抖 → `judge_long_term_memory` 确定性预判定（SKIP 丢弃 / 失败≥2 锁定 lesson 分类、内容走 LLM 蒸馏并判定 persistence / 其余交 LLM）→ LLM 抽取（含 persistence / topic_key / evidence）→ persistence 优先路由 → 去重 → 主题合并（supersede）→ 写入 → 容量淘汰（superseded 优先）。
+>
+> **确定性 lesson 的适用范围**：同类工具失败 ≥2 次的蒸馏 prompt 同样输出 `persistence`——会话局部环境状态（服务未初始化、资源未就绪等）默认 `session`（thread 级隔离），仅跨会话普适的根因才 `global`，蒸馏返回裸文本时保守回退 session 级。
 
 > **跨进程共享的已知取舍**：agent 级 namespace 默认跨进程共享，带来以下代价：
 >
@@ -727,22 +740,31 @@ _a_run_pipeline()  （buffer 超时后批量处理）
    ↓
 ① 确定性预判定  judge_long_term_memory(MemoryInputEvent)
    ↓ 返回 SKIP → 确定性丢弃；LESSON（同类失败≥2）→ 分类锁定 lesson（免 LLM 判定），
-   ↓ 内容剥离指令后缀后交 LLM 蒸馏成简短教训再入库（蒸馏失败则丢弃，绝不逐字存原文）；
+   ↓ 内容剥离指令后缀后交 LLM 蒸馏（输出 {lesson, persistence, topic_key} JSON：
+   ↓ 会话局部环境状态默认 session，仅跨会话普适教训 global）再入库
+   ↓ （蒸馏失败/判定无教训则丢弃，绝不逐字存原文）；
    ↓ IMPORTANT_CONVERSATION / None → 进入 LLM 抽取
-② LLM Fact 抽取  _a_extract_facts()
-   ↓ 从原始消息提取 {"content", "category", "confidence"} JSON 列表
+② 读取两级 existing（全量）：content 去重基准 + 既有 topic_key 清单
+③ LLM Fact 抽取  _a_extract_facts()
+   ↓ 从原始消息提取 {"content", "category", "confidence",
+   ↓   "persistence", "topic_key", "evidence"} JSON 列表
    ↓ important 消息带「用户明确要求记住」标注提高优先级
-③ 无效内容过滤（空 content 丢弃）
-④ 两级 existing 去重（同时读 query_agent_facts + query_facts(thread_id)，
-   按 content 精确比对，agent 级优先，避免跨作用域重复）
-⑤ 按 category 路由作用域并分流组装 ThreadFactItem：
-     • user_fact / lesson → scope="agent"，写入 agent namespace
-     • conv / business / 兜底 → scope="thread"，写入 thread namespace
-⑥ 分流批量写入：
-     • save_agent_facts_batch(agent_items) → ThreadMemoryStore（agent namespace）
-     • save_facts_batch(thread_id, thread_items) → ThreadMemoryStore（thread namespace）
+   ↓ prompt 附带既有 topic_key 清单（同主题复用，防键漂移）
+④ 无效内容过滤（空 content 丢弃）+ 两级 content 精确去重（agent 级优先）
+⑤ persistence 优先路由作用域并组装 ThreadFactItem：
+     • persistence=global → scope="agent"（confidence < memory_confidence_floor
+       时降级 scope="thread"，低置信内容不进跨会话共享空间）
+     • persistence=session → scope="thread"（会话隔离）
+     • persistence 缺失/非法 → 回退 category 旧路由（user_fact/lesson → agent，
+       其余 thread，兼容）
+⑥ 主题合并 + 分流批量写入：
+     • 批内同 topic_key：保留置信度最高者（平局取后出现者）
+     • 同 namespace 既有 active 同 topic_key 旧条目 → supersede_facts /
+       supersede_agent_facts 标记 superseded（先写新条目再标记旧条目，
+       保留审计痕迹，读取注入时过滤）
+     • save_agent_facts_batch(...)（agent 锁内）+ save_facts_batch(...)
    ↓
-⑦ 分流 LRU 淘汰：
+⑦ 分流容量淘汰（superseded/stale 优先于 active LRU）：
      • prune_agent_facts()：agent 级超 memory_max_agent_facts（默认 200）时淘汰
      • prune_facts(thread_id)：thread 级超 memory_max_facts_per_thread（默认 60）时淘汰
 ```
@@ -768,12 +790,14 @@ if self._memory is not None:
 
 | 返回值                     | 取值       | 作用域/行为                                                                             |
 | -------------------------- | ---------- | --------------------------------------------------------------------------------------- |
-| `LESSON_EXPERIENCE`      | `lesson` | **agent 级**（跨会话共享）——同类工具失败 ≥2 次，分类确定性锁定；内容由写中间件交 LLM 蒸馏（`_a_distill_lesson`）后入库，蒸馏失败/判定无教训则丢弃 |
+| `LESSON_EXPERIENCE`      | `lesson` | 同类工具失败 ≥2 次，分类确定性锁定；内容由写中间件交 LLM 蒸馏（`_a_distill_lesson`，输出含 persistence 判定：会话局部状态 → session/thread 级，跨会话普适 → global/agent 级）后入库，蒸馏失败/判定无教训则丢弃 |
 | `IMPORTANT_CONVERSATION` | `conv`   | 用户显式说"记住"，进入 LLM 抽取并带「用户明确要求记住」标注提高优先级                   |
 | `SKIP`                   | `skip`   | 单次失败的工具结果（且非显式记住）→ 确定性丢弃，不进 LLM 也不落库                      |
 | `None`                   | —         | 值得评估，分类交由 LLM 抽取（`user_fact` / `lesson` / `business` / `conv`）决定 |
 
-> **LLM 抽取是主闸门**：除「同类失败 ≥2 次」这一确定性信号外，最终分类（`user_fact` / `lesson` / `business` / `conv`）由 LLM 从原始对话中抽取结构化事实决定，并附带 `category` 与 `confidence`（置信度），无效分类回退为 `conv`（走 thread 级）。
+> **LLM 抽取是主闸门**：除「同类失败 ≥2 次」这一确定性信号外，最终分类（`user_fact` / `lesson` / `business` / `conv`）、**持久层级 `persistence`（session/global，决定作用域）、主题键 `topic_key`（同主题版本取代）、证据来源 `evidence`（tested/stated/inferred）**均由 LLM 从原始对话中抽取结构化事实决定，并附带 `confidence`（置信度）；无效分类回退为 `conv`（走 thread 级），无效 persistence 回退 category 旧路由，无效 topic_key/evidence 安全回退空主题/陈述型。
+
+> **记忆生命周期**：`ThreadFactItem` 携带 `status`（active / superseded / stale）、`topic_key`、`evidence`、`superseded_at` 字段。同主题新版本写入时旧条目自动标记 superseded（读取注入过滤、容量淘汰优先清理）；`evidence=inferred` 或低置信条目注入 prompt 时附「（未实测）」「（低置信）」标注，与实测事实显式区分。旧数据（无新字段）由 dataclass 默认值兜底为 active / 无主题 / 陈述型，行为与历史版本一致（无迁移需求）。项目级（workspace 级）作用域为后续演进方向，当前 persistence 仅 session/global 两档。
 
 ### 为什么 cot 不写入 checkpoint
 
@@ -3052,7 +3076,9 @@ asyncio.run(main())
 | `memory_max_facts_per_thread` | int  | 60     | 单线程最大 fact 条数（thread 级 LRU 淘汰上限；对应`conv` / `business` 类）                             |
 | `memory_max_agent_facts`      | int  | 200    | agent 级（跨会话共享）最大 fact 条数（agent 级 LRU 淘汰上限；对应`user_fact` / `lesson` 类）           |
 | `memory_agent_key`            | str  | `global` | agent 级长期记忆 namespace 标识（默认跨进程共享，可显式覆盖以隔离不同 agent 级记忆）                     |
-| `memory_recall_limit`         | int  | 20     | 召回长期记忆时的默认条数上限（聚合 agent 级 + thread 级去重后截取，同时约束每次 LLM 调用注入的 fact 条数） |
+| `memory_recall_limit`         | int  | 20     | 召回长期记忆时的默认条数上限（聚合 agent 级 + thread 级去重、同主题收敛后截取，同时约束每次 LLM 调用注入的 fact 条数） |
+| `memory_confidence_floor`     | float | 0.7   | agent 级写入置信度门槛：`persistence=global` 但 confidence 低于该值的 fact 降级写入 thread 级（防止低置信内容污染跨会话共享空间） |
+| `memory_low_confidence_threshold` | float | 0.6 | 读取注入时的低置信标注阈值：confidence 低于该值的条目注入 prompt 时附"（低置信）"标注 |
 | `session_enable_memory`       | bool | true   | SessionManager 是否启用长期记忆处理                                                                        |
 
 #### Agent 核心提示词（`agent/AGENT.md`）

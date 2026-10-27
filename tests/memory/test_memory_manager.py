@@ -202,8 +202,9 @@ class TestSubmitAndConsume:
 
     def test_consume_event_tool_result_failure_becomes_lesson(self):
         """TOOL_RESULT 失败事件经 consume_event 提取 event_type/tool_name，
-        同类失败 ≥2 次沉淀为 lesson（agent 级）：分类确定性锁定，
-        内容由 LLM 蒸馏后入库（不逐字存错误原文）。"""
+        同类失败 ≥2 次沉淀为 lesson：分类确定性锁定，内容由 LLM 蒸馏后
+        入库（不逐字存错误原文）。蒸馏返回裸文本时 persistence 保守取
+        session → thread 级（会话隔离），防止会话局部状态误升普适教训。"""
         async def run():
             from utils.events import AgentEvent, EventType
 
@@ -222,12 +223,14 @@ class TestSubmitAndConsume:
                 await mgr.consume_event(event)
             await mgr.flush_all()
 
-            agent_facts = await store.query_agent_facts()
-            assert len(agent_facts) == 1
-            assert agent_facts[0].category == "lesson"
-            assert agent_facts[0].scope == "agent"
+            thread_facts = await store.query_facts("t1")
+            assert len(thread_facts) == 1
+            assert thread_facts[0].category == "lesson"
+            assert thread_facts[0].scope == "thread"
             # 存的是蒸馏文本而非错误原文
-            assert agent_facts[0].content == distilled_text
+            assert thread_facts[0].content == distilled_text
+            # 跨会话共享空间未被污染
+            assert await store.query_agent_facts() == []
 
         asyncio.run(run())
 
