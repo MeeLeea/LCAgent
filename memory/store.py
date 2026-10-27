@@ -23,7 +23,13 @@ from typing import Any
 from langgraph.store.base import BaseStore
 from langgraph.store.memory import InMemoryStore
 
-from .models import MemoryCategory, ThreadFactItem
+from .models import (
+    FACT_STATUS_ACTIVE,
+    FACT_STATUS_SUPERSEDED,
+    MemoryCategory,
+    ThreadFactItem,
+    _naive_now,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,14 +112,23 @@ class ThreadMemoryStore:
     # ============ 内部公共方法（thread / agent 共用，消除重复） ============
 
     async def _query_facts_ns(
-        self, ns: tuple[str, ...]
+        self, ns: tuple[str, ...], active_only: bool = False
     ) -> list[ThreadFactItem]:
-        """读取指定 namespace 全部 facts，按 ``create_time`` 升序排列。"""
+        """读取指定 namespace 全部 facts，按 ``create_time`` 升序排列。
+
+        Args:
+            ns: namespace tuple
+            active_only: 为 True 时仅返回 ``status == "active"`` 的条目
+                （superseded / stale 被过滤，供 prompt 注入与召回使用）；
+                默认 False 返回全部（供审计 / 压缩 / 清理使用）
+        """
         # 查询上限取 thread 级与 agent 级容量上限的较大值，确保 asearch 不会
         # 在 max_agent_facts 配到 >200 时静默截断（原硬编码 200 与默认值撞车）
         limit = max(self._max_facts, self._max_agent_facts, 1)
         items = await self._store.asearch(ns, limit=limit)
         facts = [ThreadFactItem.from_dict(item.value) for item in items]
+        if active_only:
+            facts = [f for f in facts if f.status == FACT_STATUS_ACTIVE]
         facts.sort(key=lambda f: f.create_time)
         return facts
 
@@ -125,7 +140,11 @@ class ThreadMemoryStore:
             await self._store.aput(ns, key=item.fact_id, value=item.to_dict())
 
     async def _prune_ns(self, ns: tuple[str, ...], max_facts: int) -> int:
-        """按 ``last_used_at`` 淘汰最久未使用 fact，控制在 ``max_facts`` 以内。
+        """容量淘汰：非 active 优先、组内按 ``last_used_at`` 升序淘汰至 ``max_facts`` 以内。
+
+        淘汰优先级（元组排序，小者先淘汰）：
+        1. ``superseded`` / ``stale``（已被取代或过时，审计价值最低）优先淘汰
+        2. ``active`` 条目按 ``last_used_at`` 升序（最久未用先淘汰，LRU）
 
         Returns:
             被淘汰的 fact 数量
@@ -133,12 +152,47 @@ class ThreadMemoryStore:
         facts = await self._query_facts_ns(ns)
         if len(facts) <= max_facts:
             return 0
-        # 按 last_used_at 升序，淘汰最久未使用
-        facts.sort(key=lambda f: f.last_used_at)
+        # 非 active 优先淘汰；同优先级组内 LRU（last_used_at 升序）
+        facts.sort(
+            key=lambda f: (
+                0 if f.status != FACT_STATUS_ACTIVE else 1,
+                f.last_used_at,
+            )
+        )
         to_remove = facts[: len(facts) - max_facts]
         for fact in to_remove:
             await self._store.adelete(ns, key=fact.fact_id)
         return len(to_remove)
+
+    async def _supersede_facts_ns(
+        self, ns: tuple[str, ...], fact_ids: list[str]
+    ) -> int:
+        """将指定 facts 标记为 ``superseded``（被同主题新条目取代，保留审计）。
+
+        仅对 ``status == "active"`` 的条目生效：已是非 active 的条目跳过，
+        保留其原始 ``superseded_at`` 时间戳。
+
+        Args:
+            ns: namespace tuple
+            fact_ids: 待标记的 fact_id 列表
+
+        Returns:
+            实际标记的 fact 数量（不存在或已非 active 的不计入）
+        """
+        now = _naive_now().isoformat()
+        count = 0
+        for fact_id in fact_ids:
+            item = await self._store.aget(ns, key=fact_id)
+            if item is None:
+                continue
+            fact = ThreadFactItem.from_dict(item.value)
+            if fact.status != FACT_STATUS_ACTIVE:
+                continue
+            fact.status = FACT_STATUS_SUPERSEDED
+            fact.superseded_at = now
+            await self._store.aput(ns, key=fact.fact_id, value=fact.to_dict())
+            count += 1
+        return count
 
     async def _clear_ns(self, ns: tuple[str, ...]) -> int:
         """清空指定 namespace 全部 facts。"""
@@ -149,18 +203,24 @@ class ThreadMemoryStore:
 
     # ============ 读操作（thread 级，不加锁，允许并发读） ============
 
-    async def query_facts(self, thread_id: str) -> list[ThreadFactItem]:
+    async def query_facts(
+        self, thread_id: str, active_only: bool = False
+    ) -> list[ThreadFactItem]:
         """读取 thread 全部长期记忆 facts。
 
         读操作不加锁，允许并发读。按 ``create_time`` 升序排列。
 
         Args:
             thread_id: 会话线程 ID
+            active_only: 为 True 时仅返回 ``status == "active"`` 条目
+                （superseded / stale 过滤，供召回与 prompt 注入使用）
 
         Returns:
-            该 thread 的全部 facts 列表（可能为空）
+            该 thread 的 facts 列表（可能为空）
         """
-        return await self._query_facts_ns(self._facts_namespace(thread_id))
+        return await self._query_facts_ns(
+            self._facts_namespace(thread_id), active_only=active_only
+        )
 
     async def count_facts(self, thread_id: str) -> int:
         """统计 thread 的 fact 数量。"""
@@ -207,9 +267,10 @@ class ThreadMemoryStore:
     # ============ LRU 淘汰 ============
 
     async def prune_facts(self, thread_id: str) -> int:
-        """按 ``last_used_at`` 淘汰最久未使用 fact，防止单 thread 记忆膨胀。
+        """容量淘汰：非 active 优先 + LRU，防止单 thread 记忆膨胀。
 
-        当 fact 数量超过 ``max_facts`` 时，淘汰最旧的条目。
+        当 fact 数量超过 ``max_facts`` 时，先淘汰 ``superseded`` / ``stale``
+        条目，仍超限再按 ``last_used_at`` 淘汰最久未使用的 active 条目。
 
         Args:
             thread_id: 会话线程 ID
@@ -228,6 +289,23 @@ class ThreadMemoryStore:
                 self._max_facts,
             )
         return pruned
+
+    async def supersede_facts(self, thread_id: str, fact_ids: list[str]) -> int:
+        """将 thread 级指定 facts 标记为 ``superseded``（同主题新条目取代）。
+
+        写入合并路径调用：新记忆与既有 active 记忆 ``topic_key`` 相同时，
+        旧条目标记取代（保留审计痕迹），由新条目接管该主题。
+
+        Args:
+            thread_id: 会话线程 ID
+            fact_ids: 待标记的 fact_id 列表
+
+        Returns:
+            实际标记的条目数
+        """
+        return await self._supersede_facts_ns(
+            self._facts_namespace(thread_id), fact_ids
+        )
 
     async def touch_fact(self, thread_id: str, fact_id: str) -> None:
         """更新 fact 的 ``last_used_at``（用于 LRU 淘汰）。
@@ -356,15 +434,23 @@ class ThreadMemoryStore:
 
     # ============ Agent 级长期记忆（跨会话共享） ============
 
-    async def query_agent_facts(self) -> list[ThreadFactItem]:
+    async def query_agent_facts(
+        self, active_only: bool = False
+    ) -> list[ThreadFactItem]:
         """读取 agent 级全部长期记忆 facts。
 
         agent 级记忆跨会话共享（user_fact / lesson 类），按 ``create_time`` 升序排列。
 
+        Args:
+            active_only: 为 True 时仅返回 ``status == "active"`` 条目
+                （superseded / stale 过滤，供召回与 prompt 注入使用）
+
         Returns:
-            agent 级全部 facts 列表（可能为空）
+            agent 级 facts 列表（可能为空）
         """
-        return await self._query_facts_ns(self._facts_namespace("", scope="agent"))
+        return await self._query_facts_ns(
+            self._facts_namespace("", scope="agent"), active_only=active_only
+        )
 
     async def save_agent_fact(self, item: ThreadFactItem) -> None:
         """写入单条 agent 级 fact。
@@ -403,6 +489,22 @@ class ThreadMemoryStore:
     async def count_agent_facts(self) -> int:
         """统计 agent 级 fact 数量。"""
         return len(await self.query_agent_facts())
+
+    async def supersede_agent_facts(self, fact_ids: list[str]) -> int:
+        """将 agent 级指定 facts 标记为 ``superseded``（同主题新条目取代）。
+
+        agent namespace 跨进程共享，调用方（写中间件）必须已持有 agent 锁，
+        本方法不再自行加锁（与 :meth:`save_agent_facts_batch` 一致）。
+
+        Args:
+            fact_ids: 待标记的 fact_id 列表
+
+        Returns:
+            实际标记的条目数
+        """
+        return await self._supersede_facts_ns(
+            self._facts_namespace("", scope="agent"), fact_ids
+        )
 
     async def clear_agent_facts(self) -> int:
         """清空 agent 级全部长期记忆。

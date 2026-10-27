@@ -26,6 +26,14 @@ MEMORY_AGENT_KEY = "global"
 MEMORY_RECALL_LIMIT = 20
 """召回长期记忆时的默认条数上限"""
 
+# ── 写入质量门槛 ──
+MEMORY_CONFIDENCE_FLOOR = 0.7
+"""agent 级（跨会话共享）写入的置信度门槛：persistence=global 但 confidence
+低于该值的 fact 降级写入 thread 级（会话隔离），防止低置信内容污染全局"""
+
+MEMORY_LOW_CONFIDENCE_THRESHOLD = 0.6
+"""读取注入时的低置信标注阈值：confidence 低于该值的条目附"（低置信）"标注"""
+
 # ── Session 层开关 ──
 SESSION_ENABLE_MEMORY = True
 """SessionManager 是否启用长期记忆处理"""
@@ -38,6 +46,8 @@ CONFIG_KEYS = [
     "memory_max_agent_facts",
     "memory_agent_key",
     "memory_recall_limit",
+    "memory_confidence_floor",
+    "memory_low_confidence_threshold",
     "session_enable_memory",
 ]
 
@@ -49,5 +59,7 @@ DEFAULTS = {
     "memory_max_agent_facts": MEMORY_MAX_AGENT_FACTS,
     "memory_agent_key": MEMORY_AGENT_KEY,
     "memory_recall_limit": MEMORY_RECALL_LIMIT,
+    "memory_confidence_floor": MEMORY_CONFIDENCE_FLOOR,
+    "memory_low_confidence_threshold": MEMORY_LOW_CONFIDENCE_THRESHOLD,
     "session_enable_memory": SESSION_ENABLE_MEMORY,
 }
