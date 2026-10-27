@@ -6,6 +6,7 @@
 - ``MemoryCategory``: 记忆分类枚举
 - ``judge_long_term_memory``: 事件分类判定函数
 - ``normalize_topic_key``: 主题键归一化（写入合并的稳定性前提）
+- ``memory_score``: 淘汰 score（置信度软化 × 时间衰减），供容量淘汰排序使用
 
 记忆生命周期字段（status / evidence / topic_key）：
 - ``status``: ``active`` 生效 / ``superseded`` 被同主题新条目取代（保留审计） / ``stale`` 人工标记过时
@@ -16,6 +17,7 @@
 """
 from __future__ import annotations
 
+import math
 import re
 import uuid
 from dataclasses import asdict, dataclass, field, fields
@@ -27,6 +29,31 @@ from typing import Any
 def _naive_now() -> datetime:
     """返回本地 naive 时间（无时区），兼容历史数据格式。"""
     return datetime.now()  # noqa: DTZ005
+
+
+# ── 记忆淘汰 score 时间衰减常量 ──
+# 公式：score = (confidence ** 0.5) × e^(-λ × Δt_days)
+# confidence 是 LLM 抽取的**未校准**浮点数（普遍集中在 0.7~0.9，默认 0.8），
+# 0.01 抖动即可能跨越档位边界，故用 confidence ** 0.5 软化后再衰减，降低边界杠杆。
+# λ 按 confidence 分档：数值越小衰减越慢（记忆保留越久）。
+# 30/90/180 天为**待观察调参的初值**，非既定结论——首个观察期内人工抽查淘汰合理性再调。
+_CONFIDENCE_SOFTEN_EXPONENT = 0.5
+"""confidence 软化指数 α（score = confidence ** α × 衰减因子）。"""
+
+_LAMBDA_HIGH = math.log(2) / 180
+"""高档（confidence ≥ 0.9）衰减系数：半衰期 180 天。"""
+
+_LAMBDA_MID = math.log(2) / 90
+"""中档（0.7 ≤ confidence < 0.9）衰减系数：半衰期 90 天。"""
+
+_LAMBDA_LOW = math.log(2) / 30
+"""低档（confidence < 0.7）衰减系数：半衰期 30 天。"""
+
+_CONFIDENCE_HIGH_BAND = 0.9
+"""高低档分界（≥ 该值走 _LAMBDA_HIGH）。"""
+
+_CONFIDENCE_MID_BAND = 0.7
+"""中低档分界（≥ 该值走 _LAMBDA_MID，否则走 _LAMBDA_LOW）。"""
 
 
 # ── 记忆状态（status 字段取值） ──
@@ -222,6 +249,91 @@ def judge_long_term_memory(event: MemoryInputEvent) -> MemoryCategory | None:
     return None
 
 
+def memory_score(
+    confidence: float,
+    last_used_at: datetime | str | None,
+    create_time: datetime | str | None,
+    now: datetime | None = None,
+) -> float:
+    """计算记忆条目的淘汰 score（置信度软化 × 时间衰减）。
+
+    公式：``score = (confidence ** 0.5) × e^(-λ × Δt_days)``。
+
+    设计要点：
+    - confidence 为 LLM 抽取的未校准浮点数，用 ``confidence ** 0.5`` 软化，
+      降低档位边界附近（0.7 / 0.9）的抖动杠杆。
+    - λ 随 confidence 分档：≥0.9 → ``_LAMBDA_HIGH``（半衰期 180 天）；
+      0.7 ≤ c < 0.9 → ``_LAMBDA_MID``（90 天）；< 0.7 → ``_LAMBDA_LOW``（30 天）。
+      高置信条目衰减更慢，即"重要记忆保留更久"。
+    - ``Δt_days`` = now − last_used_at；last_used_at 缺失/为空时回退 create_time；
+      两者均缺失时无时间衰减，返回 ``confidence ** 0.5``（timeless）。
+    - 防御性钳制：confidence 非有限值（None / NaN）按 0.0 处理，超出 [0, 1] 截断；
+      时间字段晚于 now（时钟漂移）时 Δt 负值钳制为 0，不产生放大（>1 因子）。
+
+    纯函数、无副作用：不读写 Store，score 为读取时派生值，不落库。
+
+    Args:
+        confidence: 置信度（预期 0.0~1.0，非法值被钳制/兜底）
+        last_used_at: 最后使用时间（datetime 或 naive ISO 字符串；缺省回退 create_time）
+        create_time: 创建时间（datetime 或 naive ISO 字符串；均缺省则 timeless）
+        now: 基准时间（None 时取本地当前 naive 时间；测试应显式传入以消除墙钟依赖）
+
+    Returns:
+        非负的淘汰 score（数值越小越应优先淘汰）
+    """
+    # 基准时间同样走 _parse_time_anchor 归一化：消除 tz-aware now 与 naive 锚点相减的 TypeError
+    reference = _parse_time_anchor(now) or _naive_now()
+
+    # 1. 防御性钳制 confidence 到 [0.0, 1.0]（None/NaN 归 0）
+    if confidence is None or not math.isfinite(confidence):
+        clamped = 0.0
+    else:
+        clamped = min(1.0, max(0.0, float(confidence)))
+
+    softened = clamped ** _CONFIDENCE_SOFTEN_EXPONENT
+
+    # 2. 解析时间锚点：优先 last_used_at，回退 create_time
+    anchor = _parse_time_anchor(last_used_at) or _parse_time_anchor(create_time)
+    if anchor is None:
+        # 时间字段全缺失 → timeless（只按置信度）
+        return softened
+
+    # 3. Δt 钳制为 0 以上（时钟漂移不放大分数）
+    delta_days = max(0.0, (reference - anchor).total_seconds() / 86400.0)
+
+    # 4. 按 confidence 分档取 λ
+    if clamped >= _CONFIDENCE_HIGH_BAND:
+        lam = _LAMBDA_HIGH
+    elif clamped >= _CONFIDENCE_MID_BAND:
+        lam = _LAMBDA_MID
+    else:
+        lam = _LAMBDA_LOW
+
+    return softened * math.exp(-lam * delta_days)
+
+
+def _parse_time_anchor(value: datetime | str | None) -> datetime | None:
+    """把时间字段（datetime / ISO 字符串 / None）解析为 naive datetime。
+
+    兼容历史数据格式：空串 / None / 非法字符串一律返回 ``None``（视为缺失），
+    不做异常抛出，保证 legacy 数据（缺字段）与脏数据不阻断 prune 流程。
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        # 统一为 naive：丢弃时区信息，与 ISO 字符串分支 / _naive_now 口径一致
+        return value.replace(tzinfo=None)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    # 统一为 naive：丢弃时区信息，与 _naive_now 口径一致
+    return parsed.replace(tzinfo=None)
+
+
 __all__ = [
     "EVIDENCE_INFERRED",
     "EVIDENCE_STATED",
@@ -238,5 +350,6 @@ __all__ = [
     "MemoryInputEvent",
     "ThreadFactItem",
     "judge_long_term_memory",
+    "memory_score",
     "normalize_topic_key",
 ]

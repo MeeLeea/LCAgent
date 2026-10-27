@@ -25,10 +25,12 @@ from langgraph.store.memory import InMemoryStore
 
 from .models import (
     FACT_STATUS_ACTIVE,
+    FACT_STATUS_STALE,
     FACT_STATUS_SUPERSEDED,
     MemoryCategory,
     ThreadFactItem,
     _naive_now,
+    memory_score,
 )
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,21 @@ logger = logging.getLogger(__name__)
 # namespace 常量
 _NS_FACTS = "thread_facts"
 _NS_AGENT = "global_facts"
+
+# 淘汰状态优先级（显式分区，数值小者先淘汰）：
+# - superseded / stale：已被取代或过时，审计价值最低 → 优先物理删除
+# - active：按 memory_score 升序淘汰最低分
+# 说明：Phase 2 将新增 forgotten（软删除，跳过不删且不占容量）作为第三分区，
+# 届时只需在此映射补一个更大的优先级值并在 _prune_ns 中按映射分区，无需重写函数。
+_PRUNE_STATUS_PRIORITY: dict[str, int] = {
+    FACT_STATUS_SUPERSEDED: 0,
+    FACT_STATUS_STALE: 0,
+    FACT_STATUS_ACTIVE: 1,
+}
+"""状态 → 淘汰优先级映射（数值小者先淘汰）。未登记状态回退 _PRUNE_UNKNOWN_PRIORITY。"""
+
+_PRUNE_UNKNOWN_PRIORITY = 0
+"""未登记状态的默认淘汰优先级（保守：视为最高淘汰优先级，与旧 `0 if != active` 语义一致）。"""
 
 # asearch 默认上限（LangGraph Store asearch 默认 limit=10，此处按容量上限动态取值，
 # 确保 agent 级配置 max_agent_facts > 200 时不会被静默截断，避免漏读/漏淘汰）
@@ -140,11 +157,17 @@ class ThreadMemoryStore:
             await self._store.aput(ns, key=item.fact_id, value=item.to_dict())
 
     async def _prune_ns(self, ns: tuple[str, ...], max_facts: int) -> int:
-        """容量淘汰：非 active 优先、组内按 ``last_used_at`` 升序淘汰至 ``max_facts`` 以内。
+        """容量淘汰：状态分区 + active 组内按 ``memory_score`` 升序淘汰。
 
-        淘汰优先级（元组排序，小者先淘汰）：
-        1. ``superseded`` / ``stale``（已被取代或过时，审计价值最低）优先淘汰
-        2. ``active`` 条目按 ``last_used_at`` 升序（最久未用先淘汰，LRU）
+        淘汰优先级（分区映射 ``_PRUNE_STATUS_PRIORITY``，数值小者先淘汰）：
+        1. ``superseded`` / ``stale``（已被取代或过时，审计价值最低）优先物理删除
+        2. ``active`` 条目按 ``memory_score`` 升序（分数最低者先淘汰；
+           score = confidence^0.5 × 时间衰减，低置信/久未访问者分数低）
+
+        score 为读取时计算的派生值，**不落库**（避免存储 stale score）。
+
+        时序说明：本方法内以 ``_naive_now()`` 为基准时间逐条计算 score，
+        同一轮淘汰内所有条目的基准时间一致（同一次 prune 调用），排序稳定。
 
         Returns:
             被淘汰的 fact 数量
@@ -152,13 +175,23 @@ class ThreadMemoryStore:
         facts = await self._query_facts_ns(ns)
         if len(facts) <= max_facts:
             return 0
-        # 非 active 优先淘汰；同优先级组内 LRU（last_used_at 升序）
-        facts.sort(
-            key=lambda f: (
-                0 if f.status != FACT_STATUS_ACTIVE else 1,
-                f.last_used_at,
+
+        now = _naive_now()
+
+        def _sort_key(fact: ThreadFactItem) -> tuple[int, float]:
+            """淘汰排序键：(状态优先级升序, active 组内 score 升序)。"""
+            priority = _PRUNE_STATUS_PRIORITY.get(
+                fact.status, _PRUNE_UNKNOWN_PRIORITY
             )
-        )
+            score = memory_score(
+                fact.confidence,
+                fact.last_used_at or None,
+                fact.create_time or None,
+                now=now,
+            )
+            return (priority, score)
+
+        facts.sort(key=_sort_key)
         to_remove = facts[: len(facts) - max_facts]
         for fact in to_remove:
             await self._store.adelete(ns, key=fact.fact_id)
@@ -267,10 +300,11 @@ class ThreadMemoryStore:
     # ============ LRU 淘汰 ============
 
     async def prune_facts(self, thread_id: str) -> int:
-        """容量淘汰：非 active 优先 + LRU，防止单 thread 记忆膨胀。
+        """容量淘汰：状态分区 + score 衰减，防止单 thread 记忆膨胀。
 
         当 fact 数量超过 ``max_facts`` 时，先淘汰 ``superseded`` / ``stale``
-        条目，仍超限再按 ``last_used_at`` 淘汰最久未使用的 active 条目。
+        条目，仍超限再按 ``memory_score`` 升序（分数最低者先淘汰）淘汰 active 条目。
+        score = confidence^0.5 × 时间衰减（低置信/久未访问者分数低）。
 
         Args:
             thread_id: 会话线程 ID
@@ -518,9 +552,10 @@ class ThreadMemoryStore:
         return cleared
 
     async def prune_agent_facts(self) -> int:
-        """按 ``last_used_at`` 淘汰最久未使用 fact，控制 agent 级记忆在上限内。
+        """按 ``memory_score`` 淘汰最低分 fact，控制 agent 级记忆在上限内。
 
-        当 fact 数量超过 ``max_agent_facts`` 时，淘汰最旧的条目。
+        当 fact 数量超过 ``max_agent_facts`` 时，先淘汰非 active 条目，
+        其余 active 条目按 score（置信度软化 × 时间衰减）升序淘汰。
 
         Returns:
             被淘汰的 fact 数量
