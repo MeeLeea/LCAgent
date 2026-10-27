@@ -525,6 +525,88 @@ class MemoryManager:
         """统计指定会话的长期记忆条数。"""
         return await self._store.count_facts(thread_id)
 
+    # ============ 显式遗忘（软删除） ============
+
+    async def forget(
+        self,
+        thread_id: str,
+        keyword: str | None = None,
+        topic_key: str | None = None,
+        fact_id: str | None = None,
+    ) -> int:
+        """显式遗忘该会话的部分长期记忆（软删除为 ``forgotten``）。
+
+        串行化顺序与 :meth:`clear` 一致（防"复活"）：
+
+        1. 先 ``cleanup_thread`` 丢弃该 thread 未 flush 的缓冲事件（取消定时器 +
+            弹出 buffer）——否则遗忘后紧接着的防抖 flush 会把同一事实重新写成
+            active，使刚遗忘的条目"复活"；
+        2. 再持 per-thread 锁执行标记，与正在进行的写流水线串行化。
+
+        只标记不物理删除（调用 :meth:`ThreadMemoryStore.forget_facts`），
+        物理清理由 :meth:`ThreadMemoryStore.purge_forgotten` 承接。
+
+        Args:
+            thread_id: 会话线程 ID
+            keyword: 内容关键词（不区分大小写子串匹配）
+            topic_key: 主题键（内部先归一化）
+            fact_id: 记忆条目 ID（精确匹配）
+
+        Returns:
+            实际标记为 forgotten 的条数
+
+        Raises:
+            ValueError: 三个匹配条件全部缺失（由 Store 层抛出）
+        """
+        # 1. 丢弃未 flush 的缓冲事件，避免遗忘后被回写"复活"
+        await self._write_middleware.cleanup_thread(thread_id)
+        # 2. 与可能正在进行的 flush 串行化
+        lock = await self._lock_pool.get(thread_id)
+        async with lock:
+            return await self._store.forget_facts(
+                thread_id,
+                keyword=keyword,
+                topic_key=topic_key,
+                fact_id=fact_id,
+            )
+
+    async def forget_agent(
+        self,
+        keyword: str | None = None,
+        topic_key: str | None = None,
+        fact_id: str | None = None,
+    ) -> int:
+        """显式遗忘 agent 级（跨会话共享）部分长期记忆（软删除）。
+
+        串行化顺序与 :meth:`clear_agent_facts` 一致：先 ``flush_all()`` 把所有
+        thread 的防抖 buffer 写库（agent facts 可能来自任意 thread 的在途事件），
+        再持 agent 锁执行标记——先冲刷再标记，保证在途事件写入的条款也被本次
+        遗忘条件覆盖，不留"复活"窗口。
+
+        锁序约束：本方法只获取 agent 锁，不获取 per-thread 锁（与
+        :meth:`clear_agent_facts` 相同，避免与写流水线反向加锁死锁）。
+
+        Args:
+            keyword: 内容关键词（不区分大小写子串匹配）
+            topic_key: 主题键（内部先归一化）
+            fact_id: 记忆条目 ID（精确匹配）
+
+        Returns:
+            实际标记为 forgotten 的条数
+
+        Raises:
+            ValueError: 三个匹配条件全部缺失（由 Store 层抛出）
+        """
+        # 1. 先冲刷全部防抖 buffer，防止遗忘后被在途 flush 写回"复活"
+        await self._write_middleware.flush_all()
+        # 2. 持 agent 锁标记，与并发写流水线串行化
+        async with self._agent_lock:
+            return await self._store.forget_agent_facts(
+                keyword=keyword,
+                topic_key=topic_key,
+                fact_id=fact_id,
+            )
+
     # ============ 生命周期 ============
 
     async def flush_all(self) -> None:

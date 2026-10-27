@@ -40,6 +40,7 @@ from .config import (
 from .lock_pool import AgentMemoryLock, ThreadMemoryLockPool
 from .models import (
     EVIDENCE_INFERRED,
+    FACT_STATUS_FORGOTTEN,
     PERSISTENCE_GLOBAL,
     PERSISTENCE_SESSION,
     VALID_EVIDENCES,
@@ -334,10 +335,21 @@ class ThreadMemoryWriteMiddleware:
             extract_messages.append((role, content, important))
 
         # ② 读取两级 existing 作为去重基准 + 提取既有 topic_key 清单。
-        #    全量读取（含 superseded）：content 完全相同即视为"已记过"跳过，
+        #    全量读取（含 superseded / stale）：content 完全相同即视为"已记过"跳过，
         #    与既有语义一致；topic_key 清单供抽取/蒸馏 prompt 复用（防漂移）。
-        existing_thread = await self._store.query_facts(thread_id)
-        existing_agent = await self._store.query_agent_facts()
+        #    **排除 forgotten**（软删除）：否则同一事实被遗忘后再次说出会被静默
+        #    丢弃、永远无法重新学习，与「遗忘后可恢复/重新学习」语义矛盾。
+        #    该过滤同时作用于去重基准 / topic_key 清单 / supersede 目标三处消费点。
+        existing_thread = [
+            f
+            for f in await self._store.query_facts(thread_id)
+            if f.status != FACT_STATUS_FORGOTTEN
+        ]
+        existing_agent = [
+            f
+            for f in await self._store.query_agent_facts()
+            if f.status != FACT_STATUS_FORGOTTEN
+        ]
         existing_topic_keys = sorted({
             f.topic_key
             for f in [*existing_agent, *existing_thread]

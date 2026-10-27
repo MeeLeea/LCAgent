@@ -66,10 +66,15 @@ FACT_STATUS_SUPERSEDED = "superseded"
 FACT_STATUS_STALE = "stale"
 """人工/机制标记过时，读取注入时过滤"""
 
+FACT_STATUS_FORGOTTEN = "forgotten"
+"""用户/模型显式遗忘（软删除）：读取注入、容量基数、prune 一律跳过；
+不同于 superseded（系统判定被取代），forgotten 是用户意志，可由后台 purge 物理清理。"""
+
 VALID_FACT_STATUSES: frozenset[str] = frozenset({
     FACT_STATUS_ACTIVE,
     FACT_STATUS_SUPERSEDED,
     FACT_STATUS_STALE,
+    FACT_STATUS_FORGOTTEN,
 })
 
 # ── 证据来源（evidence 字段取值） ──
@@ -160,8 +165,11 @@ class ThreadFactItem:
         evidence: 证据来源。``"tested"`` 实测验证 / ``"stated"`` 对话陈述（默认） /
             ``"inferred"`` 未经实测的推断——读取注入时推断类附"（未实测）"标注
         status: 生命周期状态。``"active"`` 生效（默认）/ ``"superseded"`` 被同主题
-            新条目取代（保留审计）/ ``"stale"`` 标记过时。读取注入时过滤非 active
+            新条目取代（保留审计）/ ``"stale"`` 标记过时 /
+            ``"forgotten"`` 用户显式遗忘（软删除）。读取注入时过滤非 active
         superseded_at: 被取代时间（naive ISO 字符串，仅 status=superseded 时非空）
+        forgotten_at: 被遗忘时间（naive ISO 字符串，仅 status=forgotten 时非空；
+            legacy 数据缺失该字段时为 None，后台 purge 按此判断老化期限）
     """
 
     fact_id: str = field(default_factory=lambda: uuid.uuid4().hex)
@@ -176,6 +184,7 @@ class ThreadFactItem:
     evidence: str = EVIDENCE_STATED
     status: str = FACT_STATUS_ACTIVE
     superseded_at: str = ""
+    forgotten_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """序列化为 dict（用于 Store.aput value）。"""
@@ -339,6 +348,7 @@ __all__ = [
     "EVIDENCE_STATED",
     "EVIDENCE_TESTED",
     "FACT_STATUS_ACTIVE",
+    "FACT_STATUS_FORGOTTEN",
     "FACT_STATUS_STALE",
     "FACT_STATUS_SUPERSEDED",
     "PERSISTENCE_GLOBAL",

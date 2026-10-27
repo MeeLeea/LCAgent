@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from typing import Any
 
 from langgraph.store.base import BaseStore
@@ -25,12 +26,15 @@ from langgraph.store.memory import InMemoryStore
 
 from .models import (
     FACT_STATUS_ACTIVE,
+    FACT_STATUS_FORGOTTEN,
     FACT_STATUS_STALE,
     FACT_STATUS_SUPERSEDED,
     MemoryCategory,
     ThreadFactItem,
     _naive_now,
+    _parse_time_anchor,
     memory_score,
+    normalize_topic_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,8 +46,8 @@ _NS_AGENT = "global_facts"
 # 淘汰状态优先级（显式分区，数值小者先淘汰）：
 # - superseded / stale：已被取代或过时，审计价值最低 → 优先物理删除
 # - active：按 memory_score 升序淘汰最低分
-# 说明：Phase 2 将新增 forgotten（软删除，跳过不删且不占容量）作为第三分区，
-# 届时只需在此映射补一个更大的优先级值并在 _prune_ns 中按映射分区，无需重写函数。
+# 注意：forgotten 不在此映射中——它是**跳过分区**（见 _PRUNE_SKIPPED_STATUSES），
+# 既不参与排序淘汰，也不计入容量基数（留给后台 purge 物理清理）。
 _PRUNE_STATUS_PRIORITY: dict[str, int] = {
     FACT_STATUS_SUPERSEDED: 0,
     FACT_STATUS_STALE: 0,
@@ -53,6 +57,13 @@ _PRUNE_STATUS_PRIORITY: dict[str, int] = {
 
 _PRUNE_UNKNOWN_PRIORITY = 0
 """未登记状态的默认淘汰优先级（保守：视为最高淘汰优先级，与旧 `0 if != active` 语义一致）。"""
+
+_PRUNE_SKIPPED_STATUSES: frozenset[str] = frozenset({FACT_STATUS_FORGOTTEN})
+"""prune 跳过分区：既不淘汰也不计入容量基数（软删除，等后台 purge）。
+
+显式独立于 _PRUNE_STATUS_PRIORITY 的跳过分区，避免用"极大优先级"技巧
+表达"不删"，语义更直接；Phase 3 后台 purge 承接 forgotten 的物理清理。
+"""
 
 # asearch 默认上限（LangGraph Store asearch 默认 limit=10，此处按容量上限动态取值，
 # 确保 agent 级配置 max_agent_facts > 200 时不会被静默截断，避免漏读/漏淘汰）
@@ -157,42 +168,61 @@ class ThreadMemoryStore:
             await self._store.aput(ns, key=item.fact_id, value=item.to_dict())
 
     async def _prune_ns(self, ns: tuple[str, ...], max_facts: int) -> int:
-        """容量淘汰：状态分区 + active 组内按 ``memory_score`` 升序淘汰。
+        """容量淘汰：三分区（可删 / 跳过 / active score）+ 容量基数排除 forgotten。
 
-        淘汰优先级（分区映射 ``_PRUNE_STATUS_PRIORITY``，数值小者先淘汰）：
-        1. ``superseded`` / ``stale``（已被取代或过时，审计价值最低）优先物理删除
-        2. ``active`` 条目按 ``memory_score`` 升序（分数最低者先淘汰；
-           score = confidence^0.5 × 时间衰减，低置信/久未访问者分数低）
+        分区语义（``_PRUNE_SKIPPED_STATUSES`` 为跳过分区）：
+        1. ``superseded`` / ``stale``（及未登记状态）：可物理删除，审计价值最低，优先淘汰
+        2. ``forgotten``：**完全跳过**——既不淘汰也不计入容量基数（软删除，
+           物理清理由 Phase 3 后台 :meth:`purge_forgotten` 承接）
+        3. ``active``：按 ``memory_score`` 升序淘汰分数最低者
 
-        score 为读取时计算的派生值，**不落库**（避免存储 stale score）。
+        容量基数 = 全部 facts 数 − forgotten 数。若 forgotten 占用额度会导致
+        prune 过量淘汰 active（与计划风险表「prune 过量淘汰 active」对应）。
 
-        时序说明：本方法内以 ``_naive_now()`` 为基准时间逐条计算 score，
-        同一轮淘汰内所有条目的基准时间一致（同一次 prune 调用），排序稳定。
+        score 为读取时计算的派生值，**不落库**（避免存储 stale score）；
+        同一轮淘汰内所有条目基准时间一致（同一次 ``_naive_now()``）。
 
         Returns:
             被淘汰的 fact 数量
         """
         facts = await self._query_facts_ns(ns)
-        if len(facts) <= max_facts:
+        # 容量基数排除跳过分区（forgotten）
+        countable = [
+            f for f in facts if f.status not in _PRUNE_SKIPPED_STATUSES
+        ]
+        overflow = len(countable) - max_facts
+        if overflow <= 0:
             return 0
 
         now = _naive_now()
 
-        def _sort_key(fact: ThreadFactItem) -> tuple[int, float]:
-            """淘汰排序键：(状态优先级升序, active 组内 score 升序)。"""
-            priority = _PRUNE_STATUS_PRIORITY.get(
-                fact.status, _PRUNE_UNKNOWN_PRIORITY
-            )
-            score = memory_score(
+        def _score_of(fact: ThreadFactItem) -> float:
+            """计算单条 fact 的 score（低分先淘汰）。"""
+            return memory_score(
                 fact.confidence,
                 fact.last_used_at or None,
                 fact.create_time or None,
                 now=now,
             )
-            return (priority, score)
 
-        facts.sort(key=_sort_key)
-        to_remove = facts[: len(facts) - max_facts]
+        # 可删分区（非 active）：先按状态优先级、同优先级内按 score 升序
+        deletable = [f for f in countable if f.status != FACT_STATUS_ACTIVE]
+        deletable.sort(
+            key=lambda f: (
+                _PRUNE_STATUS_PRIORITY.get(f.status, _PRUNE_UNKNOWN_PRIORITY),
+                _score_of(f),
+            )
+        )
+        # active 分区：score 升序（分数最低者先淘汰）
+        active = [f for f in countable if f.status == FACT_STATUS_ACTIVE]
+        active.sort(key=_score_of)
+
+        # 先淘汰可删分区，仍超限再按 score 淘汰 active
+        to_remove = deletable[:overflow]
+        remaining = overflow - len(to_remove)
+        if remaining > 0:
+            to_remove.extend(active[:remaining])
+
         for fact in to_remove:
             await self._store.adelete(ns, key=fact.fact_id)
         return len(to_remove)
@@ -234,6 +264,108 @@ class ThreadMemoryStore:
             await self._store.adelete(ns, key=fact.fact_id)
         return len(facts)
 
+    async def _forget_facts_ns(
+        self,
+        ns: tuple[str, ...],
+        keyword: str | None = None,
+        topic_key: str | None = None,
+        fact_id: str | None = None,
+    ) -> int:
+        """把指定 namespace 中命中的 facts 标记为 ``forgotten``（软删除）。
+
+        匹配优先级（互斥，命中即止）：
+        1. ``fact_id`` 精确匹配（最高优先级）
+        2. ``topic_key`` 归一化后精确匹配（``normalize_topic_key``，与写入同口径）
+        3. ``keyword`` 对 ``content`` 的不区分大小写子串匹配
+
+        空 / 纯空白（以及 topic_key 归一化后为空）一律视为"未提供"。三者全缺
+        时抛 ``ValueError``（避免"空条件"退化成误伤全量）。
+
+        已是 ``forgotten`` 的条目不重复计数（幂等），其余状态（含 superseded /
+        stale）均可被标记——用户意志优先于系统判定。
+
+        Args:
+            ns: namespace tuple
+            keyword: 内容关键词（不区分大小写子串）
+            topic_key: 主题键（归一化后精确匹配）
+            fact_id: 记忆条目 ID（精确匹配）
+
+        Returns:
+            实际标记为 forgotten 的条目数
+
+        Raises:
+            ValueError: fact_id / topic_key / keyword 全部缺失（或归一化后为空）
+        """
+        effective_id = (fact_id or "").strip()
+        effective_topic = normalize_topic_key(topic_key or "")
+        effective_keyword = (keyword or "").strip()
+        if not effective_id and not effective_topic and not effective_keyword:
+            raise ValueError(
+                "遗忘条件不能全为空：需提供 fact_id / topic_key / keyword 之一"
+            )
+
+        facts = await self._query_facts_ns(ns)
+
+        # 匹配优先级：fact_id > topic_key > keyword
+        if effective_id:
+            targets = [f for f in facts if f.fact_id == effective_id]
+        elif effective_topic:
+            targets = [
+                f
+                for f in facts
+                if f.topic_key and normalize_topic_key(f.topic_key) == effective_topic
+            ]
+        else:
+            lowered = effective_keyword.lower()
+            targets = [
+                f for f in facts if lowered in (f.content or "").lower()
+            ]
+
+        forgotten_at = _naive_now().isoformat()
+        count = 0
+        for fact in targets:
+            if fact.status == FACT_STATUS_FORGOTTEN:
+                # 幂等：已遗忘不重复标记、不重复计数
+                continue
+            fact.status = FACT_STATUS_FORGOTTEN
+            fact.forgotten_at = forgotten_at
+            await self._store.aput(ns, key=fact.fact_id, value=fact.to_dict())
+            count += 1
+        return count
+
+    async def _purge_forgotten_ns(
+        self, ns: tuple[str, ...], older_than_days: float | None = None
+    ) -> int:
+        """物理删除指定 namespace 中 status == forgotten 的条目。
+
+        ``older_than_days`` 为 None 时删除全部 forgotten；否则只删除
+        ``forgotten_at`` 早于阈值的条目。legacy 数据缺 ``forgotten_at``
+        （None）在设阈值时不满足老化条件 → 跳过不删（避免无时间戳记录被误清）。
+
+        Returns:
+            被物理删除的条数
+        """
+        facts = await self._query_facts_ns(ns)
+        forgotten = [f for f in facts if f.status == FACT_STATUS_FORGOTTEN]
+
+        targets: list[ThreadFactItem]
+        if older_than_days is None:
+            targets = forgotten
+        else:
+            cutoff = _naive_now() - timedelta(days=older_than_days)
+            targets = []
+            for fact in forgotten:
+                forgotten_at = _parse_time_anchor(fact.forgotten_at)
+                if forgotten_at is None:
+                    # legacy 无 forgotten_at：设阈值时不参与老化清理
+                    continue
+                if forgotten_at <= cutoff:
+                    targets.append(fact)
+
+        for fact in targets:
+            await self._store.adelete(ns, key=fact.fact_id)
+        return len(targets)
+
     # ============ 读操作（thread 级，不加锁，允许并发读） ============
 
     async def query_facts(
@@ -256,8 +388,9 @@ class ThreadMemoryStore:
         )
 
     async def count_facts(self, thread_id: str) -> int:
-        """统计 thread 的 fact 数量。"""
-        return len(await self.query_facts(thread_id))
+        """统计 thread 的 fact 数量（排除 forgotten——用户可见计数口径）。"""
+        facts = await self.query_facts(thread_id)
+        return len([f for f in facts if f.status != FACT_STATUS_FORGOTTEN])
 
     # ============ 写操作（thread 级，上层应加锁） ============
 
@@ -340,6 +473,75 @@ class ThreadMemoryStore:
         return await self._supersede_facts_ns(
             self._facts_namespace(thread_id), fact_ids
         )
+
+    async def forget_facts(
+        self,
+        thread_id: str,
+        keyword: str | None = None,
+        topic_key: str | None = None,
+        fact_id: str | None = None,
+    ) -> int:
+        """显式遗忘 thread 级 facts（软删除为 ``forgotten``）。
+
+        匹配优先级：``fact_id`` 精确 > ``topic_key``（归一化） > ``keyword``
+        （内容不区分大小写子串）。三者全缺时抛 ``ValueError``。
+
+        只标记不物理删除：forgotten 条目不被读取注入、不计入容量基数、
+        prune 跳过，物理清理由 :meth:`purge_forgotten` 承接。
+
+        thread 级写入/标记由上层（``MemoryManager.forget``）持 per-thread 锁，
+        本方法不加锁（与 :meth:`save_facts_batch` / :meth:`supersede_facts` 一致）。
+
+        Args:
+            thread_id: 会话线程 ID
+            keyword: 内容关键词（不区分大小写子串匹配）
+            topic_key: 主题键（内部先经 ``normalize_topic_key`` 归一化）
+            fact_id: 记忆条目 ID（精确匹配）
+
+        Returns:
+            实际标记为 forgotten 的条数
+
+        Raises:
+            ValueError: 三个匹配条件全部缺失（或归一化后为空）
+        """
+        count = await self._forget_facts_ns(
+            self._facts_namespace(thread_id),
+            keyword=keyword,
+            topic_key=topic_key,
+            fact_id=fact_id,
+        )
+        if count:
+            logger.info("thread %s 显式遗忘: %d 条 (软删除)", thread_id, count)
+        return count
+
+    async def purge_forgotten(
+        self,
+        thread_id: str | None = None,
+        older_than_days: float | None = None,
+    ) -> int:
+        """物理删除 forgotten 条目（供 Phase 3 后台清理任务使用）。
+
+        Args:
+            thread_id: 会话线程 ID；为 None 时作用于 agent 级 namespace
+            older_than_days: 仅清理 ``forgotten_at`` 早于该天数的条目；
+                为 None 时清理全部 forgotten
+
+        Returns:
+            被物理删除的条数
+        """
+        ns = (
+            self._facts_namespace("", scope="agent")
+            if thread_id is None
+            else self._facts_namespace(thread_id)
+        )
+        purged = await self._purge_forgotten_ns(ns, older_than_days=older_than_days)
+        if purged:
+            logger.info(
+                "清理 forgotten 条目 [%-20s]: %d 条",
+                thread_id or f"agent={self._agent_key}",
+                purged,
+            )
+        return purged
 
     async def touch_fact(self, thread_id: str, fact_id: str) -> None:
         """更新 fact 的 ``last_used_at``（用于 LRU 淘汰）。
@@ -521,8 +723,9 @@ class ThreadMemoryStore:
         )
 
     async def count_agent_facts(self) -> int:
-        """统计 agent 级 fact 数量。"""
-        return len(await self.query_agent_facts())
+        """统计 agent 级 fact 数量（排除 forgotten——用户可见计数口径）。"""
+        facts = await self.query_agent_facts()
+        return len([f for f in facts if f.status != FACT_STATUS_FORGOTTEN])
 
     async def supersede_agent_facts(self, fact_ids: list[str]) -> int:
         """将 agent 级指定 facts 标记为 ``superseded``（同主题新条目取代）。
@@ -539,6 +742,41 @@ class ThreadMemoryStore:
         return await self._supersede_facts_ns(
             self._facts_namespace("", scope="agent"), fact_ids
         )
+
+    async def forget_agent_facts(
+        self,
+        keyword: str | None = None,
+        topic_key: str | None = None,
+        fact_id: str | None = None,
+    ) -> int:
+        """显式遗忘 agent 级 facts（软删除为 ``forgotten``）。
+
+        匹配规则与 thread 级 :meth:`forget_facts` 完全一致（fact_id > topic_key >
+        keyword，全缺抛 ``ValueError``）。
+
+        agent namespace 跨进程共享，调用方（``MemoryManager.forget_agent``）必须
+        已持有 agent 锁，本方法不再自行加锁（与 :meth:`supersede_agent_facts` 一致）。
+
+        Args:
+            keyword: 内容关键词（不区分大小写子串匹配）
+            topic_key: 主题键（内部先归一化）
+            fact_id: 记忆条目 ID（精确匹配）
+
+        Returns:
+            实际标记为 forgotten 的条数
+
+        Raises:
+            ValueError: 三个匹配条件全部缺失（或归一化后为空）
+        """
+        count = await self._forget_facts_ns(
+            self._facts_namespace("", scope="agent"),
+            keyword=keyword,
+            topic_key=topic_key,
+            fact_id=fact_id,
+        )
+        if count:
+            logger.info("agent %s 显式遗忘: %d 条 (软删除)", self._agent_key, count)
+        return count
 
     async def clear_agent_facts(self) -> int:
         """清空 agent 级全部长期记忆。
