@@ -70,6 +70,8 @@ class MemoryManager:
         agent_lock: agent 级跨进程互斥锁（保护 agent namespace 的写入/清空/压缩）。
             由 MemoryContext 传入基于文件锁的实例以实现跨进程互斥；为 None 时
             内部自建进程内锁 ``AgentMemoryLock(path=None)``，供测试使用
+        confidence_floor: agent 级写入置信度门槛，透传给写中间件
+            （低于门槛的 global 事实降级 thread 级）
     """
 
     def __init__(
@@ -82,6 +84,7 @@ class MemoryManager:
         max_buffer_messages: int | None = None,
         read_middleware: ThreadMemoryReadMiddleware | None = None,
         agent_lock: AgentMemoryLock | None = None,
+        confidence_floor: float | None = None,
     ) -> None:
         self._store = memory_store
         self._lock_pool = lock_pool
@@ -98,6 +101,7 @@ class MemoryManager:
             buffer_delay_seconds=buffer_delay_seconds,
             max_buffer_messages=max_buffer_messages,
             agent_lock=self._agent_lock,
+            confidence_floor=confidence_floor,
         )
 
         # 读中间件：awrap_model_call 时注入 thread facts 到 SystemMessage
@@ -150,7 +154,7 @@ class MemoryManager:
     async def recall(
         self, thread_id: str, limit: int | None = None
     ) -> list[ThreadFactItem]:
-        """召回指定会话的长期记忆 facts。
+        """召回指定会话的长期记忆 facts（仅 ``status == "active"``）。
 
         按 create_time 升序返回，截取最近 ``limit`` 条。
         非阻塞更新 ``last_used_at``（用于 LRU 淘汰），失败仅记日志。
@@ -160,13 +164,13 @@ class MemoryManager:
             limit: 返回条数上限（为 None 时使用构造时设定的 recall_limit）
 
         Returns:
-            facts 列表（可能为空）
+            facts 列表（可能为空；superseded / stale 条目已过滤）
         """
         if not thread_id:
             return []
         effective_limit = limit if limit is not None else self._recall_limit
         try:
-            facts = await self._store.query_facts(thread_id)
+            facts = await self._store.query_facts(thread_id, active_only=True)
         except Exception as error:
             logger.debug("召回长期记忆失败 [thread=%s]: %s", thread_id, error)
             return []
@@ -218,11 +222,12 @@ class MemoryManager:
             limit: 返回条数上限（为 None 时使用构造时设定的 recall_limit）
 
         Returns:
-            agent 级 facts 列表（可能为空）；异常仅记日志返回 ``[]``
+            agent 级 facts 列表（可能为空，仅 ``status == "active"`` 条目）；
+            异常仅记日志返回 ``[]``
         """
         effective_limit = limit if limit is not None else self._recall_limit
         try:
-            facts = await self._store.query_agent_facts()
+            facts = await self._store.query_agent_facts(active_only=True)
         except Exception as error:
             logger.debug("召回 agent 级长期记忆失败: %s", error)
             return []
@@ -394,7 +399,7 @@ class MemoryManager:
         Returns:
             ``{"success": bool, "original_count": int, ...}``
         """
-        facts = await self._store.query_facts(thread_id)
+        facts = await self._store.query_facts(thread_id, active_only=True)
         if not facts:
             return {"success": False, "error": "没有长期记忆可压缩"}
 
@@ -448,7 +453,7 @@ class MemoryManager:
             无记忆或 LLM 失败时返回 ``{"success": False, "error": str}``
         """
         async with self._agent_lock:
-            facts = await self._store.query_agent_facts()
+            facts = await self._store.query_agent_facts(active_only=True)
             if not facts:
                 return {"success": False, "error": "没有 agent 级长期记忆可压缩"}
 
