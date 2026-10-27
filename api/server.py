@@ -352,6 +352,10 @@ async def lifespan(_: FastAPI):
     provider = _startup_provider or pick_default_provider()
     logger.info("初始化提供商: %s", provider)
     agent, llm = await build_agent(provider)
+    # 注入 forget_memory 工具的会话依赖（与 main.py / scheduler/run.py 同一入口接线）
+    from tools.forget_memory import configure_for_agent as configure_forget_tool
+
+    configure_forget_tool(agent)
     # workflow 链路统一门面：与 chat 门面共享 SessionRegistry / MemoryManager
     from session.manager import create_workflow_session_manager
 
@@ -1782,6 +1786,51 @@ async def clear_memory(scope: str = "long"):
             result["scope"], result["long_cleared"], result["agent_cleared"], result["new_thread_id"],
         )
         return {"cleared": True, **result}
+
+
+@app.delete("/api/memory/facts")
+async def forget_memory_facts(
+    scope: str = "long",
+    keyword: str | None = None,
+    topic: str | None = None,
+):
+    """按条件显式遗忘记忆（软删除，status → forgotten），不物理删除。
+
+    与 ``DELETE /api/memory``（整体清空）语义区分：本端点只标记命中条目，
+    之后可被重新学习，物理清理由后台 purge 承接。作用域术语复用既有
+    ``long|agent``：本会话长期记忆（默认）/ agent 级跨会话共享记忆。
+
+    与 CLI ``forget`` 命令共用 ``cli.commands.memory.forget_memory_apply``。
+
+    Args:
+        scope: ``long``（默认，当前会话 thread 级）或 ``agent``（跨会话共享）
+        keyword: 内容关键词（不区分大小写子串匹配）
+        topic: 主题键（提供时按归一化主题精确匹配）
+
+    Returns:
+        ``{"forgotten_count": int, "scope": str, "preview": list[str]}``
+
+    Raises:
+        HTTPException: 400 —— 作用域非法，或 keyword / topic 同时缺失
+    """
+    from cli.commands.memory import forget_memory_apply
+
+    async with chat_lock:
+        try:
+            result = await forget_memory_apply(
+                agent, scope=scope, keyword=keyword, topic=topic
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        logger.info(
+            "显式遗忘记忆: scope=%s keyword=%s topic=%s forgotten=%s",
+            result["scope"], keyword, topic, result["forgotten_count"],
+        )
+        return {
+            "forgotten_count": result["forgotten_count"],
+            "scope": result["scope"],
+            "preview": result["preview"],
+        }
 
 
 # --------------------------------------------------------------------------- #

@@ -1607,6 +1607,115 @@ def test_clear_memory_default_scope(client, mock_agent):
 
 
 # --------------------------------------------------------------------------- #
+# 显式遗忘（forgotten 软删除）— DELETE /api/memory/facts
+# --------------------------------------------------------------------------- #
+def _forget_facts_response(scope: str = "long", keyword: str | None = "深色", **params: Any):
+    """构造被遗忘前后的 facts 快照（同一 fact_id，仅 status 变化），供 preview 断言使用。"""
+    from memory.models import (
+        FACT_STATUS_ACTIVE,
+        FACT_STATUS_FORGOTTEN,
+        ThreadFactItem,
+    )
+
+    target = ThreadFactItem(content="用户偏好深色主题", status=FACT_STATUS_ACTIVE)
+    other = ThreadFactItem(content="无关条目", status=FACT_STATUS_ACTIVE)
+    before = [target, other]
+
+    # 遗忘后：同一 fact_id，仅 status/forgotten_at 变化（模拟 Store 落库回读）
+    target_after = ThreadFactItem.from_dict(target.to_dict())
+    target_after.status = FACT_STATUS_FORGOTTEN
+    target_after.forgotten_at = "2026-01-01T00:00:00"
+    other_after = ThreadFactItem.from_dict(other.to_dict())
+    after = [target_after, other_after]
+    return before, after
+
+
+def test_forget_memory_facts_long(client, mock_agent):
+    """DELETE /api/memory/facts?scope=long&keyword=... → 200 + forgotten_count + preview"""
+    from memory.models import ThreadFactItem
+
+    before, after = _forget_facts_response()
+    mock_agent.session_manager.memory = MagicMock()
+    mock_agent.session_manager.memory.forget = AsyncMock(return_value=1)
+    mock_agent.session_manager.memory.store = MagicMock()
+    mock_agent.session_manager.memory.store.query_facts = AsyncMock(
+        side_effect=[before, after]
+    )
+    assert isinstance(before[0], ThreadFactItem)
+
+    response = client.delete("/api/memory/facts?scope=long&keyword=深色主题")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["scope"] == "long"
+    assert data["forgotten_count"] == 1
+    # 断言"哪条内容被遗忘"，不只断言计数
+    assert data["preview"] == ["用户偏好深色主题"]
+    mock_agent.session_manager.memory.forget.assert_awaited_once()
+    mock_agent.session_manager.memory.forget_agent.assert_not_called()
+
+
+def test_forget_memory_facts_agent_scope(client, mock_agent):
+    """scope=agent → 调用 forget_agent，且路由到 agent 级查询"""
+    from memory.models import FACT_STATUS_ACTIVE, FACT_STATUS_FORGOTTEN, ThreadFactItem
+
+    before = [ThreadFactItem(content="用户偏好中文", category="user_fact", scope="agent")]
+    after_item = ThreadFactItem.from_dict(before[0].to_dict())
+    after_item.status = FACT_STATUS_FORGOTTEN
+    after_item.forgotten_at = "2026-01-01T00:00:00"
+    after = [after_item]
+    mock_agent.session_manager.memory = MagicMock()
+    mock_agent.session_manager.memory.forget_agent = AsyncMock(return_value=1)
+    mock_agent.session_manager.memory.forget = AsyncMock(return_value=0)
+    mock_agent.session_manager.memory.store = MagicMock()
+    mock_agent.session_manager.memory.store.query_agent_facts = AsyncMock(
+        side_effect=[before, after]
+    )
+    assert before[0].status == FACT_STATUS_ACTIVE
+
+    response = client.delete("/api/memory/facts?scope=agent&keyword=中文")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["scope"] == "agent"
+    assert data["forgotten_count"] == 1
+    assert data["preview"] == ["用户偏好中文"]
+    mock_agent.session_manager.memory.forget_agent.assert_awaited_once()
+    mock_agent.session_manager.memory.forget.assert_not_called()
+
+
+def test_forget_memory_facts_topic_param(client, mock_agent):
+    """topic 查询参数透传为 topic_key"""
+    before, after = _forget_facts_response()
+    mock_agent.session_manager.memory = MagicMock()
+    mock_agent.session_manager.memory.forget = AsyncMock(return_value=0)
+    mock_agent.session_manager.memory.store = MagicMock()
+    mock_agent.session_manager.memory.store.query_facts = AsyncMock(
+        side_effect=[before, after]
+    )
+
+    response = client.delete("/api/memory/facts?scope=long&topic=Dim-Y%20Formula")
+
+    assert response.status_code == 200
+    kwargs = mock_agent.session_manager.memory.forget.await_args.kwargs
+    assert kwargs["topic_key"] == "Dim-Y Formula"
+
+
+def test_forget_memory_facts_invalid_scope(client, mock_agent):
+    """非法 scope → 400（JSON error body），不抛 500"""
+    response = client.delete("/api/memory/facts?scope=short&keyword=x")
+    assert response.status_code == 400
+    assert "detail" in response.json()
+
+
+def test_forget_memory_facts_missing_keyword(client, mock_agent):
+    """缺少 keyword 且无 topic → 400"""
+    response = client.delete("/api/memory/facts?scope=long")
+    assert response.status_code == 400
+    assert "detail" in response.json()
+
+
+# --------------------------------------------------------------------------- #
 # 安全策略
 # --------------------------------------------------------------------------- #
 def test_get_safety(client):

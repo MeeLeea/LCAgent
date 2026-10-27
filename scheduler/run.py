@@ -138,6 +138,10 @@ def make_agent_factory(provider: str):
         # 动态绑定：记忆组件按会话解析 LLM（回落 agent 当前 LLM），
         # 切换 provider 后自动同步，且会话级 provider/model 正确生效
         memory_ctx.bind_llm(build_memory_llm_resolver(agent.session, lambda: agent.llm))
+        # 注入 forget_memory 工具的会话依赖（工具无法自取 Agent，模块级注入模式）
+        from tools.forget_memory import configure_for_agent as configure_forget_tool
+
+        configure_forget_tool(agent)
         return agent
 
     return factory

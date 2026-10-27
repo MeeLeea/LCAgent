@@ -7,6 +7,7 @@ from skmng.tool import read_skill
 
 from .calculator import calculate
 from .create_tools import create_tool
+from .forget_memory import forget_memory
 from .get_local_time import get_local_time
 from .human_confirmation import request_user_confirmation
 from .open_file import open_file, open_sqlite
@@ -41,6 +42,7 @@ all_tools = [
     ask_human,
     request_user_confirmation,
     search_file_content,
+    forget_memory,
 ]
 
 __all__ = [
@@ -51,6 +53,7 @@ __all__ = [
     'cleanup_finished_tasks',
     'create_tool',
     'delete_scheduled_task',
+    'forget_memory',
     'get_local_time',
     'list_scheduled_tasks',
     'open_file',
