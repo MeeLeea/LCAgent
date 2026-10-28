@@ -70,13 +70,6 @@ FACT_STATUS_FORGOTTEN = "forgotten"
 """用户/模型显式遗忘（软删除）：读取注入、容量基数、prune 一律跳过；
 不同于 superseded（系统判定被取代），forgotten 是用户意志，可由后台 purge 物理清理。"""
 
-VALID_FACT_STATUSES: frozenset[str] = frozenset({
-    FACT_STATUS_ACTIVE,
-    FACT_STATUS_SUPERSEDED,
-    FACT_STATUS_STALE,
-    FACT_STATUS_FORGOTTEN,
-})
-
 # ── 证据来源（evidence 字段取值） ──
 EVIDENCE_TESTED = "tested"
 EVIDENCE_STATED = "stated"
@@ -354,7 +347,6 @@ __all__ = [
     "PERSISTENCE_GLOBAL",
     "PERSISTENCE_SESSION",
     "VALID_EVIDENCES",
-    "VALID_FACT_STATUSES",
     "VALID_PERSISTENCES",
     "MemoryCategory",
     "MemoryInputEvent",

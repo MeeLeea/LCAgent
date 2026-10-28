@@ -105,11 +105,6 @@ class ThreadMemoryStore:
         return self._max_facts
 
     @property
-    def max_agent_facts(self) -> int:
-        """agent 级记忆容量上限。"""
-        return self._max_agent_facts
-
-    @property
     def agent_key(self) -> str:
         """agent 级 namespace 标识（跨进程共享，默认 ``"global"``）。"""
         return self._agent_key
@@ -257,9 +252,15 @@ class ThreadMemoryStore:
             count += 1
         return count
 
-    async def _clear_ns(self, ns: tuple[str, ...]) -> int:
-        """清空指定 namespace 全部 facts。"""
-        facts = await self._query_facts_ns(ns)
+    async def _clear_ns(
+        self, ns: tuple[str, ...], facts: list[ThreadFactItem] | None = None
+    ) -> int:
+        """清空指定 namespace 全部 facts。
+
+        可传入已查询的 ``facts`` 避免重复读取（压缩摘要路径已持有全量列表）。
+        """
+        if facts is None:
+            facts = await self._query_facts_ns(ns)
         for fact in facts:
             await self._store.adelete(ns, key=fact.fact_id)
         return len(facts)
@@ -610,8 +611,6 @@ class ThreadMemoryStore:
             thread_id: 会话线程 ID
             fact_id: 记忆条目 ID
         """
-        from .models import _naive_now
-
         ns = self._facts_namespace(thread_id)
         item = await self._store.aget(ns, key=fact_id)
         if item is None:
@@ -665,9 +664,8 @@ class ThreadMemoryStore:
         facts = await self._query_facts_ns(ns)
         original_count = len(facts)
 
-        # 清空旧 facts
-        for fact in facts:
-            await self._store.adelete(ns, key=fact.fact_id)
+        # 清空旧 facts（复用 _clear_ns，传入已查询结果避免重复读取）
+        await self._clear_ns(ns, facts)
 
         # 写入摘要条目
         summary_item = ThreadFactItem(
@@ -705,9 +703,8 @@ class ThreadMemoryStore:
         facts = await self._query_facts_ns(ns)
         original_count = len(facts)
 
-        # 清空旧 facts
-        for fact in facts:
-            await self._store.adelete(ns, key=fact.fact_id)
+        # 清空旧 facts（复用 _clear_ns，传入已查询结果避免重复读取）
+        await self._clear_ns(ns, facts)
 
         # 写入摘要条目（dataclass 默认 scope="thread"，此处必须显式指定 "agent"）
         summary_item = ThreadFactItem(
@@ -878,8 +875,6 @@ class ThreadMemoryStore:
         Args:
             fact_id: 记忆条目 ID
         """
-        from .models import _naive_now
-
         ns = self._facts_namespace("", scope="agent")
         item = await self._store.aget(ns, key=fact_id)
         if item is None:
