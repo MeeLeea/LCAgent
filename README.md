@@ -483,7 +483,7 @@ Agent 有三种执行模式，对应三种不同的交互入口：
 │  │                        │  │  • 读: 两级聚合注入 SystemMsg │   │
   │  │                        │  │  • 写: 防抖→抽取→去重→合并  │   │
   │  │                        │  │  • 读: 状态过滤+主题收敛    │   │
-  │  │                        │  │  • 去重(agent优先)+LRU 淘汰  │   │
+  │  │                        │  │  • 去重(agent优先)+score 淘汰│   │
 │  └────────────────────────┘  └──────────────────────────────┘   │
 │                                                                  │
 │  基础设施: AgentMemory(checkpointer+Store) / MemoryContext(工厂)  │
@@ -575,8 +575,11 @@ awrap_model_call
 > **跨进程共享的已知取舍**：agent 级 namespace 默认跨进程共享，带来以下代价：
 >
 > - **跨进程重复 fact**：去重只在单进程写入时按 `content` 精确比对（best-effort），CLI / API / 调度器 / 飞书 并发写入同一 namespace 时可能产生重复条目。
-> - **并发 LRU 淘汰**：`prune_agent_facts` 在各自进程内读取全量后按 `last_used_at` 淘汰，多进程并发 prune 可能略微过量淘汰（over-evict）。
+> - **并发 prune 排序竞态**：`prune_agent_facts` 在各自进程内读取全量后按 **score（置信度软化 × 时间衰减）** 升序淘汰（非旧 `last_used_at`），多进程并发 prune 仍可能因各自快照不同而略微过量淘汰（over-evict）；容量基数已排除 forgotten，故软删除条目不再占用额度诱发放大。
 > - **`clear agent` 无跨进程锁**：清空只作用于当前进程可见的数据；清空后另一进程的在途写入（防抖 flush）可能立即重新写回 facts。
+> - **后台 purge 跨进程串行化**：物理清理（forgotten / 超龄 superseded）仅由长驻进程（api / scheduler）的周期任务执行，全程持有 `AgentMemoryLock`（OS 级文件锁），同一时刻仅一个进程 purge，避免并发清理的日志噪音与瞬时连接争用。
+
+> **后台物理清理（purge）**：forgotten 是软删除，需后台物理清理以免库无限增长。实现为 `MemoryManager` 的周期协程（默认 24h，`start_purge_task` / `stop_purge_task`），**仅在长驻进程启动**——api 在 lifespan 主 loop 内启动，scheduler 在 `scheduler/run.py` 单开一个**守护线程**（专属事件循环 `asyncio.run`，承载长驻 `MemoryContext`），因为 scheduler 的任务经 executor 在**临时 `asyncio.run` loop** 执行、周期协程在其中会随任务结束被销毁；executor 的 per-task 上下文**不**启动 purge。CLI 是短命会话，24h 周期在分钟级会话中永不触发，白占协程，故 CLI 不启动（其 forgotten 条目由下次 api/scheduler 进程的 purge 覆盖）。每次 tick 持 `AgentMemoryLock` 跨进程串行，删除 **forgotten 超期（默认 7 天）** 与 **superseded 超 90 天** 的条目；单次 tick 异常仅记警告并继续，绝不退出循环。**thread 级 forgotten 的清理局限**：LangGraph SQLite Store 无"列举 namespace" API，无法枚举全部 thread 批量清理，故后台 purge 只覆盖 agent namespace；thread 级 forgotten 在本会话删除（`adelete_session` 整 namespace 清空）时被物理清理——在软删除期间它们已被读取注入与计数排除，不影响正确性。
 
 ### 上下文注入机制（重要）
 
@@ -764,7 +767,7 @@ _a_run_pipeline()  （buffer 超时后批量处理）
        保留审计痕迹，读取注入时过滤）
      • save_agent_facts_batch(...)（agent 锁内）+ save_facts_batch(...)
    ↓
-⑦ 分流容量淘汰（superseded/stale 优先于 active LRU）：
+⑦ 分流容量淘汰（superseded/stale 优先 → forgotten 跳过不计容量 → active 按 score 升序）：
      • prune_agent_facts()：agent 级超 memory_max_agent_facts（默认 200）时淘汰
      • prune_facts(thread_id)：thread 级超 memory_max_facts_per_thread（默认 60）时淘汰
 ```
@@ -797,7 +800,11 @@ if self._memory is not None:
 
 > **LLM 抽取是主闸门**：除「同类失败 ≥2 次」这一确定性信号外，最终分类（`user_fact` / `lesson` / `business` / `conv`）、**持久层级 `persistence`（session/global，决定作用域）、主题键 `topic_key`（同主题版本取代）、证据来源 `evidence`（tested/stated/inferred）**均由 LLM 从原始对话中抽取结构化事实决定，并附带 `confidence`（置信度）；无效分类回退为 `conv`（走 thread 级），无效 persistence 回退 category 旧路由，无效 topic_key/evidence 安全回退空主题/陈述型。
 
-> **记忆生命周期**：`ThreadFactItem` 携带 `status`（active / superseded / stale）、`topic_key`、`evidence`、`superseded_at` 字段。同主题新版本写入时旧条目自动标记 superseded（读取注入过滤、容量淘汰优先清理）；`evidence=inferred` 或低置信条目注入 prompt 时附「（未实测）」「（低置信）」标注，与实测事实显式区分。旧数据（无新字段）由 dataclass 默认值兜底为 active / 无主题 / 陈述型，行为与历史版本一致（无迁移需求）。项目级（workspace 级）作用域为后续演进方向，当前 persistence 仅 session/global 两档。
+> **记忆生命周期**：`ThreadFactItem` 携带 `status`（active / superseded / stale / **forgotten**）、`topic_key`、`evidence`、`superseded_at`、`forgotten_at` 字段。同主题新版本写入时旧条目自动标记 superseded（读取注入过滤、容量淘汰优先清理）；`forgotten` 为**用户/模型显式遗忘**的软删除标记——硬优先：读取注入、容量基数、prune 一律跳过（可由 `forget` / `forget agent` / `DELETE /api/memory/facts` 触发，见下），物理清理由后台 purge 承接；`evidence=inferred` 或低置信条目注入 prompt 时附「（未实测）」「（低置信）」标注，与实测事实显式区分。旧数据（无新字段）由 dataclass 默认值兜底为 active / 无主题 / 陈述型，行为与历史版本一致（无迁移需求）。项目级（workspace 级）作用域为后续演进方向，当前 persistence 仅 session/global 两档。
+
+> **遗忘与容量淘汰（score 时间衰减）**：容量淘汰排序由旧纯 LRU（`last_used_at`）升级为 **score = `confidence ** 0.5` × `e^(-λ × Δt_days)`**——`confidence` 是 LLM 抽取的未校准浮点数，用开方软化降低分档边界附近（0.7 / 0.9）的抖动杠杆。`λ` 随 confidence 分档：`≥0.9` → 半衰期 **180 天**、`0.7~0.9` → **90 天**、`<0.7` → **30 天**（30/90/180 为**观察期初值**，非既定结论，后续按淘汰合理性抽查调参）。淘汰优先级分区：**superseded / stale 优先物理删除 → forgotten 完全跳过（不删、不计容量基数）→ active 按 score 升序淘汰最低分**。`last_used_at` 缺失回退 `create_time`、两者均缺则退化为 `confidence ** 0.5`（timeless）；score 为读取时派生值，不落库。用户显式遗忘见 [记忆管理命令](#记忆管理命令)。
+
+> **写入流水线的去重基准排除 forgotten**：写流水线（`ThreadMemoryWriter`）读取全量 existing facts 构造 content 去重基准、既有 `topic_key` 清单与 supersede 目标时，**只取 active + superseded/stale，排除 forgotten**——否则同一事实被遗忘后再次说出会被静默丢弃、永远无法重新学习，与「遗忘后可恢复/重新学习」的语义矛盾。遗忘过滤发生在读取层（active 白名单），先于 `recall_limit` 截取，故 forgotten 不占召回名额、不参与排序。
 
 ### 为什么 cot 不写入 checkpoint
 
@@ -970,7 +977,7 @@ ThreadMemoryStore.replace_agent_facts_with_summary(summary)
 
 `MemoryManager.compress_agent()` 返回与 `compress()` 相同的 `{"success", "original_count", "original_chars", "compressed_chars", "summary"}` 结构。
 
-> **HTTP API 说明**：`POST /api/compress` 只压缩 thread 级（与 CLI `compress` 共用同一实现，无记忆时短路返回 `skipped`）；`DELETE /api/memory?scope=long|short|agent|all` 与 CLI `clear` 语义一致——`agent` 清 agent 级跨会话记忆，`all` 同时清 thread 级 + agent 级并开启新会话。agent 级**压缩**目前仅 CLI `compress agent` 提供（API 无 agent 级压缩端点）。
+> **HTTP API 说明**：`POST /api/compress` 只压缩 thread 级（与 CLI `compress` 共用同一实现，无记忆时短路返回 `skipped`）；`DELETE /api/memory?scope=long|short|agent|all` 与 CLI `clear` 语义一致——`agent` 清 agent 级跨会话记忆，`all` 同时清 thread 级 + agent 级并开启新会话；`DELETE /api/memory/facts?scope=long|agent&keyword=...&topic=...` 与 CLI `forget` 语义一致——按条件软删除（`forgotten`），非法 scope / 缺 keyword+topic 返回 400。agent 级**压缩**目前仅 CLI `compress agent` 提供（API 无 agent 级压缩端点）。
 
 #### 特点与注意事项
 
@@ -987,6 +994,23 @@ ThreadMemoryStore.replace_agent_facts_with_summary(summary)
 | agent 级压缩        | `compress agent` 只压缩 agent 级（`user_fact` / `lesson`），不影响 thread 级 facts 与 checkpoint         |
 
 > 💡 **建议**：在 thread 级长期记忆较多时（如 `memory_max_facts_per_thread` 默认 60 条上限附近）使用，平时少量记忆无需压缩。
+
+### 遗忘长期记忆（forget）
+
+当某条记忆已经过时、说错、或用户明确要求「忘掉」时，用 `forget` 把它**软删除**（`status → forgotten`），而不是整体清空：
+
+| 命令 / API | 作用域 | 说明 |
+| --- | --- | --- |
+| `forget <关键词>` | `long`（当前会话 thread 级，默认） | 按内容关键词不区分大小写子串匹配 |
+| `forget agent <关键词>` | `agent`（跨会话共享） | 同上，作用于 agent 级 namespace |
+| `DELETE /api/memory/facts?scope=long\|agent&keyword=...&topic=...` | 由 `scope` 决定 | 与 CLI `forget` 共用同一实现；非法 scope 或缺 keyword+topic 返回 **400** |
+| 模型工具 `forget_memory(query, topic, scope)` | `long` / `agent` | LLM 可主动调用；返回 `{"success", "scope", "forgotten_count", "preview"}`，`preview` 为被遗忘内容预览（≤3 条，每条 ≤80 字符） |
+
+匹配优先级：`fact_id` 精确 > `topic_key`（经 `normalize_topic_key` 归一化后精确匹配）> `keyword`（内容子串）；三者全缺时报错而**不是**退化成误伤全量。
+
+`forgotten` 是**软删除、硬优先**：读取注入、容量基数、prune 全部跳过它，但条目仍在库中（可从 `query_facts(active_only=False)` 审计），若用户随后再次说出同一事实，写流水线会把它作为**新的 active 条目重新学习**（去重基准已排除 forgotten）。物理删除由后台 purge 承担（见「跨进程共享的已知取舍 → 后台物理清理」），默认 forgotten 超 7 天清理。
+
+> ⚠️ **与 `clear` 的区别**：`clear` 是**整体清空**（物理删除，不可恢复）；`forget` 是**按条件软删除**（可审计、可重新学习）。`forget` 的 scope 术语与 `clear` 一致：`long`（thread 级，默认）/ `agent`（跨会话），不使用 `session`。
 
 ### 记忆相关 API
 
@@ -1017,9 +1041,13 @@ ThreadMemoryStore.replace_agent_facts_with_summary(summary)
 | `await consume_event(event)`                                     | 消费 AgentEvent（`is_memory_worthy` 的 DONE / TOOL_RESULT），提交到写中间件（非阻塞） |
 | `await compress(thread_id)`                                      | 压缩该 thread 长期记忆（LLM 摘要替换为单条 fact，仅作用于 thread 级）                   |
 | `await clear(thread_id)`                                         | 清空该 thread 全部 facts，返回清除数量                                                  |
-| `await count_facts(thread_id)`                                   | 统计该 thread 的 fact 条数                                                              |
+| `await forget(thread_id, keyword/topic_key/fact_id)`             | 显式遗忘（软删除为 forgotten；缓冲清理 + per-thread 锁串行化，防 flush 复活）           |
+| `await count_facts(thread_id)`                                   | 统计该 thread 的 fact 条数（排除 forgotten）                                            |
 | `await flush_all()`                                              | 立即处理所有 buffer 事件（Agent 关闭前调用）                                            |
 | `await shutdown()`                                               | 关闭写中间件（取消定时器、清理 buffer）                                                 |
+| `start_purge_task(interval_seconds=86400, ...)`                  | 在当前 loop 启动后台 purge 周期协程（仅长驻进程；幂等，重复调用返回既有任务）           |
+| `await stop_purge_task()`                                        | 取消后台 purge 协程（同 loop，幂等）                                                    |
+| `await purge_once(forgotten_retention_days=7, superseded_retention_days=90)` | 执行一次物理清理（持 AgentMemoryLock 跨进程串行；返回 `{"forgotten", "superseded"}`） |
 
 **agent 级**（跨会话共享，`user_fact` / `lesson`）：
 
@@ -1027,8 +1055,9 @@ ThreadMemoryStore.replace_agent_facts_with_summary(summary)
 | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
 | `await recall_agent(limit=None)`      | 召回 agent 级长期记忆 facts（跨会话共享，按`create_time` 升序，截取最近 `limit` 条；不进行 touch 更新，LRU 依赖 `prune_agent_facts`） |
 | `await recall_agent_text(limit=None)` | 召回 agent 级记忆并格式化为文本片段（`【长期记忆】` 块）                                                                                  |
-| `await count_agent_facts()`           | 统计 agent 级长期记忆条数                                                                                                                   |
+| `await count_agent_facts()`           | 统计 agent 级长期记忆条数（排除 forgotten）                                                                                                 |
 | `await compress_agent()`              | 压缩 agent 级长期记忆（LLM 摘要替换为单条 fact，仅作用于 agent 级，不可逆）                                                                 |
+| `await forget_agent(keyword/topic_key/fact_id)` | 显式遗忘 agent 级记忆（软删除为 forgotten；flush_all + agent 锁串行化）                                                        |
 | `await clear_agent_facts()`           | 清空 agent 级全部长期记忆，返回清除数量                                                                                                     |
 
 #### ThreadMemoryReadMiddleware（读，LangGraph 中间件）
@@ -1047,8 +1076,11 @@ ThreadMemoryStore.replace_agent_facts_with_summary(summary)
 | -------------------------------------------------------- | ----------------------------------------------- |
 | `await query_facts(thread_id)`                         | 读取该 thread 全部 facts（按 create_time 升序） |
 | `await save_fact / save_facts_batch(thread_id, items)` | 写入单条 / 批量 facts（按 fact_id 幂等覆盖）    |
-| `await prune_facts(thread_id)`                         | LRU 淘汰（超 max_facts 后删除最久未使用）       |
+| `await prune_facts(thread_id)`                         | score 淘汰（superseded/stale 优先 → forgotten 跳过不计容量 → active 按 score 升序） |
 | `await touch_fact(thread_id, fact_id)`                 | 更新 last_used_at（读取时非阻塞触发）           |
+| `await forget_facts(thread_id, keyword/topic_key/fact_id)` | 显式遗忘（软删除为 forgotten；三者全缺抛 ValueError） |
+| `await purge_forgotten(thread_id, older_than_days)`   | 物理删除 forgotten（thread_id=None 作用于 agent 级） |
+| `await purge_superseded(thread_id, older_than_days=90)` | 物理删除超龄 superseded 条目                   |
 | `await clear_thread_memory(thread_id)`                 | 清空该 thread 全部 facts                        |
 | `await replace_with_summary(thread_id, summary)`       | 删除全部 facts 后写入单条摘要 fact              |
 
@@ -1058,7 +1090,8 @@ ThreadMemoryStore.replace_agent_facts_with_summary(summary)
 | --------------------------------------- | ----------------------------------------------------------- |
 | `await query_agent_facts()`           | 读取 agent 级全部 facts（按 create_time 升序）              |
 | `await save_agent_facts_batch(items)` | 批量写入 agent 级 facts（按 fact_id 幂等覆盖）              |
-| `await prune_agent_facts()`           | agent 级 LRU 淘汰（超`max_agent_facts` 后删除最久未使用） |
+| `await prune_agent_facts()`           | agent 级 score 淘汰（superseded/stale 优先 → forgotten 跳过 → active 按 score 升序） |
+| `await forget_agent_facts(keyword/topic_key/fact_id)` | agent 级显式遗忘（软删除为 forgotten）         |
 | `await touch_agent_fact(fact_id)`     | 更新 agent 级 fact 的 last_used_at                          |
 | `await count_agent_facts()`           | 统计 agent 级 fact 条数                                     |
 | `await clear_agent_facts()`           | 清空 agent 级全部 facts                                     |

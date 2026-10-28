@@ -16,10 +16,12 @@
       执行时通过 SessionManager.arun() 走三层架构（Agent → Session → Memory）
     - 启动时自动从数据库同步未完成的周期任务（程序重启不丢失）
 """
+import asyncio
 import json
 import logging
 import os
 import sys
+import threading
 
 # 确保项目根在 sys.path 中（支持 python -m 和直接运行）
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -109,6 +111,9 @@ def make_agent_factory(provider: str):
             process_type="scheduler",
             llm_getter=lambda: llm,
             # 记忆链路参数由 memory/config.py 统一管理，不再经 agent_config.json 配置
+            # 注意：本 factory 由 executor 经 asyncio.run 在**临时 loop** 调用，
+            # 严禁在此创建周期协程（随任务结束即被销毁）；后台 purge 由
+            # _start_purge_host 的专属守护线程 loop 承载（见 main）。
         )
         agent = await AgentCore.acreate(
             llm_client=llm,
@@ -147,10 +152,106 @@ def make_agent_factory(provider: str):
     return factory
 
 
+def _purge_host_main(
+    checkpoint_file: str,
+    interval: float,
+    forgotten_retention_days: float,
+    superseded_retention_days: float,
+    ready: threading.Event,
+    stop: threading.Event,
+) -> None:
+    """purge 守护线程的循环体：在专属事件循环内存活长驻 MemoryContext。
+
+    该 loop 独立于 executor 的 per-task ``asyncio.run`` loop，purge 周期协程
+    随线程存活直到进程退出（``stop`` 置位或线程被 daemon 回收）。
+    """
+
+    async def _run() -> None:
+        # 专用 purge 上下文：仅承载后台清理，不写任何 thread。
+        # llm_getter 传 None（purge 不需 LLM）；不传 process_type（避免无谓的
+        # thread_id 前缀——本上下文不生成 thread，不影响共享 DB 路径）。
+        ctx = await MemoryContext.acreate(
+            checkpoint_file=checkpoint_file,
+            use_sqlite=True,
+            llm_getter=None,
+            enable_purge_task=True,
+            purge_interval_seconds=interval,
+        )
+        ready.set()  # 通知调用方：purge 已启动
+        try:
+            # 保持 loop 存活直到收到停止信号（周期性 purge 协程与之并行运行）。
+            # threading.Event 同步可等待，改用短轮询避免阻塞事件循环。
+            while not stop.is_set():
+                await asyncio.sleep(1.0)
+        finally:
+            await ctx.aclose()
+
+    asyncio.run(_run())
+
+
+def _start_purge_host(
+    checkpoint_file: str,
+    interval: float = 86400,
+    forgotten_retention_days: float = 7,
+    superseded_retention_days: float = 90,
+):
+    """启动承载后台 purge 的守护线程（专属事件循环），返回可停止的 host 句柄。
+
+    为什么用守护线程而非主 loop：scheduler 的任务经 executor 在**临时
+    ``asyncio.run`` loop** 执行，周期协程若在该 loop 创建会随任务结束被销毁
+    （计划 §3.1 明令禁止）。因此为 purge 单开一个长驻 daemon 线程，在其中
+    ``asyncio.run`` 一个长驻 MemoryContext，purge 周期协程随线程存活。
+
+    Args:
+        checkpoint_file: 与 factory 相同的 SQLite 文件（共享同一长期记忆库）
+        interval: purge 周期（默认 86400s = 24h）
+        forgotten_retention_days: forgotten 保留天数阈值
+        superseded_retention_days: superseded 保留天数阈值
+
+    Returns:
+        含 ``thread``（守护线程）与 ``stop()``（幂等停止）的 host 对象。
+    """
+    ready = threading.Event()
+    stop = threading.Event()
+
+    def _target() -> None:
+        try:
+            _purge_host_main(
+                checkpoint_file,
+                interval,
+                forgotten_retention_days,
+                superseded_retention_days,
+                ready,
+                stop,
+            )
+        except Exception as error:  # pragma: no cover - 守护线程兜底
+            logger.warning("purge 守护线程异常退出: %s", error)
+
+    thread = threading.Thread(target=_target, name="memory-purge-host", daemon=True)
+    thread.start()
+    # 等待 purge 上下文就绪（有界）；超时不阻塞主流程（线程仍会继续）
+    ready.wait(timeout=10.0)
+
+    class _PurgeHost:
+        """purge 守护线程句柄。"""
+
+        def __init__(self) -> None:
+            self.thread = thread
+            self._stop = stop
+            self._stopped = False
+
+        def stop(self) -> None:
+            """幂等停止：置位停止信号并短暂等待线程退出。"""
+            if self._stopped:
+                return
+            self._stopped = True
+            self._stop.set()
+            thread.join(timeout=5.0)
+
+    return _PurgeHost()
+
+
 def pick_provider(config_provider):
-    """
-    选择 LLM 提供商，优先级：配置文件 > 环境变量 > 第一个可用提供商。
-    """
     # 配置文件指定
     if config_provider:
         return config_provider
@@ -198,6 +299,11 @@ def main():
     logger.info("使用 LLM 提供商: %s", provider)
     agent_factory = make_agent_factory(provider)
 
+    # 2.4 启动后台 purge 守护线程：专属事件循环承载长驻 MemoryContext 的
+    #     周期清理（executor 的临时 asyncio.run loop 严禁承载周期协程）
+    purge_host = _start_purge_host(CHECKPOINT_FILE)
+    logger.info("后台 purge 守护线程已启动（间隔 86400s）")
+
     # 2.5 预加载 team 模块,触发 @register_agent 装饰器注册工作流角色
     #     使 executor 中的 workflow: 任务能正确构建所需 Agent
     try:
@@ -233,6 +339,7 @@ def main():
     except KeyboardInterrupt:
         logger.info("收到中断信号，正在停止...")
         engine.stop()
+        purge_host.stop()
         logger.info("已安全退出")
 
 

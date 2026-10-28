@@ -64,6 +64,8 @@ async def build_agent(provider: str, process_type: str | None = None) -> tuple[A
         process_type=process_type,
         llm_getter=lambda: llm,
         # 记忆链路参数由 memory/config.py 统一管理，不再经 agent_config.json 配置
+        # 注：CLI 为短命进程，不启用后台 purge（24h 周期在分钟级会话中永不触发，
+        # 白占协程）；forgotten 的清理由下次 api/scheduler 进程的 purge 覆盖。
     )
     agent = await AgentCore.acreate(
         llm_client=llm,

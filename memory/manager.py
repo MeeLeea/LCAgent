@@ -92,6 +92,9 @@ class MemoryManager:
         self._recall_limit = recall_limit
         # agent 级互斥锁：agent namespace 跨进程共享，写入/清空/压缩必须串行化
         self._agent_lock = agent_lock if agent_lock is not None else AgentMemoryLock()
+        # 后台 purge 协程句柄与停止信号（仅长驻进程经 start_purge_task 置位）
+        self._purge_task: asyncio.Task[None] | None = None
+        self._purge_stop: asyncio.Event = asyncio.Event()
 
         # 写中间件：事件接收 + 防抖 + Fact 抽取流水线
         self._write_middleware = ThreadMemoryWriteMiddleware(
@@ -524,6 +527,147 @@ class MemoryManager:
     async def count_facts(self, thread_id: str) -> int:
         """统计指定会话的长期记忆条数。"""
         return await self._store.count_facts(thread_id)
+
+    # ============ 后台物理清理（purge，仅长驻进程） ============
+
+    async def purge_once(
+        self,
+        forgotten_retention_days: float = 7,
+        superseded_retention_days: float = 90,
+        thread_id: str | None = None,
+    ) -> dict[str, int]:
+        """执行一次物理清理（供后台任务每 tick 调用）。
+
+        清理范围：
+        - agent namespace（跨进程共享）：forgotten 超 ``forgotten_retention_days``、
+          superseded 超 ``superseded_retention_days`` 的条目
+        - 若传入 ``thread_id``：额外清理该 thread namespace 的同类条目
+
+        跨进程串行化：整个清理过程持有 agent 级 :class:`AgentMemoryLock`
+        （OS 级文件锁），使同一时刻仅一个进程执行 purge，避免多进程并发清理的
+        日志噪音与瞬时连接争用（幂等删除本身安全）。
+
+        **thread namespace 局限**：LangGraph SQLite Store 无"列举 namespace" API，
+        因此无法枚举全部 thread 做批量清理。thread 级 forgotten/superseded 条目
+        由以下途径兜底清理：① 传入 ``thread_id`` 时本方法会清理该 thread；
+        ② 会话删除（``adelete_session``）时整 namespace 清空。
+        这是有意的收敛（不引入 namespace 索引表）。
+
+        Returns:
+            ``{"forgotten": int, "superseded": int}``（被物理删除的条数）。
+        """
+        forgotten = 0
+        superseded = 0
+        # 持 agent 锁串行化（跨进程），覆盖 agent 级 + 可选 thread 级清理全程
+        async with self._agent_lock:
+            forgotten += await self._store.purge_forgotten(
+                thread_id=None, older_than_days=forgotten_retention_days
+            )
+            superseded += await self._store.purge_superseded(
+                thread_id=None, older_than_days=superseded_retention_days
+            )
+            if thread_id:
+                forgotten += await self._store.purge_forgotten(
+                    thread_id=thread_id, older_than_days=forgotten_retention_days
+                )
+                superseded += await self._store.purge_superseded(
+                    thread_id=thread_id, older_than_days=superseded_retention_days
+                )
+        if forgotten or superseded:
+            logger.info(
+                "后台 purge 完成: forgotten %d 条, superseded %d 条",
+                forgotten,
+                superseded,
+            )
+        return {"forgotten": forgotten, "superseded": superseded}
+
+    def start_purge_task(
+        self,
+        interval_seconds: float = 86400,
+        forgotten_retention_days: float = 7,
+        superseded_retention_days: float = 90,
+    ) -> asyncio.Task[None]:
+        """在**当前事件循环**启动后台周期清理协程（仅长驻进程调用）。
+
+        必须与 :meth:`MemoryContext.acreate` 同一事件循环创建：``AsyncSqliteSaver``
+        绑定创建时的 loop，跨 loop 复用会挂起。scheduler 路径经
+        ``execute_task → asyncio.run`` 在临时 loop 执行，**严禁**在该 loop 创建本协程
+        ——应在 ``scheduler/run.py`` 主 loop 创建。
+
+        重复调用（任务仍在运行）返回既有任务，不重复创建（幂等）。
+
+        Args:
+            interval_seconds: 清理周期（默认 24h；测试可注入极小值）
+            forgotten_retention_days: forgotten 保留天数阈值
+            superseded_retention_days: superseded 保留天数阈值
+
+        Returns:
+            已启动（或既有）的 ``asyncio.Task``。
+        """
+        if self._purge_task is not None and not self._purge_task.done():
+            return self._purge_task
+        self._purge_stop = asyncio.Event()
+        self._purge_task = asyncio.create_task(
+            self._purge_loop(
+                interval_seconds, forgotten_retention_days, superseded_retention_days
+            ),
+            name="memory-purge",
+        )
+        logger.info("后台 purge 任务已启动: 间隔 %.0fs", interval_seconds)
+        return self._purge_task
+
+    @property
+    def purge_task_running(self) -> bool:
+        """后台 purge 协程是否在运行。"""
+        return self._purge_task is not None and not self._purge_task.done()
+
+    async def stop_purge_task(self) -> None:
+        """取消后台 purge 协程（须在创建它的同一 loop 内调用，幂等）。"""
+        task = self._purge_task
+        self._purge_task = None
+        if task is None:
+            return
+        self._purge_stop.set()
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as error:  # pragma: no cover - 防御性
+            logger.debug("purge 任务退出异常: %s", error)
+        logger.info("后台 purge 任务已停止")
+
+    async def _purge_loop(
+        self,
+        interval_seconds: float,
+        forgotten_retention_days: float,
+        superseded_retention_days: float,
+    ) -> None:
+        """周期清理循环：每 ``interval_seconds`` 执行一次 :meth:`purge_once`。
+
+        单次 tick 异常仅记警告并继续（绝不退出循环）；通过 ``_purge_stop`` 事件
+        与 ``task.cancel()`` 双重响应停止信号。
+        """
+        while not self._purge_stop.is_set():
+            try:
+                await asyncio.wait_for(self._purge_stop.wait(), timeout=interval_seconds)
+                # 收到停止信号 → 退出
+                break
+            except TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                raise
+            try:
+                await self.purge_once(
+                    forgotten_retention_days=forgotten_retention_days,
+                    superseded_retention_days=superseded_retention_days,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                # 吞异常，循环继续（后台任务不得因单次失败退出）
+                logger.warning("后台 purge 单次执行失败（已跳过）: %s", error)
 
     # ============ 显式遗忘（软删除） ============
 

@@ -309,6 +309,8 @@ async def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
         process_type="server",
         llm_getter=lambda: new_llm,
         # 记忆链路参数由 memory/config.py 统一管理，不再经 agent_config.json 配置
+        # 长驻进程：在本 loop 启动后台 purge（物理清理 forgotten / 超龄 superseded）
+        enable_purge_task=True,
     )
     new_agent = await AgentCore.acreate(
         llm_client=new_llm,

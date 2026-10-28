@@ -366,6 +366,34 @@ class ThreadMemoryStore:
             await self._store.adelete(ns, key=fact.fact_id)
         return len(targets)
 
+    async def _purge_superseded_ns(
+        self, ns: tuple[str, ...], older_than_days: float
+    ) -> int:
+        """物理删除指定 namespace 中 superseded 且超龄的条目。
+
+        仅清理 ``status == superseded`` 且 ``superseded_at`` 早于阈值者；
+        legacy 数据缺 ``superseded_at``（空串）时跳过（无法判定老化，保守保留）。
+
+        Returns:
+            被物理删除的条数
+        """
+        facts = await self._query_facts_ns(ns)
+        cutoff = _naive_now() - timedelta(days=older_than_days)
+        targets: list[ThreadFactItem] = []
+        for fact in facts:
+            if fact.status != FACT_STATUS_SUPERSEDED:
+                continue
+            superseded_at = _parse_time_anchor(fact.superseded_at)
+            if superseded_at is None:
+                # 无 superseded_at（legacy）→ 不参与老化清理
+                continue
+            if superseded_at <= cutoff:
+                targets.append(fact)
+
+        for fact in targets:
+            await self._store.adelete(ns, key=fact.fact_id)
+        return len(targets)
+
     # ============ 读操作（thread 级，不加锁，允许并发读） ============
 
     async def query_facts(
@@ -538,6 +566,36 @@ class ThreadMemoryStore:
         if purged:
             logger.info(
                 "清理 forgotten 条目 [%-20s]: %d 条",
+                thread_id or f"agent={self._agent_key}",
+                purged,
+            )
+        return purged
+
+    async def purge_superseded(
+        self,
+        thread_id: str | None = None,
+        older_than_days: float = 90,
+    ) -> int:
+        """物理删除超龄的 superseded 条目（供 Phase 3 后台清理任务使用）。
+
+        superseded 保留期为审计用途，超过 ``older_than_days`` 后可安全物理清理。
+
+        Args:
+            thread_id: 会话线程 ID；为 None 时作用于 agent 级 namespace
+            older_than_days: 保留天数阈值（默认 90 天）
+
+        Returns:
+            被物理删除的条数
+        """
+        ns = (
+            self._facts_namespace("", scope="agent")
+            if thread_id is None
+            else self._facts_namespace(thread_id)
+        )
+        purged = await self._purge_superseded_ns(ns, older_than_days=older_than_days)
+        if purged:
+            logger.info(
+                "清理超龄 superseded 条目 [%-20s]: %d 条",
                 thread_id or f"agent={self._agent_key}",
                 purged,
             )

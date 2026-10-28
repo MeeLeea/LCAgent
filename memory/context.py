@@ -128,7 +128,16 @@ class MemoryContext:
     # ============ 生命周期 ============
 
     async def aclose(self) -> None:
-        """优雅关闭：刷新记忆 buffer、关闭中间件、释放 AgentMemory 资源。"""
+        """优雅关闭：取消后台 purge、刷新记忆 buffer、关闭中间件、释放资源。
+
+        purge 协程须在创建它的同一 loop 内取消（``stop_purge_task`` 在 ``aclose``
+        所在 loop 内 ``await`` 任务结束）。
+        """
+        try:
+            await self._memory_manager.stop_purge_task()
+        except Exception as error:
+            logger.warning("后台 purge 任务停止异常: %s", error, exc_info=True)
+
         try:
             await self._memory_manager.flush_all()
             await self._memory_manager.shutdown()
@@ -158,6 +167,8 @@ class MemoryContext:
         recall_limit: int = MEMORY_RECALL_LIMIT,
         confidence_floor: float = MEMORY_CONFIDENCE_FLOOR,
         low_confidence_threshold: float = MEMORY_LOW_CONFIDENCE_THRESHOLD,
+        enable_purge_task: bool = False,
+        purge_interval_seconds: float = 86400,
     ) -> MemoryContext:
         """异步创建 MemoryContext。
 
@@ -179,6 +190,11 @@ class MemoryContext:
             confidence_floor: agent 级写入置信度门槛（persistence=global 但
                 confidence 低于该值的 fact 降级 thread 级）
             low_confidence_threshold: 读取注入时低置信标注阈值
+            enable_purge_task: 是否在**当前事件循环**启动后台 purge 周期协程
+                （物理清理 forgotten / 超龄 superseded）。仅长驻进程（api /
+                scheduler）置 True；CLI 短命会话保持 False——24h 周期任务在
+                分钟级会话中永不触发，无意义且白占协程。
+            purge_interval_seconds: 后台 purge 周期（默认 86400s = 24h）
         """
         # 1. 创建 AgentMemory
         agent_memory = await AgentMemory.acreate(
@@ -233,6 +249,10 @@ class MemoryContext:
             agent_lock=agent_lock,
             confidence_floor=confidence_floor,
         )
+
+        # 7. 可选：在当前 loop 启动后台 purge 周期协程（仅长驻进程）
+        if enable_purge_task:
+            memory_manager.start_purge_task(interval_seconds=purge_interval_seconds)
 
         return cls(
             agent_memory=agent_memory,
