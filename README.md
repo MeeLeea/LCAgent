@@ -3115,7 +3115,6 @@ asyncio.run(main())
 | `memory_recall_limit`         | int  | 20     | 召回长期记忆时的默认条数上限（聚合 agent 级 + thread 级去重、同主题收敛后截取，同时约束每次 LLM 调用注入的 fact 条数） |
 | `memory_confidence_floor`     | float | 0.7   | agent 级写入置信度门槛：`persistence=global` 但 confidence 低于该值的 fact 降级写入 thread 级（防止低置信内容污染跨会话共享空间） |
 | `memory_low_confidence_threshold` | float | 0.6 | 读取注入时的低置信标注阈值：confidence 低于该值的条目注入 prompt 时附"（低置信）"标注 |
-| `session_enable_memory`       | bool | true   | SessionManager 是否启用长期记忆处理                                                                        |
 
 #### Agent 核心提示词（`agent/AGENT.md`）
 
