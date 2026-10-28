@@ -409,6 +409,12 @@ class ThreadMemoryWriteMiddleware:
             # 新 content 登记进对应 seen，防批内重复
             (agent_seen if item.scope == "agent" else thread_seen).add(item.content)
 
+        # ⑦ 观测所需：本轮各批次非空 topic_key 集合 + supersede 命中数（仅观测）
+        new_agent_keys: set[str] = set()
+        agent_supersede_ids: list[str] = []
+        new_thread_keys: set[str] = set()
+        thread_supersede_ids: list[str] = []
+
         # ⑥ 写入：同 topic_key 取代（先写新条目，再标记旧条目 superseded——
         #    中断时宁可瞬态双版本由读取侧收敛，不可丢主题记忆）+ 容量淘汰。
         #    agent 级写入/supersede/prune 必须持有 agent 锁，且仅在本次确实
@@ -416,17 +422,18 @@ class ThreadMemoryWriteMiddleware:
         #    各自按本地快照计算溢出并删除不相干集合，造成过量淘汰。
         if agent_items:
             merged_agent = self._merge_batch_by_topic(agent_items)
-            supersede_ids = self._collect_supersede_targets(
+            agent_supersede_ids = self._collect_supersede_targets(
                 merged_agent, existing_agent
             )
+            new_agent_keys = {item.topic_key for item in merged_agent if item.topic_key}
             async with self._agent_lock:
                 await self._store.save_agent_facts_batch(merged_agent)
-                if supersede_ids:
-                    await self._store.supersede_agent_facts(supersede_ids)
+                if agent_supersede_ids:
+                    await self._store.supersede_agent_facts(agent_supersede_ids)
                     logger.info(
                         "[长期记忆-agent级] thread=%s 同主题取代 %d 条旧记忆",
                         thread_id,
-                        len(supersede_ids),
+                        len(agent_supersede_ids),
                     )
                 logger.info(
                     "[长期记忆-agent级] thread=%s 写入 %d 条 (跨会话共享, namespace=global_facts)",
@@ -440,6 +447,7 @@ class ThreadMemoryWriteMiddleware:
             thread_supersede_ids = self._collect_supersede_targets(
                 merged_thread, existing_thread
             )
+            new_thread_keys = {item.topic_key for item in merged_thread if item.topic_key}
             await self._store.save_facts_batch(thread_id, merged_thread)
             if thread_supersede_ids:
                 await self._store.supersede_facts(thread_id, thread_supersede_ids)
@@ -454,6 +462,47 @@ class ThreadMemoryWriteMiddleware:
                 len(merged_thread),
             )
         await self._store.prune_facts(thread_id)
+
+        # ⑦ topic_key 漂移观测（Phase 4，仅观测不改行为）：汇总本轮两级批次的
+        #    topic_key 命中/新增计数并记一行 INFO。供后续决定是否建设 LLM 兜底判定。
+        self._log_topic_key_observation(
+            new_agent_keys,
+            len(agent_supersede_ids),
+            new_thread_keys,
+            len(thread_supersede_ids),
+            set(existing_topic_keys),
+        )
+
+    @staticmethod
+    def _log_topic_key_observation(
+        new_agent_keys: set[str],
+        agent_hits: int,
+        new_thread_keys: set[str],
+        thread_hits: int,
+        existing_topic_keys: set[str],
+    ) -> None:
+        """记录 topic_key 漂移观测（supersede 命中率 + 新增率），仅观测不改行为。
+
+        - **supersede 命中率**：非空 topic_key 的写入中，实际取代了既有同主题 active
+          条目的比例（hits / eligible）
+        - **topic_key 新增率**：批次内非空 topic_key 未出现在既有清单中的比例
+          （new / total）——新增率高说明 LLM 未复用既有键（漂移信号）
+
+        无任何非空 topic_key 时不记日志。日志为唯一观测出口（写中间件未持有
+        MetricsCollector，避免为此跨层新增管道）。
+        """
+        all_keys = {*new_agent_keys, *new_thread_keys}
+        if not all_keys:
+            return
+        hits = agent_hits + thread_hits
+        new_keys = all_keys - existing_topic_keys
+        logger.info(
+            "topic_key 观测: supersede命中 %d/%d, 新增topic_key %d/%d",
+            hits,
+            len(all_keys),
+            len(new_keys),
+            len(all_keys),
+        )
 
     def _resolve_scope(
         self, category: str, persistence: str, confidence: float
