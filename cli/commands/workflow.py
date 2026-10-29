@@ -91,6 +91,28 @@ async def run_workflow(context: CommandContext, name: str, task: str) -> dict:
         workflow_thread_id = current_sid
     else:
         workflow_thread_id = context.agent.session.generate_session_id(name)
+        # workspace 按 session_id 存储在 session_workspaces 表，新生成的工作流会话
+        # 默认没有任何绑定；若不继承，WorkspaceSecurityMW 会读到
+        # configurable.workspace_path=None 而直接放行（相对路径不会被解析进 workspace）。
+        # 因此把当前会话已绑定的 workspace 复制到新的工作流会话。
+        inherited_workspace = await context.agent.session.aget_workspace(current_sid)
+        if inherited_workspace:
+            try:
+                await context.agent.session.aset_workspace(
+                    inherited_workspace, workflow_thread_id
+                )
+            except ValueError as exc:
+                # 原绑定路径可能已被删除或不再是目录；继承失败不中断工作流，
+                # 降级为「无 workspace」继续运行。
+                logger.warning(
+                    "工作流会话 %s 继承 workspace 失败（降级为无 workspace 运行）: %s",
+                    workflow_thread_id,
+                    exc,
+                )
+                # 仅记日志时用户无从感知，明确提示本次运行不受 workspace 限制
+                context.print(
+                    f"⚠ 工作流会话继承工作空间失败，本次以无工作空间运行: {exc}"
+                )
 
     context.print(f"\n执行任务: {task}")
     context.print("-" * 50)
