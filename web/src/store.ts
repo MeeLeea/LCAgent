@@ -909,13 +909,26 @@ export const useStore = create<AppState>((set, get) => ({
     try {
       // 工作流模式下创建专属工作流会话，其余为普通对话
       const type = get().viewMode
-      const r = type === 'workflow' ? await api.createThread('workflow', 'simple') : await api.createThread('chat')
+      // workspace 按 thread_id 存储，新建工作流会话默认无绑定，
+      // 会导致 WorkspaceSecurityMW 放行文件工具，故继承当前会话的绑定。
+      // 普通对话分支保持原行为（workspace 置 null）。
+      const inherited = type === 'workflow' ? get().workspace : null
+      const r =
+        type === 'workflow'
+          ? await api.createThread('workflow', 'simple', inherited ?? undefined)
+          : await api.createThread('chat')
+      // 后端对非法 workspace_path 做降级创建（不带绑定），必须以后端回报为准，
+      // 否则前端会显示「已绑定」而实际未绑定（WorkspaceSecurityMW 仍会放行工具）。
+      if (r.workspace_error) {
+        console.warn('[前端] 工作空间继承被后端拒绝，本次会话未绑定:', r.workspace_error)
+      }
+      const bound = r.workspace_error ? null : inherited
       set((s) => ({
         currentThreadId: r.thread_id,
         messages: [],
         pendingInterrupt: null,
         failedNode: null,
-        workspace: null,
+        workspace: bound,
         messagesByThread: { ...s.messagesByThread, [r.thread_id]: [] },
       }))
       await get().refreshProviders(r.thread_id)
@@ -927,13 +940,21 @@ export const useStore = create<AppState>((set, get) => ({
 
   newWorkflowThread: async (workflowName) => {
     try {
-      const r = await api.createThread('workflow', workflowName)
+      // 同 newThread：工作流会话默认无 workspace 绑定，继承当前会话已绑定的路径，
+      // 避免 WorkspaceSecurityMW 因未绑定而放行所有文件工具。
+      const inherited = get().workspace
+      const r = await api.createThread('workflow', workflowName, inherited ?? undefined)
+      // 同 newThread：以后端回报为准，绑定被拒绝时不能显示为已绑定。
+      if (r.workspace_error) {
+        console.warn('[前端] 工作空间继承被后端拒绝，本次会话未绑定:', r.workspace_error)
+      }
+      const bound = r.workspace_error ? null : inherited
       set((s) => ({
         currentThreadId: r.thread_id,
         messages: [],
         pendingInterrupt: null,
         failedNode: null,
-        workspace: null,
+        workspace: bound,
         messagesByThread: { ...s.messagesByThread, [r.thread_id]: [] },
       }))
       await get().refreshProviders(r.thread_id)

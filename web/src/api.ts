@@ -173,11 +173,22 @@ export const api = {
     jsonFetch<WorkflowInfo>(`${BASE}/workflow?name=${encodeURIComponent(name)}`),
 
   listThreads: () => jsonFetch<{ threads: ThreadSummary[]; current: string | null }>(`${BASE}/threads`),
-  createThread: (type: 'chat' | 'workflow' = 'chat', workflowName?: string) =>
-    jsonFetch<{ thread_id: string }>(`${BASE}/threads`, {
+  /**
+   * 新建会话。
+   * workspacePath 为可选第三个参数：仅当非空时才在 body 中携带 workspace_path，
+   * 供后端在创建工作流会话时一并完成工作空间绑定（缺省保持原有行为）。
+   * workspace_error 为后端回报的绑定结果：非空表示 workspace_path 被拒绝
+   * （路径不存在 / 非目录 / 系统关键目录），此时会话以未绑定状态创建。
+   */
+  createThread: (type: 'chat' | 'workflow' = 'chat', workflowName?: string, workspacePath?: string) =>
+    jsonFetch<{ thread_id: string; workspace_error?: string | null }>(`${BASE}/threads`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type, workflow_name: workflowName }),
+      body: JSON.stringify({
+        type,
+        workflow_name: workflowName,
+        ...(workspacePath ? { workspace_path: workspacePath } : {}),
+      }),
     }),
   deleteThread: (thread_id: string) =>
     jsonFetch(`${BASE}/threads/${encodeURIComponent(thread_id)}`, { method: 'DELETE' }),
