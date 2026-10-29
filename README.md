@@ -1212,7 +1212,7 @@ session/
 
 CLI 命令 `workspace` / `workspace <路径>` / `workspace:clear` 即对应上述 API；`get_context()` 读取 `SessionContext` 供每次图执行注入。
 
-**工作流（workflow）同样受 workspace 隔离**：`workflow` 命令从会话上下文提取 `workspace_path` → 经运行器（`arun_workflow_by_name` → `arun_compiled_workflow`）注入 `config.configurable` → LangGraph 按节点签名注入 `worker_exec` 节点 → 透传 `Worker.execute_task`，使 Worker 的工具调用经 `WorkspaceSecurityMW` 路径解析与逃逸校验（`team/base.py::_create_tool_agent` 对工具型 Agent 挂载该中间件）。未绑定 workspace 的会话自动降级为不受限（`workspace_path=None`）。
+**工作流（workflow）同样受 workspace 隔离**：`workflow` 命令从会话上下文提取 `workspace_path` → 经运行器（`arun_workflow_by_name` → `arun_compiled_workflow`）注入 `config.configurable` → LangGraph 按节点签名注入 `worker_exec` 节点 → 透传 `Worker.execute_task`，使 Worker 的工具调用经 `WorkspaceSecurityMW` 路径解析与逃逸校验（`team/base.py::_create_tool_agent` 对工具型 Agent 挂载该中间件）。未绑定 workspace 的会话自动降级为不受限（`workspace_path=None`）。工作流运行在独立的工作流会话上，默认不带父会话的绑定，需按「工作流会话的 workspace 继承」一节显式继承。
 
 HTTP API（[api/server.py](api/server.py)）同样暴露三个 RESTful 端点，供 Web 前端调用：
 
@@ -1221,6 +1221,25 @@ HTTP API（[api/server.py](api/server.py)）同样暴露三个 RESTful 端点，
 | `GET`    | `/api/threads/{thread_id}/workspace` | `workspace`        | 查询绑定（`workspace` 字段为 `null` 表示未绑定）     |
 | `POST`   | `/api/threads/{thread_id}/workspace` | `workspace <路径>` | 设置/修改绑定，body`{"path": "..."}`；路径非法返回 400 |
 | `DELETE` | `/api/threads/{thread_id}/workspace` | `workspace:clear`  | 清除绑定，返回`{"cleared": true/false}`                |
+
+#### 工作流会话的 workspace 继承
+
+workspace 绑定按 `thread_id` 存储在 `session_workspaces` 表（[session/workspace_store.py](session/workspace_store.py)，读写入口是 `SessionRegistry.aset_workspace` / `aget_workspace`），而工作流运行在**独立的工作流会话**（`workflow-{name}-thread-{suffix}`）上，该会话默认没有任何绑定，因此需要显式继承。不继承的后果是：`session/workflow_adapter.py::_awarm_and_build_workflow` 读到 `workspace_path=None`，不向 `configurable` 注入路径，`midware/workspace_mw.py::WorkspaceSecurityMW.awrap_tool_call` 打印 `WARNING: 工作空间未绑定，工具 write_file 直接放行（无路径解析）` 后放行工具调用，相对路径不会被解析进 workspace。
+
+继承行为按入口分三条链路：
+
+- **CLI**（`cli/commands/workflow.py::run_workflow`）：生成新的工作流 thread_id 后，读取当前会话已绑定的 workspace，用 `aset_workspace` 复制到新会话；当前会话本身已是工作流会话时直接复用该 session_id，不做任何 workspace 读写；继承失败（如原路径已被删除触发 `ValueError`）只记 `logger.warning` 并降级为「无 workspace」继续执行，不中断工作流。
+- **Web 前端**（`web/src/api.ts::createThread`）：新增可选第三参数 `workspacePath`，非空时才在请求 body 中携带 `workspace_path`；`web/src/store.ts` 的 `newThread`（工作流模式）与 `newWorkflowThread` 会把当前会话的 workspace 一并传入，并在新线程状态里保留该值。普通对话（chat）分支行为不变，仍为未绑定。
+- **HTTP API**（`api/server.py::create_thread`）：见下表。
+
+`POST /api/threads` 创建会话时接受可选的 `workspace_path`，并在响应中回报绑定结果：
+
+| 字段             | 位置       | 说明                                                                                                                                                       |
+| ---------------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `workspace_path` | 请求 body  | 可选；非空时把新会话绑定到该目录，沿用同一套路径校验（必须为已存在的目录的绝对路径，且不能是宿主根目录、用户主目录或系统目录）                             |
+| `workspace_error`| 响应 body  | 绑定被拒绝的原因（路径不存在 / 非目录 / 系统关键目录等）；成功绑定或未传 `workspace_path` 时为空（`null`）                                                 |
+
+`workspace_path` 非法时端点不再返回 500，而是 `logger.warning` 后**不带 workspace 重新创建会话**（降级创建），响应仍正常返回新会话，同时用 `workspace_error` 说明绑定被拒绝的原因。
 
 ### 删除会话内某一轮对话（turn）
 
