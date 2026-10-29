@@ -843,22 +843,45 @@ async def create_thread(req: CreateThreadRequest | None = None):
 
     type=workflow 时创建专属工作流会话。
     workspace_path 指定会话绑定的外部工作空间路径（可选，用于多会话工作目录隔离）。
+
+    路径校验保持严格（由 SessionRegistry 负责），但 API 边界做降级：
+    workspace_path 非法（不存在 / 不是目录 / 系统关键目录）时不再整体失败，
+    而是记录 warning 后不绑定 workspace 重新创建同一会话，并在响应体
+    workspace_error 中返回被拒绝的原因（成功绑定时该字段为 None）。
     """
+    workspace_path = req.workspace_path if req else None
+    workspace_error: str | None = None
     async with chat_lock:
         if req and req.type == "workflow":
             workflow_name = req.workflow_name or "simple"
-            tid = agent.session.new_workflow_session(
-                workflow_name,
-                workspace_path=req.workspace_path if req else None,
-            )
+            try:
+                tid = agent.session.new_workflow_session(
+                    workflow_name,
+                    workspace_path=workspace_path,
+                )
+            except ValueError as error:
+                workspace_error = str(error)
+                logger.warning(
+                    "工作流会话 workspace 绑定被拒绝，降级为不绑定: %s (%s)",
+                    workspace_path,
+                    workspace_error,
+                )
+                tid = agent.session.new_workflow_session(workflow_name)
             agent.set_current_session(tid)
         else:
-            tid = agent.session.new_session(
-                workspace_path=req.workspace_path if req else None,
-            )
+            try:
+                tid = agent.session.new_session(workspace_path=workspace_path)
+            except ValueError as error:
+                workspace_error = str(error)
+                logger.warning(
+                    "会话 workspace 绑定被拒绝，降级为不绑定: %s (%s)",
+                    workspace_path,
+                    workspace_error,
+                )
+                tid = agent.session.new_session()
             agent.set_current_session(tid)
-    logger.info("创建会话: %s (workspace=%s)", tid, req.workspace_path if req else None)
-    return {"thread_id": tid}
+    logger.info("创建会话: %s (workspace=%s)", tid, workspace_path)
+    return {"thread_id": tid, "workspace_error": workspace_error}
 
 
 @app.delete("/api/threads/{thread_id}")
