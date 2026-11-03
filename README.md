@@ -92,6 +92,7 @@
     - [工具超时保护（Tool Timeout）](#工具超时保护tool-timeout)
     - [统一异常层次](#统一异常层次)
   - [异步 Public API](#异步-public-api)
+  - [后台方案设计子程序（Planner）](#后台方案设计子程序planner)
   - [定时任务调度（Scheduler）](#定时任务调度scheduler)
     - [工具接口](#工具接口)
     - [快速开始](#快速开始-1)
@@ -230,6 +231,14 @@ LangChainAgent/
 │   ├── executor.py          # AgentCore 异步执行桥接(acreate/arun/aclose 单 loop)
 │   ├── engine.py            # APScheduler 引擎
 │   └── run.py               # 独立进程入口
+├── subagent/                # 后台子程序（独立进程，经 @tool 调用）
+│   └── planner/              # 复杂需求的后台方案设计子程序（一次性，无记忆）
+│       ├── config.py        # PlannerConfig / LLM 设置解析
+│       ├── config.json      # provider/model/超时/输出目录
+│       ├── AGENT.md         # 系统提示词 + 单个 ## workflow:design 模板
+│       ├── store.py         # 文件系统任务存储（原子写/独占认领/PID 回收）
+│       ├── launcher.py      # detached 进程启动 + PID 存活检测 + preflight
+│       └── worker.py        # 子进程入口：一次 LLM 调用 → plan.md
 ├── data/                  # 运行时数据库目录（自动生成）
 │   ├── checkpoints_async.sqlite # Checkpoint 持久化数据库 + 长期记忆 Store（同一文件）
 │   └── scheduled_tasks.sqlite# 定时任务数据库
@@ -412,6 +421,7 @@ LangChainAgent/
 | [cli/commands/types.py](cli/commands/types.py)                           | 命令依赖上下文、活动 LLM 状态和分发结果类型                                                                                                                                                                                                                                                                                                                                                        |
 | [cli/commands/](cli/commands/)                                           | 会话、记忆、模型、MCP、技能、安全及 Agent 执行命令                                                                                                                                                                                                                                                                                                                                                 |
 | [scheduler/](scheduler/)                                                 | 定时任务调度：TaskStore（SQLite CRUD）、SchedulerEngine（APScheduler 轮询）、独立进程入口                                                                                                                                                                                                                                                                                                          |
+| [subagent/planner/](subagent/planner/)                                     | 后台方案设计子程序（一次性、无记忆）：`subagent/planner/tool.py` 的 3 个 async 工具派活 → detached 子进程用 `LLMClient` **一次调用**产出 `plan.md` → 文件系统任务存储（原子写 + 独占 `worker.lock` + PID 回收 + `cancel.flag`）。产物落 `data/subagent/planner/<task_id>/`，仅 `status=done` 可读 `plan.md` |
 
 ### llm/llm_client.py 主要 API
 
@@ -1379,6 +1389,9 @@ Agent 的工具分为两类：
 | `create_tool`    | [tools/create_tools.py](tools/create_tools.py)     | 动态生成工具代码并保存为 .py 文件（默认保存到 tools/ 目录、自动注册到 tools/__init__.py，并顺带生成单元测试到 tests/tools/test_<tool>.py；tool_logic 支持含 f-string/多行字符串的代码，内容行不会被误缩进）。安全边界：工具名须为合法 Python 标识符、工具路径限制在 tools/ 内且测试路径限制在 tests/tools/ 内禁止逃逸、默认禁止覆盖已有文件（`force=True` 可覆盖）、生成源码经 AST 校验禁止导入 os/subprocess/socket 等高风险模块 | `tool_name`, `tool_description`, `args_spec`, `tool_logic`, `tool_path`, `force`, `with_test` |
 | `ask_human`      | [cli/human_input.py](cli/human_input.py)           | 暂停 LangGraph 图并请求人工结构化选择                                                                                                                                                                                                                                                                                                                    | `prompt`, `choices`                                                                      |
 | `request_user_confirmation` | [tools/human_confirmation.py](tools/human_confirmation.py) | 多问题批量人工确认（LangGraph interrupt，`kind="user_confirmation"`），与单选语义的 `ask_human` 区分 | `items`（问题+选项清单） |
+| `start_planner_task` | [subagent/planner/tool.py](subagent/planner/tool.py) | 在后台启动方案设计子程序（非阻塞，毫秒级返回 task_id；启动前校验 provider/API Key） | `requirement`, `context` |
+| `query_planner_task` | [subagent/planner/tool.py](subagent/planner/tool.py) | 查询进度 / 读取结果（有界等待 ≤30 秒；`done` 时直接返回 `plan`；对 running 任务顺带回收死进程） | `task_id`, `wait_seconds`, `max_chars` |
+| `cancel_planner_task` | [subagent/planner/tool.py](subagent/planner/tool.py) | 请求取消（queued 立即取消；running 在当前 LLM 调用结束后生效，不写 `plan.md`） | `task_id` |
 
 > `open_sqlite` 会自动查找 DB Browser for SQLite 路径（环境变量 `SQLITE_BROWSER_PATH` → 常见安装位置 → `shutil.which`），找不到则返回下载链接。Linux 下安装 `sqlitebrowser` 包即可使用。
 
@@ -2107,6 +2120,76 @@ LCAgentError                    ← 所有 LCAgent 异常的基类（含 detail 
 - **跨会话并发**：不同 `thread_id` 各自持有独立锁，可同时流式对话，互不阻塞。
 - **配置隔离**：两个会话可同时使用不同 provider/model/角色，互不污染——模型对象、系统提示词、`recursion_limit` 均不经过任何共享属性传递。
 - **轮内快照**：一轮开始处捕获不可变的 `SessionConfig` 快照，轮中修改会话配置只对下一轮生效。
+
+---
+
+## 后台方案设计子程序（Planner）
+
+当用户提出**复杂需求**、需要一份包含架构取舍、候选方案对比与落地计划的完整方案时，主 Agent
+调用 `start_planner_task` 把活派给独立后台子程序。子程序是**一次性任务**：在分离进程中用
+`LLMClient` 做**一次 LLM 调用**，产出 `plan.md` 后退出——不维护会话记忆、不写 checkpoint。
+
+```
+主 Agent 进程（subagent/planner/tool.py）              后台子进程（subagent.planner.worker）
+──────────────────────────────────               ──────────────────────────────────
+start_planner_task(requirement, context)
+  │  preflight 校验 provider/model/API Key
+  │  写 task.json（status=queued）
+  ▼
+spawn_worker → detached Popen ──────────────────►  claim（独占 worker.lock）
+  │  毫秒级返回 task_id                              │
+  ▼                                                  ▼
+query_planner_task(task_id, wait_seconds≤30)     system(AGENT.md) + user(需求/上下文/结构)
+  │  读 task.json + reap 死进程                     │
+  │                                                  ▼
+  │                                              LLMClient.ainvoke()
+  │                                                  │
+  │                                                  ▼
+  │                                              plan.md（仅 status=done 可读）
+  ▼                                                  │
+query_planner_task 返回 plan ◄────────────────────────┘
+```
+
+**单次调用的输入**：系统提示词来自 `subagent/planner/AGENT.md` 的 `## workflow:design` 之前部分，
+用户模板来自该小节之后部分，只支持 `{requirement}` 与 `{context}` 两个占位符。输出固定为一份
+自包含方案文档（背景/范围/假设/总览/候选方案对比/模块接口/关键流程/实施计划/验收标准/风险缓解），
+末行 `<!-- END OF PLAN -->`。
+
+**可靠性与安全边界**：
+
+| 机制 | 行为 |
+| --- | --- |
+| 非阻塞 | `start_planner_task` 只做 preflight + 写 task.json + `Popen`，毫秒级返回；`wait_seconds` 用 `asyncio.sleep`，不阻塞主进程事件循环 |
+| 独占认领 | `worker.lock` 以 `O_CREAT|O_EXCL` 原子创建，并发/重复启动只有一个 worker 继续 |
+| 僵尸回收 | `task.json` 记录 `pid`；查询工具对 `running` 任务 `reap()`：PID 已死 → `failed` |
+| 取消语义 | `queued` 立即取消；`running` 在当前 LLM 调用结束后停止，**不写 `plan.md`**，不会把半成品当结果 |
+| 终态保证 | worker 整段 `try/except BaseException/finally`，异常必写 `failed` + `error`；空输出经 `final_answer_is_empty` 判定为失败 |
+| 防编造 | 3 个工具的 docstring 均明确：`done != true` 前不得编造/推测方案内容 |
+| 失败前置 | `preflight` 在派活阶段同步校验 provider/model/API Key，缺 Key 直接返回 `success:false`，不产生僵尸任务 |
+
+**典型调用序列**：
+
+```
+1. start_planner_task(requirement="为现有 CLI 增加插件机制并给出落地方案", context="...")
+   → {"success": true, "task_id": "pl-20261102-143012-ab12cd34", "status": "queued", ...}
+
+2. query_planner_task(task_id, wait_seconds=30)
+   → {"success": true, "done": false, "status": "running", ...}   # 未完成，继续轮询
+
+3. query_planner_task(task_id, wait_seconds=30)
+   → {"success": true, "done": true, "status": "done", "plan": "# ...", "chars": 8231}
+```
+
+**配置与产物**：
+
+- 配置：`subagent/planner/config.json` 为**可选本地配置**（被 `.gitignore` 的 `*.json` 忽略，不入库）；
+  文件缺失时使用 `config.py` 内置默认值。字段含 provider/model/`temperature`/`max_tokens`/`timeout_seconds`/
+  `output_root` 等；`provider=null` 时自动选择第一个已配置 API Key 的提供商。
+- 产物：`data/subagent/planner/<task_id>/`（`task.json`、`worker.log`、`prompt.md`、`plan.md`）。
+  可用环境变量 `LCAGENT_PLANNER_ROOT` 覆盖根目录。
+- 手动调试：`uv run python -m subagent.planner.worker --task-id <id>`。
+- 已知限制：任务目录不会自动清理；取消不是立即 kill；文件系统 + PID 检测假设单机部署；
+  方案深度受单次输出预算限制。详见 [subagent/planner/README.md](subagent/planner/README.md)。
 
 ---
 
@@ -3369,6 +3452,7 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 | `tests/memory/test_memory.py`                   | memory/ 包`AgentMemory`：checkpointer + Store 基础设施的初始化、SQLite/acreate/aclose                                                                                                     |
 | `tests/agent/test_agent_core_regressions.py`    | Agent 核心回归：HITL 恢复、会话隔离、技能匹配、长上下文裁剪等                                                                                                                               |
 | `tests/scheduler/test_scheduler.py`             | 定时任务调度：TaskStore CRUD、原子抢占、重试逻辑                                                                                                                                            |
+| `tests/subagent/`                               | Planner 子程序：`test_store`（原子写/独占认领/PID 回收/取消）、`test_launcher`（PID 存活检测/preflight）、`test_worker`（单次调用成功/失败/空输出/取消/超时/提示词解析）、`test_tools`（3 工具注册/非阻塞/等待上限/防编造门禁） |
 | `tests/api/test_api.py`                         | API Server：端点路由、流式聊天、命令执行（FastAPI TestClient）                                                                                                                              |
 | `tests/llm/test_message_utils.py`               | LLM 异常信息提取：429/5xx/鉴权/未知错误的中文提示                                                                                                                                           |
 | `tests/llm/test_llm_client.py`                  | 瞬时错误自动重试：should_retry 判定与重试行为                                                                                                                                               |
