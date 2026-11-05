@@ -92,8 +92,9 @@
     - [工具超时保护（Tool Timeout）](#工具超时保护tool-timeout)
     - [统一异常层次](#统一异常层次)
   - [异步 Public API](#异步-public-api)
-  - [后台方案设计子程序（Planner）](#后台方案设计子程序planner)
-  - [定时任务调度（Scheduler）](#定时任务调度scheduler)
+- [后台方案设计子程序（Planner）](#后台方案设计子程序planner)
+- [后台任务执行子程序（Executor）](#后台任务执行子程序executor)
+- [定时任务调度（Scheduler）](#定时任务调度scheduler)
     - [工具接口](#工具接口)
     - [快速开始](#快速开始-1)
     - [模块结构](#模块结构)
@@ -232,13 +233,26 @@ LangChainAgent/
 │   ├── engine.py            # APScheduler 引擎
 │   └── run.py               # 独立进程入口
 ├── subagent/                # 后台子程序（独立进程，经 @tool 调用）
-│   └── planner/              # 复杂需求的后台方案设计子程序（一次性，无记忆）
-│       ├── config.py        # PlannerConfig / LLM 设置解析
-│       ├── config.json      # provider/model/超时/输出目录
-│       ├── AGENT.md         # 系统提示词 + 单个 ## workflow:design 模板
-│       ├── store.py         # 文件系统任务存储（原子写/独占认领/PID 回收）
-│       ├── launcher.py      # detached 进程启动 + PID 存活检测 + preflight
-│       └── worker.py        # 子进程入口：一次 LLM 调用 → plan.md
+│   ├── common/               # 子程序共享件（仅标准库，worker 复用）
+│   │   ├── fsx.py            # 原子写/任务 ID/裸名校验/时间戳/文本截断
+│   │   ├── proc.py           # 分离进程启动 + Windows PID 存活探测
+│   │   └── paths.py          # 路径归一化/包含校验/workspace 拒绝清单
+│   ├── planner/              # 复杂需求的后台方案设计子程序（一次性，无记忆）
+│   │   ├── config.py         # PlannerConfig / LLM 设置解析
+│   │   ├── config.json       # provider/model/超时/输出目录
+│   │   ├── AGENT.md          # 系统提示词 + 单个 ## workflow:design 模板
+│   │   ├── store.py          # 文件系统任务存储（原子写/独占认领/PID 回收）
+│   │   ├── launcher.py       # detached 进程启动 + PID 存活检测 + preflight
+│   │   └── worker.py         # 子进程入口:一次 LLM 调用 → plan.md
+│   └── executor/             # 后台多步任务执行子程序（受限工具集 ReAct 循环）
+│       ├── config.py         # ExecutorConfig / LLM 设置解析（config.json 可选）
+│       ├── AGENT.md          # 系统提示词 + ## workflow:execute 模板
+│       ├── store.py          # 文件系统任务存储（原子写/独占认领/PID 回收）
+│       ├── workspace.py      # 显式 workspace 校验（拒绝清单/系统目录）
+│       ├── tools.py          # 受限工具集工厂（read_file/write_file/list_dir）
+│       ├── launcher.py       # detached 进程启动 + preflight（复用 common.proc）
+│       ├── worker.py         # 子进程入口：ReAct 工具循环 → result.md
+│       └── tool.py           # 3 个 @tool：start/query/cancel
 ├── data/                  # 运行时数据库目录（自动生成）
 │   ├── checkpoints_async.sqlite # Checkpoint 持久化数据库 + 长期记忆 Store（同一文件）
 │   └── scheduled_tasks.sqlite# 定时任务数据库
@@ -383,6 +397,7 @@ LangChainAgent/
 │   ├── memory/              # 记忆：AgentMemory、MemoryManager、ThreadMemoryStore、读写中间件
 │   ├── scheduler/           # 定时任务：TaskStore CRUD、原子抢占、执行器与调度引擎
 │   ├── session/             # 会话存储、WorkspaceStore 映射、WorkflowAdapter
+│   ├── subagent/             # 后台子程序：planner/executor 的 store/launcher/worker/tool 测试
 │   ├── team/                # 团队：TeamAgent 基类、角色切换与 LLM 重建
 │   ├── tools/               # 工具：calculator/create_tool/terminal/safety/search/MCP/包装器
 │   └── utils/               # 公共组件：events/metrics/logging/exceptions
@@ -422,6 +437,7 @@ LangChainAgent/
 | [cli/commands/](cli/commands/)                                           | 会话、记忆、模型、MCP、技能、安全及 Agent 执行命令                                                                                                                                                                                                                                                                                                                                                 |
 | [scheduler/](scheduler/)                                                 | 定时任务调度：TaskStore（SQLite CRUD）、SchedulerEngine（APScheduler 轮询）、独立进程入口                                                                                                                                                                                                                                                                                                          |
 | [subagent/planner/](subagent/planner/)                                     | 后台方案设计子程序（一次性、无记忆）：`subagent/planner/tool.py` 的 3 个 async 工具派活 → detached 子进程用 `LLMClient` **一次调用**产出 `plan.md` → 文件系统任务存储（原子写 + 独占 `worker.lock` + PID 回收 + `cancel.flag`）。产物落 `data/subagent/planner/<task_id>/`，仅 `status=done` 可读 `plan.md` |
+| [subagent/executor/](subagent/executor/)                                   | 后台任务执行子程序（多步 ReAct 工具循环，会真实写盘）：`subagent/executor/tool.py` 的 3 个 async 工具派活 → detached 子进程在工作区内用受限工具集（`read_file`/`write_file`/`list_dir`，全部绑定工作区并经路径包含校验）多步执行 → 落盘自包含 `result.md`；工作区互斥锁 + 显式 workspace 拒绝清单（见 [subagent/common/](subagent/common/)）。产物落 `data/subagent/executor/<task_id>/`，仅 `status=done` 可读 `result.md` |
 
 ### llm/llm_client.py 主要 API
 
@@ -1392,6 +1408,9 @@ Agent 的工具分为两类：
 | `start_planner_task` | [subagent/planner/tool.py](subagent/planner/tool.py) | 在后台启动方案设计子程序（非阻塞，毫秒级返回 task_id；启动前校验 provider/API Key） | `requirement`, `context` |
 | `query_planner_task` | [subagent/planner/tool.py](subagent/planner/tool.py) | 查询进度 / 读取结果（有界等待 ≤30 秒；`done` 时直接返回 `plan`；对 running 任务顺带回收死进程） | `task_id`, `wait_seconds`, `max_chars` |
 | `cancel_planner_task` | [subagent/planner/tool.py](subagent/planner/tool.py) | 请求取消（queued 立即取消；running 在当前 LLM 调用结束后生效，不写 `plan.md`） | `task_id` |
+| `start_executor_task` | [subagent/executor/tool.py](subagent/executor/tool.py) | 在后台启动任务执行子程序（非阻塞，毫秒级返回 task_id；preflight + workspace 校验；**会真实写盘**，工作区默认为任务目录内的隔离目录） | `task`, `plan`, `context`, `workspace` |
+| `query_executor_task` | [subagent/executor/tool.py](subagent/executor/tool.py) | 查询进度 / 读取结果（有界等待 ≤30 秒；`done` 时直接返回 `result` 正文与产出清单；对 running 任务顺带回收死进程） | `task_id`, `wait_seconds`, `max_chars` |
+| `cancel_executor_task` | [subagent/executor/tool.py](subagent/executor/tool.py) | 请求取消（阶段边界生效，不写 `result.md`；已写入工作区的文件不会回滚） | `task_id` |
 
 > `open_sqlite` 会自动查找 DB Browser for SQLite 路径（环境变量 `SQLITE_BROWSER_PATH` → 常见安装位置 → `shutil.which`），找不到则返回下载链接。Linux 下安装 `sqlitebrowser` 包即可使用。
 
@@ -2190,6 +2209,95 @@ query_planner_task 返回 plan ◄───────────────�
 - 手动调试：`uv run python -m subagent.planner.worker --task-id <id>`。
 - 已知限制：任务目录不会自动清理；取消不是立即 kill；文件系统 + PID 检测假设单机部署；
   方案深度受单次输出预算限制。详见 [subagent/planner/README.md](subagent/planner/README.md)。
+
+---
+
+## 后台任务执行子程序（Executor）
+
+executor 是 planner 的姊妹子程序：planner 产出**方案文档**（一次 LLM 调用，零写盘副作用），
+executor 负责**真实实现**——主 Agent 通过 `start_executor_task` 派活，分离子进程
+`subagent.executor.worker` 持一个受限工具集（`read_file` / `write_file` / `list_dir`，
+全部绑定到工作区），按 ReAct 循环多步执行，最终在任务目录落一份自包含的 `result.md` 结果文档。
+
+**与 planner 的分工**：纯方案讨论用 `start_planner_task`（零副作用）；只有已有明确的
+「任务 + 可执行计划」（例如 planner 产出的方案要点）才派 executor，两者不要串联混用于同一目标。
+
+| 维度 | planner（方案设计） | executor（任务执行） |
+| --- | --- | --- |
+| LLM 调用 | 一次 one-shot | 多步 ReAct 循环（每步 = 一次模型调用 + 本轮全部 tool_calls 执行） |
+| 可用工具 | 无（纯文本） | `read_file` / `write_file` / `list_dir`（v1 不提供 `run_shell`） |
+| 副作用 | 无 | 工作区内真实创建/修改文件（取消/失败**不回滚**） |
+| 终态产物 | `plan.md` | `result.md` |
+| 适用前提 | 纯方案讨论 | 已有明确的任务与可执行计划 |
+
+### 执行流程
+
+```
+主 Agent（subagent/executor/tool.py）            后台子进程（subagent.executor.worker）
+──────────────────────────────────               ──────────────────────────────────
+start_executor_task(task, plan, context, ws)
+  │  preflight（提示词/API Key）+ workspace 校验
+  │  写 task.json（status=queued，workspace 已固化）
+  ▼
+spawn_worker → detached Popen ─────────────────►  claim（独占 worker.lock）
+  │  毫秒级返回 task_id                            │  获取工作区互斥锁
+  ▼                                               ▼
+query_executor_task(task_id, wait_seconds≤30)   prompt.md 落盘（审计产物）
+  │  读 task.json + reap 死进程                    │
+  │                                               ▼
+  │                                       model.bind_tools([工具集])
+  │                                               │
+  │                                       ReAct 循环（≤ max_steps 步）
+  │                                       每步：LLM 调用 → 本轮 tool_calls
+  │                                       全部执行 → 同 id ToolMessage 配对
+  │                                               │
+  │                                       无 tool_calls 且内容非空 → 最终答复
+  │                                               ▼
+  │                                       result.md（含 <!-- END OF RESULT -->）
+  ▼                                               │
+query_executor_task 返回 result ◄─────────────────┘
+```
+
+### ReAct 循环契约
+
+| 机制 | 行为 |
+| --- | --- |
+| 工具绑定 | 统一 `model.bind_tools(tools)`（`bind(tools=...)` 不会序列化 schema） |
+| ToolMessage 配对 | 每个工具调用（含失败与未知工具名）恰好得到一条同 `tool_call_id` 的 `ToolMessage`（异常包装为 `status="error"`），杜绝孤儿 tool_call 触发网关 400 |
+| 观测截断 | 单条工具输出截断到 `max_observation_chars`（默认 6000） |
+| 终结判定 | 无 tool_calls 且内容非空 → 最终答复；空 `AIMessage` 一律判 `failed`，不做同预算重试 |
+| 步数上限 | 超过 `max_steps`（默认 24）仍未收敛 → `failed`（`steps_used` 保留进度） |
+| 时间预算 | 总预算 `timeout_seconds`（默认 1800s）；剩余 < 30s 不发起新一步 |
+| 取消检查点 | 每步开始 / 每次模型调用中（轮询）/ 写 `result.md` 前；取消**不写** `result.md` |
+
+### 可靠性与安全边界
+
+| 机制 | 行为 |
+| --- | --- |
+| 非阻塞 | `start` 只做 preflight + 校验 + `Popen`，毫秒级返回；`query` 有界等待 ≤30 秒 |
+| 独占认领 | `worker.lock`（`O_CREAT\|O_EXCL`）：同一任务并发启动只有一个 worker 继续 |
+| 工作区互斥 | `.lcagent-executor.lock`：同一 workspace 同时只允许一个 executor 任务运行 |
+| 僵尸回收 | `query` 对 `running` 任务 `reap`：PID 已死 → `failed`（`steps_used` 保留诊断进度） |
+| 工作区边界 | 未指定 → 任务目录内隔离 `workspace/`（推荐）；指定 → 必须是已存在的目录绝对路径，拒绝清单覆盖卷根 / 系统目录 / ProgramFiles / 用户主目录 / 项目根及其关键子目录（`agent`/`config`/`.git`/`.venv`/`data`/`subagent`） |
+| 工具路径校验 | 每次工具调用前 `realpath`+`normcase` 归一化 + `commonpath` 包含判定；`write_file` 对父目录二次校验后原子写入 |
+| 终态保证 | 整段 `try/except BaseException/finally`：异常必写 `failed` + `error`，绝不留 `running` 僵尸 |
+| 防编造 | `done != true` 前不得编造任何执行结果（3 个工具的 docstring 反复提示） |
+| 副作用提示 | 取消/失败**不回滚**工作区已写入文件——工具 docstring 与消息均已声明该语义 |
+
+### 配置与产物
+
+- 配置：`subagent/executor/config.json` 为**可选本地配置**（被 `.gitignore` 的 `*.json` 忽略，
+  不入库）；文件缺失时使用 `config.py` 内置默认值：`temperature=0.2`、`max_tokens=8192`、
+  `timeout_seconds=1800`、`max_steps=24`、`max_observation_chars=6000`、`max_read_bytes=262144`、
+  `max_list_entries=500`；`provider=null` 时自动选择第一个已配置 API Key 的提供商。
+- 产物：`data/subagent/executor/<task_id>/`（`task.json`、`worker.log`、`prompt.md`、
+  `workspace/`、终态时 `result.md`）。可用环境变量 `LCAGENT_EXECUTOR_ROOT` 覆盖根目录。
+- 提示词：`subagent/executor/AGENT.md`（系统提示词 + `## workflow:execute` 模板，占位符
+  `{task}`/`{plan}`/`{context}`/`{workspace}`）；结果文档固定结构为「任务与目标 / 执行过程 /
+  产出清单 / 假设与遗留问题」，末尾 `<!-- END OF RESULT -->`（缺失只记录 `marker_present`，不判失败）。
+- 手动调试：`uv run python -m subagent.executor.worker --task-id <id>`。
+- 已知限制：任务目录不会自动清理；取消不是立即 kill；文件系统 + PID 检测假设单机部署；
+  v1 不提供 `run_shell`/delete/rename（detached 进程无人机确认兜底，默认禁用）。
 
 ---
 
@@ -3452,7 +3560,7 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 | `tests/memory/test_memory.py`                   | memory/ 包`AgentMemory`：checkpointer + Store 基础设施的初始化、SQLite/acreate/aclose                                                                                                     |
 | `tests/agent/test_agent_core_regressions.py`    | Agent 核心回归：HITL 恢复、会话隔离、技能匹配、长上下文裁剪等                                                                                                                               |
 | `tests/scheduler/test_scheduler.py`             | 定时任务调度：TaskStore CRUD、原子抢占、重试逻辑                                                                                                                                            |
-| `tests/subagent/`                               | Planner 子程序：`test_store`（原子写/独占认领/PID 回收/取消）、`test_launcher`（PID 存活检测/preflight）、`test_worker`（单次调用成功/失败/空输出/取消/超时/提示词解析）、`test_tools`（3 工具注册/非阻塞/等待上限/防编造门禁） |
+| `tests/subagent/`                               | 后台子程序（planner + executor）：planner 侧 `test_store`（原子写/独占认领/PID 回收/取消）、`test_launcher`（PID 存活检测/preflight）、`test_worker`（单次调用成功/失败/空输出/取消/超时/提示词解析）、`test_tools`（3 工具注册/非阻塞/等待上限/防编造门禁）；executor 侧 `test_executor_store`（原子写/独占认领/PID 回收/取消）、`test_executor_tools_confinement`（受限工具集路径包含校验/拒绝清单/写入原子性）、`test_executor_worker`（ReAct 循环/ToolMessage 配对/步数与时间预算/取消检查点/空输出判失败）、`test_executor_tool`（3 工具注册/非阻塞/防编造门禁)` |
 | `tests/api/test_api.py`                         | API Server：端点路由、流式聊天、命令执行（FastAPI TestClient）                                                                                                                              |
 | `tests/llm/test_message_utils.py`               | LLM 异常信息提取：429/5xx/鉴权/未知错误的中文提示                                                                                                                                           |
 | `tests/llm/test_llm_client.py`                  | 瞬时错误自动重试：should_retry 判定与重试行为                                                                                                                                               |
