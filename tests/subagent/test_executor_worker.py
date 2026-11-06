@@ -19,7 +19,6 @@ FakeModel 契约：
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -44,43 +43,15 @@ from subagent.executor.worker import (
     load_prompt_sections,
     run_task,
 )
+from tests.subagent._fakes import (
+    ExecutorFakeModel,
+    open_tasks_excluding_current,
+    tool_call_message,
+)
 
-# 模型调用处理器：入参为（调用序号, 消息列表），返回一条 AIMessage 或抛异常。
-ModelHandler = Callable[[int, list[BaseMessage]], Awaitable[AIMessage]]
-
-
-def _tool_call_message(name: str, args: dict[str, Any], call_index: int) -> AIMessage:
-    """构造一条带单个 tool_call 的 AIMessage。"""
-    return AIMessage(
-        content="",
-        tool_calls=[{
-            "name": name,
-            "args": args,
-            "id": f"call_{call_index}",
-            "type": "tool_call",
-        }],
-    )
-
-
-class FakeModel:
-    """可编排的假聊天模型：记录 bind_tools 绑定、按序号执行 handler。"""
-
-    def __init__(self, handler: ModelHandler | None = None) -> None:
-        self.calls: int = 0
-        self.handler = handler
-        self.bound_tools: list[Any] | None = None
-
-    def bind_tools(self, tools: list[Any]) -> FakeModel:
-        """记录绑定的工具并返回自身（模拟可链式绑定的模型）。"""
-        self.bound_tools = list(tools)
-        return self
-
-    async def ainvoke(self, messages: list[BaseMessage]) -> AIMessage:
-        """按序号执行处理器；未提供处理器时返回占位最终答复。"""
-        self.calls += 1
-        if self.handler is not None:
-            return await self.handler(self.calls, messages)
-        return AIMessage(content=f"执行结果-{self.calls}\n\n{RESULT_MARKER}")
+# 复用共享假模型（默认回复模拟带结束标记的最终答复）与工具消息构造器
+FakeModel = ExecutorFakeModel
+_tool_call_message = tool_call_message
 
 
 @pytest.fixture
@@ -461,10 +432,8 @@ def test_run_task_skips_when_lock_exists(store: ExecutorStore, tmp_path: Path) -
 # ================================================================ _await_with_cancel ===
 
 
-def _open_tasks_excluding_current() -> int:
-    """返回当前事件循环中除本协程外尚未完成的任务数量。"""
-    current = asyncio.current_task()
-    return sum(1 for task in asyncio.all_tasks() if task is not current and not task.done())
+# 复用共享辅助（防任务泄漏断言）
+_open_tasks_excluding_current = open_tasks_excluding_current
 
 
 def test_await_with_cancel_completes_normally() -> None:

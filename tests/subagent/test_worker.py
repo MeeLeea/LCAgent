@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import re
-from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -37,30 +36,10 @@ from subagent.planner.worker import (
     load_prompt_sections,
     run_task,
 )
+from tests.subagent._fakes import PlannerFakeModel, open_tasks_excluding_current
 
-# 模型调用处理器：入参为（调用序号, 消息列表），返回一条 AIMessage 或抛异常。
-ModelHandler = Callable[[int, list[BaseMessage]], Awaitable[AIMessage]]
-
-
-class FakeModel:
-    """可编排的假聊天模型：按调用序号返回消息、抛异常或执行副作用。"""
-
-    def __init__(self, handler: ModelHandler | None = None) -> None:
-        self.calls: int = 0
-        self.handler = handler
-        self.bind_kwargs: dict[str, Any] = {}
-
-    def bind(self, **kwargs: Any) -> FakeModel:
-        """记录绑定的 max_tokens 并返回自身，模拟可链式绑定的模型。"""
-        self.bind_kwargs = dict(kwargs)
-        return self
-
-    async def ainvoke(self, messages: list[BaseMessage]) -> AIMessage:
-        """按序号执行处理器；未提供处理器时返回占位文本。"""
-        self.calls += 1
-        if self.handler is not None:
-            return await self.handler(self.calls, messages)
-        return AIMessage(content=f"方案输出-{self.calls}")
+# 复用共享假模型（未提供 handler 时返回「方案输出-{call}」占位文本）
+FakeModel = PlannerFakeModel
 
 
 @pytest.fixture
@@ -256,10 +235,8 @@ def test_run_task_timeout_marks_failed(store: PlannerStore) -> None:
 # ================================================================ _await_with_cancel ===
 
 
-def _open_tasks_excluding_current() -> int:
-    """返回当前事件循环中除本协程外尚未完成的任务数量。"""
-    current = asyncio.current_task()
-    return sum(1 for task in asyncio.all_tasks() if task is not current and not task.done())
+# 复用共享辅助（防任务泄漏断言）
+_open_tasks_excluding_current = open_tasks_excluding_current
 
 
 def test_await_with_cancel_completes_normally() -> None:
