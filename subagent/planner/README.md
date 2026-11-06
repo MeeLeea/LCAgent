@@ -42,8 +42,8 @@ query_planner_task 返回 plan ◄───────────────�
 
 ```
 subagent/planner/
-├── config.py       # PlannerConfig 瘦壳（字段集 + 默认值引 subagent/config 总表 + load 委托 common.config）
-├── config.json     # 可选本地配置（被 .gitignore 忽略；缺失时用 subagent/config 总表默认值）
+├── config.py       # PlannerConfig（planner/executor 配置统一在 subagent/config.py 模块）
+├── config.json     # （已移除）planner/executor 配置统一在 ../config.json 的 planner 小节
 ├── AGENT.md        # 系统提示词 + 单个 ## workflow:design 模板
 ├── store.py        # 文件系统任务存储（原子写 + 独占认领 + PID 回收）
 ├── launcher.py     # detached 启动 + 跨平台 PID 存活检测 + preflight
@@ -117,7 +117,7 @@ queued ──claim──► running ──LLM 调用成功──► done
 输出固定为一份自包含方案文档（背景/范围/假设/总览/候选方案对比/模块接口/关键流程/
 实施计划/验收标准/风险缓解），最后一行 `<!-- END OF PLAN -->`。
 
-## 六、配置（subagent/planner/config.json）
+## 六、配置（subagent/config.json 的 planner 小节）
 
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |
@@ -131,9 +131,11 @@ queued ──claim──► running ──LLM 调用成功──► done
 > `provider` / `model` / API Key 在 `start_planner_task` 阶段由 `launcher.preflight` 同步校验：
 > 缺 Key 会直接返回 `success:false`，不会创建一个永远排队的僵尸任务。
 >
-> `config.json` 是**可选本地配置**：仓库 `.gitignore` 的 `*.json` 规则会忽略它，缺失时直接使用
-> `subagent/config.py` 总表默认值（与上表一致；该总表是 planner/executor 默认值的唯一事实源，
-> `config.py` 瘦壳承载字段集与通用加载机制委托），因此新克隆的仓库无需该文件即可运行。
+> planner/executor 的配置**统一在本目录上级**：`subagent/config.json`（已入库，
+> planner 与 executor 各占 `planner` / `executor` 一节）+ `subagent/config.py`
+> （`PlannerConfig` 数据类 + 默认值 + `load_planner_config()` 加载函数）。子程序
+> 初始化时经 `load_planner_config()` 读取 `planner` 小节合并到 dataclass 默认值，
+> 小节缺失/损坏时回退默认值，因此新克隆的仓库开箱即可运行。
 
 ## 七、手动运行与调试
 
