@@ -22,7 +22,7 @@ from typing import Any
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage
 
-from subagent.planner.config import DEFAULT_AGENT_PROMPT_FILE, PlannerConfig
+from subagent.config import PLANNER_AGENT_PROMPT_FILE, PlannerConfig
 from subagent.planner.store import (
     STATUS_CANCELLED,
     STATUS_DONE,
@@ -66,20 +66,20 @@ def _run(
 
 def test_load_prompt_sections_real_agent_md() -> None:
     """真实 AGENT.md：系统提示与模板均非空，且只有一个 workflow 小节。"""
-    system_prompt, template = load_prompt_sections(DEFAULT_AGENT_PROMPT_FILE)
+    system_prompt, template = load_prompt_sections(PLANNER_AGENT_PROMPT_FILE)
 
     assert system_prompt.strip()
     assert template.strip()
     assert template.rstrip().endswith("<!-- END OF PLAN -->")
 
-    text = Path(DEFAULT_AGENT_PROMPT_FILE).read_text(encoding="utf-8")
+    text = Path(PLANNER_AGENT_PROMPT_FILE).read_text(encoding="utf-8")
     workflow_lines = [line for line in text.splitlines() if line.strip().startswith("## workflow:")]
     assert len(workflow_lines) == 1
 
 
 def test_load_prompt_sections_placeholders() -> None:
     """真实模板中的占位符恰好为 {requirement} 与 {context}。"""
-    _system_prompt, template = load_prompt_sections(DEFAULT_AGENT_PROMPT_FILE)
+    _system_prompt, template = load_prompt_sections(PLANNER_AGENT_PROMPT_FILE)
     placeholders = set(re.findall(r"\{[a-zA-Z_]+\}", template))
     assert placeholders == {"{requirement}", "{context}"}
 

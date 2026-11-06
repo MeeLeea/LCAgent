@@ -240,7 +240,7 @@ def test_resolve_missing_model_message_includes_label(monkeypatch) -> None:
 
     monkeypatch.setattr(llm_client, "load_providers", _no_model)
     with pytest.raises(
-        ValueError, match="提供商 deepseek 未配置默认模型，请在 planner config.json 指定 model"
+        ValueError, match="提供商 deepseek 未配置默认模型，请在 subagent/config.json 的 planner 小节指定 model"
     ):
         resolve_llm_settings(_MiniConfig(), label="planner")
 
@@ -251,3 +251,115 @@ def test_resolve_unknown_provider_rejected(monkeypatch) -> None:
     monkeypatch.setattr(llm_client, "load_providers", _providers)
     with pytest.raises(ValueError, match="不支持的提供商: nope（可用: zhipu, deepseek）"):
         resolve_llm_settings(_MiniConfig(provider="nope"), label="mini")
+
+
+def test_resolve_missing_model_label_defaults_to_config_name(monkeypatch) -> None:
+    """显式 label 缺省时从 ``config.name`` 推导（子程序 dataclass 均含 name 字段）。"""
+    from llm import llm_client
+
+    def _no_model() -> dict[str, dict[str, object]]:
+        return {"deepseek": {"name": "DeepSeek", "env_key": "DEEPSEEK_API_KEY", "api_key": "sk-x"}}
+
+    monkeypatch.setattr(llm_client, "load_providers", _no_model)
+    with pytest.raises(
+        ValueError, match="请在 subagent/config.json 的 executor 小节指定 model"
+    ):
+        resolve_llm_settings(_MiniConfig(provider="deepseek", name="executor"))
+
+
+# ---- build_config：section 小节模式（统一配置文件 subagent/config.json）----
+
+
+def test_section_reads_matching_section_only(tmp_path, monkeypatch) -> None:
+    """section 模式只读取匹配小节，其他小节的同名键不得串扰。"""
+    config_file = tmp_path / "config.json"
+    config_file.write_text(
+        json.dumps(
+            {
+                "other": {"temperature": 9.9, "provider": "evil"},
+                "mini": {"temperature": 0.7, "provider": "mini-provider"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("LCAGENT_MINI_ROOT", raising=False)
+    config = build_config(
+        _MiniConfig,
+        config_file=str(config_file),
+        field_kinds=_FIELD_KINDS,
+        env_key="LCAGENT_MINI_ROOT",
+        base_dir=str(tmp_path),
+        label="mini",
+        section="mini",
+    )
+    assert config.temperature == 0.7
+    assert config.provider == "mini-provider"
+
+
+def test_section_missing_falls_back_with_warning(tmp_path, caplog) -> None:
+    """小节缺失时整节回退默认值并记 warning。"""
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps({"other": {"temperature": 9.9}}), encoding="utf-8")
+    config = build_config(
+        _MiniConfig,
+        config_file=str(config_file),
+        field_kinds=_FIELD_KINDS,
+        env_key="LCAGENT_MINI_ROOT",
+        base_dir=str(tmp_path),
+        label="mini",
+        section="mini",
+    )
+    assert config.temperature == 0.5
+    assert config.provider is None
+    assert "缺少 mini 小节" in caplog.text
+
+
+# ---- load_planner_config / load_executor_config：统一配置文件入口 ----
+
+
+def test_load_planner_config_reads_shared_file_defaults() -> None:
+    """真实 ``subagent/config.json`` 的 planner 小节与总表默认值一致。"""
+    from subagent.config import (
+        PLANNER_MAX_TOKENS,
+        PLANNER_TEMPERATURE,
+        PLANNER_TIMEOUT_SECONDS,
+        load_planner_config,
+    )
+
+    config = load_planner_config()
+    assert config.name == "planner"
+    assert config.provider is None
+    assert config.temperature == PLANNER_TEMPERATURE
+    assert config.max_tokens == PLANNER_MAX_TOKENS
+    assert config.timeout_seconds == PLANNER_TIMEOUT_SECONDS
+    assert os.path.isabs(config.output_root)
+
+
+def test_load_executor_config_reads_shared_file_defaults() -> None:
+    """真实 ``subagent/config.json`` 的 executor 小节与总表默认值一致。"""
+    from subagent.config import (
+        EXECUTOR_MAX_STEPS,
+        EXECUTOR_TEMPERATURE,
+        load_executor_config,
+    )
+
+    config = load_executor_config()
+    assert config.name == "executor"
+    assert config.provider is None
+    assert config.temperature == EXECUTOR_TEMPERATURE
+    assert config.max_steps == EXECUTOR_MAX_STEPS
+    assert os.path.isabs(config.output_root)
+
+
+def test_load_config_file_overrides_shared_defaults(tmp_path) -> None:
+    """显式传入统一配置文件路径时按传入文件合并（测试隔离用）。"""
+    from subagent.config import load_planner_config
+
+    config_file = tmp_path / "config.json"
+    config_file.write_text(
+        json.dumps({"planner": {"temperature": 0.9, "max_tokens": 123}}),
+        encoding="utf-8",
+    )
+    config = load_planner_config(config_file=str(config_file), base_dir=str(tmp_path))
+    assert config.temperature == 0.9
+    assert config.max_tokens == 123

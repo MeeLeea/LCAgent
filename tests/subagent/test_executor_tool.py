@@ -27,9 +27,9 @@ import pytest
 from langchain_core.tools import BaseTool
 
 import tools as tools_pkg
+from subagent.common.config import PROJECT_ROOT
 from subagent.common.proc import LauncherError
 from subagent.executor import tool as executor_tool
-from subagent.executor.config import PROJECT_ROOT
 from subagent.executor.store import (
     STATUS_CANCELLED,
     STATUS_DONE,

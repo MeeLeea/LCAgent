@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from subagent.executor.config import PROJECT_ROOT
+from subagent.common.config import PROJECT_ROOT
 from subagent.executor.store import (
     STATUS_CANCELLED,
     STATUS_DONE,

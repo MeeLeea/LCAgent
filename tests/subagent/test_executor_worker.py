@@ -25,7 +25,7 @@ from typing import Any
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage
 
-from subagent.executor.config import DEFAULT_AGENT_PROMPT_FILE, ExecutorConfig
+from subagent.config import EXECUTOR_AGENT_PROMPT_FILE, ExecutorConfig
 from subagent.executor.store import (
     STATUS_CANCELLED,
     STATUS_DONE,
@@ -110,12 +110,12 @@ def _workspace_startswith_error(observation: str) -> bool:
 
 def test_load_prompt_sections_real_agent_md() -> None:
     """真实 AGENT.md：系统提示与模板均非空，且只有一个 workflow 小节。"""
-    system_prompt, template = load_prompt_sections(DEFAULT_AGENT_PROMPT_FILE)
+    system_prompt, template = load_prompt_sections(EXECUTOR_AGENT_PROMPT_FILE)
 
     assert system_prompt.strip()
     assert template.strip()
 
-    text = Path(DEFAULT_AGENT_PROMPT_FILE).read_text(encoding="utf-8")
+    text = Path(EXECUTOR_AGENT_PROMPT_FILE).read_text(encoding="utf-8")
     workflow_lines = [
         line for line in text.splitlines() if line.strip().startswith("## workflow:")
     ]
@@ -124,7 +124,7 @@ def test_load_prompt_sections_real_agent_md() -> None:
 
 def test_load_prompt_sections_placeholders(tmp_path: Path) -> None:
     """真实模板的占位符恰为 {task}/{plan}/{context}/{workspace}。"""
-    _system_prompt, template = load_prompt_sections(DEFAULT_AGENT_PROMPT_FILE)
+    _system_prompt, template = load_prompt_sections(EXECUTOR_AGENT_PROMPT_FILE)
 
     import re
 
