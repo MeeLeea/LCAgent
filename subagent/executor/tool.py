@@ -43,7 +43,7 @@ from typing import Any
 from langchain_core.tools import tool
 
 from subagent.common.proc import LauncherError
-from subagent.executor.config import ExecutorConfig
+from subagent.config import load_executor_config
 from subagent.executor.launcher import preflight, spawn_worker
 from subagent.executor.store import (
     STATUS_CANCELLED,
@@ -159,7 +159,7 @@ async def start_executor_task(
         return _json({"success": False, "error": "task 不能为空"})
 
     store = _get_store()
-    config = ExecutorConfig.load()
+    config = load_executor_config()
 
     try:
         provider, model = preflight(config)
@@ -197,7 +197,9 @@ async def start_executor_task(
         })
 
     try:
-        pid = spawn_worker(task_id, root=config.resolved_output_root(), config=config)
+        pid = spawn_worker(
+            task_id, root=os.path.normpath(config.output_root), config=config
+        )
     except (LauncherError, OSError) as exc:
         # 尽力把任务标记为失败，避免留下永远 queued 的僵尸任务
         try:

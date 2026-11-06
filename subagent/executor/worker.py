@@ -17,7 +17,7 @@
   异常也在循环内 catch 成 ``status="error"``，杜绝孤儿 tool_call 触发网关 400；
 - 单条观测截断到 ``max_observation_chars``（防上下文爆炸）；
 - 空 AIMessage / ``finish_reason=length`` 一律判 failed，不做同预算重试；
-- ``max_steps`` 耗尽或剩余 deadline 不足 ``MIN_STEP_SECONDS`` 时判
+- ``max_steps`` 耗尽或剩余 deadline 不足 ``EXECUTOR_MIN_STEP_SECONDS`` 时判
   failed，不发起注定失败的调用。
 
 进程入口：``python -m subagent.executor.worker --task-id <id>``。
@@ -40,10 +40,11 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, To
 from llm.llm_client import LLMClient
 from llm.message_utils import final_answer_is_empty, stringify_content
 from subagent.common.awaitx import await_with_cancel
+from subagent.common.config import resolve_llm_settings
 from subagent.common.fsx import truncate_text
 from subagent.common.paths import normalize_path
 from subagent.common.prompt import parse_workflow_section, render_placeholders
-from subagent.executor.config import MIN_STEP_SECONDS, ExecutorConfig, resolve_llm_settings
+from subagent.config import EXECUTOR_MIN_STEP_SECONDS, ExecutorConfig, load_executor_config
 from subagent.executor.store import (
     STATUS_CANCELLED,
     STATUS_DONE,
@@ -202,9 +203,9 @@ async def _arun_loop(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise RuntimeError(f"总预算耗尽（timeout_seconds={config.timeout_seconds}s）")
-        if remaining < MIN_STEP_SECONDS:
+        if remaining < EXECUTOR_MIN_STEP_SECONDS:
             raise RuntimeError(
-                f"剩余预算不足（{remaining:.0f}s < {MIN_STEP_SECONDS:.0f}s），"
+                f"剩余预算不足（{remaining:.0f}s < {EXECUTOR_MIN_STEP_SECONDS:.0f}s），"
                 "不再发起可能注定超时的新一步"
             )
 
@@ -261,7 +262,7 @@ async def run_task(
     Returns: 返回码 0=完成/取消，1=失败，2=任务不存在。
     """
     store = store or ExecutorStore()
-    config = config or ExecutorConfig.load()
+    config = config or load_executor_config()
 
     task = store.get(task_id)
     if task is None:

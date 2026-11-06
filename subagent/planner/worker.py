@@ -32,9 +32,10 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from llm.llm_client import LLMClient
 from llm.message_utils import final_answer_is_empty, stringify_content
 from subagent.common.awaitx import await_with_cancel
+from subagent.common.config import resolve_llm_settings
 from subagent.common.prompt import parse_workflow_section, render_placeholders
+from subagent.config import PlannerConfig, load_planner_config
 
-from .config import PlannerConfig, resolve_llm_settings
 from .store import (
     STATUS_CANCELLED,
     STATUS_DONE,
@@ -131,7 +132,7 @@ async def run_task(
         return 0
 
     try:
-        config = config or PlannerConfig.load()
+        config = config or load_planner_config()
         system_prompt, template = load_prompt_sections(config.agent_prompt_file)
 
         if model is None:

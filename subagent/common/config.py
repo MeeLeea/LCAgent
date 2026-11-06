@@ -1,17 +1,17 @@
 """子程序配置通用机制（stdlib-only）。
 
-承载 ``planner`` / ``executor`` 两个子程序 ``config.py`` 中**逐字相同**的加载
-与校验逻辑，作为唯一事实源：
+承载 ``planner`` / ``executor`` 两个后台子程序共用的配置**加载与校验机制**，
+作为唯一事实源：
 
-- :func:`build_config` — 按「字段声明表」把本地 ``config.json`` 覆盖值合并到
-  dataclass 默认值上（含环境变量对 ``output_root`` 的优先覆盖、类型回退、
-  相对路径解析）；
+- :func:`build_config` — 按「字段声明表」把统一配置文件 ``subagent/config.json``
+  的对应小节覆盖值合并到 dataclass 默认值上（含环境变量对 ``output_root`` 的
+  优先覆盖、类型回退、相对路径解析）；
 - :func:`resolve_llm_settings` — 解析并校验 LLM 提供商与模型（惰性导入
   ``llm.llm_client``，缺 API Key 在派活阶段同步暴露）；
 - ``PROJECT_ROOT`` 及私有数值/路径/提供商辅助函数。
 
-各子程序 ``config.py`` 保留为**瘦壳**：dataclass 字段集、默认值（引自
-``subagent.config`` 总表）与 ``load()`` 委托。
+各子程序专属的 dataclass、默认值总表与加载函数在 :mod:`subagent.config`
+（配置模块唯一入口），本模块不持有任何子程序特有信息。
 
 设计约束：
 - 模块级只依赖标准库，保证 ``tools`` 包在主对话进程 eager import 时不会因
@@ -60,23 +60,28 @@ def build_config[C: object](
     env_key: str,
     base_dir: str,
     label: str,
+    section: str | None = None,
 ) -> C:
-    """按「字段声明表」把本地配置文件覆盖值合并到 dataclass 默认值。
+    """按「字段声明表」把统一配置文件对应小节的覆盖值合并到 dataclass 默认值。
 
     等价复刻原每子程序 ``XxxConfig.load`` 的合并语义：
 
     1. ``config_file`` 存在时读取 JSON 对象；缺失/损坏/非对象仅记 warning 回退。
+       ``section`` 非空时按顶层键取子程序专属小节（如 ``"planner"``），小节缺失
+       或非对象时记 warning 并整节回退默认值。
     2. ``output_root`` 的值 = ``os.environ[env_key]``（非空时优先，测试/隔离用）
        否则文件覆盖值，都缺省用 dataclass 默认值；随后按 ``base_dir`` 解析。
     3. 其余字段按 ``field_kinds`` 分派（含非法值回退默认值）。
 
     Args:
         cls: 目标 dataclass（frozen ``dataclass`` 由调用方保证）。
-        config_file: 配置文件路径；``None`` 表示不存在本地文件。
+        config_file: 统一配置文件路径；``None`` 表示不读取文件。
         field_kinds: 字段名 → 解析器种类（见 :data:`_SUPPORTED_KINDS`）。
         env_key: ``output_root`` 的环境变量覆盖键；空串表示无覆盖。
         base_dir: 相对路径锚定的基准目录（默认项目根）。
-        label: 子程序名（warning 文案用，如 ``"planner"``）。
+        label: 子程序名（warning / 报错文案用，如 ``"planner"``）。
+        section: 顶层配置小节键名；``None`` 表示把整个 JSON 对象当平铺小节
+            （通用语义，供测试/其他调用方使用）。
 
     Returns:
         合并后的 ``cls`` 实例。
@@ -90,7 +95,16 @@ def build_config[C: object](
             with open(config_file, "r", encoding="utf-8") as fh:
                 loaded = json.load(fh)
             if isinstance(loaded, dict):
-                raw = loaded
+                if section is None:
+                    raw = loaded
+                else:
+                    section_raw = loaded.get(section)
+                    if isinstance(section_raw, dict):
+                        raw = section_raw
+                    else:
+                        logger.warning(
+                            "读取 %s 配置失败，回退默认值: 缺少 %s 小节", label, section
+                        )
         except (OSError, json.JSONDecodeError) as exc:
             logger.warning("读取 %s 配置失败，回退默认值: %s", label, exc)
 
@@ -135,7 +149,7 @@ def build_config[C: object](
 
 
 def resolve_llm_settings(
-    config: LLMSettingsLike, *, label: str
+    config: LLMSettingsLike, *, label: str | None = None
 ) -> tuple[str, str]:
     """解析并校验 LLM 提供商与模型。
 
@@ -143,8 +157,10 @@ def resolve_llm_settings(
     同步暴露，而不是变成一个永远 ``running`` 的僵尸任务。
 
     Args:
-        config: 携带 ``provider`` / ``model`` 的子程序配置。
-        label: 子程序名，用于 ``model`` 缺失时的报错文案（如 ``"planner"``）。
+        config: 携带 ``provider`` / ``model`` 的子程序配置；若类型含 ``name``
+            字段且 ``label`` 未显式提供，``label`` 缺省取 ``config.name``。
+        label: 子程序名，用于 ``model`` 缺失时的报错文案（如 ``"planner"``）；
+            缺省时从 ``config.name`` 推导。
 
     Returns:
         ``(provider, model)``。
@@ -153,6 +169,8 @@ def resolve_llm_settings(
         ValueError: 未配置任何提供商、指定 provider 不存在、API Key 缺失
             或未解析出模型名。
     """
+    label = label or str(getattr(config, "name", "")) or "subagent"
+
     # 惰性导入：避免主对话进程 import tools 时加载 langchain 重依赖。
     from llm.llm_client import load_providers
 
@@ -179,7 +197,8 @@ def resolve_llm_settings(
     model = config.model or provider_config.get("model")
     if not model:
         raise ValueError(
-            f"提供商 {provider} 未配置默认模型，请在 {label} config.json 指定 model"
+            f"提供商 {provider} 未配置默认模型，"
+            f"请在 subagent/config.json 的 {label} 小节指定 model"
         )
     return provider, str(model)
 

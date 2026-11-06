@@ -30,7 +30,8 @@ import os
 import subprocess
 import sys
 
-from .config import PROJECT_ROOT, PlannerConfig, resolve_llm_settings
+from subagent.common.config import PROJECT_ROOT, resolve_llm_settings
+from subagent.config import PlannerConfig, load_planner_config
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +167,7 @@ def preflight(config: PlannerConfig | None = None) -> tuple[str, str]:
     Raises:
         ValueError: 提示词文件缺失/为空，或 provider / API Key / model 配置非法。
     """
-    resolved = config or PlannerConfig.load()
+    resolved = config or load_planner_config()
 
     prompt_file = resolved.agent_prompt_file
     if not _prompt_file_is_usable(prompt_file):
@@ -209,7 +210,7 @@ def spawn_worker(
 
     Args:
         task_id: 任务目录名（裸目录名，禁止路径分隔符与 ``..``）。
-        root: 输出根目录；``None`` 时取配置的 ``resolved_output_root()``。
+        root: 输出根目录；``None`` 时取配置 ``output_root`` 的规范化路径。
         config: Planner 配置；``None`` 时加载默认配置。
 
     Returns:
@@ -221,8 +222,8 @@ def spawn_worker(
     """
     _validate_task_id(task_id)
 
-    resolved_config = config or PlannerConfig.load()
-    output_root = root or resolved_config.resolved_output_root()
+    resolved_config = config or load_planner_config()
+    output_root = root or os.path.normpath(resolved_config.output_root)
     task_dir = os.path.join(output_root, task_id)
     if not os.path.isdir(task_dir):
         raise LauncherError(f"任务目录不存在: {task_dir}")

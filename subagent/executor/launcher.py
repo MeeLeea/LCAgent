@@ -11,8 +11,9 @@ from __future__ import annotations
 import logging
 import os
 
+from subagent.common.config import resolve_llm_settings
 from subagent.common.proc import spawn_detached
-from subagent.executor.config import ExecutorConfig, resolve_llm_settings
+from subagent.config import ExecutorConfig, load_executor_config
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,7 @@ def preflight(config: ExecutorConfig | None = None) -> tuple[str, str]:
     Raises:
         ValueError: 提示词文件缺失/为空，或 provider / API Key / model 配置非法。
     """
-    resolved = config or ExecutorConfig.load()
+    resolved = config or load_executor_config()
 
     prompt_file = resolved.agent_prompt_file
     if not _prompt_file_is_usable(prompt_file):
@@ -72,7 +73,7 @@ def spawn_worker(
 
     Args:
         task_id: 任务目录名（裸目录名，禁止路径分隔符与 ``..``）。
-        root: 输出根目录；``None`` 时取配置的 ``resolved_output_root()``。
+        root: 输出根目录；``None`` 时取配置 ``output_root`` 的规范化路径。
         config: Executor 配置；``None`` 时加载默认配置。
 
     Returns:
@@ -81,6 +82,6 @@ def spawn_worker(
     Raises:
         LauncherError: 任务目录不存在，或 ``Popen`` 启动失败。
     """
-    resolved_config = config or ExecutorConfig.load()
-    output_root = root or resolved_config.resolved_output_root()
+    resolved_config = config or load_executor_config()
+    output_root = root or os.path.normpath(resolved_config.output_root)
     return spawn_detached(_WORKER_MODULE, task_id, root=output_root, log_file=_LOG_FILENAME)

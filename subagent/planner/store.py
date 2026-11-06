@@ -13,7 +13,7 @@
 公共基类——planner 的 ``update`` 用裸 ``json.load``（损坏 JSON 抛
 ``JSONDecodeError``），语义与 executor 不同，收敛会丢掉这一测试锁定的行为。
 
-本模块只依赖标准库与 ``subagent.planner.config``，不在模块级导入
+本模块只依赖标准库与 ``subagent.config``，不在模块级导入
 ``langchain`` / ``team`` 等重依赖，避免主进程的工具导入链被拉重。
 """
 from __future__ import annotations
@@ -40,7 +40,7 @@ from subagent.common.task_state import (
     TERMINAL_STATUSES,
 )
 from subagent.common.task_store import TaskStoreBase
-from subagent.planner.config import DEFAULT_OUTPUT_ROOT
+from subagent.config import PLANNER_DEFAULT_OUTPUT_ROOT
 
 # task.json 中允许通过 update 修改的字段（task_id 为不可变主键，不在此列）
 _EDITABLE_FIELDS: frozenset[str] = frozenset(
@@ -67,7 +67,9 @@ class PlannerStore(TaskStoreBase):
 
     def __init__(self, root: str | None = None) -> None:
         """初始化存储；``root`` 为 ``None`` 时使用默认输出根目录。"""
-        super().__init__(root or DEFAULT_OUTPUT_ROOT, default_root=DEFAULT_OUTPUT_ROOT)
+        super().__init__(
+            root or PLANNER_DEFAULT_OUTPUT_ROOT, default_root=PLANNER_DEFAULT_OUTPUT_ROOT
+        )
 
     def create(
         self,

@@ -36,7 +36,8 @@ from typing import Any
 
 from langchain_core.tools import tool
 
-from .config import PlannerConfig
+from subagent.config import load_planner_config
+
 from .launcher import LauncherError, preflight, spawn_worker
 from .store import (
     STATUS_CANCELLED,
@@ -133,7 +134,7 @@ async def start_planner_task(requirement: str, context: str = "") -> str:
         return _json({"success": False, "error": "requirement 不能为空"})
 
     store = _get_store()
-    config = PlannerConfig.load()
+    config = load_planner_config()
 
     try:
         provider, model = preflight(config)
@@ -148,7 +149,9 @@ async def start_planner_task(requirement: str, context: str = "") -> str:
     task_id = store.create(requirement, context, provider=provider, model=model)
 
     try:
-        pid = spawn_worker(task_id, root=config.resolved_output_root(), config=config)
+        pid = spawn_worker(
+            task_id, root=os.path.normpath(config.output_root), config=config
+        )
     except (LauncherError, OSError) as exc:
         # 尽力把任务标记为失败，避免留下永远 queued 的僵尸任务
         try:
