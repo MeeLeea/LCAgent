@@ -42,8 +42,8 @@ query_planner_task 返回 plan ◄───────────────�
 
 ```
 subagent/planner/
-├── config.py       # PlannerConfig（provider/model/预算/超时/输出目录）
-├── config.json     # 可选本地配置（被 .gitignore 忽略；缺失时用内置默认值）
+├── config.py       # PlannerConfig 瘦壳（字段集 + 默认值引 subagent/config 总表 + load 委托 common.config）
+├── config.json     # 可选本地配置（被 .gitignore 忽略；缺失时用 subagent/config 总表默认值）
 ├── AGENT.md        # 系统提示词 + 单个 ## workflow:design 模板
 ├── store.py        # 文件系统任务存储（原子写 + 独占认领 + PID 回收）
 ├── launcher.py     # detached 启动 + 跨平台 PID 存活检测 + preflight
@@ -132,7 +132,8 @@ queued ──claim──► running ──LLM 调用成功──► done
 > 缺 Key 会直接返回 `success:false`，不会创建一个永远排队的僵尸任务。
 >
 > `config.json` 是**可选本地配置**：仓库 `.gitignore` 的 `*.json` 规则会忽略它，缺失时直接使用
-> `config.py` 内置默认值（与上表一致），因此新克隆的仓库无需该文件即可运行。
+> `subagent/config.py` 总表默认值（与上表一致；该总表是 planner/executor 默认值的唯一事实源，
+> `config.py` 瘦壳承载字段集与通用加载机制委托），因此新克隆的仓库无需该文件即可运行。
 
 ## 七、手动运行与调试
 

@@ -238,18 +238,20 @@ LangChainAgent/
 │   │   ├── proc.py           # 分离进程启动 + Windows PID 存活探测
 │   │   ├── paths.py          # 路径归一化/包含校验/workspace 拒绝清单
 │   │   ├── task_state.py     # 任务状态常量(STATUS_*/ping/cancel.flag/终态判定，planner/executor 共用唯一事实源)
-│   │   ├── task_store.py     # TaskStoreBase 基类(原子写/独占认claim/PID 回收/取消请求/文本读写复用流程)
+│   │   ├── task_store.py     # TaskStoreBase 基类(原子写/独占认领/PID 回收/取消请求/文本读写复用流程)
 │   │   ├── prompt.py         # AGENT.md 解析(parse_workflow_section)+占位符渲染(render_placeholders)
-│   │   └── awaitx.py         # await_with_cancel:超时+取消轮询包装(LLM 调用的超时/用户取消统一语义)
+│   │   ├── awaitx.py         # await_with_cancel:超时+取消轮询包装(LLM 调用的超时/用户取消统一语义)
+│   │   └── config.py         # 配置机制(build_config 字段声明表合并 + resolve_llm_settings)
+│   ├── config.py             # 子程序配置总表(PLANNER_*/EXECUTOR_* 默认值唯一事实源)
 │   ├── planner/              # 复杂需求的后台方案设计子程序（一次性，无记忆）
-│   │   ├── config.py         # PlannerConfig / LLM 设置解析
-│   │   ├── config.json       # provider/model/超时/输出目录
+│   │   ├── config.py         # PlannerConfig 瘦壳(字段集+默认值引总表+load 委托 common.build_config)
+│   │   ├── config.json       # provider/model/超时/输出目录（可选本地配置，不入库）
 │   │   ├── AGENT.md          # 系统提示词 + 单个 ## workflow:design 模板
 │   │   ├── store.py          # 继承 common.task_store.TaskStoreBase（plan.md 产物 + 取消文案）
 │   │   ├── launcher.py       # detached 进程启动 + PID 存活检测 + preflight
 │   │   └── worker.py         # 子进程入口:一次 LLM 调用 → plan.md（薄包装 common.prompt/awaitx）
 │   └── executor/             # 后台多步任务执行子程序（受限工具集 ReAct 循环）
-│       ├── config.py         # ExecutorConfig / LLM 设置解析（config.json 可选）
+│       ├── config.py         # ExecutorConfig 瘦壳(字段集+默认值引总表+load 委托 common.build_config)
 │       ├── AGENT.md          # 系统提示词 + ## workflow:execute 模板
 │       ├── store.py          # 继承 common.task_store.TaskStoreBase（result.md 产物 + 取消文案）
 │       ├── workspace.py      # 显式 workspace 校验（拒绝清单/系统目录）
@@ -442,7 +444,7 @@ LangChainAgent/
 | [scheduler/](scheduler/)                                                 | 定时任务调度：TaskStore（SQLite CRUD）、SchedulerEngine（APScheduler 轮询）、独立进程入口                                                                                                                                                                                                                                                                                                          |
 | [subagent/planner/](subagent/planner/)                                     | 后台方案设计子程序（一次性、无记忆）：`subagent/planner/tool.py` 的 3 个 async 工具派活 → detached 子进程用 `LLMClient` **一次调用**产出 `plan.md` → 文件系统任务存储（原子写 + 独占 `worker.lock` + PID 回收 + `cancel.flag`）。产物落 `data/subagent/planner/<task_id>/`，仅 `status=done` 可读 `plan.md` |
 | [subagent/executor/](subagent/executor/)                                   | 后台任务执行子程序（多步 ReAct 工具循环，会真实写盘）：`subagent/executor/tool.py` 的 3 个 async 工具派活 → detached 子进程在工作区内用受限工具集（`read_file`/`write_file`/`list_dir`，全部绑定工作区并经路径包含校验）多步执行 → 落盘自包含 `result.md`；工作区互斥锁 + 显式 workspace 拒绝清单（见 [subagent/common/](subagent/common/)）。产物落 `data/subagent/executor/<task_id>/`，仅 `status=done` 可读 `result.md` |
-| [subagent/common/](subagent/common/)                                       | 子程序共享件包（仅标准库，禁止反向 import planner/executor）：`fsx.py`（原子写/任务 ID/裸名校验/`TRUNCATION_SUFFIX` 文本截断）+ `proc.py`（分离进程启动/PID 存活探测）+ `paths.py`（路径包含校验/workspace 拒绝清单）+ `task_state.py`（状态常量唯一事实源：`STATUS_*` / ping / `cancel.flag` / 终态判定）+ `task_store.py`（`TaskStoreBase` 基类：独占 `worker.lock` 认领 / PID 回收 reap / `request_cancel` 三分支 / 文本读写复用流程，planner/executor 的 Store 继承后仅声明 `result_filename` 与运行中取消文案）+ `prompt.py`（`parse_workflow_section` 切分 AGENT.md 系统提示词与 workflow 模板 + `render_placeholders` 按插入序渲染占位符）+ `awaitx.py`（`await_with_cancel`：LLM 调用的超时 + 用户取消轮询统一语义，`{timeout}` 占位注入） |
+| [subagent/common/](subagent/common/)                                       | 子程序共享件包（仅标准库，禁止反向 import planner/executor）：`fsx.py`（原子写/任务 ID/裸名校验/`TRUNCATION_SUFFIX` 文本截断）+ `proc.py`（分离进程启动/PID 存活探测）+ `paths.py`（路径包含校验/workspace 拒绝清单）+ `task_state.py`（状态常量唯一事实源：`STATUS_*` / ping / `cancel.flag` / 终态判定）+ `task_store.py`（`TaskStoreBase` 基类：独占 `worker.lock` 认领 / PID 回收 reap / `request_cancel` 三分支 / 文本读写复用流程，planner/executor 的 Store 继承后仅声明 `result_filename` 与运行中取消文案）+ `prompt.py`（`parse_workflow_section` 切分 AGENT.md 系统提示词与 workflow 模板 + `render_placeholders` 按插入序渲染占位符）+ `awaitx.py`（`await_with_cancel`：LLM 调用的超时 + 用户取消轮询统一语义，`{timeout}` 占位注入）+ `config.py`（配置加载机制：`build_config` 按「字段声明表」把本地 config.json 覆盖值合并到 dataclass 默认值（`output_root` 支持环境变量优先覆盖 + 防字段漂移校验）、`resolve_llm_settings` 解析并校验 LLM 提供商/模型——planner/executor 的 `config.py` 瘦壳 `load()` 委托它，默认值唯一事实源在 [subagent/config.py](subagent/config.py) 总表） |
 
 ### llm/llm_client.py 主要 API
 
@@ -2207,8 +2209,8 @@ query_planner_task 返回 plan ◄───────────────�
 **配置与产物**：
 
 - 配置：`subagent/planner/config.json` 为**可选本地配置**（被 `.gitignore` 的 `*.json` 忽略，不入库）；
-  文件缺失时使用 `config.py` 内置默认值。字段含 provider/model/`temperature`/`max_tokens`/`timeout_seconds`/
-  `output_root` 等；`provider=null` 时自动选择第一个已配置 API Key 的提供商。
+  文件缺失时使用 `subagent/config.py` 总表默认值（`temperature`/`max_tokens`/`timeout_seconds` 等的唯一事实源，
+  `config.py` 瘦壳仅承载 planner 字段集与 `load` 委托）。`provider=null` 时自动选择第一个已配置 API Key 的提供商。
 - 产物：`data/subagent/planner/<task_id>/`（`task.json`、`worker.log`、`prompt.md`、`plan.md`）。
   可用环境变量 `LCAGENT_PLANNER_ROOT` 覆盖根目录。
 - 手动调试：`uv run python -m subagent.planner.worker --task-id <id>`。
@@ -2292,7 +2294,7 @@ query_executor_task 返回 result ◄──────────────�
 ### 配置与产物
 
 - 配置：`subagent/executor/config.json` 为**可选本地配置**（被 `.gitignore` 的 `*.json` 忽略，
-  不入库）；文件缺失时使用 `config.py` 内置默认值：`temperature=0.2`、`max_tokens=8192`、
+  不入库）；文件缺失时使用 `subagent/config.py` 总表默认值（唯一事实源）：`temperature=0.2`、`max_tokens=8192`、
   `timeout_seconds=1800`、`max_steps=24`、`max_observation_chars=6000`、`max_read_bytes=262144`、
   `max_list_entries=500`；`provider=null` 时自动选择第一个已配置 API Key 的提供商。
 - 产物：`data/subagent/executor/<task_id>/`（`task.json`、`worker.log`、`prompt.md`、
@@ -3565,7 +3567,7 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 | `tests/memory/test_memory.py`                   | memory/ 包`AgentMemory`：checkpointer + Store 基础设施的初始化、SQLite/acreate/aclose                                                                                                     |
 | `tests/agent/test_agent_core_regressions.py`    | Agent 核心回归：HITL 恢复、会话隔离、技能匹配、长上下文裁剪等                                                                                                                               |
 | `tests/scheduler/test_scheduler.py`             | 定时任务调度：TaskStore CRUD、原子抢占、重试逻辑                                                                                                                                            |
-| `tests/subagent/`                               | 后台子程序（planner + executor + common）：公共侧 `_fakes.py`（两 worker 测试共享的模型/工具调用夹具）、`test_common_task_state.py`（状态常量/claim 互斥/reap/request_cancel 三分支/read_result 截断）、`test_common_prompt.py`（workflow 小节切分/精确文案/占位符渲染）、`test_common_awaitx.py`（超时+取消轮询/`{timeout}` 注入/超时优先于取消）；planner 侧 `test_store`（原子写/独占认领/PID 回收/取消）、`test_launcher`（PID 存活检测/preflight）、`test_worker`（单次调用成功/失败/空输出/取消/超时/提示词解析）、`test_tools`（3 工具注册/非阻塞/等待上限/防编造门禁）；executor 侧 `test_executor_store`（原子写/独占认领/PID 回收/取消）、`test_executor_tools_confinement`（受限工具集路径包含校验/拒绝清单/写入原子性）、`test_executor_worker`（ReAct 循环/ToolMessage 配对/步数与时间预算/取消检查点/空输出判失败）、`test_executor_tool`（3 工具注册/非阻塞/防编造门禁)` |
+| `tests/subagent/`                               | 后台子程序（planner + executor + common）：公共侧 `_fakes.py`（两 worker 测试共享的模型/工具调用夹具）、`test_common_task_state.py`（状态常量/claim 互斥/reap/request_cancel 三分支/read_result 截断）、`test_common_prompt.py`（workflow 小节切分/精确文案/占位符渲染）、`test_common_awaitx.py`（超时+取消轮询/`{timeout}` 注入/超时优先于取消）、`test_common_config.py`（字段声明表分派/非法值回退/env 覆盖/损坏 json 警告/防御分支/resolve_llm_settings 提供商校验与 label 报错文案）；planner 侧 `test_store`（原子写/独占认领/PID 回收/取消）、`test_launcher`（PID 存活检测/preflight）、`test_worker`（单次调用成功/失败/空输出/取消/超时/提示词解析）、`test_tools`（3 工具注册/非阻塞/等待上限/防编造门禁）；executor 侧 `test_executor_store`（原子写/独占认领/PID 回收/取消）、`test_executor_tools_confinement`（受限工具集路径包含校验/拒绝清单/写入原子性）、`test_executor_worker`（ReAct 循环/ToolMessage 配对/步数与时间预算/取消检查点/空输出判失败）、`test_executor_tool`（3 工具注册/非阻塞/防编造门禁)` |
 | `tests/api/test_api.py`                         | API Server：端点路由、流式聊天、命令执行（FastAPI TestClient）                                                                                                                              |
 | `tests/llm/test_message_utils.py`               | LLM 异常信息提取：429/5xx/鉴权/未知错误的中文提示                                                                                                                                           |
 | `tests/llm/test_llm_client.py`                  | 瞬时错误自动重试：should_retry 判定与重试行为                                                                                                                                               |
