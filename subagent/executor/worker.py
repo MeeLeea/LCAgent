@@ -39,8 +39,10 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, To
 
 from llm.llm_client import LLMClient
 from llm.message_utils import final_answer_is_empty, stringify_content
+from subagent.common.awaitx import await_with_cancel
 from subagent.common.fsx import truncate_text
 from subagent.common.paths import normalize_path
+from subagent.common.prompt import parse_workflow_section, render_placeholders
 from subagent.executor.config import MIN_STEP_SECONDS, ExecutorConfig, resolve_llm_settings
 from subagent.executor.store import (
     STATUS_CANCELLED,
@@ -81,70 +83,32 @@ def _now_iso() -> str:
 def load_prompt_sections(prompt_file: str) -> tuple[str, str]:
     """解析提示词文件，返回 ``(系统提示词, 执行模板)``。
 
-    契约与 planner 相同：文件被唯一一个 ``## workflow:`` 小节切成两半——其上为
-    系统提示词，其下为该小节模板正文（从该行下一行起直到下一个 ``## `` 二级
-    标题（不含）；模板内 ``###`` 不截断）。提示词与模板任一为空即抛 ``ValueError``。
+    契约与 planner 相同（公共实现薄包装，注入 executor 缺失文案）：文件被唯一
+    一个 ``## workflow:`` 小节切成两半——其上为系统提示词，其下为该小节模板正文。
 
     Raises: ValueError（文件缺失/为空、缺 ``## workflow:`` 小节、或任一侧为空）。
     """
-    try:
-        with open(prompt_file, "r", encoding="utf-8") as fh:
-            text = fh.read()
-    except OSError:
-        raise ValueError(f"执行者提示词文件缺失或为空: {prompt_file}") from None
-    if not text.strip():
-        raise ValueError(f"执行者提示词文件缺失或为空: {prompt_file}")
-
-    lines = text.splitlines()
-    workflow_index: int | None = None
-    for index, line in enumerate(lines):
-        if line.strip().startswith("## workflow:"):
-            workflow_index = index
-            break
-    if workflow_index is None:
-        raise ValueError(f"提示词文件缺少 ## workflow: 小节: {prompt_file}")
-
-    system_prompt = "\n".join(lines[:workflow_index]).strip()
-    template_lines: list[str] = []
-    for line in lines[workflow_index + 1:]:
-        if line.strip().startswith("## "):
-            break
-        template_lines.append(line)
-    template = "\n".join(template_lines).strip()
-
-    if not system_prompt:
-        raise ValueError(f"提示词文件在 ## workflow: 之前缺少系统提示词: {prompt_file}")
-    if not template:
-        raise ValueError(f"提示词文件的 ## workflow: 小节缺少模板内容: {prompt_file}")
-    return system_prompt, template
+    return parse_workflow_section(
+        prompt_file, missing_file_label="执行者提示词文件缺失或为空"
+    )
 
 
 async def _await_with_cancel(
     awaitable: Awaitable[Any], *, timeout: float,
     cancel_check: Callable[[], bool], poll_seconds: float,
 ) -> Any:
-    """在可取消、可超时的前提下等待协程完成，不泄漏挂起任务。
+    """在可取消、可超时的前提下等待协程完成（公共实现薄包装，注入 executor 文案）。
 
     Raises: ExecutorCancelled（命中取消）/ TimeoutError（超过 ``timeout``）。
     """
-    work = asyncio.ensure_future(awaitable)
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    effective_poll = poll_seconds if poll_seconds > 0 else 0.5
-    try:
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                raise TimeoutError(f"模型调用超时（{timeout}s）")
-            if cancel_check():
-                raise ExecutorCancelled("用户取消")
-            done, _pending = await asyncio.wait({work}, timeout=min(effective_poll, remaining))
-            if work in done:
-                return work.result()
-    finally:
-        if not work.done():
-            work.cancel()
-            await asyncio.gather(work, return_exceptions=True)
+    return await await_with_cancel(
+        awaitable,
+        timeout=timeout,
+        cancel_check=cancel_check,
+        poll_seconds=poll_seconds,
+        cancel_exception=ExecutorCancelled,
+        timeout_message=f"模型调用超时（{timeout}s）",
+    )
 
 
 def _mark_terminal(
@@ -343,10 +307,12 @@ async def run_task(
             model = client.get_chat_model()
 
         task = store.get(task_id) or task
-        user_prompt = template.replace("{task}", str(task.get("task") or ""))
-        user_prompt = user_prompt.replace("{plan}", str(task.get("plan") or "") or "（无）")
-        user_prompt = user_prompt.replace("{context}", str(task.get("context") or "") or "（无）")
-        user_prompt = user_prompt.replace("{workspace}", workspace)
+        user_prompt = render_placeholders(template, {
+            "{task}": str(task.get("task") or ""),
+            "{plan}": str(task.get("plan") or "") or "（无）",
+            "{context}": str(task.get("context") or "") or "（无）",
+            "{workspace}": workspace,
+        })
 
         # 审计产物：把实际投喂的提示词落盘（不是记忆）
         store.write_text(task_id, PROMPT_FILE, f"{system_prompt}\n\n---\n\n{user_prompt}")

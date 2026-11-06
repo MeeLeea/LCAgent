@@ -31,6 +31,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from llm.llm_client import LLMClient
 from llm.message_utils import final_answer_is_empty, stringify_content
+from subagent.common.awaitx import await_with_cancel
+from subagent.common.prompt import parse_workflow_section, render_placeholders
 
 from .config import PlannerConfig, resolve_llm_settings
 from .store import (
@@ -69,64 +71,27 @@ def load_prompt_sections(prompt_file: str) -> tuple[str, str]:
 
     Raises: ValueError（文件缺失/为空、缺 ``## workflow:`` 小节、或任一侧为空）。
     """
-    try:
-        with open(prompt_file, "r", encoding="utf-8") as fh:
-            text = fh.read()
-    except OSError:
-        raise ValueError(f"规划者提示词文件缺失或为空: {prompt_file}") from None
-    if not text.strip():
-        raise ValueError(f"规划者提示词文件缺失或为空: {prompt_file}")
-
-    lines = text.splitlines()
-    workflow_index: int | None = None
-    for index, line in enumerate(lines):
-        if line.strip().startswith("## workflow:"):
-            workflow_index = index
-            break
-    if workflow_index is None:
-        raise ValueError(f"提示词文件缺少 ## workflow: 小节: {prompt_file}")
-
-    system_prompt = "\n".join(lines[:workflow_index]).strip()
-    template_lines: list[str] = []
-    for line in lines[workflow_index + 1:]:
-        if line.strip().startswith("## "):
-            break
-        template_lines.append(line)
-    design_template = "\n".join(template_lines).strip()
-
-    if not system_prompt:
-        raise ValueError(f"提示词文件在 ## workflow: 之前缺少系统提示词: {prompt_file}")
-    if not design_template:
-        raise ValueError(f"提示词文件的 ## workflow: 小节缺少模板内容: {prompt_file}")
-    return system_prompt, design_template
+    return parse_workflow_section(
+        prompt_file, missing_file_label="规划者提示词文件缺失或为空"
+    )
 
 
 async def _await_with_cancel(
     awaitable: Awaitable[Any], *, timeout: float,
     cancel_check: Callable[[], bool], poll_seconds: float,
 ) -> Any:
-    """在可取消、可超时的前提下等待协程完成，不泄漏挂起任务。
+    """在可取消、可超时的前提下等待协程完成（公共实现薄包装，注入 planner 文案）。
 
     Raises: PlannerCancelled（命中取消）/ TimeoutError（超过 ``timeout``）。
     """
-    work = asyncio.ensure_future(awaitable)
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    effective_poll = poll_seconds if poll_seconds > 0 else 0.5
-    try:
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                raise TimeoutError(f"LLM 调用超时（{timeout}s）")
-            if cancel_check():
-                raise PlannerCancelled("用户取消")
-            done, _pending = await asyncio.wait({work}, timeout=min(effective_poll, remaining))
-            if work in done:
-                return work.result()
-    finally:
-        if not work.done():
-            work.cancel()
-            await asyncio.gather(work, return_exceptions=True)
+    return await await_with_cancel(
+        awaitable,
+        timeout=timeout,
+        cancel_check=cancel_check,
+        poll_seconds=poll_seconds,
+        cancel_exception=PlannerCancelled,
+        timeout_message=f"LLM 调用超时（{timeout}s）",
+    )
 
 
 def _mark_terminal(
@@ -180,8 +145,10 @@ async def run_task(
 
         requirement = str(task.get("requirement") or "")
         context = str(task.get("context") or "")
-        user_prompt = template.replace("{requirement}", requirement)
-        user_prompt = user_prompt.replace("{context}", context or "（无）")
+        user_prompt = render_placeholders(template, {
+            "{requirement}": requirement,
+            "{context}": context or "（无）",
+        })
 
         # 审计产物：把实际投喂的提示词落盘，便于事后复盘（不是记忆）。
         store.write_text(task_id, PROMPT_FILE, f"{system_prompt}\n\n---\n\n{user_prompt}")
