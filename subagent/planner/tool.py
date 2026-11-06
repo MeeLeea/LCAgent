@@ -36,7 +36,7 @@ from typing import Any
 
 from langchain_core.tools import tool
 
-from subagent.config import load_planner_config
+from subagent.common.config import load_planner_config
 
 from .launcher import LauncherError, preflight, spawn_worker
 from .store import (

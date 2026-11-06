@@ -25,7 +25,7 @@ from typing import Any
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage
 
-from subagent.config import EXECUTOR_AGENT_PROMPT_FILE, ExecutorConfig
+from subagent.common.config import EXECUTOR_AGENT_PROMPT_FILE, ExecutorConfig
 from subagent.executor.store import (
     STATUS_CANCELLED,
     STATUS_DONE,

@@ -42,8 +42,6 @@ query_planner_task 返回 plan ◄───────────────�
 
 ```
 subagent/planner/
-├── config.py       # PlannerConfig（planner/executor 配置统一在 subagent/config.py 模块）
-├── config.json     # （已移除）planner/executor 配置统一在 ../config.json 的 planner 小节
 ├── AGENT.md        # 系统提示词 + 单个 ## workflow:design 模板
 ├── store.py        # 文件系统任务存储（原子写 + 独占认领 + PID 回收）
 ├── launcher.py     # detached 启动 + 跨平台 PID 存活检测 + preflight
@@ -132,8 +130,9 @@ queued ──claim──► running ──LLM 调用成功──► done
 > 缺 Key 会直接返回 `success:false`，不会创建一个永远排队的僵尸任务。
 >
 > planner/executor 的配置**统一在本目录上级**：`subagent/config.json`（已入库，
-> planner 与 executor 各占 `planner` / `executor` 一节）+ `subagent/config.py`
-> （`PlannerConfig` 数据类 + 默认值 + `load_planner_config()` 加载函数）。子程序
+> planner 与 executor 各占 `planner` / `executor` 一节）+ `subagent/common/config.py`
+> （`PlannerConfig` 数据类 + 默认值 + `load_planner_config()` 加载函数，机制与
+> 要素同处一模块）。子程序
 > 初始化时经 `load_planner_config()` 读取 `planner` 小节合并到 dataclass 默认值，
 > 小节缺失/损坏时回退默认值，因此新克隆的仓库开箱即可运行。
 

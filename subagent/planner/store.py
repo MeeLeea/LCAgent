@@ -22,6 +22,7 @@ import json
 import os
 from typing import Any, ClassVar
 
+from subagent.common.config import PLANNER_DEFAULT_OUTPUT_ROOT
 from subagent.common.fsx import (
     atomic_write_json,
     is_safe_component,
@@ -40,7 +41,6 @@ from subagent.common.task_state import (
     TERMINAL_STATUSES,
 )
 from subagent.common.task_store import TaskStoreBase
-from subagent.config import PLANNER_DEFAULT_OUTPUT_ROOT
 
 # task.json 中允许通过 update 修改的字段（task_id 为不可变主键，不在此列）
 _EDITABLE_FIELDS: frozenset[str] = frozenset(

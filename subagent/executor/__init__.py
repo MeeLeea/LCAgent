@@ -9,6 +9,6 @@
 主对话进程启动时 eager import ``subagent.executor.tool``，一旦这里拉起
 ``team`` / ``langchain`` 依赖，会让主进程的 tools 导入链变重并形成脆弱环。
 """
-from subagent.config import ExecutorConfig
+from subagent.common.config import ExecutorConfig
 
 __all__ = ["ExecutorConfig"]

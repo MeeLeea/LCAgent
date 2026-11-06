@@ -11,9 +11,12 @@ from __future__ import annotations
 import logging
 import os
 
-from subagent.common.config import resolve_llm_settings
+from subagent.common.config import (
+    ExecutorConfig,
+    load_executor_config,
+    resolve_llm_settings,
+)
 from subagent.common.proc import spawn_detached
-from subagent.config import ExecutorConfig, load_executor_config
 
 logger = logging.getLogger(__name__)
 

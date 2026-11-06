@@ -40,11 +40,15 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, To
 from llm.llm_client import LLMClient
 from llm.message_utils import final_answer_is_empty, stringify_content
 from subagent.common.awaitx import await_with_cancel
-from subagent.common.config import resolve_llm_settings
+from subagent.common.config import (
+    EXECUTOR_MIN_STEP_SECONDS,
+    ExecutorConfig,
+    load_executor_config,
+    resolve_llm_settings,
+)
 from subagent.common.fsx import truncate_text
 from subagent.common.paths import normalize_path
 from subagent.common.prompt import parse_workflow_section, render_placeholders
-from subagent.config import EXECUTOR_MIN_STEP_SECONDS, ExecutorConfig, load_executor_config
 from subagent.executor.store import (
     STATUS_CANCELLED,
     STATUS_DONE,

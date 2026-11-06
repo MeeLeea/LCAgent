@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from subagent.config import PlannerConfig
+from subagent.common.config import PlannerConfig
 from subagent.planner import launcher
 from subagent.planner.launcher import LauncherError, pid_is_alive, preflight, spawn_worker
 

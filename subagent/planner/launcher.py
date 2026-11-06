@@ -30,8 +30,12 @@ import os
 import subprocess
 import sys
 
-from subagent.common.config import PROJECT_ROOT, resolve_llm_settings
-from subagent.config import PlannerConfig, load_planner_config
+from subagent.common.config import (
+    PROJECT_ROOT,
+    PlannerConfig,
+    load_planner_config,
+    resolve_llm_settings,
+)
 
 logger = logging.getLogger(__name__)
 

@@ -242,8 +242,7 @@ LangChainAgent/
 │   │   ├── task_store.py     # TaskStoreBase 基类(原子写/独占认领/PID 回收/取消请求/文本读写复用流程)
 │   │   ├── prompt.py         # AGENT.md 解析(parse_workflow_section)+占位符渲染(render_placeholders)
 │   │   ├── awaitx.py         # await_with_cancel:超时+取消轮询包装(LLM 调用的超时/用户取消统一语义)
-│   │   └── config.py         # 配置通用机制(build_config 字段声明表合并 + resolve_llm_settings)
-│   ├── config.py             # 子程序配置模块(PlannerConfig/ExecutorConfig + 默认值总表 + load_planner_config/load_executor_config)
+│   │   └── config.py         # 子程序配置模块(通用机制 build_config/resolve_llm_settings + PlannerConfig/ExecutorConfig 默认值总表 + load_planner_config/load_executor_config)
 │   ├── config.json           # 统一子程序配置文件(planner/executor 两节小节，已入库)
 │   ├── planner/              # 复杂需求的后台方案设计子程序（一次性，无记忆）
 │   │   ├── AGENT.md          # 系统提示词 + 单个 ## workflow:design 模板
@@ -443,7 +442,7 @@ LangChainAgent/
 | [scheduler/](scheduler/)                                                 | 定时任务调度：TaskStore（SQLite CRUD）、SchedulerEngine（APScheduler 轮询）、独立进程入口                                                                                                                                                                                                                                                                                                          |
 | [subagent/planner/](subagent/planner/)                                     | 后台方案设计子程序（一次性、无记忆）：`subagent/planner/tool.py` 的 3 个 async 工具派活 → detached 子进程用 `LLMClient` **一次调用**产出 `plan.md` → 文件系统任务存储（原子写 + 独占 `worker.lock` + PID 回收 + `cancel.flag`）。产物落 `data/subagent/planner/<task_id>/`，仅 `status=done` 可读 `plan.md` |
 | [subagent/executor/](subagent/executor/)                                   | 后台任务执行子程序（多步 ReAct 工具循环，会真实写盘）：`subagent/executor/tool.py` 的 3 个 async 工具派活 → detached 子进程在工作区内用受限工具集（`read_file`/`write_file`/`list_dir`，全部绑定工作区并经路径包含校验）多步执行 → 落盘自包含 `result.md`；工作区互斥锁 + 显式 workspace 拒绝清单（见 [subagent/common/](subagent/common/)）。产物落 `data/subagent/executor/<task_id>/`，仅 `status=done` 可读 `result.md` |
-| [subagent/common/](subagent/common/)                                       | 子程序共享件包（仅标准库，禁止反向 import planner/executor）：`fsx.py`（原子写/任务 ID/裸名校验/`TRUNCATION_SUFFIX` 文本截断）+ `proc.py`（分离进程启动/PID 存活探测）+ `paths.py`（路径包含校验/workspace 拒绝清单）+ `task_state.py`（状态常量唯一事实源：`STATUS_*` / ping / `cancel.flag` / 终态判定）+ `task_store.py`（`TaskStoreBase` 基类：独占 `worker.lock` 认领 / PID 回收 reap / `request_cancel` 三分支 / 文本读写复用流程，planner/executor 的 Store 继承后仅声明 `result_filename` 与运行中取消文案）+ `prompt.py`（`parse_workflow_section` 切分 AGENT.md 系统提示词与 workflow 模板 + `render_placeholders` 按插入序渲染占位符）+ `awaitx.py`（`await_with_cancel`：LLM 调用的超时 + 用户取消轮询统一语义，`{timeout}` 占位注入）+ `config.py`（配置通用机制：`build_config` 按「字段声明表」把统一配置文件 `subagent/config.json` 对应小节的覆盖值合并到 dataclass 默认值（支持 `section` 小节读取 + `output_root` 环境变量优先覆盖 + 防字段漂移校验）、`resolve_llm_settings` 解析并校验 LLM 提供商/模型（缺省 label 从 `config.name` 推导）——子程序专属的数据类/默认值/加载函数在 [subagent/config.py](subagent/config.py) 配置模块唯一入口） |
+| [subagent/common/](subagent/common/)                                       | 子程序共享件包（仅标准库，禁止反向 import planner/executor）：`fsx.py`（原子写/任务 ID/裸名校验/`TRUNCATION_SUFFIX` 文本截断）+ `proc.py`（分离进程启动/PID 存活探测）+ `paths.py`（路径包含校验/workspace 拒绝清单）+ `task_state.py`（状态常量唯一事实源：`STATUS_*` / ping / `cancel.flag` / 终态判定）+ `task_store.py`（`TaskStoreBase` 基类：独占 `worker.lock` 认领 / PID 回收 reap / `request_cancel` 三分支 / 文本读写复用流程，planner/executor 的 Store 继承后仅声明 `result_filename` 与运行中取消文案）+ `prompt.py`（`parse_workflow_section` 切分 AGENT.md 系统提示词与 workflow 模板 + `render_placeholders` 按插入序渲染占位符）+ `awaitx.py`（`await_with_cancel`：LLM 调用的超时 + 用户取消轮询统一语义，`{timeout}` 占位注入）+ `config.py`（配置模块唯一入口，机制+要素同处一模块：通用机制 `build_config` 按「字段声明表」把统一配置文件 `subagent/config.json` 对应小节的覆盖值合并到 dataclass 默认值（支持 `section` 小节读取 + `output_root` 环境变量优先覆盖 + 防字段漂移校验）、`resolve_llm_settings` 解析并校验 LLM 提供商/模型（缺省 label 从 `config.name` 推导）；子程序配置要素（`PlannerConfig`/`ExecutorConfig` 数据类、默认值总表、`load_planner_config()`/`load_executor_config()`）亦在本模块，不再有单独的 `subagent/config.py`） |
 
 ### llm/llm_client.py 主要 API
 
@@ -2209,7 +2208,7 @@ query_planner_task 返回 plan ◄───────────────�
 
 - 配置：`subagent/config.json`（**统一配置文件，已入库**）中 `planner` 小节的
   `provider`/`model`/`temperature`/`max_tokens`/`timeout_seconds` 在子程序初始化时生效：
-  `load_planner_config()`（[subagent/config.py](subagent/config.py)）读取该小节合并到 dataclass 默认值，
+  `load_planner_config()`（[subagent/common/config.py](subagent/common/config.py)）读取该小节合并到 dataclass 默认值，
   小节缺失/损坏时回退总表默认值。`provider=null` 时自动选择第一个已配置 API Key 的提供商。
 - 产物：`data/subagent/planner/<task_id>/`（`task.json`、`worker.log`、`prompt.md`、`plan.md`）。
   可用环境变量 `LCAGENT_PLANNER_ROOT` 覆盖根目录。
@@ -2296,7 +2295,7 @@ query_executor_task 返回 result ◄──────────────�
 - 配置：`subagent/config.json`（**统一配置文件，已入库**，planner/executor 共用一文件分小节）中
   `executor` 小节的默认值：`temperature=0.2`、`max_tokens=8192`、
   `timeout_seconds=1800`、`max_steps=24`、`max_observation_chars=6000`、`max_read_bytes=262144`、
-  `max_list_entries=500`；`load_executor_config()`（[subagent/config.py](subagent/config.py)）在初始化时
+  `max_list_entries=500`；`load_executor_config()`（[subagent/common/config.py](subagent/common/config.py)）在初始化时
   读取该小节，小节缺失/损坏时回退总表默认值；`provider=null` 时自动选择第一个已配置 API Key 的提供商。
 - 产物：`data/subagent/executor/<task_id>/`（`task.json`、`worker.log`、`prompt.md`、
   `workspace/`、终态时 `result.md`）。可用环境变量 `LCAGENT_EXECUTOR_ROOT` 覆盖根目录。
@@ -3541,7 +3540,7 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 
 > **subagent 统一配置文件**：后台子程序（planner/executor）的参数（provider/model/采样/预算等）
 > 统一在 [subagent/config.json](subagent/config.json)（已入库，`planner` / `executor` 各占一节小节），
-> 初始化时由 [subagent/config.py](subagent/config.py) 的 `load_planner_config()` /
+> 初始化时由 [subagent/common/config.py](subagent/common/config.py) 的 `load_planner_config()` /
 > `load_executor_config()` 读取合并，小节缺失/损坏时回退该模块内的默认值。
 
 ---

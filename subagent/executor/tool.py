@@ -42,8 +42,8 @@ from typing import Any
 
 from langchain_core.tools import tool
 
+from subagent.common.config import load_executor_config
 from subagent.common.proc import LauncherError
-from subagent.config import load_executor_config
 from subagent.executor.launcher import preflight, spawn_worker
 from subagent.executor.store import (
     STATUS_CANCELLED,

@@ -9,6 +9,6 @@
 ``team`` / ``langchain`` 依赖，会让主进程的 tools 导入链变重并形成
 ``tools → subagent → team → tools`` 的脆弱环。
 """
-from subagent.config import PlannerConfig
+from subagent.common.config import PlannerConfig
 
 __all__ = ["PlannerConfig"]

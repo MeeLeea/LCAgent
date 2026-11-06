@@ -22,7 +22,7 @@ from typing import Any
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage
 
-from subagent.config import PLANNER_AGENT_PROMPT_FILE, PlannerConfig
+from subagent.common.config import PLANNER_AGENT_PROMPT_FILE, PlannerConfig
 from subagent.planner.store import (
     STATUS_CANCELLED,
     STATUS_DONE,

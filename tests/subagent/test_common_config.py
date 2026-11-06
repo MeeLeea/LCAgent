@@ -319,7 +319,7 @@ def test_section_missing_falls_back_with_warning(tmp_path, caplog) -> None:
 
 def test_load_planner_config_reads_shared_file_defaults() -> None:
     """真实 ``subagent/config.json`` 的 planner 小节与总表默认值一致。"""
-    from subagent.config import (
+    from subagent.common.config import (
         PLANNER_MAX_TOKENS,
         PLANNER_TEMPERATURE,
         PLANNER_TIMEOUT_SECONDS,
@@ -337,7 +337,7 @@ def test_load_planner_config_reads_shared_file_defaults() -> None:
 
 def test_load_executor_config_reads_shared_file_defaults() -> None:
     """真实 ``subagent/config.json`` 的 executor 小节与总表默认值一致。"""
-    from subagent.config import (
+    from subagent.common.config import (
         EXECUTOR_MAX_STEPS,
         EXECUTOR_TEMPERATURE,
         load_executor_config,
@@ -353,7 +353,7 @@ def test_load_executor_config_reads_shared_file_defaults() -> None:
 
 def test_load_config_file_overrides_shared_defaults(tmp_path) -> None:
     """显式传入统一配置文件路径时按传入文件合并（测试隔离用）。"""
-    from subagent.config import load_planner_config
+    from subagent.common.config import load_planner_config
 
     config_file = tmp_path / "config.json"
     config_file.write_text(
