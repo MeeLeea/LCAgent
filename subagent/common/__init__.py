@@ -9,6 +9,8 @@
 - :mod:`subagent.common.task_store` — 任务存储骨架 ``TaskStoreBase``（认领/回收/取消协议）
 - :mod:`subagent.common.prompt` — ``AGENT.md`` 解析（``## workflow:`` 小节切分）+ 占位符渲染
 - :mod:`subagent.common.awaitx` — 可取消、可超时的异步等待 ``await_with_cancel``
+- :mod:`subagent.common.config` — 配置加载机制（``build_config`` / ``resolve_llm_settings``），
+  供各子程序 ``config.py`` 瘦壳复用
 
 设计约束（与 ``subagent.planner`` 的导入纪律一致）：
 本包**禁止**在模块级导入 ``langchain`` / ``langgraph`` / ``agent`` / ``team`` /
