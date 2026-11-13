@@ -20,7 +20,20 @@
 
 ## 功能模板（Vivado Xsim Tcl 模板库）
 
-> 基于 `tests/ddr/scripts/start.tcl` 的验证流程按功能分块，并统一改为 filelist 驱动的 `xvlog`/`xelab`/`xsim` 风格（与本文约束一致）。各功能块如下：
+> 验证流程按功能分块，统一为 filelist 驱动的 `xvlog`/`xelab`/`xsim` 风格（与本文约束一致），其整体流程即以下源码片段所示：
+>
+> ```tcl
+> # Flow:
+> #   1) parse scripts/sim_filelist.f (single source of truth, never invent files)
+> #   2) file-exists check for every entry, abort on missing files
+> #   3) xvlog -sv -work xil_defaultlib -i ./src -f scripts/sim_filelist.f
+> #   4) xvlog -work xil_defaultlib $XILINX_VIVADO/data/verilog/src/glbl.v
+> #   5) per testbench: xelab -> xsim (functional coverage db per tb in ./cov_db)
+> #   6) parse ./reports/<tb>_simulate.log for PASS/FAIL (xsim exit code is unreliable)
+> #   7) coverage report into ./reports/
+> ```
+>
+> 各功能块如下：
 
 1. **初始化与读取 filelist**：创建 `./reports` 目录，读取 `scripts/sim_filelist.f`（缺失则报错，禁止编造），过滤注释/空行得到待编译列表。
 2. **编译源文件**：`exec xvlog -i <incdirs> -f scripts/sim_filelist.f` 一次性编译全部源文件（取代旧版 `create_project`/`add_files`/`glob`；`xvlog`/`xelab`/`xsim` 在 Vivado batch 下为外部可执行程序，须用 `exec` 前缀调用）。
@@ -31,20 +44,20 @@
 
 ### 单 tb 定向回归模板（run_one.tcl，filelist 驱动）
 
-> 对应 `tests/ddr/scripts/run_one.tcl`；原文件用 `open_project`+`launch_simulation`+`close_sim`
-> 旧写法，此处已重构为 filelist 驱动（复用 `start.tcl` 已编译产物，不创建/打开工程）。
+> 该模板为 filelist 驱动，复用 `start.tcl` 已编译产物（不创建/打开工程），
+> 取代旧版 `open_project`+`launch_simulation`+`close_sim` 写法。
 
 ```tcl
 # =============================================================================
 # 单 testbench 定向回归脚本（filelist 驱动，适配 AGENT.md 约束）
 # 用法 (在仿真工程根目录下):
-#   vivado -mode batch -source scripts/run_one.tcl -tclargs tb_ddr5_cmd_arbiter
-# 不传参数时默认跑 tb_ddr5_reset_sync
+#   vivado -mode batch -source scripts/run_one.tcl -tclargs <tb_name>
+# 不传参数时默认跑 tb_default
 # 依赖: 已执行过 start.tcl 完成 xvlog 编译（work 库已存在，无需 open_project）
 # =============================================================================
 
 set tb_name [lindex $argv 0]
-if {$tb_name eq ""} { set tb_name tb_ddr5_reset_sync }
+if {$tb_name eq ""} { set tb_name tb_default }
 
 file mkdir ./reports
 file mkdir ./cov_db
