@@ -642,6 +642,30 @@ class TeamAgent:
             for intr in getattr(task, "interrupts", []) or []
         ]
 
+    async def aget_pending_interrupts(self, config: dict | None = None) -> list[Interrupt]:
+        """公开入口:查询内层 agent_executor 当前挂起的 pending interrupts
+
+        与 ``_aget_pending_interrupts`` 的区别:接收**外层** RunnableConfig,
+        内部经 ``_build_run_config`` 改写为内层隔离 thread_id(``team:{name}:{tid}``),
+        供 ``run_team_turn_with_interrupt`` 在节点重入(resume)时判断内层是否已
+        挂起中断,从而跳过 ``arun_structured`` 的整段重放(重放会向内层追加新的
+        HumanMessage 而非 ``Command(resume=...)``,导致挂起的工具调用永远拿不到
+        ToolMessage)。
+
+        纯文本模式(无 agent_executor)或未启用 checkpointer 时返回空列表;
+        状态读取失败同样返回空列表,由调用方回退到正常执行路径。
+
+        Args:
+            config: 外层 RunnableConfig(含 configurable.thread_id / workspace_path)
+
+        Returns:
+            pending interrupts 列表;无或不可读时为空
+        """
+        # getattr 容错:测试中的轻量替身/未走 __init__ 的实例可能没有该属性
+        if getattr(self, "agent_executor", None) is None:
+            return []
+        return await self._aget_pending_interrupts(self._build_run_config(config))
+
     def _parse_turn_result(self, result: dict) -> AgentTurnResult:
         """解析 ainvoke 返回的 dict,检查 __interrupt__(对照 turn_runners.py:207-217)
 
