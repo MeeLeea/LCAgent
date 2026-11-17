@@ -2528,6 +2528,19 @@ resume = {
 
 **多轮暂停**也支持：恢复后若又遇到新的 `ask_human`，`complete_human_input_turn` 会继续循环处理，直到 `status == "completed"`。例如一个图节点里连续两次 `ask_human`，需要两次 resume 才能完成。
 
+### 工作流节点的中断转发（team/interrupt.py）
+
+工作流节点内部是 **TeamAgent 自己的内层 agent 图**，其 `ask_human` / `request_user_confirmation` 中断需要经 `run_team_turn_with_interrupt` 转发到**外层工作流图**（两层图、两次 interrupt）。关键约束：LangGraph 在 resume 时会**从节点函数首行重新执行**整个节点，因此转发逻辑必须做到幂等重入：
+
+| 语义 | 行为 |
+| --- | --- |
+| **不重放内层 turn** | 恢复轮先判定 scratchpad 是否携带 resume（`get_null_resume(False)` 窥视不消费），是则跳过 `arun_structured`，改用 `TeamAgent.aget_pending_interrupts()` 读取内层挂起中断。若重放 `arun_structured`，会向内层注入重复 `HumanMessage`，导致 `AIMessage.tool_calls` 无对应 `ToolMessage`，OpenAI 直接返回 400（`tool_call_ids did not have response messages`） |
+| **位置重放** | `interrupt()` 按「本 task 已消费答案数」索引恢复值，重入时必须先用等量 `interrupt(None)` 消费旧答案、把位置计数器推进到新中断处；否则多轮中断会读到**上一轮**答案 |
+| **陈旧中断清场** | 内层图残留与当前问题无关的 pending interrupt（上次中断后未恢复）时，进入新轮次前用 `{"cancelled": True, "answers": {}}` 清场（最多 2 次），仍有残留只记 warning，不阻塞新任务 |
+| **返回契约** | 内层 `completed` → 返回输出；`cancelled` → 返回取消文案（`TASK_ERROR_PREFIX: 任务被取消`）；未知状态抛 `RuntimeError` |
+
+回归守护：[tests/team/test_interrupt_forward.py](tests/team/test_interrupt_forward.py)（真实 `StateGraph` + `MemorySaver` 验证 resume 不重放内层 turn、第二轮拿到新答案）。
+
 ### 线程隔离
 
 `resume_structured` 会校验当前 `thread_id` 与产生 interrupt 的线程一致，跨线程恢复会抛 `ValueError`：
@@ -2596,6 +2609,9 @@ output = chat_until_completion(agent, "需要人工选择时请先问我")
 | **同一 AgentCore 实例** | `resume_structured` 要求在同一个 `AgentCore` 实例中调用，跨实例恢复不支持                                        |
 | **跨线程拒绝**          | `resume_structured` 校验 `thread_id`，跨线程恢复会抛 `ValueError`                                              |
 | **与 cot 无关**         | `cot()` 模式不走 LangGraph，不会触发 interrupt；HITL 仅对 `run_structured`/`chat_structured` 生效              |
+| **工作流中断须经 workflow 门面恢复** | 工作流会话的 interrupt 挂在外层 workflow 图上，`POST /api/chat/resume` 对 `workflow-*` 会话走 `workflow_sm.aresume_stream`；若误用 chat 会话管理器恢复，工作流会原地不动 |
+| **HTTP 入口不替用户作答** | `CommandContext.interactive=False`（API 命令入口）：遇到 interrupt 只把事件转发给前端后退出本轮，答案由前端 `POST /api/chat/resume` 提交；CLI 入口仍用方向键结构化收集。user_confirmation 的 resume 负载为 `{"answers": {item_id: {"choice_id": ...}}}`，human_choice 为 `{"choice_id": ...}` |
+| **存量中毒会话需新建**   | 修复前留下 pending interrupt 的工作流会话（内层 `team:*` thread 已污染）没有公开 API 清理，建议新建工作流会话重跑；已完成的会话不受影响 |
 | **测试覆盖**            | [tests/agent/test_human_input.py](tests/agent/test_human_input.py) 覆盖了 interrupt、resume、并行选择、线程隔离等场景 |
 
 ---
