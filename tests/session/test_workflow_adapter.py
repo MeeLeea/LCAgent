@@ -459,6 +459,44 @@ def test_arun_events_history_injected(monkeypatch):
     assert "用户新任务" not in raw_context
 
 
+def test_arun_events_injects_user_message(monkeypatch):
+    """用户任务作为 HumanMessage 写入 messages 通道（前端历史可见用户输入）。
+
+    回归守护：此前 initial_state 只放 task，工作流会话 checkpoint 无任何
+    HumanMessage，前端重载历史（selectThread / reattach）后用户消息消失。
+    """
+    fake_graph = FakeGraph()
+    monkeypatch.setattr(
+        "graph.common.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
+    adapter = _make_adapter()
+
+    _collect(adapter, task="帮我设计一个加法器", thread_id="workflow-simple-thread-1")
+
+    messages = fake_graph.last_state["messages"]
+    assert len(messages) == 1
+    assert isinstance(messages[0], HumanMessage)
+    assert messages[0].content == "帮我设计一个加法器"
+    # task 通道仍然保留（节点 prompt 从 task 取值，不受影响）
+    assert fake_graph.last_state["task"] == "帮我设计一个加法器"
+
+
+def test_aresume_events_does_not_reinject_user_message(monkeypatch):
+    """aresume_events 用 Command(resume=...) 恢复，不重复注入 HumanMessage。"""
+    fake_graph = FakeGraphResume(result={"final_answer": "恢复后完成"})
+    monkeypatch.setattr(
+        "graph.common.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
+    adapter = _make_adapter()
+
+    _collect_resume(adapter, {"answer": "yes"}, thread_id="workflow-simple-thread-1")
+
+    # resume 传的是 Command，而非含 messages 的 initial_state
+    assert isinstance(fake_graph.received_input, Command)
+
+
 def test_arun_events_done_is_important_false_by_default(monkeypatch):
     """is_run_mode=False（对话模式）时 DONE 事件 is_important=False。"""
     fake_graph = FakeGraph()

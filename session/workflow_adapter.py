@@ -49,7 +49,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
 
 from graph.common import _build_compaction_middleware, build_tracking_callbacks
@@ -162,10 +162,12 @@ class WorkflowAdapter:
             runtime = await self._awarm_and_build_workflow(tid, trace_id)
             # 执行前上下文：checkpoint 历史消息 + 长期记忆
             raw_context = await self._build_raw_context(tid)
-            initial_state: dict[str, str] = {
+            # 用户任务同时作为 HumanMessage 写入 messages 通道（add_messages reducer 追加）。
+            initial_state: dict[str, Any] = {
                 "task": message,
                 "raw_context": raw_context,
                 "context_summary": "",
+                "messages": [HumanMessage(content=message)],
             }
             async for ev in self._arun_input_events(runtime, initial_state, is_run_mode):
                 yield ev
