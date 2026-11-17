@@ -1282,6 +1282,9 @@ async def chat(req: ChatRequest, request: Request):
                             mcp_config_file=MCP_CONFIG_FILE,
                             workflow_event_cb=emit_workflow_event,
                             workflow_sm=workflow_sm,
+                            # 非交互入口：遇到 interrupt 不在后端替用户作答，
+                            # 保留 pending interrupt 交由 /api/chat/resume 恢复
+                            interactive=False,
                         )
                         
                         # 执行型命令（json:/react:/cot:/skill:<task>）走流式通道
@@ -1454,7 +1457,16 @@ async def chat_resume(req: ResumeRequest, request: Request):
             _active_streams[tid] = stream
 
             async def source() -> AsyncIterator[dict[str, Any]]:
-                async for ev_dict in agent.session_manager.aresume_stream(req.payload, thread_id=tid):
+                # 工作流会话的中断挂在外层 workflow 图上，必须经 workflow_sm
+                # （绑定 WorkflowAdapter）恢复；若走 agent 的会话管理器只会恢复
+                # chat 图，工作流会原地不动并秒回「完成」。
+                if workflow_sm is not None and agent.session.is_workflow_session(tid):
+                    resume_stream = workflow_sm.aresume_stream(req.payload, thread_id=tid)
+                else:
+                    resume_stream = agent.session_manager.aresume_stream(
+                        req.payload, thread_id=tid
+                    )
+                async for ev_dict in resume_stream:
                     await stream.publish(ev_dict)
                     yield ev_dict
 
@@ -1680,6 +1692,8 @@ async def execute_command(req: CommandRequest):
                 base_dir=BASE_DIR,
                 config_file=AGENT_CONFIG_FILE,
                 mcp_config_file=MCP_CONFIG_FILE,
+                # 命令执行入口同样是非交互的（中断交由 /api/chat/resume 恢复）
+                interactive=False,
             )
             
             outcome = await dispatch_command(context, command)
