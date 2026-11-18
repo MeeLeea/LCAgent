@@ -26,12 +26,16 @@
 2. build_workflow 构建图（checkpointer + compaction 默认启用）
 3. 执行前：checkpoint 历史消息 + 长期记忆拼 raw_context 注入
 4. graph.ainvoke 边执行边经 NodeTrackingHandler 队列吐出节点事件
+   （队列静默超过 _WORKFLOW_HEARTBEAT_INTERVAL 时补发 HEARTBEAT 保活，
+   防止前端看门狗误判"响应超时"拉黑线程）
 5. 结束后：__interrupt__ → INTERRUPT；否则 DONE(final_answer)；
    记忆沉淀由 SessionManager 消费事件完成
 
 恢复流程（aresume_events / aretry_events）：
 1. 复用 _awarm_and_build_workflow 重建 graph + config（与 arun_events 一致）
-2. aresume_events 用 Command(resume=payload) 恢复被 interrupt 的节点
+2. aresume_events 前置校验挂起中断（fail-open）：无挂起 → 优雅 DONE；
+   user_confirmation 答案与挂起项 id 完全无交集（陈旧卡片重复提交）→
+   重放当前 INTERRUPT 供用户重新作答；否则用 Command(resume=payload) 恢复
 3. aretry_events 用 ainvoke(None) 从失败节点断点续跑（checkpointer 的
    pending task 即失败节点；已成功节点不重跑）
 
@@ -45,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -68,6 +73,39 @@ logger = logging.getLogger(__name__)
 _HISTORY_MSG_PREVIEW_CHARS = 200
 # 注入 raw_context 的历史消息条数上限
 _HISTORY_MSG_COUNT = 5
+# 事件泵静默期心跳间隔（秒）：节点内 LLM 长流式 / 工具长执行（如 Vivado 仿真）
+# 期间 node_queue 无事件产出，周期性发 HEARTBEAT 喂前端看门狗（90s），
+# 防止其误判"响应超时"拉黑线程（拉黑后 interrupt 事件曾整批丢失）。
+_WORKFLOW_HEARTBEAT_INTERVAL = 15.0
+
+
+def _merge_interrupt_event(
+    interrupt_values: list[Any], tid: str, trace_id: str
+) -> AgentEvent:
+    """把一组挂起中断 value 合并为单个 INTERRUPT 事件（多 interrupt 批量语义）。
+
+    终态分支（graph.ainvoke 返回 ``__interrupt__``）与 aresume 陈旧载荷重放
+    共用该构建逻辑，避免两处 prompt/choices/items 合并规则漂移。
+
+    Args:
+        interrupt_values: 各挂起中断的 ``interrupt.value``（可为任意结构）
+        tid: 目标 workflow 会话 ID
+        trace_id: 本轮追踪 ID
+    """
+    ev_dicts = [build_interrupt_event(v) for v in interrupt_values]
+    # 多 interrupt 合并 prompt（同 interrupts.py 的批量语义）
+    prompt = "\n\n".join(d.get("prompt", "") for d in ev_dicts)
+    choices = ev_dicts[0].get("choices") if ev_dicts else None
+    # 多 interrupt 时把各分组待确认项拼接成一个列表（user_confirmation
+    # 才有 items；human_choice/dangerous_command 的 items 为空）
+    items = [it for d in ev_dicts for it in (d.get("items") or [])]
+    return AgentEvent.interrupt(
+        prompt=prompt,
+        choices=choices,
+        items=items,
+        thread_id=tid,
+        trace_id=trace_id,
+    )
 
 
 class WorkflowAdapter:
@@ -198,6 +236,28 @@ class WorkflowAdapter:
         with TraceContext(trace_id=trace_id, thread_id=tid):
             logger.info("workflow aresume_events [%s]", tid)
             runtime = await self._awarm_and_build_workflow(tid, trace_id)
+
+            # 前置校验（fail-open）：无挂起中断时 Command(resume) 不报错，
+            # 但会让前端白等到看门狗超时（用户侧表现为"响应超时/节点失败"）；
+            # 陈旧载荷（并行重跑产生的旧卡片重复提交）同样白等。两者都优雅收尾。
+            pending = await self._apending_interrupt_values(runtime, tid)
+            if pending is not None:
+                if not pending:
+                    logger.warning("workflow 恢复被忽略 [%s]: 无挂起的人工确认", tid)
+                    yield AgentEvent.done(
+                        content="当前没有挂起的人工确认，本次恢复已忽略。",
+                        thread_id=tid,
+                        role="assistant",
+                        trace_id=trace_id,
+                    )
+                    return
+                if self._is_stale_confirmation_payload(payload, pending):
+                    logger.warning(
+                        "workflow 恢复载荷与挂起确认项错配，重放当前中断 [%s]", tid
+                    )
+                    yield _merge_interrupt_event(pending, tid, trace_id)
+                    return
+
             resume_command = Command(resume=payload)
             async for ev in self._arun_input_events(
                 runtime, resume_command, is_run_mode=False
@@ -243,6 +303,63 @@ class WorkflowAdapter:
             # input=None：LangGraph 从 checkpoint 的 pending task（失败节点）续跑
             async for ev in self._arun_input_events(runtime, None, is_run_mode=False):
                 yield ev
+
+    async def _apending_interrupt_values(
+        self, runtime: _WorkflowRuntime, tid: str
+    ) -> list[Any] | None:
+        """读取 checkpoint 当前挂起的中断 value 列表（aresume 前置校验用）。
+
+        Returns:
+            - ``list``：正常读到状态（无挂起中断时为空列表）
+            - ``None``：无法判定（图不支持 ``aget_state`` / 读取异常）——
+              调用方视为"未知"放行，不拦截正常恢复（fail-open）
+        """
+        getter = getattr(runtime.graph, "aget_state", None)
+        if getter is None:
+            return None
+        try:
+            state = await getter(runtime.config)
+        except Exception as error:
+            logger.warning("读取挂起中断失败，跳过恢复前置校验 [%s]: %s", tid, error)
+            return None
+        if state is None:
+            return []
+        values: list[Any] = []
+        for task in getattr(state, "tasks", ()) or ():
+            for intr in getattr(task, "interrupts", ()) or ():
+                values.append(getattr(intr, "value", None))
+        return values
+
+    @staticmethod
+    def _is_stale_confirmation_payload(
+        payload: Any, pending_values: list[Any]
+    ) -> bool:
+        """判定 resume 载荷是否与挂起确认项完全错配（陈旧卡片重复提交）。
+
+        仅当载荷为 user_confirmation 的 ``{"answers": {item_id: {...}}}`` 形态、
+        挂起侧存在 user_confirmation 项、且 answers 的 key 与全部挂起项 id
+        无任何交集时判为陈旧。其余情况一律放行（fail-open），避免误拦
+        human_choice 的 ``{"choice_id": ...}`` 与部分作答等合法载荷。
+        """
+        if not isinstance(payload, dict):
+            return False
+        answers = payload.get("answers")
+        if not isinstance(answers, dict) or not answers:
+            return False
+        pending_ids: set[str] = set()
+        has_confirmation = False
+        for value in pending_values:
+            if not isinstance(value, dict):
+                continue
+            if value.get("kind") != "user_confirmation":
+                continue
+            has_confirmation = True
+            for item in value.get("items") or ():
+                if isinstance(item, dict) and item.get("id"):
+                    pending_ids.add(str(item["id"]))
+        if not has_confirmation or not pending_ids:
+            return False
+        return not {str(key) for key in answers} & pending_ids
 
     # ============ SessionAgent 协议：历史 ============
 
@@ -544,6 +661,8 @@ class WorkflowAdapter:
             # finally 兜底：外层被取消（dispatch_task.cancel / 客户端断开）时，
             # 同步取消 run_task，避免 graph.ainvoke 继续执行后续节点。
             final: Any = None
+            # 上一次向前端产出事件的时刻：用于静默期心跳判定
+            last_emit_at = time.monotonic()
             try:
                 while True:
                     try:
@@ -558,9 +677,22 @@ class WorkflowAdapter:
                                 final = e
                             break
                         await asyncio.sleep(0.005)
+                        # 静默期心跳：节点内 LLM 长流式 / 巨型工具参数生成 / 工具长执行
+                        # （如 Vivado 仿真）期间 node_queue 无任何事件产出，此间前端看门狗
+                        # （90s）会误判"响应超时"并拉黑线程——拉黑后 interrupt 事件被整批
+                        # 丢弃，HITL 确认卡片永不渲染。周期性 HEARTBEAT 纯保活、不渲染 UI。
+                        if (
+                            time.monotonic() - last_emit_at
+                            >= _WORKFLOW_HEARTBEAT_INTERVAL
+                        ):
+                            last_emit_at = time.monotonic()
+                            yield AgentEvent.heartbeat(
+                                thread_id=tid, trace_id=trace_id
+                            )
                         continue
                     if ev.event_type == EventType.NODE_ERROR:
                         last_error_node = ev.node
+                    last_emit_at = time.monotonic()
                     yield ev
             finally:
                 if not run_task.done():
@@ -606,23 +738,11 @@ class WorkflowAdapter:
                 if interrupts:
                     # 失败已被 interrupt 场景取代，清除旧失败记录
                     await self._aclear_failure_record(tid)
-                    ev_dicts = [
-                        build_interrupt_event(getattr(intr, "value", None))
-                        for intr in interrupts
-                    ]
-                    # 多 interrupt 合并 prompt（同 interrupts.py:179-189 的批量语义）
-                    prompt = "\n\n".join(d.get("prompt", "") for d in ev_dicts)
-                    choices = ev_dicts[0].get("choices") if ev_dicts else None
-                    # 多 interrupt 时把各分组待确认项拼接成一个列表（user_confirmation
-                    # 才有 items；human_choice/dangerous_command 走 d.get("items") or [] 为空）
-                    items = [it for d in ev_dicts for it in (d.get("items") or [])]
                     logger.info("工作流执行被中断 [%s] interrupts=%d", tid, len(interrupts))
-                    yield AgentEvent.interrupt(
-                        prompt=prompt,
-                        choices=choices,
-                        items=items,
-                        thread_id=tid,
-                        trace_id=trace_id,
+                    yield _merge_interrupt_event(
+                        [getattr(intr, "value", None) for intr in interrupts],
+                        tid,
+                        trace_id,
                     )
                     return
 
