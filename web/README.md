@@ -143,6 +143,7 @@ npm run preview
 - 节点/边结构与状态通过 `GET /api/workflow?name=<name>` 获取，渲染为节点卡片 + mermaid 流程图；工作流结构带进程级缓存，仅点击刷新按钮强制重新拉取。
 - 哨兵节点（`__start__`/`__end__`）映射为 `START`/`END` 标签；节点初始状态为 `pending`。
 - **运行进度实时跟踪**：工作流执行期间，`POST /api/chat` 的 SSE 流会推送 `workflow_node`（节点 `running`/`done`）与 `workflow_status`（整体 `running`/`done`）事件，前端据此实时高亮节点卡片与流程图中的当前节点。
+- **不做 token 级流式渲染**：工作流会话收到 `token` 事件时只重置看门狗、不写入聊天区——节点产出统一由 `workflow_node`（`status=done`）结果块呈现，否则同一文本会在消息区出现两份（流式原文 + 节点块），中断恢复（resume）后满屏刷流式文本时尤为明显。`heartbeat` 事件同样只保活不渲染。
 
 #### 相关 API
 

@@ -382,9 +382,13 @@ function handleStreamEvent(
   ev: StreamEvent,
   ctx: { finish: () => void },
 ): string {
-  // terminatedThreads 仅阻止终止事件重复处理（done/error/cancelled/interrupt），
+  // terminatedThreads 仅阻止终止事件重复处理（done/error/cancelled），
   // 不阻止 tool_result 等迟到事件——代理缓冲可能导致 done 先于 tool_result 到达。
-  const isTerminalEv = ev.type === 'done' || ev.type === 'error' || ev.type === 'cancelled' || ev.type === 'interrupt'
+  // interrupt 必须豁免：HITL 中断是需要用户响应的状态机事件而非迟到重复包。
+  // 若被本守卫吞掉（典型场景：节点 LLM 流式期间 SSE 静默触发看门狗误判超时、
+  // 线程被拉黑后真实中断到达），确认卡片将不再渲染，用户无法恢复工作流。
+  // 重复 interrupt 幂等：pendingInterrupt 被同值覆盖、消息重复标记 interrupted 无副作用。
+  const isTerminalEv = ev.type === 'done' || ev.type === 'error' || ev.type === 'cancelled'
   if (isTerminalEv && terminatedThreads.has(threadId)) return threadId
   const arr = [...(get().messagesByThread[threadId] ?? [])]
   const lastIndex = arr.length - 1
@@ -414,11 +418,21 @@ function handleStreamEvent(
       rebindThread(get, set, threadId, ev.thread_id)
       get().fetchThreads()
       return ev.thread_id
-    case 'token':
+    case 'token': {
+      // 工作流会话不做 token 级渲染：节点产出一律以 workflow_node(done) 结果块
+      // 呈现（见下方 case），若再把同一文本实时灌入通用气泡，消息区会出现
+      // "流式原文 + 节点块"两份重复内容（resume 后尤为明显：中断节点恢复时
+      // 满屏刷流式文本）。token 事件仍会被消费——调用方在事件回调里重置看门狗。
+      const tokenThread = get().threads.find((t) => t.thread_id === threadId)
+      const isWfThread = tokenThread
+        ? isWorkflowThread(tokenThread)
+        : threadId.includes('workflow')
+      if (isWfThread) return threadId
       if (!streamLast || streamLast.role !== 'assistant') return threadId
       arr[streamIdx] = { ...streamLast, content: streamLast.content + ev.content }
       commitThreadMessages(get, set, threadId, arr)
       break
+    }
     case 'tool_call':
       if (!streamLast || streamLast.role !== 'assistant') return threadId
       // ask_human 的 UI 由 INTERRUPT 事件渲染，不添加到 toolCalls 避免重复显示
