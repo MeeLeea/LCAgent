@@ -57,7 +57,12 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
 
-from graph.common import _build_compaction_middleware, build_tracking_callbacks
+from graph.common import (
+    WORKFLOWS,
+    _build_compaction_middleware,
+    build_tracking_callbacks,
+    reset_round_counters,
+)
 from llm.llm_client import RETRY_ATTEMPTS, RETRY_MAX_DELAY, should_retry
 from llm.message_utils import build_interrupt_event
 from memory.manager import MemoryManager
@@ -200,13 +205,27 @@ class WorkflowAdapter:
             runtime = await self._awarm_and_build_workflow(tid, trace_id)
             # 执行前上下文：checkpoint 历史消息 + 长期记忆
             raw_context = await self._build_raw_context(tid)
+            # 三层覆盖：底座默认 < 工作流声明的 initial_fields < 调用方入参。
+            # initial_fields 是"本轮起始态"的唯一声明处（产物/计数器回空值），
+            # 否则 checkpoint 会让上一轮的 rtl_code / verification_report /
+            # output_files 串到新任务里（designer_output 会拼进旧产物）。
+            workflow_name = self._registry.workflow_name_of(tid)
+            initial_fields = (
+                WORKFLOWS.get(workflow_name or "", {}).get("initial_fields") or {}
+            )
             # 用户任务同时作为 HumanMessage 写入 messages 通道（add_messages reducer 追加）。
             initial_state: dict[str, Any] = {
+                "context_summary": "",
+                **initial_fields,
                 "task": message,
                 "raw_context": raw_context,
-                "context_summary": "",
                 "messages": [HumanMessage(content=message)],
             }
+            # active_skills 是 per-thread 持久化的手动技能，不随任务重置
+            initial_state.pop("active_skills", None)
+            # 兜底：initial_fields 未声明 round 的图也把轮次计数器归零。
+            # aresume/aretry 不经过此处，续跑/重试的轮次语义不变。
+            reset_round_counters(runtime.graph, initial_state)
             async for ev in self._arun_input_events(runtime, initial_state, is_run_mode):
                 yield ev
 

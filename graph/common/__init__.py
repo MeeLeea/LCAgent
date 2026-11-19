@@ -47,6 +47,7 @@ from graph.common.schema import compose_state_schema
 # 通用运行器
 from graph.common.workflow_runner import (
     arun_compiled_workflow,
+    reset_round_counters,
 )
 
 # 加载内置工作流模块（触发自注册）— 放在所有子模块导入完成后调用，
@@ -69,4 +70,5 @@ __all__ = [
     "register_agent",
     "register_nodes",
     "register_workflow",
+    "reset_round_counters",
 ]
