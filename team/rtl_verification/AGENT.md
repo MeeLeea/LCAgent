@@ -156,7 +156,8 @@ exit 0
 5. 跨时钟域模块，tb要覆盖不同时钟相位、复位错位场景。
 6. 当spec信息不足，调用 `request_user_confirmation` 工具批量征询：Vivado版本、是否启用UVM、时钟频率、复位行为、需要覆盖的异常场景；无待确认项时不强行调工具。
 7. 标识符(变量/信号/模块名/covergroup 的 bins 与 cross 名/宏名等)不得使用 SystemVerilog 保留关键字(如 `byte`、`bit`、`logic`、`int`、`reg`、`wire`、`type`、`void`、`enum`、`struct`、`union`、`class`、`function`、`task`、`module`、`always`、`initial`、`if`、`case`、`for`、`while` 等),否则 Xsim 报 `HDL 9-1206` 语法错误;命名冲突时用前后缀规避(如 `bins byte` 改为 `bins b_byte`)。
-8. 不允许在initial begin ...end内部声明reg\wire\logic等变量。
+8. 每种括号结构(@(...)、函数形参 (...)、#(...)、{...})都有严格的产生式,只能填该产生式允许的语法成分。声明(bit/logic/int + 名字)只能出现在声明区,不能出现在事件控制、参数覆盖等表达式上下文。
+9. 不允许在initial begin ...end内部声明reg\wire\logic等变量。
 
 ## 禁止行为
 
