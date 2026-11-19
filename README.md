@@ -1354,7 +1354,26 @@ workflow 链路（`session/workflow_adapter.py`）对节点异常（LLM 调用�
 
 **状态迁移**：图级失败 → 写记录；重试成功 / 转 INTERRUPT / 新任务开跑（`arun_events`）→ 清记录；再次失败 → 覆盖更新。
 
-**前端刷新还原**：`GET /api/threads/{thread_id}/stream-status` 响应体新增 `failure` 字段（workflow 会话返回上述记录或 `null`），前端据此还原失败节点红态与"从失败节点重试"入口。
+**前端刷新还原与断点/挂起判定**：`GET /api/threads/{thread_id}/stream-status` 在原有 `streaming` / `failure` 之外新增三个字段，让前端能区分三种"看起来可恢复"的现场（真实节点失败 vs HITL 挂起等人工确认 vs 普通断点续跑）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `pending_interrupt` | `{"kind": str, "payload": Any} \| null` | 图的挂起人工确认，来源 `graph.aget_state(config).interrupts` 的首个中断；`kind` 取中断 value 的 `kind`/`type`（缺失回落 `"interrupt"`），`payload` 为该 value。无图/无状态/读取异常时恒为 `null`（不抛错） |
+| `resumable` | `bool` | = `bool(StateSnapshot.next)`（非空表示还有待执行任务，可从断点续跑） |
+| `resume_kind` | `"interrupt" \| "retry" \| "resume" \| null` | 恢复入口类型，判定优先级见下表 |
+
+`resume_kind` 判定优先级（自上而下命中即止）：
+
+| 优先级 | 条件 | 取值 | 前端入口 |
+| --- | --- | --- | --- |
+| 1 | 有 `pending_interrupt` | `"interrupt"` | 人工确认卡片（`POST /api/chat/resume`） |
+| 2 | 无挂起、有 `failure` 记录 | `"retry"` | 从失败节点重试（`POST /api/chat/retry`；不可续跑时前端提示"无可恢复断点"） |
+| 3 | 无挂起、无 failure、`resumable` 为真 | `"resume"` | 从断点继续（复用 `POST /api/chat/resume`） |
+| 4 | 其余 | `null` | 无恢复入口 |
+
+> `streaming` 为真（后台仍在跑）时**不短路** `pending_interrupt` / `resumable`，仍返回真实值——前端以 `streaming` 优先判断"后台仍在执行"，其余字段供刷新后还原。
+
+实现要点：`WorkflowAdapter.aget_resume_state(thread_id)`（只读，不修改图状态）在 `try/except` 内构建图并读取 `graph.aget_state`，任何异常（图不支持 / 读取失败 / 非 workflow 会话）都返回空 `ResumeState`（`pending_interrupt=None`、`resumable=False`），保证查询路径永不失败；`SessionManager.aget_resume_state` 做透传，chat 链路无此接口时返回 `None` 回落到仅凭 `failure` 判定。`_extract_pending_interrupt` 优先读 `StateSnapshot.interrupts`，缺失时回退遍历 `tasks[*].interrupts`（兼容旧结构）。
 
 回归守护：`tests/session/test_workflow_adapter.py`（FakeGraph 重试/落库/断点校验/心跳/恢复前置校验）、`tests/session/test_session_store.py`（failures 存取）、`tests/graph/test_workflow_failure_recovery_integration.py`（真实 StateGraph + MemorySaver 验证 ainvoke(None) 仅重跑失败节点、已完结图不空转）。
 
@@ -1363,6 +1382,8 @@ workflow 链路（`session/workflow_adapter.py`）对节点异常（LLM 调用�
 workflow 链路在两类"看起来像节点失败"的场景做了专门防护（`session/workflow_adapter.py`）：
 
 **1. 事件泵静默期心跳（HEARTBEAT）**：`_arun_input_events` 的事件泵队列（`node_queue`）在节点内 LLM 长流式、巨型工具调用参数生成（`tool_call_chunks` 期间 `content` 为空、无 TOKEN 事件）、工具长执行（如 Vivado 仿真）期间可能持续无任何事件产出。前端看门狗（`web/src/store.ts` 的 `WATCHDOG_MS = 90_000`）在此期间会误判"响应超时"并 `finish()` 拉黑线程——拉黑期间到达的 `interrupt` 事件被终止去重守卫丢弃，HITL 确认卡片永不渲染。事件泵因此在距上次产出事件超过 `_WORKFLOW_HEARTBEAT_INTERVAL`（15 秒，看门狗的 1/6）时补发 `AgentEvent.heartbeat`（纯保活：不渲染 UI、不沉淀记忆、不是终止事件），前端收到后仅重置看门狗。
+
+> ⚠️ **转发链路必须放行 heartbeat**：事件泵产出的 `heartbeat` 要真正到达客户端，中间每一跳都不得按事件类型白名单丢弃。工作流经 `/api/chat`（命令模式 `/workflow:<name> <任务>`）执行时，`cli/commands/workflow.py::run_workflow` 逐条消费 `workflow_sm.arun_stream` / `aresume_stream` 的事件并转发——它**必须显式转发 `heartbeat`**（否则长节点静默期前端仍会 90s 看门狗误判"响应超时"）。历史上该循环只处理 `workflow_node` / `done` / `error` / `interrupt` 四类、静默丢弃 `heartbeat`，是"事件泵已产心跳但实测 0 心跳"的根因。回归守护见 `tests/cli/test_workflow_hitl.py`。
 
 **2. aresume 前置校验（fail-open）**：无挂起中断时 `Command(resume=...)` 不会报错、图原地不动，现象是前端静默等到看门狗超时（用户理解为"节点失败"）；并行重跑产生的旧确认卡片重复提交时，载荷与当前挂起项错配。`aresume_events` 在 `_awarm_and_build_workflow` 后读取 `graph.aget_state` 的挂起中断列表：
 

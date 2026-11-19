@@ -102,7 +102,33 @@ npm run preview
 
 - SSE（Server-Sent Events）实时接收 token 增量
 - 工具调用过程默认折叠，异常时自动展开高亮
-- 看门狗机制：90 秒无响应自动复位，防止流卡死
+- 看门狗机制：90 秒无响应**不再直接写死「请重试」并永久拉黑线程**——超时后先向后端求证真实状态，再按状态分支渲染，详见下方「超时求证（stream-status）」。
+
+### 超时求证（stream-status）
+
+单节点执行常达 5 分钟（远超 `WATCHDOG_MS = 90_000`），且静默期心跳不保证到达客户端，故看门狗超时不再等同「失败」。超时回调改为异步求证：调用 `GET /api/threads/{thread_id}/stream-status` 取后端真实状态，再按如下决策路径分支（前端**不自行推导**续跑方式，直接采信后端算好的 `resume_kind`，优先级 `interrupt` > `retry` > `resume` > `null`）：
+
+| 后端状态 | 前端行为 |
+|----------|----------|
+| `streaming === true` | 后端仍在执行：**不拉黑**、不写超时；挂提示「⏱️ 前端等待超时，但后端仍在执行，正在重新连接…」，复用 `reattachStream` 重连（重放错过事件 + 续传），并由重连逻辑重新 arm 看门狗（间隔不小于原 `WATCHDOG_MS`，不会无限快速轮询） |
+| `resume_kind === "interrupt"` | 等待人工确认：把 `pending_interrupt` 转为 `pendingInterrupts`，让 HITL 确认卡片正常渲染（**不拉黑**，否则卡片点不了）；文案「⏸️ 已中断，等待你确认后继续。」 |
+| `resume_kind === "retry"` | 从失败节点重试：沿用失败路径（同步 `failure` 记录 + 写失败文案 + `finish`），使工作流视图的「从失败节点重试」横幅出现 |
+| `resume_kind === "resume"` | 从断点继续：文案「⏸️ 已中断，可从断点继续。」，并置 `resumableThreads[threadId] = true`，供工作流视图渲染「从断点继续」按钮 |
+| `resume_kind === null` | 保留旧的「⏱️ 响应超时，请重试。」行为 |
+| 求证失败（网络错误/超时） | 降级为旧行为（写超时文案 + `finish`），不把异常抛回事件循环打断 store |
+
+> `terminatedThreads` 拉黑机制本身保留（其它路径仍在用），仅在「后端仍在跑 / 等待确认 / 可续跑」三种情况下不再把线程永久拉黑。
+
+`GET /api/threads/{thread_id}/stream-status` 响应字段：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `thread_id` | `string` | 线程 ID |
+| `streaming` | `boolean` | 后端是否仍在执行该线程的流 |
+| `failure` | `StreamFailure \| null` | 最近一次工作流失败记录（无则 `null`；chat 会话恒为 `null`） |
+| `pending_interrupt` | `{ kind: string; payload: unknown } \| null` | 待确认的人工中断（HITL）；前端按 `payload` 逐字段容错解析为确认卡片 |
+| `resumable` | `boolean` | 后端仍有待执行任务，可从断点继续 |
+| `resume_kind` | `"interrupt" \| "retry" \| "resume" \| null` | 后端按优先级算好的续跑方式：`interrupt` > `retry` > `resume` > `null` |
 
 ### 并发多会话
 
