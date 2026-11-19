@@ -113,6 +113,21 @@ def _merge_interrupt_event(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class ResumeState:
+    """workflow 会话的可恢复状态快照（stream-status 端点查询用）。
+
+    Attributes:
+        pending_interrupt: 首个挂起中断 ``{"kind": str, "payload": Any}``；
+            无挂起中断或状态不可判定时为 ``None``。
+        resumable: 是否存在待执行的 pending task（LangGraph ``StateSnapshot.next``
+            非空表示图仍可从断点续跑，如失败节点待重跑或中断待恢复）。
+    """
+
+    pending_interrupt: dict[str, Any] | None = None
+    resumable: bool = False
+
+
 class WorkflowAdapter:
     """Workflow 执行体适配器 — 使 workflow 接入统一 SessionManager 门面。
 
@@ -399,6 +414,76 @@ class WorkflowAdapter:
         except Exception as error:
             logger.warning("读取失败记录失败 [%s]: %s", sid, error)
             return None
+
+    async def aget_resume_state(
+        self, session_id: str | None = None
+    ) -> ResumeState:
+        """读取 workflow 会话的可恢复状态（挂起中断 + 是否可续跑）。
+
+        供 stream-status 端点区分两种"看起来可恢复"的现场：
+
+        - **HITL 挂起**：``pending_interrupt`` 非空（图停在人工确认节点等待 resume）；
+        - **失败断点**：无挂起中断但 ``resumable`` 为真（图停在某失败节点待重跑）。
+
+        只读，不修改图状态。非 workflow 会话、图构建失败或 ``aget_state`` 抛异常时
+        统一返回空 ``ResumeState``（不抛出，保证查询路径永不失败）。
+
+        Args:
+            session_id: 目标 workflow 会话 ID（为 None 时使用当前会话）
+
+        Returns:
+            ``ResumeState(pending_interrupt, resumable)``；无法判定时取默认值
+            （pending_interrupt=None、resumable=False）。
+        """
+        tid = self._current_sid(session_id)
+        workflow_name = self._registry.workflow_name_of(tid)
+        if not workflow_name:
+            return ResumeState()
+
+        from graph.common import build_workflow
+
+        try:
+            graph, _agents = build_workflow(
+                workflow_name, checkpointer=self._checkpointer
+            )
+            config: dict[str, Any] = {"configurable": {"thread_id": tid}}
+            state = await graph.aget_state(config)
+        except Exception as error:
+            logger.warning("读取 workflow 可恢复状态失败 [%s]: %s", tid, error)
+            return ResumeState()
+        if state is None:
+            return ResumeState()
+
+        resumable = bool(getattr(state, "next", ()) or ())
+        return ResumeState(
+            pending_interrupt=self._extract_pending_interrupt(state),
+            resumable=resumable,
+        )
+
+    @staticmethod
+    def _extract_pending_interrupt(state: Any) -> dict[str, Any] | None:
+        """从 StateSnapshot 提取首个挂起中断（防御式，任意形状都不抛异常）。
+
+        优先读 ``state.interrupts``（LangGraph ``StateSnapshot`` 顶层聚合字段）；
+        该属性缺失/为空时回退遍历 ``state.tasks[*].interrupts``（兼容旧结构）。
+
+        ``value`` 为 dict 时 ``kind`` 取其中的 ``kind``/``type``（缺失回落
+        ``"interrupt"``）、``payload`` 即该 dict；``value`` 非 dict 时
+        ``kind="interrupt"``、``payload=value``。
+        """
+        interrupts: list[Any] = list(getattr(state, "interrupts", None) or ())
+        if not interrupts:
+            for task in getattr(state, "tasks", ()) or ():
+                interrupts.extend(getattr(task, "interrupts", ()) or ())
+        if not interrupts:
+            return None
+
+        interrupt = interrupts[0]
+        value = getattr(interrupt, "value", None)
+        if isinstance(value, dict):
+            kind = value.get("kind") or value.get("type") or "interrupt"
+            return {"kind": str(kind), "payload": value}
+        return {"kind": "interrupt", "payload": value}
 
     async def aget_execution_history(
         self, session_id: str | None = None
@@ -838,4 +923,4 @@ class WorkflowAdapter:
         return "\n\n".join(parts)
 
 
-__all__ = ["WorkflowAdapter"]
+__all__ = ["ResumeState", "WorkflowAdapter"]

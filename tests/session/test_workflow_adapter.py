@@ -26,7 +26,7 @@ from langgraph.types import Command
 
 from graph.common import WORKFLOWS
 from session.context import SessionContext
-from session.workflow_adapter import WorkflowAdapter
+from session.workflow_adapter import ResumeState, WorkflowAdapter
 from utils.events import EventType
 
 
@@ -230,6 +230,34 @@ class FakeGraphRetryable(FakeGraph):
     async def ainvoke(self, state, config):
         self.received_input = state
         return await super().ainvoke(state, config)
+
+
+class FakeGraphResumeState(FakeGraph):
+    """带 ``aget_state`` 且可注入挂起中断的图（供 ``aget_resume_state`` 测试）。
+
+    - ``interrupts``: 顶层 ``state.interrupts`` 列表（元素为含 ``value`` 的对象），
+      为空时模拟无挂起中断；
+    - ``next_nodes``: 待执行节点元组（决定 ``resumable``）；
+    - ``state_error``: 非 None 时 ``aget_state`` 抛出该异常（验证防御式兜底）。
+    """
+
+    def __init__(
+        self,
+        next_nodes: tuple[str, ...] = (),
+        interrupts: list | None = None,
+        state_error: BaseException | None = None,
+    ) -> None:
+        super().__init__(result={"final_answer": ""})
+        self.next_nodes = next_nodes
+        self.interrupts = list(interrupts or [])
+        self.state_error = state_error
+
+    async def aget_state(self, config):
+        if self.state_error is not None:
+            raise self.state_error
+        return types.SimpleNamespace(
+            values={}, next=self.next_nodes, interrupts=self.interrupts
+        )
 
 
 class FakeStore:
@@ -1084,6 +1112,142 @@ def test_aget_failure_record_without_store_returns_none():
     assert asyncio.run(adapter.aget_failure_record()) is None
 
 
+# ────────────── aget_resume_state：可恢复状态（断点/挂起） ──────────────
+
+
+def _patch_graph(monkeypatch, graph) -> None:
+    """把 build_workflow 替换为返回指定 FakeGraph 的桩。"""
+    monkeypatch.setattr(
+        "graph.common.build_workflow",
+        lambda name, checkpointer=None: (graph, {"manager": object()}),
+    )
+
+
+def test_aget_resume_state_with_interrupt(monkeypatch):
+    """有挂起中断 → pending_interrupt 非空（kind 取自 value.kind）+ resumable 真。"""
+    interrupt_value = {"kind": "user_confirmation", "items": [{"id": "clk"}]}
+    fake_graph = FakeGraphResumeState(
+        next_nodes=("node_a",),
+        interrupts=[types.SimpleNamespace(value=interrupt_value)],
+    )
+    _patch_graph(monkeypatch, fake_graph)
+    adapter = _make_adapter()
+
+    state = asyncio.run(adapter.aget_resume_state("workflow-simple-thread-1"))
+
+    assert isinstance(state, ResumeState)
+    assert state.pending_interrupt == {
+        "kind": "user_confirmation",
+        "payload": interrupt_value,
+    }
+    assert state.resumable is True
+
+
+def test_aget_resume_state_resumable_without_interrupt(monkeypatch):
+    """无挂起中断但 next 非空 → resumable 真、pending_interrupt None。"""
+    _patch_graph(monkeypatch, FakeGraphResumeState(next_nodes=("node_a",)))
+    adapter = _make_adapter()
+
+    state = asyncio.run(adapter.aget_resume_state("workflow-simple-thread-1"))
+
+    assert state.pending_interrupt is None
+    assert state.resumable is True
+
+
+def test_aget_resume_state_finished_graph_not_resumable(monkeypatch):
+    """next 为空（图已跑完/从未执行）→ 空状态（不可续跑、无挂起）。"""
+    _patch_graph(monkeypatch, FakeGraphResumeState(next_nodes=()))
+    adapter = _make_adapter()
+
+    state = asyncio.run(adapter.aget_resume_state("workflow-simple-thread-1"))
+
+    assert state == ResumeState()
+
+
+def test_aget_resume_state_interrupt_kind_fallbacks(monkeypatch):
+    """kind 取值优先级：value.kind > value.type > 默认 "interrupt"。"""
+    cases = [
+        ({"kind": "k1"}, "k1"),
+        ({"type": "k2"}, "k2"),
+        ({"prompt": "无 kind/type"}, "interrupt"),
+    ]
+    for value, expected_kind in cases:
+        fake_graph = FakeGraphResumeState(
+            interrupts=[types.SimpleNamespace(value=value)]
+        )
+        _patch_graph(monkeypatch, fake_graph)
+        adapter = _make_adapter()
+
+        state = asyncio.run(adapter.aget_resume_state("workflow-simple-thread-1"))
+
+        assert state.pending_interrupt == {"kind": expected_kind, "payload": value}
+
+
+def test_aget_resume_state_non_dict_value(monkeypatch):
+    """value 非 dict → kind="interrupt"、payload=value。"""
+    _patch_graph(
+        monkeypatch,
+        FakeGraphResumeState(interrupts=[types.SimpleNamespace(value="raw_payload")]),
+    )
+    adapter = _make_adapter()
+
+    state = asyncio.run(adapter.aget_resume_state("workflow-simple-thread-1"))
+
+    assert state.pending_interrupt == {"kind": "interrupt", "payload": "raw_payload"}
+
+
+def test_aget_resume_state_tasks_fallback(monkeypatch):
+    """顶层无 interrupts 时回退遍历 tasks[*].interrupts。"""
+
+    class _TasksOnlyState(FakeGraphResumeState):
+        async def aget_state(self, config):
+            task = types.SimpleNamespace(
+                interrupts=[types.SimpleNamespace(value={"kind": "human_choice"})]
+            )
+            return types.SimpleNamespace(values={}, next=("node_a",), tasks=[task])
+
+    _patch_graph(monkeypatch, _TasksOnlyState())
+    adapter = _make_adapter()
+
+    state = asyncio.run(adapter.aget_resume_state("workflow-simple-thread-1"))
+
+    assert state.pending_interrupt == {"kind": "human_choice", "payload": {"kind": "human_choice"}}
+    assert state.resumable is True
+
+
+def test_aget_resume_state_state_error_returns_empty(monkeypatch):
+    """aget_state 抛异常 → 返回空 ResumeState（不抛出）。"""
+    _patch_graph(monkeypatch, FakeGraphResumeState(state_error=RuntimeError("boom")))
+    adapter = _make_adapter()
+
+    state = asyncio.run(adapter.aget_resume_state("workflow-simple-thread-1"))
+
+    assert state == ResumeState()
+
+
+def test_aget_resume_state_build_error_returns_empty(monkeypatch):
+    """build_workflow 抛异常 → 返回空 ResumeState（不抛出）。"""
+
+    def _boom(name, checkpointer=None):
+        raise RuntimeError("构建图失败")
+
+    monkeypatch.setattr("graph.common.build_workflow", _boom)
+    adapter = _make_adapter()
+
+    state = asyncio.run(adapter.aget_resume_state("workflow-simple-thread-1"))
+
+    assert state == ResumeState()
+
+
+def test_aget_resume_state_non_workflow_session(monkeypatch):
+    """非 workflow 会话 → 空 ResumeState（不构建图）。"""
+    adapter = _make_adapter(_make_registry(workflow_name=None))
+
+    state = asyncio.run(adapter.aget_resume_state("thread-abc"))
+
+    assert state == ResumeState()
+
+
 def test_aget_execution_history_reuses_store():
     """执行历史委托 SessionStore 按会话隔离。"""
     reg = _make_registry()
@@ -1327,7 +1491,6 @@ def test_aclear_skills_non_workflow_session_noop(monkeypatch):
 
     assert built == []
 
-
 # ────────────── 新任务初始 state：按 registry initial_fields 播种 ──────────────
 
 
@@ -1387,3 +1550,4 @@ def test_arun_events_seed_excludes_active_skills(monkeypatch):
     assert state is not None
     assert "active_skills" not in state
     assert state["draft"] == ""
+    assert state["task"] == "任务"
