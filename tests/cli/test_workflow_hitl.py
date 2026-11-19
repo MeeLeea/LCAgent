@@ -207,3 +207,22 @@ def test_interactive_collects_and_resumes() -> None:
         {"answers": {"q1": {"choice_id": "a"}, "q2": {"choice_id": "a"}}}
     ]
     assert result["final_answer"] == "最终答案"
+
+
+def test_heartbeat_forwarded_to_event_cb() -> None:
+    """静默期 heartbeat 事件必须转发给 SSE 通道
+
+    Given:workflow_sm 首轮流产出 heartbeat → done
+    When:run_workflow(interactive=False)
+    Then:heartbeat 事件出现在 workflow_event_cb 收到的事件里(否则长节点
+         静默期前端 90s 看门狗会误判"响应超时"拉黑线程)
+    """
+    heartbeat = {"type": "heartbeat"}
+    sm = _FakeWorkflowSM([heartbeat, {"type": "done", "content": "完成"}])
+    events: list[dict[str, str]] = []
+    context = _make_context(sm, interactive=False, events=events)
+
+    result = asyncio.run(run_workflow(context, "simple", "任务"))
+
+    assert any(ev.get("type") == "heartbeat" for ev in events)
+    assert result["final_answer"] == "完成"

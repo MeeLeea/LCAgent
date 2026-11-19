@@ -198,6 +198,11 @@ async def run_workflow(context: CommandContext, name: str, task: str) -> dict:
                     )
                     _emit(ev_dict)
                     got_done = True
+                elif ev_type == "heartbeat":
+                    # 静默期心跳：节点内 LLM 长流式 / 工具长执行期间事件泵补发，
+                    # 必须转发给 SSE 客户端（前端仅重置看门狗、不渲染 UI），
+                    # 否则工作流长节点会被前端 90s 看门狗误判"响应超时"拉黑线程。
+                    _emit(ev_dict)
                 elif ev_type == "interrupt":
                     # 先转发事件：SSE 需要立即把中断卡片推给前端
                     _emit(ev_dict)
