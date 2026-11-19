@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, MagicMock
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
 
+from graph.common import WORKFLOWS
 from session.context import SessionContext
 from session.workflow_adapter import WorkflowAdapter
 from utils.events import EventType
@@ -1325,3 +1326,64 @@ def test_aclear_skills_non_workflow_session_noop(monkeypatch):
     asyncio.run(adapter.aclear_skills())
 
     assert built == []
+
+
+# ────────────── 新任务初始 state：按 registry initial_fields 播种 ──────────────
+
+
+def _patch_seed_graph(monkeypatch, graph) -> None:
+    """把 build_workflow 替换为返回指定 FakeGraph 的桩（本区块自包含）。"""
+    monkeypatch.setattr(
+        "graph.common.build_workflow",
+        lambda name, checkpointer=None: (graph, {"manager": object()}),
+    )
+
+
+def test_arun_events_seeds_initial_fields(monkeypatch):
+    """新任务按 registry 的 initial_fields 播种：上一轮产物/计数器回空。
+
+    回归场景：checkpoint 按 thread 持久化，若不播种，第二条任务会继承
+    上一轮的 rtl_code / verification_report / output_files（designer_output
+    把旧产物拼进交付物），且 round 已接近 max_rounds。
+    """
+    fake_graph = FakeGraph()
+    _patch_seed_graph(monkeypatch, fake_graph)
+    adapter = _make_adapter(_make_registry(workflow_name="rtl_graph"))
+
+    _collect(adapter, task="第二条任务")
+
+    state = fake_graph.last_state
+    assert state is not None
+    assert state["task"] == "第二条任务"
+    assert state["rtl_code"] == ""
+    assert state["verification_report"] == ""
+    assert state["output_files"] == []
+    assert state["sim_status"] == ""
+    assert state["sim_log_path"] == ""
+    assert state["round"] == 0
+    assert state["max_rounds"] == 3
+    assert [m.content for m in state["messages"]] == ["第二条任务"]
+
+
+def test_arun_events_seed_excludes_active_skills(monkeypatch):
+    """initial_fields 若声明 active_skills，播种时必须剔除（per-thread 持久化技能）。"""
+    fake_graph = FakeGraph()
+    _patch_seed_graph(monkeypatch, fake_graph)
+    monkeypatch.setitem(
+        WORKFLOWS,
+        "_test_seed_flow",
+        {
+            "builder": lambda *args, **kwargs: None,
+            "initial_fields": {"active_skills": ["git-helper"], "draft": ""},
+            "roles": [],
+            "description": "",
+        },
+    )
+    adapter = _make_adapter(_make_registry(workflow_name="_test_seed_flow"))
+
+    _collect(adapter, task="任务")
+
+    state = fake_graph.last_state
+    assert state is not None
+    assert "active_skills" not in state
+    assert state["draft"] == ""
