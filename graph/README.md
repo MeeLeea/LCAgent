@@ -255,6 +255,8 @@ r2 = asyncio.run(arun_compiled_workflow(graph, "第二轮", thread_id="wf-1"))
 | 跨轮次记忆 | 读 `checkpoint` 上一轮的 `task`/`plan`/`worker_result`/`final_answer`，压成 `【上一轮工作流记录】` 拼进 `raw_context` |
 | 长期记忆 | 传 `memory=` / `memory_thread_id=` 时召回文本注入，结束后把 `final_answer` 作为 DONE 事件沉淀 |
 | `active_skills` | **仅非空时**写入初始 state，避免清空 checkpoint 中已持久化的 per-thread 技能 |
+| 轮次计数器清零 | `reset_round_counters(graph, state)`：兜底把通道名以 `round` 结尾的计数器（`round` / `xxx_round`）置 0，`max_rounds` 保留；覆盖 `initial_fields` 未声明 `round` 的图。HITL `Command(resume=...)` 与断点 `ainvoke(None)` 不经过新任务入口，轮次语义不变 |
+| 新任务初始态播种 | `initial_fields` 是"本轮起始态"的唯一声明处。`WorkflowAdapter.arun_events` 按 `{底座默认} < {initial_fields} < {task/raw_context/messages}` 三层覆盖组装初始 state，产物字段（`rtl_code` / `verification_report` / `output_files` / `design_spec` 等）随新任务回空，不继承上一轮；`active_skills` 是 per-thread 持久化技能，播种时显式剔除 |
 | workspace | `workspace_path` 非 None 时写入 `configurable`，供 `WorkspaceSecurityMW` 解析路径 |
 | 进度回调 | 传了任一 `on_node_*` 才挂 `NodeTrackingHandler`，否则零开销 |
 
@@ -273,6 +275,7 @@ r2 = asyncio.run(arun_compiled_workflow(graph, "第二轮", thread_id="wf-1"))
 | 期望 builder 收到 `skills_dir` / `max_rounds` 等参数 | `build_workflow` 只传 `agents` 与 `checkpointer`，其余参数走默认值 | 需要非默认值时直接调 `builder(agents, checkpointer=..., max_rounds=N)`，或把默认值写进 `initial_fields` |
 | 在节点里自己再做消息压缩 | 与 `LCAgentCompactionMiddleware.before_model` 双重压缩 | 节点级压缩已移除，压缩交给中间件 |
 | 终态节点没有写 `final_answer` | 跨轮次记忆与 DONE 事件内容为空 | 所有 `→ END` 路径都要经过写 `final_answer` 的交付节点（如 `designer_output`） |
+| 把 `round` / 产物字段直接当"本轮"用 | checkpoint 按 thread 持久化：计数器跨任务累积（第二条任务开局就接近 `max_rounds`），产物跨任务残留（`designer_output` 把上一轮 RTL/报告拼进交付物） | 新任务入口按 `initial_fields` 播种回空（`reset_round_counters` 兜底），跨任务记忆走 checkpoint `messages` / `raw_context`，不要依赖 state 残留 |
 
 ---
 
