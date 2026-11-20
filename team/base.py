@@ -15,12 +15,13 @@ import os
 from collections.abc import AsyncIterator, Sequence
 from typing import Any, ClassVar
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, ToolMessage
 from langchain_core.tools import BaseTool
 from langgraph.types import Command, Interrupt
 
 from agent.turn_types import AgentTurnResult
 from llm.llm_client import LLMClient
+from llm.message_utils import final_answer_is_empty
 from skmng.core import build_skill_block as _build_skill_block
 from skmng.core import inject_into_prompt as _inject_into_prompt
 from skmng.manager import SkillManager, default_skills_dir
@@ -429,7 +430,9 @@ class TeamAgent:
           聚合 token(保留流式,经 callbacks 流出到外层 NodeTrackingHandler),
           流后调 ``aget_state`` 检查 pending interrupts(对照
           agent/streaming.py:322-326)。有 interrupt → interrupted;否则
-          completed。``UserRejectedCommandError`` → cancelled。
+          检查空最终回答(reasoning token 耗尽 / ``finish_reason=length``),
+          命中则先从内层 checkpoint 移除空 assistant 消息再 → cancelled;
+          其余 → completed。``UserRejectedCommandError`` → cancelled。
         - **纯文本模式**(agent_executor is None):走 ``astream`` 聚合,
           返回 completed,**不检查 interrupt**(纯文本通道不进 ReAct 循环,
           不会触发工具内 interrupt())。
@@ -469,7 +472,8 @@ class TeamAgent:
                 # aget_state 检查 pending interrupts(对照 streaming.py:322-326)
                 run_config = self._build_run_config(config)
                 chunks: list[str] = []
-                async for chunk in self._astream_with_tools(task, config):
+                final_ai: list[AIMessage] = []
+                async for chunk in self._astream_with_tools(task, config, final_ai=final_ai):
                     chunks.append(chunk)
                 output = "".join(chunks)
                 if output.startswith(TASK_ERROR_PREFIX):
@@ -477,6 +481,23 @@ class TeamAgent:
                 interrupts = await self._aget_pending_interrupts(run_config)
                 if interrupts:
                     return AgentTurnResult.interrupted(interrupts)
+                # 空最终回答检测(reasoning token 耗尽 / finish_reason=length 等):
+                # 先把空 assistant 消息从内层 checkpoint 移除——内层 thread
+                # (team:{name}:{tid})被同角色后续节点复用,残留空 assistant 会让
+                # 严格网关 400("role 'assistant' must not be empty");再返回
+                # cancelled + 原因。顺序置于 interrupt 检查之后,保证挂起中断优先
+                # (对照 agent/streaming.py 的空回答守卫)。
+                # 仅当本轮**无任何可见输出**时判定为空回答:若已流式产出文本,维持
+                # 既有 completed 语义(不丢弃用户已见内容),也避免个别网关
+                # on_chat_model_end 内容与流式分片不一致导致的误判。
+                empty_reason = (
+                    final_answer_is_empty(final_ai[0])
+                    if final_ai and not output
+                    else None
+                )
+                if empty_reason:
+                    await self._aremove_empty_final_ai(run_config, final_ai[0])
+                    return AgentTurnResult.cancelled(f"{TASK_ERROR_PREFIX}: {empty_reason}")
                 return AgentTurnResult.completed(output)
             # 纯文本模式:astream 聚合,不检查 interrupt(纯文本不进 ReAct 循环)
             chunks = []
@@ -613,6 +634,47 @@ class TeamAgent:
         except (AttributeError, RuntimeError, TypeError, ValueError) as e:
             logger.warning("[%s] 修复 checkpoint 状态失败: %s", self.name, e)
 
+    async def _aremove_empty_final_ai(
+        self,
+        config: dict,
+        msg: AIMessage,
+    ) -> None:
+        """把空最终 AIMessage 从内层 checkpoint 移除,避免污染后续节点上下文。
+
+        思考型模型(reasoning token 计入 max_tokens)在预算耗尽时返回空 AIMessage
+        (``finish_reason=length``),该消息在模型节点结束的 superstep 已随图自动落库。
+        若保留,内层 thread(``team:{name}:{tid}``)被同角色后续节点复用时,会携带一条
+        "什么都没说"的 assistant 轮次发给严格的 OpenAI 兼容网关,触发 400
+        (``message ... role 'assistant' must not be empty``)。此清理对照
+        ``agent/streaming.py::_aremove_empty_final_ai``(主 Agent 同名能力)移植。
+
+        未启用 checkpointer / 无 agent_executor 时直接返回(无 checkpoint 可改);
+        消息无 ``id``(部分网关不返回)时无法删除,记 warning 后仅返回,由调用方
+        照常返回 cancelled。删除失败不抛异常(不阻塞 cancelled 结果返回)。
+
+        Args:
+            config: 内层 run_config(含 thread_id,由 ``_build_run_config`` 构造)
+            msg: 待移除的空最终 AIMessage
+        """
+        if getattr(self, "agent_executor", None) is None or getattr(
+            self, "_checkpointer", None
+        ) is None:
+            return
+        msg_id = getattr(msg, "id", None)
+        if not msg_id:
+            logger.warning(
+                "[%s] 空最终回答无 id,无法从 checkpoint 移除,下一节点可能仍触发网关 400",
+                self.name,
+            )
+            return
+        try:
+            await self.agent_executor.aupdate_state(
+                config,
+                {"messages": [RemoveMessage(id=msg_id)]},
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError) as e:
+            logger.warning("[%s] 清理空最终回答消息失败: %s", self.name, e)
+
     async def _aget_pending_interrupts(self, config: dict) -> list[Interrupt]:
         """流后读取 checkpoint 的 pending interrupts(对照 streaming.py:322-326)
 
@@ -722,12 +784,27 @@ class TeamAgent:
         # 多中断 + 裸值:将同一答案应用到所有 pending interrupts
         return Command(resume={intr.id: payload for intr in interrupts})
     
-    async def _astream_with_tools(self, task: str, config: dict | None = None) -> AsyncIterator[str]:
+    async def _astream_with_tools(
+        self,
+        task: str,
+        config: dict | None = None,
+        *,
+        final_ai: list[AIMessage] | None = None,
+    ) -> AsyncIterator[str]:
         """工具模式异步流式执行(经 agent_executor.astream_events)
 
         除产出 LLM token 增量外,顺带收集运行时指标:
         - on_chat_model_end → 记录 LLM 调用(token 用量,msg id 去重)
         - on_tool_end / on_tool_error → 记录工具执行(失败/超时)
+
+        Args:
+            task: 任务描述
+            config: 外层运行配置(RunnableConfig)
+            final_ai: 可选输出参数。传入时把最后一次 ``on_chat_model_end`` 的
+                AIMessage 写入 ``final_ai``(切片赋值,取最新即最终)。调用方
+                ``arun_structured`` 在流结束后据此检测空最终回答(reasoning
+                token 耗尽 / ``finish_reason=length``),避免空 assistant 消息
+                残留在内层 checkpoint 污染同角色后续节点。
         """
         from midware.terminal_retry_cap_mw import is_timeout_content
 
@@ -755,6 +832,11 @@ class TeamAgent:
                 elif event_name == "on_chat_model_end":
                     # 记录 LLM 指标(与 agent/streaming.py 同构,msg id 去重)
                     output = data_dict.get("output")
+                    if isinstance(output, AIMessage) and final_ai is not None:
+                        # 记录最新(也是最终)AIMessage,供调用方检测空回答
+                        # (reasoning token 耗尽 / finish_reason=length)。切片赋值
+                        # 兼容空/已占位列表,杜绝 list assignment index out of range。
+                        final_ai[:] = [output]
                     if output is not None:
                         msg_id = getattr(output, "id", None) or str(id(output))
                         if msg_id not in recorded_msg_ids:
