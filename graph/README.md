@@ -392,7 +392,7 @@ START
   → verification_check                   # Testbench / 验证报告
   → sim_exec_check                       # Vivado 仿真 + 覆盖率
       ├─ 通过 ─────────────→ designer_output
-      ├─ 未达 max_rounds ──→ designer_verilog（带反馈重新设计）
+      ├─ 未达 max_rounds ──→ designer_verilog（带验证报告 + sim_log_path 反馈重新设计）
       └─ 达 max_rounds ────→ designer_output
   → designer_output（零 LLM 机械拼装）
   → END
@@ -415,6 +415,8 @@ START
 | `verification_check` | `VerificationAgent.check_node` | `verification_report` | rtl_verification |
 | `sim_exec_check` | `rtl_verification.sim_exec_check_node`（实例方法，跑 Vivado） | `sim_check_passed` / `sim_status` / `sim_log_path` | rtl_verification |
 | `designer_output` | `rtl_designer.designer_output_node`（实例方法，零 LLM） | `final_answer` / `output_files` | rtl_designer |
+
+> **仿真失败反馈的交割方式（state 而非条件边）**：`sim_exec_check` 失败回退到 `designer_verilog` 时，日志正文只落盘 `workspace/logs/sim_exec.log`，state 仅携带 `sim_status="FAIL"` + `sim_log_path`；`_designer_verilog_task` 在 `round > 0 and sim_status == "FAIL" and sim_log_path` 时把**路径**与 `read_file` 指引拼进 prompt，由 designer 自行读取日志（不内嵌正文，避免撑大 checkpoint）。`_designer_verilog_extra` 在消费后把 `sim_status` / `sim_log_path` 复位为空，防止 `designer_file_check` 回退时把更早轮次的陈旧日志当作"上一轮"反馈注入。注意条件边（`add_conditional_edges`）只决定下一个节点，**不携带数据**，真正的交割靠这两处 state 写入/读取。
 
 ### 11.3 工作流级额外通道
 
