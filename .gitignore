@@ -49,7 +49,6 @@ Thumbs.db
 *.svg
 
 # Project specific
-calibrate_*.png
 *.log
 .opencode/
 .omo/
@@ -61,8 +60,11 @@ config/*
 docs/
 *.json
 .drafts/
+AGENTS.md
+
 # 必需入库的 JSON 配置（放回白名单）
 !agent/agent_config.json
+!subagent/config.json
 !web/package.json
 !web/package-lock.json
 !web/tsconfig.json

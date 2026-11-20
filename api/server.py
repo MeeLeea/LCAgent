@@ -309,6 +309,8 @@ async def build_agent(provider: str) -> tuple[AgentCore, LLMClient]:
         process_type="server",
         llm_getter=lambda: new_llm,
         # 记忆链路参数由 memory/config.py 统一管理，不再经 agent_config.json 配置
+        # 长驻进程：在本 loop 启动后台 purge（物理清理 forgotten / 超龄 superseded）
+        enable_purge_task=True,
     )
     new_agent = await AgentCore.acreate(
         llm_client=new_llm,
@@ -352,6 +354,10 @@ async def lifespan(_: FastAPI):
     provider = _startup_provider or pick_default_provider()
     logger.info("初始化提供商: %s", provider)
     agent, llm = await build_agent(provider)
+    # 注入 forget_memory 工具的会话依赖（与 main.py / scheduler/run.py 同一入口接线）
+    from tools.forget_memory import configure_for_agent as configure_forget_tool
+
+    configure_forget_tool(agent)
     # workflow 链路统一门面：与 chat 门面共享 SessionRegistry / MemoryManager
     from session.manager import create_workflow_session_manager
 
@@ -837,22 +843,45 @@ async def create_thread(req: CreateThreadRequest | None = None):
 
     type=workflow 时创建专属工作流会话。
     workspace_path 指定会话绑定的外部工作空间路径（可选，用于多会话工作目录隔离）。
+
+    路径校验保持严格（由 SessionRegistry 负责），但 API 边界做降级：
+    workspace_path 非法（不存在 / 不是目录 / 系统关键目录）时不再整体失败，
+    而是记录 warning 后不绑定 workspace 重新创建同一会话，并在响应体
+    workspace_error 中返回被拒绝的原因（成功绑定时该字段为 None）。
     """
+    workspace_path = req.workspace_path if req else None
+    workspace_error: str | None = None
     async with chat_lock:
         if req and req.type == "workflow":
             workflow_name = req.workflow_name or "simple"
-            tid = agent.session.new_workflow_session(
-                workflow_name,
-                workspace_path=req.workspace_path if req else None,
-            )
+            try:
+                tid = agent.session.new_workflow_session(
+                    workflow_name,
+                    workspace_path=workspace_path,
+                )
+            except ValueError as error:
+                workspace_error = str(error)
+                logger.warning(
+                    "工作流会话 workspace 绑定被拒绝，降级为不绑定: %s (%s)",
+                    workspace_path,
+                    workspace_error,
+                )
+                tid = agent.session.new_workflow_session(workflow_name)
             agent.set_current_session(tid)
         else:
-            tid = agent.session.new_session(
-                workspace_path=req.workspace_path if req else None,
-            )
+            try:
+                tid = agent.session.new_session(workspace_path=workspace_path)
+            except ValueError as error:
+                workspace_error = str(error)
+                logger.warning(
+                    "会话 workspace 绑定被拒绝，降级为不绑定: %s (%s)",
+                    workspace_path,
+                    workspace_error,
+                )
+                tid = agent.session.new_session()
             agent.set_current_session(tid)
-    logger.info("创建会话: %s (workspace=%s)", tid, req.workspace_path if req else None)
-    return {"thread_id": tid}
+    logger.info("创建会话: %s (workspace=%s)", tid, workspace_path)
+    return {"thread_id": tid, "workspace_error": workspace_error}
 
 
 @app.delete("/api/threads/{thread_id}")
@@ -863,6 +892,32 @@ async def delete_thread(thread_id: str):
         logger.warning("删除失败: %s", thread_id)
         raise HTTPException(status_code=404, detail="会话不存在或删除失败")
     return {"deleted": True, "thread_id": thread_id}
+
+
+@app.delete("/api/threads/{thread_id}/turns/{turn_index}")
+async def delete_thread_turn(thread_id: str, turn_index: int):
+    """删除会话内某一轮对话（用户消息 + AI 回复及工具调用链）。
+
+    轮序号按 HumanMessage（user 回合）计数，与会话窗口中的用户消息顺序一致。
+    该会话正在流式执行时返回 409，避免与 checkpoint 写入竞态。
+    """
+    lock = _thread_lock(thread_id)
+    if lock.locked():
+        raise HTTPException(status_code=409, detail="该会话正在执行，请稍后再试")
+    async with lock:
+        try:
+            removed = await agent.session_manager.adelete_turn(thread_id, turn_index)
+        except ValueError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+    logger.info(
+        "删除会话轮次: %s turn=%d removed=%d", thread_id, turn_index, removed
+    )
+    return {
+        "deleted": True,
+        "thread_id": thread_id,
+        "turn_index": turn_index,
+        "removed_messages": removed,
+    }
 
 
 @app.patch("/api/threads/{thread_id}")
@@ -1227,6 +1282,9 @@ async def chat(req: ChatRequest, request: Request):
                             mcp_config_file=MCP_CONFIG_FILE,
                             workflow_event_cb=emit_workflow_event,
                             workflow_sm=workflow_sm,
+                            # 非交互入口：遇到 interrupt 不在后端替用户作答，
+                            # 保留 pending interrupt 交由 /api/chat/resume 恢复
+                            interactive=False,
                         )
                         
                         # 执行型命令（json:/react:/cot:/skill:<task>）走流式通道
@@ -1399,7 +1457,16 @@ async def chat_resume(req: ResumeRequest, request: Request):
             _active_streams[tid] = stream
 
             async def source() -> AsyncIterator[dict[str, Any]]:
-                async for ev_dict in agent.session_manager.aresume_stream(req.payload, thread_id=tid):
+                # 工作流会话的中断挂在外层 workflow 图上，必须经 workflow_sm
+                # （绑定 WorkflowAdapter）恢复；若走 agent 的会话管理器只会恢复
+                # chat 图，工作流会原地不动并秒回「完成」。
+                if workflow_sm is not None and agent.session.is_workflow_session(tid):
+                    resume_stream = workflow_sm.aresume_stream(req.payload, thread_id=tid)
+                else:
+                    resume_stream = agent.session_manager.aresume_stream(
+                        req.payload, thread_id=tid
+                    )
+                async for ev_dict in resume_stream:
                     await stream.publish(ev_dict)
                     yield ev_dict
 
@@ -1501,19 +1568,56 @@ async def chat_retry(req: RetryRequest, request: Request):
 
 @app.get("/api/threads/{thread_id}/stream-status")
 async def thread_stream_status(thread_id: str):
-    """查询线程流式状态 + 最近一次工作流失败记录。
+    """查询线程流式状态 + 断点/挂起语义 + 最近一次工作流失败记录。
 
     - streaming: 是否有正在进行的流（前端刷新后据此决定是否 attach）
     - failure: workflow 会话的最近失败记录 {"node", "error", "ts"}（无则 None），
       前端据此还原失败节点红态与重试入口
+    - pending_interrupt: 挂起的人工确认 {"kind", "payload"}（无则 None），
+      来源为 ``graph.aget_state`` 的挂起中断；无图/无状态/异常时恒为 None
+    - resumable: 是否还有待执行任务（``StateSnapshot.next`` 非空即可从断点续跑）
+    - resume_kind: 恢复入口类型，判定优先级见下
+
+    ``resume_kind`` 优先级（前端据此选择恢复入口）：
+
+    1. 有 ``pending_interrupt`` → ``"interrupt"``（人工确认卡片，POST /api/chat/resume）
+    2. 有 ``failure`` 记录 → ``"retry"``（从失败节点重试，POST /api/chat/retry；
+       不可续跑时前端自行提示"无可恢复断点"）
+    3. 无挂起、无 failure、``resumable`` → ``"resume"``（从断点继续，
+       POST /api/chat/resume）
+    4. 其余 → ``None``
+
+    ``streaming`` 为真时仍返回真实的 ``resumable`` / ``pending_interrupt``
+    （前端以 ``streaming`` 优先判断"后台仍在跑"，不短路为默认值）。
     """
     failure = None
+    resume_state = None
     if workflow_sm is not None and agent and agent.session.is_workflow_session(thread_id):
         failure = await workflow_sm.aget_failure(thread_id)
+        resume_state = await workflow_sm.aget_resume_state(thread_id)
+
+    # 非 workflow 会话 / 图不可用时 resume_state 为 None，防御式取默认值
+    pending_interrupt = getattr(resume_state, "pending_interrupt", None)
+    resumable = bool(getattr(resume_state, "resumable", False))
+
+    if pending_interrupt is not None:
+        resume_kind: str | None = "interrupt"
+    elif failure is not None:
+        # 无挂起但有失败记录：无论能否续跑都返回 retry（保持旧行为，
+        # 不可续跑时前端自行报"无可恢复断点"）
+        resume_kind = "retry"
+    elif resumable:
+        resume_kind = "resume"
+    else:
+        resume_kind = None
+
     return {
         "thread_id": thread_id,
         "streaming": thread_id in _active_streams,
         "failure": failure,
+        "pending_interrupt": pending_interrupt,
+        "resumable": resumable,
+        "resume_kind": resume_kind,
     }
 
 
@@ -1625,6 +1729,8 @@ async def execute_command(req: CommandRequest):
                 base_dir=BASE_DIR,
                 config_file=AGENT_CONFIG_FILE,
                 mcp_config_file=MCP_CONFIG_FILE,
+                # 命令执行入口同样是非交互的（中断交由 /api/chat/resume 恢复）
+                interactive=False,
             )
             
             outcome = await dispatch_command(context, command)
@@ -1756,6 +1862,51 @@ async def clear_memory(scope: str = "long"):
             result["scope"], result["long_cleared"], result["agent_cleared"], result["new_thread_id"],
         )
         return {"cleared": True, **result}
+
+
+@app.delete("/api/memory/facts")
+async def forget_memory_facts(
+    scope: str = "long",
+    keyword: str | None = None,
+    topic: str | None = None,
+):
+    """按条件显式遗忘记忆（软删除，status → forgotten），不物理删除。
+
+    与 ``DELETE /api/memory``（整体清空）语义区分：本端点只标记命中条目，
+    之后可被重新学习，物理清理由后台 purge 承接。作用域术语复用既有
+    ``long|agent``：本会话长期记忆（默认）/ agent 级跨会话共享记忆。
+
+    与 CLI ``forget`` 命令共用 ``cli.commands.memory.forget_memory_apply``。
+
+    Args:
+        scope: ``long``（默认，当前会话 thread 级）或 ``agent``（跨会话共享）
+        keyword: 内容关键词（不区分大小写子串匹配）
+        topic: 主题键（提供时按归一化主题精确匹配）
+
+    Returns:
+        ``{"forgotten_count": int, "scope": str, "preview": list[str]}``
+
+    Raises:
+        HTTPException: 400 —— 作用域非法，或 keyword / topic 同时缺失
+    """
+    from cli.commands.memory import forget_memory_apply
+
+    async with chat_lock:
+        try:
+            result = await forget_memory_apply(
+                agent, scope=scope, keyword=keyword, topic=topic
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        logger.info(
+            "显式遗忘记忆: scope=%s keyword=%s topic=%s forgotten=%s",
+            result["scope"], keyword, topic, result["forgotten_count"],
+        )
+        return {
+            "forgotten_count": result["forgotten_count"],
+            "scope": result["scope"],
+            "preview": result["preview"],
+        }
 
 
 # --------------------------------------------------------------------------- #

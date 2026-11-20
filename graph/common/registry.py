@@ -162,7 +162,9 @@ def build_workflow(name: str, checkpointer=None) -> tuple[object, dict[str, obje
             mcp_loaded = load_all_mcp_tools_sync()
             if mcp_loaded:
                 tools.extend(mcp_loaded)
-                logger.info(
+                # 工作流每次构建都会重建角色并重复触发 MCP 加载，逐角色清单降为
+                # DEBUG 防止日志刷屏；加载失败/降级仍保留 WARNING（见下方分支）。
+                logger.debug(
                     "角色 %s: 加载 %d 个 MCP 工具(全部): %s",
                     role, len(mcp_loaded), [t.name for t in mcp_loaded],
                 )
@@ -177,7 +179,8 @@ def build_workflow(name: str, checkpointer=None) -> tuple[object, dict[str, obje
             mcp_loaded = load_mcp_tools_by_name_sync(mcp_names)
             if mcp_loaded:
                 tools.extend(mcp_loaded)
-                logger.info(
+                # 同上：工作流反复构建时逐角色加载清单属重复噪音，降为 DEBUG。
+                logger.debug(
                     "角色 %s: 加载 %d 个 MCP 工具: %s",
                     role, len(mcp_loaded), [t.name for t in mcp_loaded],
                 )

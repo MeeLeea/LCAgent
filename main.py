@@ -64,6 +64,8 @@ async def build_agent(provider: str, process_type: str | None = None) -> tuple[A
         process_type=process_type,
         llm_getter=lambda: llm,
         # 记忆链路参数由 memory/config.py 统一管理，不再经 agent_config.json 配置
+        # 注：CLI 为短命进程，不启用后台 purge（24h 周期在分钟级会话中永不触发，
+        # 白占协程）；forgotten 的清理由下次 api/scheduler 进程的 purge 覆盖。
     )
     agent = await AgentCore.acreate(
         llm_client=llm,
@@ -93,6 +95,10 @@ async def build_agent(provider: str, process_type: str | None = None) -> tuple[A
     # 动态绑定：记忆组件按会话解析 LLM（回落 agent 当前 LLM），
     # 切换 provider 后自动同步，且会话级 provider/model 正确生效
     memory_ctx.bind_llm(build_memory_llm_resolver(agent.session, lambda: agent.llm))
+    # 注入 forget_memory 工具的会话依赖（工具无法自取 Agent，模块级注入模式）
+    from tools.forget_memory import configure_for_agent as configure_forget_tool
+
+    configure_forget_tool(agent)
     return agent, llm
 
 

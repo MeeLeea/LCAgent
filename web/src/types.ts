@@ -254,12 +254,33 @@ export interface StreamFailure {
   ts: number
 }
 
+/** 后端挂起的人工中断（GET /api/threads/{id}/stream-status 的 pending_interrupt） */
+export interface PendingInterrupt {
+  /** 中断类型（如 user_confirmation / human_choice） */
+  kind: string
+  /** 中断载荷（结构由后端中断类型决定，前端按需容错解析，不使用 any） */
+  payload: unknown
+}
+
+/**
+ * 后端算好的续跑方式（优先级 interrupt > retry > resume > null）。
+ * 前端不自行推导，直接按此分支渲染。
+ */
+export type ResumeKind = 'interrupt' | 'retry' | 'resume' | null
+
 /** 线程流式状态（GET /api/threads/{id}/stream-status） */
 export interface StreamStatus {
   thread_id: string
+  /** 后端是否仍在执行该线程的流 */
   streaming: boolean
   /** 最近一次工作流失败记录（无则 null；chat 会话恒为 null） */
   failure: StreamFailure | null
+  /** 待确认的人工中断（无则 null）；供看门狗超时后还原 HITL 确认卡片 */
+  pending_interrupt: PendingInterrupt | null
+  /** 后端仍有待执行任务，可从断点继续 */
+  resumable: boolean
+  /** 后端按优先级算好的续跑方式；前端据此分支，不自行推导 */
+  resume_kind: ResumeKind
 }
 
 /** SSE 事件联合类型 */

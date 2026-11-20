@@ -102,7 +102,33 @@ npm run preview
 
 - SSE（Server-Sent Events）实时接收 token 增量
 - 工具调用过程默认折叠，异常时自动展开高亮
-- 看门狗机制：90 秒无响应自动复位，防止流卡死
+- 看门狗机制：90 秒无响应**不再直接写死「请重试」并永久拉黑线程**——超时后先向后端求证真实状态，再按状态分支渲染，详见下方「超时求证（stream-status）」。
+
+### 超时求证（stream-status）
+
+单节点执行常达 5 分钟（远超 `WATCHDOG_MS = 90_000`），且静默期心跳不保证到达客户端，故看门狗超时不再等同「失败」。超时回调改为异步求证：调用 `GET /api/threads/{thread_id}/stream-status` 取后端真实状态，再按如下决策路径分支（前端**不自行推导**续跑方式，直接采信后端算好的 `resume_kind`，优先级 `interrupt` > `retry` > `resume` > `null`）：
+
+| 后端状态 | 前端行为 |
+|----------|----------|
+| `streaming === true` | 后端仍在执行：**不拉黑**、不写超时；挂提示「⏱️ 前端等待超时，但后端仍在执行，正在重新连接…」，复用 `reattachStream` 重连（重放错过事件 + 续传），并由重连逻辑重新 arm 看门狗（间隔不小于原 `WATCHDOG_MS`，不会无限快速轮询） |
+| `resume_kind === "interrupt"` | 等待人工确认：把 `pending_interrupt` 转为 `pendingInterrupts`，让 HITL 确认卡片正常渲染（**不拉黑**，否则卡片点不了）；文案「⏸️ 已中断，等待你确认后继续。」 |
+| `resume_kind === "retry"` | 从失败节点重试：沿用失败路径（同步 `failure` 记录 + 写失败文案 + `finish`），使工作流视图的「从失败节点重试」横幅出现 |
+| `resume_kind === "resume"` | 从断点继续：文案「⏸️ 已中断，可从断点继续。」，并置 `resumableThreads[threadId] = true`，供工作流视图渲染「从断点继续」按钮 |
+| `resume_kind === null` | 保留旧的「⏱️ 响应超时，请重试。」行为 |
+| 求证失败（网络错误/超时） | 降级为旧行为（写超时文案 + `finish`），不把异常抛回事件循环打断 store |
+
+> `terminatedThreads` 拉黑机制本身保留（其它路径仍在用），仅在「后端仍在跑 / 等待确认 / 可续跑」三种情况下不再把线程永久拉黑。
+
+`GET /api/threads/{thread_id}/stream-status` 响应字段：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `thread_id` | `string` | 线程 ID |
+| `streaming` | `boolean` | 后端是否仍在执行该线程的流 |
+| `failure` | `StreamFailure \| null` | 最近一次工作流失败记录（无则 `null`；chat 会话恒为 `null`） |
+| `pending_interrupt` | `{ kind: string; payload: unknown } \| null` | 待确认的人工中断（HITL）；前端按 `payload` 逐字段容错解析为确认卡片 |
+| `resumable` | `boolean` | 后端仍有待执行任务，可从断点继续 |
+| `resume_kind` | `"interrupt" \| "retry" \| "resume" \| null` | 后端按优先级算好的续跑方式：`interrupt` > `retry` > `resume` > `null` |
 
 ### 并发多会话
 
@@ -143,6 +169,7 @@ npm run preview
 - 节点/边结构与状态通过 `GET /api/workflow?name=<name>` 获取，渲染为节点卡片 + mermaid 流程图；工作流结构带进程级缓存，仅点击刷新按钮强制重新拉取。
 - 哨兵节点（`__start__`/`__end__`）映射为 `START`/`END` 标签；节点初始状态为 `pending`。
 - **运行进度实时跟踪**：工作流执行期间，`POST /api/chat` 的 SSE 流会推送 `workflow_node`（节点 `running`/`done`）与 `workflow_status`（整体 `running`/`done`）事件，前端据此实时高亮节点卡片与流程图中的当前节点。
+- **不做 token 级流式渲染**：工作流会话收到 `token` 事件时只重置看门狗、不写入聊天区——节点产出统一由 `workflow_node`（`status=done`）结果块呈现，否则同一文本会在消息区出现两份（流式原文 + 节点块），中断恢复（resume）后满屏刷流式文本时尤为明显。`heartbeat` 事件同样只保活不渲染。
 
 #### 相关 API
 
@@ -158,6 +185,18 @@ npm run preview
 - **重命名**：就地内联编辑展示名（Enter/失焦提交，Esc 取消，清空提交=恢复默认预览名）。后端 `PATCH /api/threads/{id}`，body `{"title": "新名字"}`；展示名持久化在 LangGraph Store（`lcagent.sessions/{sid}/display` 命名空间），空 `title` 清除自定义名。
 - **分叉**：完整复制当前会话生成新会话并自动切换过去。后端 `POST /api/threads/{id}/fork`，复制内容包括 checkpoint 全量历史（checkpoints + writes 表，含祖先链与中断现场）、会话配置（provider/model/role 等）、workspace 绑定、自定义展示名与执行历史；工作流会话分叉后新 ID 保留 `workflow-{name}` 前缀。
 - **删除**：同原删除功能（`DELETE /api/threads/{id}`），会话数据与展示名一并清理。
+
+### 删除某一轮对话（turn）
+
+每条**用户消息**气泡的操作栏提供「删除」按钮（复制 / 编辑旁），删除该轮完整对话：
+
+- 删除范围：该条用户消息 + 其 AI 回复及全部工具调用卡片（后端 `DELETE /api/threads/{id}/turns/{turnIndex}` 真删 checkpoint 历史，非仅本地隐藏）；
+- 轮序号按会话内用户消息顺序计数，与后端 `HumanMessage` 划轮一致；
+- 二次确认：第一次点击变红色「确认删除」，3 秒内再点执行，超时自动复位；
+- 流式生成中禁用；后端检测到该会话正在执行时返回 409，前端提示后可稍后重试；
+- 删除失败（如前后端轮数不一致）时自动重载会话历史对齐后端权威状态；
+- 删除的是最后一轮且该轮存在挂起的 HITL 中断卡片时，中断卡片一并清理；
+- 注意：只删对话历史，不影响已沉淀的长期记忆。
 
 ## Tauri 桌面应用
 

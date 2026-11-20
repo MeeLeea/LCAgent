@@ -179,10 +179,17 @@ class TestDeleteAndClear:
 
 class TestPruneAndTouch:
     def test_prune_facts_removes_oldest(self):
+        """超上限时按 memory_score 升序淘汰；同 confidence 下最旧者分数最低先出。
+
+        注：淘汰依据已由纯 last_used_at（LRU）升级为 score = confidence^0.5 × 时间衰减
+        （见 test_memory_scoring.py 的分档/低置信优先用例）。本用例固定 confidence 相同，
+        score 随 Δt 单调递减，故最旧者仍先淘汰（与旧 LRU 观测结果守恒）。
+        """
         async def run():
             store = ThreadMemoryStore(max_facts=3)
             for i in range(5):
                 item = _make_fact(f"fact-{i}")
+                item.confidence = 0.8  # 同档 → 排序只由 Δt（时间衰减）决定
                 item.last_used_at = f"2026-01-0{i+1}T00:00:00"
                 item.create_time = f"2026-01-0{i+1}T00:00:00"
                 await store.save_fact("t1", item)
@@ -401,11 +408,12 @@ class TestAgentScope:
         asyncio.run(run())
 
     def test_prune_agent_facts(self):
-        """超过 max_agent_facts 时按 last_used_at 淘汰最久未使用。"""
+        """超过 max_agent_facts 时按 memory_score 升序淘汰（同 confidence 下最旧先出）。"""
         async def run():
             store = ThreadMemoryStore(max_agent_facts=2)
             for i in range(3):
                 item = _make_fact(f"agent-{i}", "user_fact")
+                item.confidence = 0.8  # 同档 → 排序只由 Δt（时间衰减）决定
                 item.last_used_at = f"2026-01-0{i+1}T00:00:00"
                 item.create_time = f"2026-01-0{i+1}T00:00:00"
                 await store.save_agent_fact(item)
@@ -415,7 +423,7 @@ class TestAgentScope:
             facts = await store.query_agent_facts()
             assert len(facts) == 2
             contents = {f.content for f in facts}
-            # last_used_at 最旧的 agent-0 被淘汰
+            # score 最低（最旧、同 confidence）的 agent-0 被淘汰
             assert "agent-0" not in contents
             assert "agent-2" in contents
 

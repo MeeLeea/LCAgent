@@ -27,6 +27,8 @@ import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
+from langchain_core.messages import HumanMessage, RemoveMessage
+
 from memory.manager import MemoryManager
 from utils.events import AgentEvent
 
@@ -200,6 +202,24 @@ class SessionManager:
         chat 链路（AgentCore）无 aget_failure_record 接口时返回 None。
         """
         aget = getattr(self._agent, "aget_failure_record", None)
+        if aget is None:
+            return None
+        tid = self._resolve_thread_id(thread_id)
+        return await aget(tid)
+
+    async def aget_resume_state(
+        self, thread_id: str | None = None
+    ) -> Any:
+        """读取会话可恢复状态（挂起中断 + 是否可续跑）。
+
+        委托 workflow 执行体的 ``aget_resume_state``（workflow 会话返回
+        ``ResumeState``）；chat 链路（AgentCore）无此接口时返回 None，
+        由调用方回落到仅凭 failure 判定。
+
+        Args:
+            thread_id: 目标会话线程 ID（为 None 时使用当前会话）
+        """
+        aget = getattr(self._agent, "aget_resume_state", None)
         if aget is None:
             return None
         tid = self._resolve_thread_id(thread_id)
@@ -380,6 +400,60 @@ class SessionManager:
         """获取会话消息列表。"""
         return await self.session.aget_messages(session_id)
 
+    async def adelete_turn(self, thread_id: str, turn_index: int) -> int:
+        """删除会话内某一轮对话（用户消息 + AI 回复 + 工具调用链）。
+
+        轮（turn）以 ``HumanMessage`` 为锚点：第 ``turn_index`` 条
+        ``HumanMessage`` 起、到下一条 ``HumanMessage``（不含）为止的连续
+        消息块。轮序号与前端会话窗口中 user 回合的顺序一致（压缩摘要也是
+        ``HumanMessage``，会被计为一轮，删除属用户主动行为）。
+
+        经编译图 ``aupdate_state`` + ``RemoveMessage`` 按消息 id 整块移除，
+        不破坏 AIMessage(tool_calls) 与 ToolMessage 的配对完整性；
+        在 per-thread 锁内执行，与流式执行/配置更新互斥。
+
+        只删 checkpoint 消息历史；已沉淀的长期记忆 facts 无法归属单轮，
+        不做清理（与 ``adelete_session`` 的语义不同）。
+
+        Args:
+            thread_id: 目标会话 ID。
+            turn_index: 轮序号（0-based，按 ``HumanMessage`` 计数）。
+
+        Returns:
+            实际删除的消息条数。
+
+        Raises:
+            ValueError: 会话无消息或轮序号越界。
+        """
+        lock = await self._get_thread_lock(thread_id)
+        async with lock:
+            messages = await self.session.aget_messages(thread_id)
+            human_idx = [
+                i for i, m in enumerate(messages) if isinstance(m, HumanMessage)
+            ]
+            if turn_index < 0 or turn_index >= len(human_idx):
+                raise ValueError(
+                    f"轮序号越界: {turn_index}（该会话共 {len(human_idx)} 轮）"
+                )
+            start = human_idx[turn_index]
+            end = (
+                human_idx[turn_index + 1]
+                if turn_index + 1 < len(human_idx)
+                else len(messages)
+            )
+            removals = [
+                RemoveMessage(id=m.id)
+                for m in messages[start:end]
+                if getattr(m, "id", None)
+            ]
+            if not removals:
+                return 0
+            config = {"configurable": {"thread_id": thread_id}}
+            await self._agent.agent_executor.aupdate_state(
+                config, {"messages": removals}
+            )
+            return len(removals)
+
     async def aexport_session(
         self, session_id: str | None = None, fmt: str = "text"
     ) -> str:
@@ -437,6 +511,18 @@ class SessionManager:
         if self._memory is None:
             return 0
         return await self._memory.clear_agent_facts()
+
+    async def arecall_memory(self, session_id: str | None = None, limit: int | None = None) -> str:
+        """召回当前（或指定）会话的 thread 级长期记忆并格式化为文本片段。
+
+        与 :meth:`arecall_agent_memory` 对应：本方法只读取 thread 级
+        namespace（``conv`` / ``business``，会话隔离），agent 级
+        （跨会话共享）记忆请用 :meth:`arecall_agent_memory`。
+        """
+        if self._memory is None:
+            return ""
+        sid = self._resolve_thread_id(session_id)
+        return await self._memory.recall_text(sid, limit)
 
     async def arecall_agent_memory(self, limit: int | None = None) -> str:
         """召回 agent 级长期记忆并格式化为文本片段。"""
