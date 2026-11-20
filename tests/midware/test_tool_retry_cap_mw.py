@@ -18,7 +18,7 @@ if ROOT not in sys.path:
 
 from langchain.messages import AIMessage, ToolMessage
 
-from agent.tool_retry_cap_mw import (
+from midware.tool_retry_cap_mw import (
     MAX_IDENTICAL_FAILURES,
     ToolRetryCapMW,
     _count_identical_failures,

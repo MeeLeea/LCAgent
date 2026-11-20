@@ -172,7 +172,11 @@ async def load_mcp_tools(config_file: str = DEFAULT_CONFIG_FILE) -> list[BaseToo
             client = MultiServerMCPClient({name: server_cfg})
             tools = await client.get_tools()
             if tools:
-                logger.info("MCP %s: 加载了 %d 个工具", name, len(tools))
+                # 按名加载路径(aload_mcp_tools_by_name)内部委托本函数，而工作流每次
+                # 构建/恢复都会逐角色重新加载 MCP 工具，同一启动周期内该日志会重复
+                # 十余次刷屏（实测一份日志中占 22% 行数），故降为 DEBUG；启动期的
+                # MCP 工具总量仍由 agent.mcp_tools 的 INFO 日志可见。
+                logger.debug("MCP %s: 加载了 %d 个工具", name, len(tools))
                 all_tools.extend(tools)
         except Exception:
             logger.exception("MCP %s: 加载失败", name)

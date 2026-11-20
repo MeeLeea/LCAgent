@@ -34,6 +34,8 @@ from .agent_memory import AgentMemory
 from .config import (
     MEMORY_AGENT_KEY,
     MEMORY_BUFFER_DELAY_SECONDS,
+    MEMORY_CONFIDENCE_FLOOR,
+    MEMORY_LOW_CONFIDENCE_THRESHOLD,
     MEMORY_MAX_AGENT_FACTS,
     MEMORY_MAX_BUFFER_MESSAGES,
     MEMORY_MAX_FACTS_PER_THREAD,
@@ -126,7 +128,16 @@ class MemoryContext:
     # ============ 生命周期 ============
 
     async def aclose(self) -> None:
-        """优雅关闭：刷新记忆 buffer、关闭中间件、释放 AgentMemory 资源。"""
+        """优雅关闭：取消后台 purge、刷新记忆 buffer、关闭中间件、释放资源。
+
+        purge 协程须在创建它的同一 loop 内取消（``stop_purge_task`` 在 ``aclose``
+        所在 loop 内 ``await`` 任务结束）。
+        """
+        try:
+            await self._memory_manager.stop_purge_task()
+        except Exception as error:
+            logger.warning("后台 purge 任务停止异常: %s", error, exc_info=True)
+
         try:
             await self._memory_manager.flush_all()
             await self._memory_manager.shutdown()
@@ -154,6 +165,10 @@ class MemoryContext:
         max_facts_per_thread: int = MEMORY_MAX_FACTS_PER_THREAD,
         max_agent_facts: int = MEMORY_MAX_AGENT_FACTS,
         recall_limit: int = MEMORY_RECALL_LIMIT,
+        confidence_floor: float = MEMORY_CONFIDENCE_FLOOR,
+        low_confidence_threshold: float = MEMORY_LOW_CONFIDENCE_THRESHOLD,
+        enable_purge_task: bool = False,
+        purge_interval_seconds: float = 86400,
     ) -> MemoryContext:
         """异步创建 MemoryContext。
 
@@ -172,6 +187,14 @@ class MemoryContext:
             max_facts_per_thread: 单线程最大 fact 条数
             max_agent_facts: agent 级（跨会话共享）最大 fact 条数
             recall_limit: 召回条数上限
+            confidence_floor: agent 级写入置信度门槛（persistence=global 但
+                confidence 低于该值的 fact 降级 thread 级）
+            low_confidence_threshold: 读取注入时低置信标注阈值
+            enable_purge_task: 是否在**当前事件循环**启动后台 purge 周期协程
+                （物理清理 forgotten / 超龄 superseded）。仅长驻进程（api /
+                scheduler）置 True；CLI 短命会话保持 False——24h 周期任务在
+                分钟级会话中永不触发，无意义且白占协程。
+            purge_interval_seconds: 后台 purge 周期（默认 86400s = 24h）
         """
         # 1. 创建 AgentMemory
         agent_memory = await AgentMemory.acreate(
@@ -194,9 +217,12 @@ class MemoryContext:
         # 3. 创建 per-thread 并发锁池
         lock_pool = ThreadMemoryLockPool()
 
-        # 4. 创建读中间件（recall_limit 约束每次 LLM 调用注入的 fact 条数）
+        # 4. 创建读中间件（recall_limit 约束每次 LLM 调用注入的 fact 条数；
+        #    low_confidence_threshold 控制注入时的"（低置信）"标注阈值）
         read_middleware = ThreadMemoryReadMiddleware(
-            memory_store, recall_limit=recall_limit
+            memory_store,
+            recall_limit=recall_limit,
+            low_confidence_threshold=low_confidence_threshold,
         )
 
         # 5. 创建 agent 级跨进程互斥锁：锁文件与 checkpoint 同目录（仅作 OS 级
@@ -221,7 +247,12 @@ class MemoryContext:
             max_buffer_messages=max_buffer_messages,
             read_middleware=read_middleware,
             agent_lock=agent_lock,
+            confidence_floor=confidence_floor,
         )
+
+        # 7. 可选：在当前 loop 启动后台 purge 周期协程（仅长驻进程）
+        if enable_purge_task:
+            memory_manager.start_purge_task(interval_seconds=purge_interval_seconds)
 
         return cls(
             agent_memory=agent_memory,

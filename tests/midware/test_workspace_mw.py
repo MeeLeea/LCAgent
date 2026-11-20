@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Any
 from unittest.mock import MagicMock
 
-from agent.workspace_mw import WorkspaceSecurityMW
+from midware.workspace_mw import WorkspaceSecurityMW
 
 
 @dataclass

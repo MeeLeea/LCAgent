@@ -1,5 +1,5 @@
 // 工作流视图：作为可折叠顶部面板展示工作流节点/边结构图与节点状态
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent } from 'react'
 import {
   GitBranch,
@@ -9,6 +9,8 @@ import {
   MessageSquarePlus,
   ChevronUp,
   ChevronDown,
+  RotateCcw,
+  Play,
 } from 'lucide-react'
 import { useStore, selectIsStreaming } from '../store'
 import { WorkflowGraph } from './WorkflowGraph'
@@ -65,7 +67,11 @@ export function WorkflowView() {
   const fetchWorkflow = useStore((s) => s.fetchWorkflow)
   const fetchWorkflows = useStore((s) => s.fetchWorkflows)
   const newWorkflowThread = useStore((s) => s.newWorkflowThread)
+  const failedNode = useStore((s) => s.failedNode)
+  const retryCurrentThread = useStore((s) => s.retryCurrentThread)
   const isStreaming = useStore(selectIsStreaming)
+  const currentThreadId = useStore((s) => s.currentThreadId)
+  const resumableThreads = useStore((s) => s.resumableThreads)
   const [collapsed, setCollapsed] = useState(false)
   const [panelHeight, setPanelHeight] = useState(loadPanelHeight)
   const [isResizing, setIsResizing] = useState(false)
@@ -109,10 +115,26 @@ export function WorkflowView() {
   const status = workflow?.workflow_status ?? 'idle'
   const selectValue = workflow?.name ?? workflows[0] ?? ''
 
+  // 刷新还原失败红态：以后端 Store 失败记录驱动，把仍处于 pending 的失败节点显示为 error。
+  // 仅覆盖 pending（刷新后复位的状态）；实时态由 SSE workflow_node 事件驱动，互不冲突。
+  const displayWorkflow = useMemo(() => {
+    if (!workflow || !failedNode?.node) return workflow
+    if (!workflow.nodes.some((n) => n.id === failedNode.node)) return workflow
+    return {
+      ...workflow,
+      nodes: workflow.nodes.map((n) =>
+        n.id === failedNode.node && n.status === 'pending' ? { ...n, status: 'error' as const } : n,
+      ),
+    }
+  }, [workflow, failedNode])
+
   // 折叠时不设固定高度，由内容（仅头部）撑开；拖拽时禁用过渡避免卡顿
   const panelStyle = collapsed
     ? undefined
     : { height: panelHeight, transition: isResizing ? 'none' : undefined }
+
+  // 可从断点继续：失败横幅优先，其次才展示续跑入口
+  const canResume = !!currentThreadId && resumableThreads[currentThreadId] === true
 
   return (
     <div
@@ -171,6 +193,56 @@ export function WorkflowView() {
 
       {!collapsed && (
         <div className="workflow-body">
+          {failedNode && (
+            <div className="workflow-failure-banner">
+              <AlertTriangle size={15} className="workflow-failure-icon" />
+              <div className="workflow-failure-info">
+                <span className="workflow-failure-title">
+                  {failedNode.node ? `节点「${failedNode.node}」执行失败` : '工作流执行失败'}
+                </span>
+                {failedNode.error && (
+                  <span className="workflow-failure-detail" title={failedNode.error}>
+                    {failedNode.error}
+                  </span>
+                )}
+              </div>
+              <button
+                className="choice-btn workflow-retry-btn"
+                onClick={retryCurrentThread}
+                disabled={isStreaming}
+                title={
+                  isStreaming
+                    ? '正在执行中，结束后可重试'
+                    : '从 checkpoint 断点仅重跑失败节点，已完成节点不重跑'
+                }
+              >
+                <RotateCcw size={13} />
+                从失败节点重试
+              </button>
+            </div>
+          )}
+          {!failedNode && canResume && (
+            <div className="workflow-resume-banner">
+              <Play size={15} className="workflow-resume-icon" />
+              <div className="workflow-resume-info">
+                <span className="workflow-resume-title">工作流已暂停，可从断点继续</span>
+                <span className="workflow-failure-detail">
+                  后端保留了待执行任务，点击可继续执行
+                </span>
+              </div>
+              <button
+                className="choice-btn workflow-retry-btn"
+                onClick={retryCurrentThread}
+                disabled={isStreaming}
+                title={
+                  isStreaming ? '正在执行中，结束后可继续' : '从 checkpoint 断点继续执行待完成任务'
+                }
+              >
+                <Play size={13} />
+                从断点继续
+              </button>
+            </div>
+          )}
           {loading ? (
             <div className="workflow-loading">
               <Loader2 size={20} className="spin" />
@@ -194,7 +266,7 @@ export function WorkflowView() {
               <div className="workflow-section">
                 <div className="workflow-section-title">节点</div>
                 <div className="wf-node-list">
-                  {workflow.nodes.map((n) => (
+                  {displayWorkflow!.nodes.map((n) => (
                     <NodeCard key={n.id} node={n} />
                   ))}
                 </div>
@@ -203,7 +275,7 @@ export function WorkflowView() {
               <div className="workflow-section">
                 <div className="workflow-section-title">执行链路</div>
                 <div className="wf-graph-wrap">
-                  <WorkflowGraph workflow={workflow} />
+                  <WorkflowGraph workflow={displayWorkflow!} />
                 </div>
               </div>
             </>

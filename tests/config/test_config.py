@@ -123,6 +123,14 @@ def test_prompt_file_empty(tmp_path):
     assert result == _DEFAULT_AGENT_CORE_PROMPT
 
 
+def test_agent_md_matches_builtin_fallback():
+    """真实 agent/AGENT.md 与内置兜底提示词逐字符一致（防两侧漂移）。"""
+    prompt_path = os.path.join(ROOT, "agent", "AGENT.md")
+    with open(prompt_path, "r", encoding="utf-8") as f:
+        file_content = f.read().strip()
+    assert file_content == _DEFAULT_AGENT_CORE_PROMPT
+
+
 # ──────────────────────────────────────────────
 # compose_role_system_prompt: 角色提示词拼接基础规则
 # ──────────────────────────────────────────────

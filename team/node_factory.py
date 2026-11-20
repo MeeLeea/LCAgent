@@ -3,6 +3,9 @@
 create_llm_node 生成统一签名的异步节点函数，封装
 render_template → 基础提示词前置 → inject_into_prompt → run_team_turn_with_interrupt
 → return 链路，通过回调参数支持各节点的差异化逻辑。
+
+本模块原位于 ``graph/common/node_factory.py``,随节点实现下沉迁至 team/
+(唯一调用方是各角色类与少量手写节点,语义上是 TeamAgent 的节点化适配器)。
 """
 from __future__ import annotations
 
@@ -12,8 +15,8 @@ from typing import TYPE_CHECKING, Any, Optional
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 
-from graph.common.interrupt_forward import run_team_turn_with_interrupt
 from llm.config import load_agent_rules
+from team.interrupt import run_team_turn_with_interrupt
 
 if TYPE_CHECKING:
     from team.base import TeamAgent

@@ -1,5 +1,5 @@
 // API 客户端：REST 请求 + SSE 流式解析
-import type { ProvidersInfo, ThreadSummary, RawMessage, StreamEvent, WorkflowInfo, MetricsSummary, CompactResult, MemorySummary, CompressResult, SafetyConfig, SkillInfo, ExportResult, WorkspaceInfo, BrowseResult, SessionConfigPatch, SessionConfigResponse } from './types'
+import type { ProvidersInfo, ThreadSummary, RawMessage, StreamEvent, StreamStatus, WorkflowInfo, MetricsSummary, CompactResult, MemorySummary, CompressResult, SafetyConfig, SkillInfo, ExportResult, WorkspaceInfo, BrowseResult, SessionConfigPatch, SessionConfigResponse } from './types'
 
 // Vite 构建期从 config/server_config.json 注入的后端地址（Tauri 模式使用）
 declare const __SERVER_HOST__: string
@@ -173,14 +173,51 @@ export const api = {
     jsonFetch<WorkflowInfo>(`${BASE}/workflow?name=${encodeURIComponent(name)}`),
 
   listThreads: () => jsonFetch<{ threads: ThreadSummary[]; current: string | null }>(`${BASE}/threads`),
-  createThread: (type: 'chat' | 'workflow' = 'chat', workflowName?: string) =>
-    jsonFetch<{ thread_id: string }>(`${BASE}/threads`, {
+  /**
+   * 新建会话。
+   * workspacePath 为可选第三个参数：仅当非空时才在 body 中携带 workspace_path，
+   * 供后端在创建工作流会话时一并完成工作空间绑定（缺省保持原有行为）。
+   * workspace_error 为后端回报的绑定结果：非空表示 workspace_path 被拒绝
+   * （路径不存在 / 非目录 / 系统关键目录），此时会话以未绑定状态创建。
+   */
+  createThread: (type: 'chat' | 'workflow' = 'chat', workflowName?: string, workspacePath?: string) =>
+    jsonFetch<{ thread_id: string; workspace_error?: string | null }>(`${BASE}/threads`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type, workflow_name: workflowName }),
+      body: JSON.stringify({
+        type,
+        workflow_name: workflowName,
+        ...(workspacePath ? { workspace_path: workspacePath } : {}),
+      }),
     }),
   deleteThread: (thread_id: string) =>
     jsonFetch(`${BASE}/threads/${encodeURIComponent(thread_id)}`, { method: 'DELETE' }),
+  /**
+   * 删除会话内某一轮对话（用户消息 + AI 回复及工具调用链）。
+   * turnIndex 按 user 回合顺序计数（0-based），与会话窗口展示一致；
+   * 该会话正在流式执行时后端返回 409。
+   */
+  deleteTurn: (thread_id: string, turnIndex: number) =>
+    jsonFetch<{ deleted: boolean; thread_id: string; turn_index: number; removed_messages: number }>(
+      `${BASE}/threads/${encodeURIComponent(thread_id)}/turns/${turnIndex}`,
+      { method: 'DELETE' },
+    ),
+  /** 重命名会话（修改展示名；空字符串清除自定义名，回落消息预览） */
+  renameThread: (thread_id: string, title: string) =>
+    jsonFetch<{ thread_id: string; title: string | null }>(
+      `${BASE}/threads/${encodeURIComponent(thread_id)}`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title }),
+      },
+    ),
+  /** 分叉会话：完整复制会话历史与配置，返回新会话 ID */
+  forkThread: (thread_id: string) =>
+    jsonFetch<{ thread_id: string; source_thread_id: string }>(
+      `${BASE}/threads/${encodeURIComponent(thread_id)}/fork`,
+      { method: 'POST' },
+    ),
   getMessages: (thread_id: string) =>
     jsonFetch<{ thread_id: string; messages: RawMessage[] }>(
       `${BASE}/threads/${encodeURIComponent(thread_id)}/messages`,
@@ -200,9 +237,23 @@ export const api = {
     onEvent: (ev: StreamEvent) => void,
   ): (() => void) => streamRequest(`${BASE}/chat/resume`, body, onEvent),
 
-  /** 查询线程是否有正在进行的流式生成（页面刷新后据此决定是否 attach） */
-  getStreamStatus: (thread_id: string) =>
-    jsonFetch<{ thread_id: string; streaming: boolean }>(
+  /**
+   * 从失败断点重试工作流会话（POST /api/chat/retry，SSE）。
+   * 后端从 checkpointer 的 pending task 仅重跑失败节点，已成功节点不重跑。
+   */
+  streamRetry: (
+    body: { thread_id?: string | null },
+    onEvent: (ev: StreamEvent) => void,
+  ): (() => void) => streamRequest(`${BASE}/chat/retry`, body, onEvent),
+
+  /**
+   * 查询线程真实流式状态（GET /api/threads/{id}/stream-status）。
+   * 返回 streaming / failure / pending_interrupt / resumable / resume_kind，
+   * 供页面刷新还原失败横幅/重连，以及看门狗超时后向后端求证真实状态使用。
+   * 前端按后端已算好的 resume_kind 分支（interrupt > retry > resume > null），不自行推导。
+   */
+  fetchStreamStatus: (thread_id: string) =>
+    jsonFetch<StreamStatus>(
       `${BASE}/threads/${encodeURIComponent(thread_id)}/stream-status`,
     ),
 

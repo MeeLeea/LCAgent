@@ -171,6 +171,10 @@ class CommandContext:
     # workflow 链路的统一 SessionManager 门面(绑定 WorkflowAdapter)。
     # 提供 arun_stream 等接口;为 None 时 workflow 命令不可用。
     workflow_sm: Any = None
+    # 是否为交互式入口(CLI 默认 True)。HTTP API 传 False:workflow 遇到
+    # interrupt 时不在后端替用户作答,而是保留 pending interrupt,交由
+    # /api/chat/resume 携带前端答案恢复(否则会用 choices[0] 秒答用户问题)。
+    interactive: bool = True
 
     def print(self, value: str = "") -> None:
         self.print_fn(value)

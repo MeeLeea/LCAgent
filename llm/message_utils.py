@@ -109,9 +109,11 @@ def stringify_content(content: Any) -> str:
 
 
 def final_answer_is_empty(msg: Any) -> str | None:
-    """检查 final AIMessage 是否为空（reasoning 耗尽 / finish_reason=length）。
+    """检查 final AIMessage 是否为空（reasoning 耗尽 / 网络中断等）。
 
     返回适合展示给用户的原因字符串；有内容或仍在工具循环中返回 None。
+    提示文案按 finish_reason 分支：length 才是推理 token 耗尽预算，
+    其余（network_error 等非标准值）是上游断流/网关异常，与 max_tokens 无关。
     """
     if msg is None:
         return None
@@ -120,11 +122,17 @@ def final_answer_is_empty(msg: Any) -> str | None:
     content = stringify_content(getattr(msg, "content", None))
     if content and content.strip():
         return None  # 有内容，正常
-    finish_reason = ((msg.response_metadata or {}).get("finish_reason")) if hasattr(msg, "response_metadata") else "unknown"
-    return (
-        f"模型未返回任何内容（finish_reason={finish_reason}）。"
-        "输出预算可能被推理 token 耗尽，请提高 max_tokens 后重试。"
-    )
+    finish_reason = (
+        (msg.response_metadata or {}).get("finish_reason")
+        if hasattr(msg, "response_metadata")
+        else None
+    ) or "unknown"
+    prefix = f"模型未返回任何内容（finish_reason={finish_reason}）。"
+    if finish_reason == "length":
+        # 思考型模型的 reasoning token 计入 max_tokens，预算在推理阶段耗尽
+        return prefix + "输出预算可能被推理 token 耗尽，请提高 max_tokens 后重试。"
+    # network_error 等：上游断流/网关异常，提高 max_tokens 无济于事
+    return prefix + "可能是网络中断或网关异常，请直接重试。"
 
 
 def build_interrupt_event(value: Any) -> dict[str, Any]:

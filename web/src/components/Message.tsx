@@ -1,6 +1,6 @@
 // 消息气泡组件
 import { memo, useState, useRef, useEffect } from 'react'
-import { Bot, User, Copy, Check, RotateCcw, Pencil, Send, ChevronDown, ChevronUp } from 'lucide-react'
+import { Bot, User, Copy, Check, RotateCcw, Pencil, Send, Trash2, ChevronDown, ChevronUp } from 'lucide-react'
 import { Markdown } from './Markdown'
 import { ToolCallCard } from './ToolCallCard'
 import { stripWorkflowPrefix } from '../store'
@@ -10,6 +10,8 @@ interface Props {
   message: ChatMessage
   onRegenerate?: () => void
   onEdit?: (newText: string) => void
+  /** 删除该轮对话（后端真删，二次确认后触发；仅 user 消息提供） */
+  onDelete?: () => void
 }
 
 /** 格式化时间戳为 HH:MM */
@@ -21,14 +23,36 @@ function formatTime(ts?: number): string {
   return `${h}:${m}`
 }
 
-export const Message = memo(function Message({ message, onRegenerate, onEdit }: Props) {
+export const Message = memo(function Message({ message, onRegenerate, onEdit, onDelete }: Props) {
   const [copied, setCopied] = useState(false)
   const [editing, setEditing] = useState(false)
   const [editText, setEditText] = useState(message.content)
+  // 删除二次确认：第一次点击变"确认删除"，3 秒内再点执行，超时自动复位
+  const [confirmingDelete, setConfirmingDelete] = useState(false)
+  const deleteConfirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   // 节点结果块默认折叠（内容与 token 实时流重复，折叠降低视觉噪音）
   const [nodeOpen, setNodeOpen] = useState(false)
   const editRef = useRef<HTMLTextAreaElement>(null)
   const isUser = message.role === 'user'
+
+  // 组件卸载时清理确认定时器
+  useEffect(() => {
+    return () => {
+      if (deleteConfirmTimer.current) clearTimeout(deleteConfirmTimer.current)
+    }
+  }, [])
+
+  const handleDeleteClick = () => {
+    if (!onDelete) return
+    if (confirmingDelete) {
+      if (deleteConfirmTimer.current) clearTimeout(deleteConfirmTimer.current)
+      setConfirmingDelete(false)
+      onDelete()
+      return
+    }
+    setConfirmingDelete(true)
+    deleteConfirmTimer.current = setTimeout(() => setConfirmingDelete(false), 3000)
+  }
 
   const handleCopy = () => {
     navigator.clipboard.writeText(message.content)
@@ -167,6 +191,16 @@ export const Message = memo(function Message({ message, onRegenerate, onEdit }: 
                   <button className="msg-action-btn" onClick={startEdit}>
                     <Pencil size={12} />
                     编辑
+                  </button>
+                )}
+                {onDelete && (
+                  <button
+                    className={`msg-action-btn${confirmingDelete ? ' danger' : ''}`}
+                    onClick={handleDeleteClick}
+                    title={confirmingDelete ? '再次点击确认删除这一轮（含 AI 回复）' : '删除这一轮对话'}
+                  >
+                    <Trash2 size={12} />
+                    {confirmingDelete ? '确认删除' : '删除'}
                   </button>
                 )}
               </>

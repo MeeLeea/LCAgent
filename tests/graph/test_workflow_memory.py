@@ -13,8 +13,14 @@ from __future__ import annotations
 
 import asyncio
 
-from graph.simple import arun_simple_workflow, build_simple_workflow
-from tests.graph.test_workflow import FakeAgent
+from graph.common.workflow_runner import arun_compiled_workflow
+from graph.simple import build_simple_workflow
+from tests.graph.test_workflow import (
+    SIMPLE_INITIAL_FIELDS,
+    FakeManagerAgent,
+    FakeTerminatorAgent,
+    FakeWorkerAgent,
+)
 from utils.events import EventType
 
 
@@ -36,9 +42,9 @@ class FakeMemory:
 
 def _build_graph():
     """构建 simple 工作流(Fake agents,无 llm → 不启用 compaction)。"""
-    manager = FakeAgent(name="manager", response="计划", summary_response="摘要")
-    worker = FakeAgent(name="worker", response="结果")
-    terminator = FakeAgent(name="terminator", response="最终答案: 完成")
+    manager = FakeManagerAgent(name="manager", response="计划", summary_response="摘要")
+    worker = FakeWorkerAgent(name="worker", response="结果")
+    terminator = FakeTerminatorAgent(name="terminator", response="最终答案: 完成")
     graph = build_simple_workflow(
         {"manager": manager, "worker": worker, "terminator": terminator}
     )
@@ -51,8 +57,8 @@ def test_recall_injected_into_raw_context():
     memory = FakeMemory()
 
     asyncio.run(
-        arun_simple_workflow(
-            graph, "测试任务", memory=memory, memory_thread_id="wf-mem-1"
+        arun_compiled_workflow(
+            graph, "测试任务", initial_fields=SIMPLE_INITIAL_FIELDS, memory=memory, memory_thread_id="wf-mem-1"
         )
     )
 
@@ -68,8 +74,8 @@ def test_done_event_consumed():
     memory = FakeMemory()
 
     asyncio.run(
-        arun_simple_workflow(
-            graph, "测试任务", memory=memory, memory_thread_id="wf-mem-2"
+        arun_compiled_workflow(
+            graph, "测试任务", initial_fields=SIMPLE_INITIAL_FIELDS, memory=memory, memory_thread_id="wf-mem-2"
         )
     )
 
@@ -88,8 +94,8 @@ def test_is_run_mode_marks_important():
     memory = FakeMemory()
 
     asyncio.run(
-        arun_simple_workflow(
-            graph, "测试任务", memory=memory, memory_thread_id="wf-mem-3", is_run_mode=True
+        arun_compiled_workflow(
+            graph, "测试任务", initial_fields=SIMPLE_INITIAL_FIELDS, memory=memory, memory_thread_id="wf-mem-3", is_run_mode=True
         )
     )
 
@@ -100,7 +106,7 @@ def test_memory_none_skips_all():
     """不传 memory 时无召回无提交,运行正常。"""
     graph, manager, _ = _build_graph()
 
-    asyncio.run(arun_simple_workflow(graph, "测试任务"))
+    asyncio.run(arun_compiled_workflow(graph, "测试任务", initial_fields=SIMPLE_INITIAL_FIELDS))
 
     assert manager.calls[0][0] == "arun_structured"
     assert "【长期记忆】" not in manager.calls[0][1]
@@ -111,7 +117,7 @@ def test_memory_without_thread_id_skips():
     graph, manager, _ = _build_graph()
     memory = FakeMemory()
 
-    asyncio.run(arun_simple_workflow(graph, "测试任务", memory=memory))
+    asyncio.run(arun_compiled_workflow(graph, "测试任务", initial_fields=SIMPLE_INITIAL_FIELDS, memory=memory))
 
     assert memory.recall_calls == []
     assert memory.consumed_events == []
@@ -125,8 +131,8 @@ def test_empty_final_answer_skips_consume():
     memory = FakeMemory()
 
     asyncio.run(
-        arun_simple_workflow(
-            graph, "测试任务", memory=memory, memory_thread_id="wf-mem-4"
+        arun_compiled_workflow(
+            graph, "测试任务", initial_fields=SIMPLE_INITIAL_FIELDS, memory=memory, memory_thread_id="wf-mem-4"
         )
     )
 
@@ -137,9 +143,9 @@ def test_coexists_with_checkpoint_summary():
     """长期记忆与 checkpoint 跨轮次摘要并存(raw_context 同时含两段)。"""
     from langgraph.checkpoint.memory import MemorySaver
 
-    manager = FakeAgent(name="manager", response="计划2", summary_response="摘要2")
-    worker = FakeAgent(name="worker", response="结果2")
-    terminator = FakeAgent(name="terminator", response="答案2")
+    manager = FakeManagerAgent(name="manager", response="计划2", summary_response="摘要2")
+    worker = FakeWorkerAgent(name="worker", response="结果2")
+    terminator = FakeTerminatorAgent(name="terminator", response="答案2")
     checkpointer = MemorySaver()
     graph = build_simple_workflow(
         {"manager": manager, "worker": worker, "terminator": terminator},
@@ -149,16 +155,16 @@ def test_coexists_with_checkpoint_summary():
 
     # 第一轮:产生 checkpoint 历史
     asyncio.run(
-        arun_simple_workflow(
-            graph, "第一轮任务", thread_id="wf-mem-5", memory=memory, memory_thread_id="wf-mem-5"
+        arun_compiled_workflow(
+            graph, "第一轮任务", initial_fields=SIMPLE_INITIAL_FIELDS, thread_id="wf-mem-5", memory=memory, memory_thread_id="wf-mem-5"
         )
     )
 
     # 第二轮:raw_context 同时含 checkpoint 摘要与长期记忆
     manager.calls.clear()
     asyncio.run(
-        arun_simple_workflow(
-            graph, "第二轮任务", thread_id="wf-mem-5", memory=memory, memory_thread_id="wf-mem-5"
+        arun_compiled_workflow(
+            graph, "第二轮任务", initial_fields=SIMPLE_INITIAL_FIELDS, thread_id="wf-mem-5", memory=memory, memory_thread_id="wf-mem-5"
         )
     )
 

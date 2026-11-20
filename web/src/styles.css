@@ -463,7 +463,8 @@ button {
   color: var(--text-faint);
 }
 
-.thread-delete {
+/* 会话操作按钮（悬浮显示，点击展开菜单） */
+.thread-menu-btn {
   opacity: 0;
   position: absolute;
   right: 8px;
@@ -475,12 +476,65 @@ button {
   background: var(--bg-elevated);
 }
 
-.thread-item:hover .thread-delete {
+.thread-item:hover .thread-menu-btn,
+.thread-item .thread-menu-btn:focus-visible {
   opacity: 1;
 }
 
-.thread-delete:hover {
+.thread-menu-btn:hover {
+  color: var(--accent);
+}
+
+/* 会话操作菜单（重命名 / 分叉 / 删除） */
+.thread-menu {
+  position: absolute;
+  right: 6px;
+  top: calc(100% - 4px);
+  z-index: 30;
+  min-width: 112px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.22);
+}
+
+.thread-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 9px;
+  font-size: 12px;
+  color: var(--text);
+  border-radius: 5px;
+  text-align: left;
+}
+
+.thread-menu-item:hover {
+  background: var(--bg-hover);
+}
+
+.thread-menu-item.danger {
   color: var(--danger);
+}
+
+.thread-menu-item.danger:hover {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+
+/* 内联重命名输入框 */
+.thread-rename-input {
+  width: 100%;
+  font-size: 13px;
+  padding: 2px 6px;
+  border: 1px solid var(--accent);
+  border-radius: 5px;
+  background: var(--bg-elevated);
+  color: var(--text);
+  outline: none;
 }
 
 .sidebar-footer {
@@ -1934,6 +1988,83 @@ tool-group,
 .workflow-error {
   flex-direction: column;
   color: var(--danger);
+}
+
+/* 失败横幅：失败节点名 + 错误摘要 + 断点重试按钮 */
+.workflow-failure-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+  padding: 10px 14px;
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+  border-radius: 10px;
+}
+
+.workflow-failure-icon {
+  flex: none;
+  color: var(--danger);
+}
+
+.workflow-failure-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.workflow-failure-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--danger);
+}
+
+.workflow-failure-detail {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.workflow-retry-btn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 「从断点继续」横幅：提示工作流暂停 + 续跑按钮（与失败横幅同构，改用强调色） */
+.workflow-resume-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+  padding: 10px 14px;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  border-radius: 10px;
+}
+
+.workflow-resume-icon {
+  flex: none;
+  color: var(--accent);
+}
+
+.workflow-resume-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.workflow-resume-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
 }
 
 .spin {

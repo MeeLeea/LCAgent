@@ -12,9 +12,9 @@ Agent核心调度模块 - 基于LangChain 1.x + LangGraph
 - interrupts.py      Interrupts：中断检查/恢复命令/拒绝处理
 - turn_runners.py    TurnRunners：结构化执行入口 + 工具步骤记账
 - turn_types.py      AgentTurnResult（避免 mixin 反向导入 agent_core）
-- tool_error_mw.py   工具错误纠错中间件 ToolExecutionErrorMW
-- workspace_mw.py    工作空间安全中间件 WorkspaceSecurityMW
 - role_sw.py         团队角色目录发现（可用角色扫描 / 角色目录定位）
+
+中间件（tool_error_mw / workspace_mw / compaction 等）已迁出至顶层 midware/ 包。
 """
 from __future__ import annotations
 
@@ -26,6 +26,7 @@ from typing import Any, Self
 from langchain_core.tools import BaseTool
 
 from llm.llm_client import LLMClient
+from midware.compaction import CompactionConfig
 from session import SessionStore
 from skmng.manager import SkillManager, default_skills_dir
 from skmng.middleware import SkillInjectionMW
@@ -35,7 +36,6 @@ from tools.mcp_pool import MCPPool
 from utils.exceptions import AgentStateError
 from utils.metrics import MetricsCollector
 
-from .compaction import CompactionConfig
 from .graph_builder import GraphBuilder
 from .interrupts import Interrupts
 from .mcp_tools import McpTools

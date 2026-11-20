@@ -70,6 +70,8 @@ class MemoryManager:
         agent_lock: agent 级跨进程互斥锁（保护 agent namespace 的写入/清空/压缩）。
             由 MemoryContext 传入基于文件锁的实例以实现跨进程互斥；为 None 时
             内部自建进程内锁 ``AgentMemoryLock(path=None)``，供测试使用
+        confidence_floor: agent 级写入置信度门槛，透传给写中间件
+            （低于门槛的 global 事实降级 thread 级）
     """
 
     def __init__(
@@ -82,6 +84,7 @@ class MemoryManager:
         max_buffer_messages: int | None = None,
         read_middleware: ThreadMemoryReadMiddleware | None = None,
         agent_lock: AgentMemoryLock | None = None,
+        confidence_floor: float | None = None,
     ) -> None:
         self._store = memory_store
         self._lock_pool = lock_pool
@@ -89,6 +92,9 @@ class MemoryManager:
         self._recall_limit = recall_limit
         # agent 级互斥锁：agent namespace 跨进程共享，写入/清空/压缩必须串行化
         self._agent_lock = agent_lock if agent_lock is not None else AgentMemoryLock()
+        # 后台 purge 协程句柄与停止信号（仅长驻进程经 start_purge_task 置位）
+        self._purge_task: asyncio.Task[None] | None = None
+        self._purge_stop: asyncio.Event = asyncio.Event()
 
         # 写中间件：事件接收 + 防抖 + Fact 抽取流水线
         self._write_middleware = ThreadMemoryWriteMiddleware(
@@ -98,6 +104,7 @@ class MemoryManager:
             buffer_delay_seconds=buffer_delay_seconds,
             max_buffer_messages=max_buffer_messages,
             agent_lock=self._agent_lock,
+            confidence_floor=confidence_floor,
         )
 
         # 读中间件：awrap_model_call 时注入 thread facts 到 SystemMessage
@@ -150,7 +157,7 @@ class MemoryManager:
     async def recall(
         self, thread_id: str, limit: int | None = None
     ) -> list[ThreadFactItem]:
-        """召回指定会话的长期记忆 facts。
+        """召回指定会话的长期记忆 facts（仅 ``status == "active"``）。
 
         按 create_time 升序返回，截取最近 ``limit`` 条。
         非阻塞更新 ``last_used_at``（用于 LRU 淘汰），失败仅记日志。
@@ -160,13 +167,13 @@ class MemoryManager:
             limit: 返回条数上限（为 None 时使用构造时设定的 recall_limit）
 
         Returns:
-            facts 列表（可能为空）
+            facts 列表（可能为空；superseded / stale 条目已过滤）
         """
         if not thread_id:
             return []
         effective_limit = limit if limit is not None else self._recall_limit
         try:
-            facts = await self._store.query_facts(thread_id)
+            facts = await self._store.query_facts(thread_id, active_only=True)
         except Exception as error:
             logger.debug("召回长期记忆失败 [thread=%s]: %s", thread_id, error)
             return []
@@ -218,11 +225,12 @@ class MemoryManager:
             limit: 返回条数上限（为 None 时使用构造时设定的 recall_limit）
 
         Returns:
-            agent 级 facts 列表（可能为空）；异常仅记日志返回 ``[]``
+            agent 级 facts 列表（可能为空，仅 ``status == "active"`` 条目）；
+            异常仅记日志返回 ``[]``
         """
         effective_limit = limit if limit is not None else self._recall_limit
         try:
-            facts = await self._store.query_agent_facts()
+            facts = await self._store.query_agent_facts(active_only=True)
         except Exception as error:
             logger.debug("召回 agent 级长期记忆失败: %s", error)
             return []
@@ -394,7 +402,7 @@ class MemoryManager:
         Returns:
             ``{"success": bool, "original_count": int, ...}``
         """
-        facts = await self._store.query_facts(thread_id)
+        facts = await self._store.query_facts(thread_id, active_only=True)
         if not facts:
             return {"success": False, "error": "没有长期记忆可压缩"}
 
@@ -448,7 +456,7 @@ class MemoryManager:
             无记忆或 LLM 失败时返回 ``{"success": False, "error": str}``
         """
         async with self._agent_lock:
-            facts = await self._store.query_agent_facts()
+            facts = await self._store.query_agent_facts(active_only=True)
             if not facts:
                 return {"success": False, "error": "没有 agent 级长期记忆可压缩"}
 
@@ -519,6 +527,229 @@ class MemoryManager:
     async def count_facts(self, thread_id: str) -> int:
         """统计指定会话的长期记忆条数。"""
         return await self._store.count_facts(thread_id)
+
+    # ============ 后台物理清理（purge，仅长驻进程） ============
+
+    async def purge_once(
+        self,
+        forgotten_retention_days: float = 7,
+        superseded_retention_days: float = 90,
+        thread_id: str | None = None,
+    ) -> dict[str, int]:
+        """执行一次物理清理（供后台任务每 tick 调用）。
+
+        清理范围：
+        - agent namespace（跨进程共享）：forgotten 超 ``forgotten_retention_days``、
+          superseded 超 ``superseded_retention_days`` 的条目
+        - 若传入 ``thread_id``：额外清理该 thread namespace 的同类条目
+
+        跨进程串行化：整个清理过程持有 agent 级 :class:`AgentMemoryLock`
+        （OS 级文件锁），使同一时刻仅一个进程执行 purge，避免多进程并发清理的
+        日志噪音与瞬时连接争用（幂等删除本身安全）。
+
+        **thread namespace 局限**：LangGraph SQLite Store 无"列举 namespace" API，
+        因此无法枚举全部 thread 做批量清理。thread 级 forgotten/superseded 条目
+        由以下途径兜底清理：① 传入 ``thread_id`` 时本方法会清理该 thread；
+        ② 会话删除（``adelete_session``）时整 namespace 清空。
+        这是有意的收敛（不引入 namespace 索引表）。
+
+        Returns:
+            ``{"forgotten": int, "superseded": int}``（被物理删除的条数）。
+        """
+        forgotten = 0
+        superseded = 0
+        # 持 agent 锁串行化（跨进程），覆盖 agent 级 + 可选 thread 级清理全程
+        async with self._agent_lock:
+            forgotten += await self._store.purge_forgotten(
+                thread_id=None, older_than_days=forgotten_retention_days
+            )
+            superseded += await self._store.purge_superseded(
+                thread_id=None, older_than_days=superseded_retention_days
+            )
+            if thread_id:
+                forgotten += await self._store.purge_forgotten(
+                    thread_id=thread_id, older_than_days=forgotten_retention_days
+                )
+                superseded += await self._store.purge_superseded(
+                    thread_id=thread_id, older_than_days=superseded_retention_days
+                )
+        if forgotten or superseded:
+            logger.info(
+                "后台 purge 完成: forgotten %d 条, superseded %d 条",
+                forgotten,
+                superseded,
+            )
+        return {"forgotten": forgotten, "superseded": superseded}
+
+    def start_purge_task(
+        self,
+        interval_seconds: float = 86400,
+        forgotten_retention_days: float = 7,
+        superseded_retention_days: float = 90,
+    ) -> asyncio.Task[None]:
+        """在**当前事件循环**启动后台周期清理协程（仅长驻进程调用）。
+
+        必须与 :meth:`MemoryContext.acreate` 同一事件循环创建：``AsyncSqliteSaver``
+        绑定创建时的 loop，跨 loop 复用会挂起。scheduler 路径经
+        ``execute_task → asyncio.run`` 在临时 loop 执行，**严禁**在该 loop 创建本协程
+        ——应在 ``scheduler/run.py`` 主 loop 创建。
+
+        重复调用（任务仍在运行）返回既有任务，不重复创建（幂等）。
+
+        Args:
+            interval_seconds: 清理周期（默认 24h；测试可注入极小值）
+            forgotten_retention_days: forgotten 保留天数阈值
+            superseded_retention_days: superseded 保留天数阈值
+
+        Returns:
+            已启动（或既有）的 ``asyncio.Task``。
+        """
+        if self._purge_task is not None and not self._purge_task.done():
+            return self._purge_task
+        self._purge_stop = asyncio.Event()
+        self._purge_task = asyncio.create_task(
+            self._purge_loop(
+                interval_seconds, forgotten_retention_days, superseded_retention_days
+            ),
+            name="memory-purge",
+        )
+        logger.info("后台 purge 任务已启动: 间隔 %.0fs", interval_seconds)
+        return self._purge_task
+
+    @property
+    def purge_task_running(self) -> bool:
+        """后台 purge 协程是否在运行。"""
+        return self._purge_task is not None and not self._purge_task.done()
+
+    async def stop_purge_task(self) -> None:
+        """取消后台 purge 协程（须在创建它的同一 loop 内调用，幂等）。"""
+        task = self._purge_task
+        self._purge_task = None
+        if task is None:
+            return
+        self._purge_stop.set()
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as error:  # pragma: no cover - 防御性
+            logger.debug("purge 任务退出异常: %s", error)
+        logger.info("后台 purge 任务已停止")
+
+    async def _purge_loop(
+        self,
+        interval_seconds: float,
+        forgotten_retention_days: float,
+        superseded_retention_days: float,
+    ) -> None:
+        """周期清理循环：每 ``interval_seconds`` 执行一次 :meth:`purge_once`。
+
+        单次 tick 异常仅记警告并继续（绝不退出循环）；通过 ``_purge_stop`` 事件
+        与 ``task.cancel()`` 双重响应停止信号。
+        """
+        while not self._purge_stop.is_set():
+            try:
+                await asyncio.wait_for(self._purge_stop.wait(), timeout=interval_seconds)
+                # 收到停止信号 → 退出
+                break
+            except TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                raise
+            try:
+                await self.purge_once(
+                    forgotten_retention_days=forgotten_retention_days,
+                    superseded_retention_days=superseded_retention_days,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                # 吞异常，循环继续（后台任务不得因单次失败退出）
+                logger.warning("后台 purge 单次执行失败（已跳过）: %s", error)
+
+    # ============ 显式遗忘（软删除） ============
+
+    async def forget(
+        self,
+        thread_id: str,
+        keyword: str | None = None,
+        topic_key: str | None = None,
+        fact_id: str | None = None,
+    ) -> int:
+        """显式遗忘该会话的部分长期记忆（软删除为 ``forgotten``）。
+
+        串行化顺序与 :meth:`clear` 一致（防"复活"）：
+
+        1. 先 ``cleanup_thread`` 丢弃该 thread 未 flush 的缓冲事件（取消定时器 +
+            弹出 buffer）——否则遗忘后紧接着的防抖 flush 会把同一事实重新写成
+            active，使刚遗忘的条目"复活"；
+        2. 再持 per-thread 锁执行标记，与正在进行的写流水线串行化。
+
+        只标记不物理删除（调用 :meth:`ThreadMemoryStore.forget_facts`），
+        物理清理由 :meth:`ThreadMemoryStore.purge_forgotten` 承接。
+
+        Args:
+            thread_id: 会话线程 ID
+            keyword: 内容关键词（不区分大小写子串匹配）
+            topic_key: 主题键（内部先归一化）
+            fact_id: 记忆条目 ID（精确匹配）
+
+        Returns:
+            实际标记为 forgotten 的条数
+
+        Raises:
+            ValueError: 三个匹配条件全部缺失（由 Store 层抛出）
+        """
+        # 1. 丢弃未 flush 的缓冲事件，避免遗忘后被回写"复活"
+        await self._write_middleware.cleanup_thread(thread_id)
+        # 2. 与可能正在进行的 flush 串行化
+        lock = await self._lock_pool.get(thread_id)
+        async with lock:
+            return await self._store.forget_facts(
+                thread_id,
+                keyword=keyword,
+                topic_key=topic_key,
+                fact_id=fact_id,
+            )
+
+    async def forget_agent(
+        self,
+        keyword: str | None = None,
+        topic_key: str | None = None,
+        fact_id: str | None = None,
+    ) -> int:
+        """显式遗忘 agent 级（跨会话共享）部分长期记忆（软删除）。
+
+        串行化顺序与 :meth:`clear_agent_facts` 一致：先 ``flush_all()`` 把所有
+        thread 的防抖 buffer 写库（agent facts 可能来自任意 thread 的在途事件），
+        再持 agent 锁执行标记——先冲刷再标记，保证在途事件写入的条款也被本次
+        遗忘条件覆盖，不留"复活"窗口。
+
+        锁序约束：本方法只获取 agent 锁，不获取 per-thread 锁（与
+        :meth:`clear_agent_facts` 相同，避免与写流水线反向加锁死锁）。
+
+        Args:
+            keyword: 内容关键词（不区分大小写子串匹配）
+            topic_key: 主题键（内部先归一化）
+            fact_id: 记忆条目 ID（精确匹配）
+
+        Returns:
+            实际标记为 forgotten 的条数
+
+        Raises:
+            ValueError: 三个匹配条件全部缺失（由 Store 层抛出）
+        """
+        # 1. 先冲刷全部防抖 buffer，防止遗忘后被在途 flush 写回"复活"
+        await self._write_middleware.flush_all()
+        # 2. 持 agent 锁标记，与并发写流水线串行化
+        async with self._agent_lock:
+            return await self._store.forget_agent_facts(
+                keyword=keyword,
+                topic_key=topic_key,
+                fact_id=fact_id,
+            )
 
     # ============ 生命周期 ============
 

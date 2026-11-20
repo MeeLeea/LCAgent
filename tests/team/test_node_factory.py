@@ -1,5 +1,4 @@
-"""
-测试 graph/common.node_factory.create_llm_node 与 llm.config.load_agent_rules
+"""测试 team/node_factory.create_llm_node 与 llm.config.load_agent_rules
 
 覆盖:
 - load_agent_rules: 默认仅返回「重要规则」通用节; include_tool_rules=True 追加「工具规则」
@@ -7,6 +6,9 @@
 - create_llm_node: 按角色能力运行时解析(持有工具才注入「工具规则」)
 - create_llm_node: base_prompts="" 关闭注入; 传字符串覆盖默认解析
 - prompt 顺序: 基础提示词 → 节点模板 → 技能块
+
+注: 本文件原位于 tests/graph/test_node_factory.py,随 create_llm_node
+从 graph/common/node_factory.py 迁至 team/node_factory.py 一并迁移。
 """
 from __future__ import annotations
 
@@ -15,8 +17,8 @@ from typing import ClassVar
 
 import pytest
 
-from graph.common import node_factory
 from llm.config import load_agent_rules
+from team import node_factory
 
 RULES_HEADING = "## 重要规则"
 TOOL_RULES_HEADING = "## 工具规则"

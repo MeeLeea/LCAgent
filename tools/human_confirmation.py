@@ -7,7 +7,7 @@
       interrupt value kind="user_confirmation",
       resume payload = {"answers": {item_id: {"choice_id": selected_id}}}
 
-执行链路(经 ``graph/common.run_team_turn_with_interrupt`` 透传):
+执行链路(经 ``team.interrupt.run_team_turn_with_interrupt`` 透传):
     1. LLM 在 ReAct 循环中调用本工具 → ``_request_user_confirmation`` 内调
        ``langgraph.types.interrupt({"kind": "user_confirmation", "items": items})``
     2. 内层 agent_executor(checkpointer 已注入)捕获 pending interrupt,

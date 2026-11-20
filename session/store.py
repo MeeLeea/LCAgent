@@ -1,8 +1,9 @@
 """会话状态存储 - 基于 LangGraph Store 的 per-session 隔离封装。
 
-按 session_id（= thread_id）隔离三类会话状态：
+按 session_id（= thread_id）隔离四类会话状态：
 - execution_history: 工具调用执行历史（有界队列，仅 CLI 展示用）
 - pending_interrupts: 挂起的中断模式（run/chat，记录是哪种执行被中断）
+- pending_failures: 最近一次工作流失败记录（失败节点名 + 错误信息 + 时间戳）
 - session_config: 每个会话的 provider/model/role 配置
 
 ``session_config`` 是 per-session provider/model/role 的唯一事实源；checkpoint
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -152,6 +154,32 @@ class SessionStore:
         """清除挂起中断状态。"""
         await self._safe_delete(_ns(session_id, "interrupts"), "pending")
 
+    # ============ pending_failures ============
+
+    async def aget_failure(self, session_id: str) -> dict[str, Any] | None:
+        """读取最近一次工作流失败记录；无记录时返回 None。
+
+        返回结构：{"node": 失败节点名, "error": 错误信息, "ts": 时间戳}。
+        失败节点位置本身以 checkpointer 的 pending task 为准，
+        此记录仅补充异常详情供展示与诊断。
+        """
+        item = await self._store.aget(_ns(session_id, "failures"), key="last")
+        if item is None:
+            return None
+        return dict(item.value)
+
+    async def aset_failure(self, session_id: str, node: str, error: str) -> None:
+        """覆盖写入最近一次工作流失败记录（每会话仅保留最新一条）。"""
+        await self._store.aput(
+            _ns(session_id, "failures"),
+            key="last",
+            value={"node": node, "error": error, "ts": time.time()},
+        )
+
+    async def aclear_failure(self, session_id: str) -> None:
+        """清除失败记录（重试成功或会话重新开跑时调用）。"""
+        await self._safe_delete(_ns(session_id, "failures"), "last")
+
     # ============ session_config ============
 
     async def aget_session_config(self, session_id: str) -> SessionConfig | None:
@@ -195,13 +223,45 @@ class SessionStore:
         """幂等删除会话配置。"""
         await self._safe_delete(_ns(session_id, STORE_KIND), "current")
 
+    # ============ display（自定义展示名） ============
+
+    async def aget_title(self, session_id: str) -> str | None:
+        """读取会话自定义展示名（重命名）；未设置时返回 None。"""
+        item = await self._store.aget(_ns(session_id, "display"), key="title")
+        if item is None:
+            return None
+        return item.value.get("title")
+
+    async def aset_title(self, session_id: str, title: str) -> None:
+        """写入会话自定义展示名。"""
+        await self._store.aput(
+            _ns(session_id, "display"), key="title", value={"title": title}
+        )
+
+    async def adelete_title(self, session_id: str) -> None:
+        """幂等清除会话自定义展示名（回落到消息预览）。"""
+        await self._safe_delete(_ns(session_id, "display"), "title")
+
+    async def aget_titles(self, session_ids: Sequence[str]) -> dict[str, str]:
+        """批量读取自定义展示名，省略未设置的会话。"""
+        titles = await asyncio.gather(
+            *(self.aget_title(session_id) for session_id in session_ids)
+        )
+        return {
+            session_id: title
+            for session_id, title in zip(session_ids, titles, strict=True)
+            if title is not None
+        }
+
     # ============ 会话级清理 ============
 
     async def adelete_session(self, session_id: str) -> None:
         """删除指定会话在 Store 中的全部状态。"""
         await self.aclear_history(session_id)
         await self.aclear_interrupt(session_id)
+        await self.aclear_failure(session_id)
         await self.adelete_session_config(session_id)
+        await self.adelete_title(session_id)
 
     # ============ 内部辅助 ============
 

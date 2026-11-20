@@ -3,9 +3,9 @@
 延迟导入 AgentCore 以避免与 session 包的循环导入：
 session/__init__ → manager → utils.events → agent/__init__ → agent_core → session
 事件模型已迁移至 utils.events，`from utils.events import AgentEvent` 不触发 agent_core。
-压缩中间件（compaction）归位于 agent 包内（agent/compaction.py），为不依赖
-agent 包内部任何子模块的叶子模块，仅引用 langchain/langgraph，agent_core 经
-`from .compaction import ...` 导入，不触发循环。
+中间件（compaction / *_mw / session_config_middleware）已迁出至顶层 midware/ 包，
+均为不依赖 agent 包内部任何子模块的叶子模块，agent_core 经
+`from midware.compaction import ...` 等绝对导入引入，不触发循环。
 """
 __all__ = ['AgentCore']
 

@@ -69,12 +69,10 @@ def get_available_team_roles() -> list[str]:
         sub_dir = os.path.join(_TEAM_DIR, entry)
         if not os.path.isdir(sub_dir):
             continue
-        # 合法角色：在统一配置中定义，且有 AGENT.md
+        # 合法角色：在统一配置 team_agents.json 中定义，且有 AGENT.md
         has_unified = entry in unified_roles
         has_prompt = os.path.isfile(os.path.join(sub_dir, "AGENT.md"))
-        # 兼容：过渡期保留 agent_config.json 检查
-        has_config = os.path.isfile(os.path.join(sub_dir, "agent_config.json"))
-        if (has_unified or has_config) and has_prompt:
+        if has_unified and has_prompt:
             available.append(entry)
 
     return available
@@ -84,7 +82,7 @@ def _locate_team_agent_dir(agent_name: str) -> str:
 
     实现方式参考 graph/registry.py::_load_builtin_workflows():
     遍历 team/ 下的子目录,按 folder name 精确匹配用户输入的角色名。
-    命中的目录必须同时包含 agent_config.json 与 AGENT.md 才视为合法角色。
+    合法角色必须在 team_agents.json 中有条目且目录含 AGENT.md。
 
     Args:
         agent_name: team/ 下的角色文件夹名(如 "manager"/"worker")

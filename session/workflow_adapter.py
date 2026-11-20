@@ -3,8 +3,8 @@
 使 workflow 链路获得与 AgentCore 会话链路同级的 SessionManager 门面接入
 （统一会话/记忆/锁/SSE），上层（CLI/API）可无差别调度两类执行体。
 
-实现 SessionAgent 协议（SessionManager 对 agent 依赖的 11 个接口）：
-    arun_events / aresume_events / session / _current_sid /
+实现 SessionAgent 协议（SessionManager 对 agent 依赖的接口）：
+    arun_events / aresume_events / aretry_events / session / _current_sid /
     set_current_session / checkpoint_info / aget_execution_history /
     aclear_history / manually_compact / aclose
 
@@ -15,19 +15,29 @@
 - arun_events 与 aresume_events 同构：均基于 _arun_input_events 处理
   graph.ainvoke 的事件队列 + 终止事件
 - 跨轮次上下文由 checkpoint messages 通道 + 长期记忆(recall_text)承载
+- 失败现场保存：节点异常时 checkpointer 保留 pending task（失败节点），
+  SessionStore.failures 持久化失败节点名 + 异常信息（供重启后展示）
+- 图级自动重试：瞬时错误（should_retry 判定）自动 ainvoke(None) 从失败
+  节点续跑（指数退避，最多 RETRY_ATTEMPTS 次）；耗尽后落库失败记录
+- aretry_events：手动从失败断点续跑（前置 aget_state 校验断点存在）
 
 执行流程（arun_events）：
 1. 从 session_id 反解 workflow 名称（registry.workflow_name_of）
 2. build_workflow 构建图（checkpointer + compaction 默认启用）
 3. 执行前：checkpoint 历史消息 + 长期记忆拼 raw_context 注入
 4. graph.ainvoke 边执行边经 NodeTrackingHandler 队列吐出节点事件
+   （队列静默超过 _WORKFLOW_HEARTBEAT_INTERVAL 时补发 HEARTBEAT 保活，
+   防止前端看门狗误判"响应超时"拉黑线程）
 5. 结束后：__interrupt__ → INTERRUPT；否则 DONE(final_answer)；
    记忆沉淀由 SessionManager 消费事件完成
 
-恢复流程（aresume_events）：
+恢复流程（aresume_events / aretry_events）：
 1. 复用 _awarm_and_build_workflow 重建 graph + config（与 arun_events 一致）
-2. 用 Command(resume=payload) 调 graph.ainvoke 恢复外层 graph
-3. 复用 _arun_input_events 吐出节点事件 + INTERRUPT/DONE
+2. aresume_events 前置校验挂起中断（fail-open）：无挂起 → 优雅 DONE；
+   user_confirmation 答案与挂起项 id 完全无交集（陈旧卡片重复提交）→
+   重放当前 INTERRUPT 供用户重新作答；否则用 Command(resume=payload) 恢复
+3. aretry_events 用 ainvoke(None) 从失败节点断点续跑（checkpointer 的
+   pending task 即失败节点；已成功节点不重跑）
 
 allow: SIZE_OK — 文件 ~290 pure LOC 超 250 上限；arun_events/aresume_events
 共享 _WorkflowRuntime + _awarm_and_build_workflow + _arun_input_events 三件套
@@ -39,20 +49,27 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
 
-from agent.compaction import CompactionConfig
-from graph.common import NodeTrackingHandler, _build_compaction_middleware
+from graph.common import (
+    WORKFLOWS,
+    _build_compaction_middleware,
+    build_tracking_callbacks,
+    reset_round_counters,
+)
+from llm.llm_client import RETRY_ATTEMPTS, RETRY_MAX_DELAY, should_retry
 from llm.message_utils import build_interrupt_event
 from memory.manager import MemoryManager
+from midware.compaction import CompactionConfig
 from session.registry import SessionRegistry
 from skmng.manager import SkillManager, default_skills_dir
-from utils.events import AgentEvent
+from utils.events import AgentEvent, EventType
 from utils.logging_config import TraceContext, generate_trace_id
 
 logger = logging.getLogger(__name__)
@@ -61,6 +78,54 @@ logger = logging.getLogger(__name__)
 _HISTORY_MSG_PREVIEW_CHARS = 200
 # 注入 raw_context 的历史消息条数上限
 _HISTORY_MSG_COUNT = 5
+# 事件泵静默期心跳间隔（秒）：节点内 LLM 长流式 / 工具长执行（如 Vivado 仿真）
+# 期间 node_queue 无事件产出，周期性发 HEARTBEAT 喂前端看门狗（90s），
+# 防止其误判"响应超时"拉黑线程（拉黑后 interrupt 事件曾整批丢失）。
+_WORKFLOW_HEARTBEAT_INTERVAL = 15.0
+
+
+def _merge_interrupt_event(
+    interrupt_values: list[Any], tid: str, trace_id: str
+) -> AgentEvent:
+    """把一组挂起中断 value 合并为单个 INTERRUPT 事件（多 interrupt 批量语义）。
+
+    终态分支（graph.ainvoke 返回 ``__interrupt__``）与 aresume 陈旧载荷重放
+    共用该构建逻辑，避免两处 prompt/choices/items 合并规则漂移。
+
+    Args:
+        interrupt_values: 各挂起中断的 ``interrupt.value``（可为任意结构）
+        tid: 目标 workflow 会话 ID
+        trace_id: 本轮追踪 ID
+    """
+    ev_dicts = [build_interrupt_event(v) for v in interrupt_values]
+    # 多 interrupt 合并 prompt（同 interrupts.py 的批量语义）
+    prompt = "\n\n".join(d.get("prompt", "") for d in ev_dicts)
+    choices = ev_dicts[0].get("choices") if ev_dicts else None
+    # 多 interrupt 时把各分组待确认项拼接成一个列表（user_confirmation
+    # 才有 items；human_choice/dangerous_command 的 items 为空）
+    items = [it for d in ev_dicts for it in (d.get("items") or [])]
+    return AgentEvent.interrupt(
+        prompt=prompt,
+        choices=choices,
+        items=items,
+        thread_id=tid,
+        trace_id=trace_id,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ResumeState:
+    """workflow 会话的可恢复状态快照（stream-status 端点查询用）。
+
+    Attributes:
+        pending_interrupt: 首个挂起中断 ``{"kind": str, "payload": Any}``；
+            无挂起中断或状态不可判定时为 ``None``。
+        resumable: 是否存在待执行的 pending task（LangGraph ``StateSnapshot.next``
+            非空表示图仍可从断点续跑，如失败节点待重跑或中断待恢复）。
+    """
+
+    pending_interrupt: dict[str, Any] | None = None
+    resumable: bool = False
 
 
 class WorkflowAdapter:
@@ -147,16 +212,35 @@ class WorkflowAdapter:
         tid = self._current_sid(thread_id)
         trace_id = generate_trace_id()
 
+        # 新任务开跑前清除上一轮的失败记录（stale 断点不再有意义）
+        await self._aclear_failure_record(tid)
+
         with TraceContext(trace_id=trace_id, thread_id=tid):
             logger.info("workflow arun_events [%s]: %s", tid, message[:100])
             runtime = await self._awarm_and_build_workflow(tid, trace_id)
             # 执行前上下文：checkpoint 历史消息 + 长期记忆
             raw_context = await self._build_raw_context(tid)
-            initial_state: dict[str, str] = {
+            # 三层覆盖：底座默认 < 工作流声明的 initial_fields < 调用方入参。
+            # initial_fields 是"本轮起始态"的唯一声明处（产物/计数器回空值），
+            # 否则 checkpoint 会让上一轮的 rtl_code / verification_report /
+            # output_files 串到新任务里（designer_output 会拼进旧产物）。
+            workflow_name = self._registry.workflow_name_of(tid)
+            initial_fields = (
+                WORKFLOWS.get(workflow_name or "", {}).get("initial_fields") or {}
+            )
+            # 用户任务同时作为 HumanMessage 写入 messages 通道（add_messages reducer 追加）。
+            initial_state: dict[str, Any] = {
+                "context_summary": "",
+                **initial_fields,
                 "task": message,
                 "raw_context": raw_context,
-                "context_summary": "",
+                "messages": [HumanMessage(content=message)],
             }
+            # active_skills 是 per-thread 持久化的手动技能，不随任务重置
+            initial_state.pop("active_skills", None)
+            # 兜底：initial_fields 未声明 round 的图也把轮次计数器归零。
+            # aresume/aretry 不经过此处，续跑/重试的轮次语义不变。
+            reset_round_counters(runtime.graph, initial_state)
             async for ev in self._arun_input_events(runtime, initial_state, is_run_mode):
                 yield ev
 
@@ -172,7 +256,7 @@ class WorkflowAdapter:
         仅 graph.ainvoke 的输入不同（initial_state vs resume_command）。
 
         外层 graph 从被 interrupt 的节点恢复，节点内
-        run_team_turn_with_interrupt 的 interrupt() 返回 resume_value，
+        run_team_turn_with_interrupt（team/interrupt.py）的 interrupt() 返回 resume_value，
         调 aresume_structured 恢复内层 TeamAgent。
 
         Args:
@@ -186,13 +270,220 @@ class WorkflowAdapter:
         with TraceContext(trace_id=trace_id, thread_id=tid):
             logger.info("workflow aresume_events [%s]", tid)
             runtime = await self._awarm_and_build_workflow(tid, trace_id)
+
+            # 前置校验（fail-open）：无挂起中断时 Command(resume) 不报错，
+            # 但会让前端白等到看门狗超时（用户侧表现为"响应超时/节点失败"）；
+            # 陈旧载荷（并行重跑产生的旧卡片重复提交）同样白等。两者都优雅收尾。
+            pending = await self._apending_interrupt_values(runtime, tid)
+            if pending is not None:
+                if not pending:
+                    logger.warning("workflow 恢复被忽略 [%s]: 无挂起的人工确认", tid)
+                    yield AgentEvent.done(
+                        content="当前没有挂起的人工确认，本次恢复已忽略。",
+                        thread_id=tid,
+                        role="assistant",
+                        trace_id=trace_id,
+                    )
+                    return
+                if self._is_stale_confirmation_payload(payload, pending):
+                    logger.warning(
+                        "workflow 恢复载荷与挂起确认项错配，重放当前中断 [%s]", tid
+                    )
+                    yield _merge_interrupt_event(pending, tid, trace_id)
+                    return
+
             resume_command = Command(resume=payload)
             async for ev in self._arun_input_events(
                 runtime, resume_command, is_run_mode=False
             ):
                 yield ev
 
+    async def aretry_events(
+        self,
+        *,
+        thread_id: str | None = None,
+    ) -> AsyncIterator[AgentEvent]:
+        """从失败断点手动重试 — ainvoke(None) 让图从失败节点续跑。
+
+        与 aresume_events 的区别：interrupt 挂起需 Command(resume=payload)
+        恢复；节点异常失败时 checkpointer 保留失败节点为 pending task，
+        ainvoke(None) 即从该节点重跑（已成功节点不重跑，state 延续）。
+
+        前置校验 aget_state：无 checkpoint 或 next 为空（图已跑完/从未跑过）
+        时 yield ERROR，避免 ainvoke(None) 抛 EmptyInputError 或空转。
+
+        Args:
+            thread_id: 目标 workflow 会话 ID（为 None 时用当前会话）
+        """
+        self._ensure_not_closed()
+        tid = self._current_sid(thread_id)
+        trace_id = generate_trace_id()
+
+        with TraceContext(trace_id=trace_id, thread_id=tid):
+            logger.info("workflow aretry_events [%s]", tid)
+            runtime = await self._awarm_and_build_workflow(tid, trace_id)
+
+            # 前置校验：checkpoint 必须有待执行节点（失败断点）
+            state = await runtime.graph.aget_state(runtime.config)
+            if state is None or not state.next:
+                logger.warning("workflow 重试被拒绝 [%s]: 无可恢复的失败断点", tid)
+                yield AgentEvent.error(
+                    content="无可恢复的失败断点（工作流可能已完成或从未执行）",
+                    thread_id=tid,
+                    trace_id=trace_id,
+                )
+                return
+
+            # input=None：LangGraph 从 checkpoint 的 pending task（失败节点）续跑
+            async for ev in self._arun_input_events(runtime, None, is_run_mode=False):
+                yield ev
+
+    async def _apending_interrupt_values(
+        self, runtime: _WorkflowRuntime, tid: str
+    ) -> list[Any] | None:
+        """读取 checkpoint 当前挂起的中断 value 列表（aresume 前置校验用）。
+
+        Returns:
+            - ``list``：正常读到状态（无挂起中断时为空列表）
+            - ``None``：无法判定（图不支持 ``aget_state`` / 读取异常）——
+              调用方视为"未知"放行，不拦截正常恢复（fail-open）
+        """
+        getter = getattr(runtime.graph, "aget_state", None)
+        if getter is None:
+            return None
+        try:
+            state = await getter(runtime.config)
+        except Exception as error:
+            logger.warning("读取挂起中断失败，跳过恢复前置校验 [%s]: %s", tid, error)
+            return None
+        if state is None:
+            return []
+        values: list[Any] = []
+        for task in getattr(state, "tasks", ()) or ():
+            for intr in getattr(task, "interrupts", ()) or ():
+                values.append(getattr(intr, "value", None))
+        return values
+
+    @staticmethod
+    def _is_stale_confirmation_payload(
+        payload: Any, pending_values: list[Any]
+    ) -> bool:
+        """判定 resume 载荷是否与挂起确认项完全错配（陈旧卡片重复提交）。
+
+        仅当载荷为 user_confirmation 的 ``{"answers": {item_id: {...}}}`` 形态、
+        挂起侧存在 user_confirmation 项、且 answers 的 key 与全部挂起项 id
+        无任何交集时判为陈旧。其余情况一律放行（fail-open），避免误拦
+        human_choice 的 ``{"choice_id": ...}`` 与部分作答等合法载荷。
+        """
+        if not isinstance(payload, dict):
+            return False
+        answers = payload.get("answers")
+        if not isinstance(answers, dict) or not answers:
+            return False
+        pending_ids: set[str] = set()
+        has_confirmation = False
+        for value in pending_values:
+            if not isinstance(value, dict):
+                continue
+            if value.get("kind") != "user_confirmation":
+                continue
+            has_confirmation = True
+            for item in value.get("items") or ():
+                if isinstance(item, dict) and item.get("id"):
+                    pending_ids.add(str(item["id"]))
+        if not has_confirmation or not pending_ids:
+            return False
+        return not {str(key) for key in answers} & pending_ids
+
     # ============ SessionAgent 协议：历史 ============
+
+    async def aget_failure_record(
+        self, session_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """读取最近一次失败记录（供 stream-status 端点查询）。
+
+        返回 {"node": 失败节点名, "error": 错误信息, "ts": 时间戳} 或 None。
+        Store 不可达时静默返回 None（不阻塞查询路径）。
+        """
+        sid = self._current_sid(session_id)
+        store = getattr(self._registry, "_store", None)
+        if store is None:
+            return None
+        try:
+            return await store.aget_failure(sid)
+        except Exception as error:
+            logger.warning("读取失败记录失败 [%s]: %s", sid, error)
+            return None
+
+    async def aget_resume_state(
+        self, session_id: str | None = None
+    ) -> ResumeState:
+        """读取 workflow 会话的可恢复状态（挂起中断 + 是否可续跑）。
+
+        供 stream-status 端点区分两种"看起来可恢复"的现场：
+
+        - **HITL 挂起**：``pending_interrupt`` 非空（图停在人工确认节点等待 resume）；
+        - **失败断点**：无挂起中断但 ``resumable`` 为真（图停在某失败节点待重跑）。
+
+        只读，不修改图状态。非 workflow 会话、图构建失败或 ``aget_state`` 抛异常时
+        统一返回空 ``ResumeState``（不抛出，保证查询路径永不失败）。
+
+        Args:
+            session_id: 目标 workflow 会话 ID（为 None 时使用当前会话）
+
+        Returns:
+            ``ResumeState(pending_interrupt, resumable)``；无法判定时取默认值
+            （pending_interrupt=None、resumable=False）。
+        """
+        tid = self._current_sid(session_id)
+        workflow_name = self._registry.workflow_name_of(tid)
+        if not workflow_name:
+            return ResumeState()
+
+        from graph.common import build_workflow
+
+        try:
+            graph, _agents = build_workflow(
+                workflow_name, checkpointer=self._checkpointer
+            )
+            config: dict[str, Any] = {"configurable": {"thread_id": tid}}
+            state = await graph.aget_state(config)
+        except Exception as error:
+            logger.warning("读取 workflow 可恢复状态失败 [%s]: %s", tid, error)
+            return ResumeState()
+        if state is None:
+            return ResumeState()
+
+        resumable = bool(getattr(state, "next", ()) or ())
+        return ResumeState(
+            pending_interrupt=self._extract_pending_interrupt(state),
+            resumable=resumable,
+        )
+
+    @staticmethod
+    def _extract_pending_interrupt(state: Any) -> dict[str, Any] | None:
+        """从 StateSnapshot 提取首个挂起中断（防御式，任意形状都不抛异常）。
+
+        优先读 ``state.interrupts``（LangGraph ``StateSnapshot`` 顶层聚合字段）；
+        该属性缺失/为空时回退遍历 ``state.tasks[*].interrupts``（兼容旧结构）。
+
+        ``value`` 为 dict 时 ``kind`` 取其中的 ``kind``/``type``（缺失回落
+        ``"interrupt"``）、``payload`` 即该 dict；``value`` 非 dict 时
+        ``kind="interrupt"``、``payload=value``。
+        """
+        interrupts: list[Any] = list(getattr(state, "interrupts", None) or ())
+        if not interrupts:
+            for task in getattr(state, "tasks", ()) or ():
+                interrupts.extend(getattr(task, "interrupts", ()) or ())
+        if not interrupts:
+            return None
+
+        interrupt = interrupts[0]
+        value = getattr(interrupt, "value", None)
+        if isinstance(value, dict):
+            kind = value.get("kind") or value.get("type") or "interrupt"
+            return {"kind": str(kind), "payload": value}
+        return {"kind": "interrupt", "payload": value}
 
     async def aget_execution_history(
         self, session_id: str | None = None
@@ -232,7 +523,7 @@ class WorkflowAdapter:
         """加载技能到指定 workflow 会话（写入 state.active_skills）。
 
         技能名存入 workflow 会话的 per-thread checkpoint state，由节点经
-        ``create_llm_node`` 读取 ``state["active_skills"]`` 后注入提示词。
+        ``create_llm_node``（team/node_factory.py）读取 ``state["active_skills"]`` 后注入提示词。
         与 ``SkillOps.aload_skill`` 语义一致，仅图来源不同。
 
         Args:
@@ -298,7 +589,7 @@ class WorkflowAdapter:
             thread_id: 目标 workflow 会话 ID
 
         Returns:
-            {"summary", "messages_before", "messages_after"} 或 None（无消息/失败）
+            {"messages_before", "messages_after"} 或 None（无消息/失败）
         """
         tid = self._current_sid(thread_id)
         msgs = await self._registry.aget_messages(tid)
@@ -308,19 +599,6 @@ class WorkflowAdapter:
         workflow_name = self._registry.workflow_name_of(tid)
         if not workflow_name:
             return None
-
-        # 读取当前 state 中的已有摘要
-        existing_summary = ""
-        config = {"configurable": {"thread_id": tid}}
-        try:
-            getter = getattr(self._checkpointer, "aget_tuple", None)
-            tup = await getter(config) if callable(getter) else None
-            if tup is not None and tup.checkpoint is not None:
-                existing_summary = (
-                    tup.checkpoint.get("channel_values", {}).get("summary", "") or ""
-                )
-        except Exception as error:
-            logger.debug("读取 workflow 摘要失败: %s", error)
 
         # 惰性构造压缩中间件（从任一角色 agent 的 llm）
         from graph.common import build_workflow
@@ -332,13 +610,18 @@ class WorkflowAdapter:
         if mw is None:
             return None
 
-        update = await mw.arun_compaction(msgs, existing_summary=existing_summary, force=force)
+        # 工作流 State 无 summary 通道：existing_summary 固定为空串（D1-A），
+        # 手动 compact 仅压缩 messages
+        update = await mw.arun_compaction(msgs, existing_summary="", force=force)
         if update is None:
             return None
 
+        # summary 已不再持久化到任何通道，写回前丢弃以免污染 state
+        # （LangGraph 对未声明通道写入静默丢弃，不会崩，但保持语义干净）
+        update.pop("summary", None)
+        config: dict[str, Any] = {"configurable": {"thread_id": tid}}
         await _graph.aupdate_state(config, update)
         return {
-            "summary": update["summary"],
             "messages_before": len(msgs),
             "messages_after": len(update["messages"]) - 1,
         }
@@ -415,10 +698,6 @@ class WorkflowAdapter:
         node_queue: asyncio.Queue[AgentEvent] = asyncio.Queue()
 
         # 4. NodeTrackingHandler：节点事件 + LLM token 增量入队
-        known_nodes = {
-            n.id for n in graph.get_graph().nodes.values() if not n.id.startswith("__")
-        }
-
         def _on_token(ev: AgentEvent) -> None:
             """LLM token 增量 → TOKEN 事件入队（补充会话元数据）。"""
             node_queue.put_nowait(
@@ -432,15 +711,13 @@ class WorkflowAdapter:
 
         config: dict[str, Any] = {
             "configurable": configurable,
-            "callbacks": [
-                NodeTrackingHandler(
-                    known_nodes,
-                    on_node_start=node_queue.put_nowait,
-                    on_node_end=node_queue.put_nowait,
-                    on_node_error=node_queue.put_nowait,
-                    on_token=_on_token,
-                )
-            ],
+            "callbacks": build_tracking_callbacks(
+                graph,
+                on_node_start=node_queue.put_nowait,
+                on_node_end=node_queue.put_nowait,
+                on_node_error=node_queue.put_nowait,
+                on_token=_on_token,
+            ),
         }
 
         return self._WorkflowRuntime(
@@ -459,90 +736,154 @@ class WorkflowAdapter:
     ) -> AsyncIterator[AgentEvent]:
         """执行 graph.ainvoke 并吐出节点事件 + 终止事件。
 
-        arun_events 传 initial_state；aresume_events 传 Command(resume=...)。
+        arun_events 传 initial_state；aresume_events 传 Command(resume=...)；
+        aretry_events 传 None（从 checkpoint pending task 续跑）。
+
+        图级自动重试：final 为瞬时异常（should_retry 判定）且未达
+        RETRY_ATTEMPTS 时，指数退避后以 input=None 重跑失败节点
+        （checkpointer 保留 pending task，已成功节点不重跑）。
+        事件泵跨尝试共用同一 node_queue，第二轮 NODE_START 会继续
+        流给前端（节点红→running→绿）。
+
         终止事件逻辑：
-        - final 为异常 → ERROR
-        - final 含 __interrupt__ → INTERRUPT（对照 interrupts.py:166-196）
-        - 否则 → DONE(final_answer)
+        - final 为异常（不可重试/已耗尽）→ 落库失败记录 + ERROR
+        - final 含 __interrupt__ → 清失败记录 + INTERRUPT
+        - 否则 → 清失败记录 + DONE(final_answer)
         """
-        async def _run() -> Any:
-            return await runtime.graph.ainvoke(graph_input, config=runtime.config)
-
-        run_task = asyncio.create_task(_run())
-
-        # 边执行边吐出节点事件（NodeTrackingHandler 回调实时入队）
-        # finally 兜底：外层被取消（dispatch_task.cancel / 客户端断开）时，
-        # 同步取消 run_task，避免 graph.ainvoke 继续执行后续节点。
-        final: Any = None
-        try:
-            while True:
-                try:
-                    ev = runtime.node_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    if run_task.done():
-                        final = run_task.result()
-                        break
-                    await asyncio.sleep(0.005)
-                    continue
-                yield ev
-        finally:
-            if not run_task.done():
-                run_task.cancel()
-                try:
-                    await run_task
-                except (asyncio.CancelledError, Exception):  # noqa: S110 - 主动取消 run_task
-                    # 仅吞 run_task 自身的取消/执行异常；
-                    # 外层 CancelledError 不在此处被吞，会在 finally 完成后继续向上传播
-                    pass
-
-        # 终止事件：ERROR / INTERRUPT / DONE
+        last_error_node = ""  # 最近一次 NODE_ERROR 事件的节点名
+        attempt = 0
+        current_input = graph_input
         tid = runtime.tid
         trace_id = runtime.trace_id
-        if isinstance(final, BaseException):
-            logger.error("工作流执行异常 [%s]: %s", tid, final)
-            yield AgentEvent.error(
-                content=f"工作流执行失败: {final}",
-                thread_id=tid,
-                trace_id=trace_id,
-            )
-            return
 
-        # Todo 3.1：检测 __interrupt__，yield INTERRUPT（对照 interrupts.py:166-196
-        # + streaming.py:323-326）。interrupt 时 final_answer 为空。
-        if isinstance(final, dict) and "__interrupt__" in final:
-            interrupts = final["__interrupt__"] or []
-            if interrupts:
-                ev_dicts = [
-                    build_interrupt_event(getattr(intr, "value", None))
-                    for intr in interrupts
-                ]
-                # 多 interrupt 合并 prompt（同 interrupts.py:179-189 的批量语义）
-                prompt = "\n\n".join(d.get("prompt", "") for d in ev_dicts)
-                choices = ev_dicts[0].get("choices") if ev_dicts else None
-                # 多 interrupt 时把各分组待确认项拼接成一个列表（user_confirmation
-                # 才有 items；human_choice/dangerous_command 走 d.get("items") or [] 为空）
-                items = [it for d in ev_dicts for it in (d.get("items") or [])]
-                logger.info("工作流执行被中断 [%s] interrupts=%d", tid, len(interrupts))
-                yield AgentEvent.interrupt(
-                    prompt=prompt,
-                    choices=choices,
-                    items=items,
+        while True:
+            run_task = asyncio.create_task(
+                runtime.graph.ainvoke(current_input, config=runtime.config)
+            )
+
+            # 边执行边吐出节点事件（NodeTrackingHandler 回调实时入队）
+            # finally 兜底：外层被取消（dispatch_task.cancel / 客户端断开）时，
+            # 同步取消 run_task，避免 graph.ainvoke 继续执行后续节点。
+            final: Any = None
+            # 上一次向前端产出事件的时刻：用于静默期心跳判定
+            last_emit_at = time.monotonic()
+            try:
+                while True:
+                    try:
+                        ev = runtime.node_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        if run_task.done():
+                            # run_task 异常时 result() 会 raise，捕获为返回值；
+                            # CancelledError 非 Exception，自然向上传播（外层取消仍生效）
+                            try:
+                                final = run_task.result()
+                            except Exception as e:
+                                final = e
+                            break
+                        await asyncio.sleep(0.005)
+                        # 静默期心跳：节点内 LLM 长流式 / 巨型工具参数生成 / 工具长执行
+                        # （如 Vivado 仿真）期间 node_queue 无任何事件产出，此间前端看门狗
+                        # （90s）会误判"响应超时"并拉黑线程——拉黑后 interrupt 事件被整批
+                        # 丢弃，HITL 确认卡片永不渲染。周期性 HEARTBEAT 纯保活、不渲染 UI。
+                        if (
+                            time.monotonic() - last_emit_at
+                            >= _WORKFLOW_HEARTBEAT_INTERVAL
+                        ):
+                            last_emit_at = time.monotonic()
+                            yield AgentEvent.heartbeat(
+                                thread_id=tid, trace_id=trace_id
+                            )
+                        continue
+                    if ev.event_type == EventType.NODE_ERROR:
+                        last_error_node = ev.node
+                    last_emit_at = time.monotonic()
+                    yield ev
+            finally:
+                if not run_task.done():
+                    run_task.cancel()
+                    try:
+                        await run_task
+                    except (asyncio.CancelledError, Exception):  # noqa: S110 - 主动取消 run_task
+                        # 仅吞 run_task 自身的取消/执行异常；
+                        # 外层 CancelledError 不在此处被吞，会在 finally 完成后继续向上传播
+                        pass
+
+            # 终止事件判定：瞬时异常 → 自动重试（input=None 从失败节点续跑）
+            if isinstance(final, BaseException):
+                if should_retry(final) and attempt < RETRY_ATTEMPTS - 1:
+                    attempt += 1
+                    delay = min(RETRY_MAX_DELAY, float(2**attempt))
+                    logger.warning(
+                        "工作流瞬时异常，%.1fs 后从失败节点重试(第 %d/%d 次) [%s]: %s",
+                        delay,
+                        attempt,
+                        RETRY_ATTEMPTS - 1,
+                        tid,
+                        final,
+                    )
+                    await asyncio.sleep(delay)
+                    current_input = None
+                    continue
+
+                # 不可重试或已耗尽：落库失败记录（节点名+异常信息）+ ERROR
+                logger.error("工作流执行异常 [%s]: %s", tid, final)
+                await self._aset_failure_record(tid, last_error_node, str(final))
+                yield AgentEvent.error(
+                    content=f"工作流执行失败: {final}",
                     thread_id=tid,
                     trace_id=trace_id,
                 )
                 return
 
-        final_answer = (
-            final.get("final_answer", "") if isinstance(final, dict) else ""
-        ) or ""
-        logger.info("工作流执行完成 [%s]", tid)
-        yield AgentEvent.done(
-            content=final_answer,
-            thread_id=tid,
-            role="assistant",
-            is_important=is_run_mode,
-            trace_id=trace_id,
-        )
+            # Todo 3.1：检测 __interrupt__，yield INTERRUPT（对照 interrupts.py:166-196
+            # + streaming.py:323-326）。interrupt 时 final_answer 为空。
+            if isinstance(final, dict) and "__interrupt__" in final:
+                interrupts = final["__interrupt__"] or []
+                if interrupts:
+                    # 失败已被 interrupt 场景取代，清除旧失败记录
+                    await self._aclear_failure_record(tid)
+                    logger.info("工作流执行被中断 [%s] interrupts=%d", tid, len(interrupts))
+                    yield _merge_interrupt_event(
+                        [getattr(intr, "value", None) for intr in interrupts],
+                        tid,
+                        trace_id,
+                    )
+                    return
+
+            # 重试成功（或正常完成）：清除失败记录
+            await self._aclear_failure_record(tid)
+            final_answer = (
+                final.get("final_answer", "") if isinstance(final, dict) else ""
+            ) or ""
+            logger.info("工作流执行完成 [%s]", tid)
+            yield AgentEvent.done(
+                content=final_answer,
+                thread_id=tid,
+                role="assistant",
+                is_important=is_run_mode,
+                trace_id=trace_id,
+            )
+            return
+
+    async def _aset_failure_record(self, tid: str, node: str, error: str) -> None:
+        """写入失败记录到 SessionStore（Store 不可达或写失败时静默跳过）。"""
+        store = getattr(self._registry, "_store", None)
+        if store is None:
+            return
+        try:
+            await store.aset_failure(tid, node=node, error=error)
+        except Exception as e:
+            logger.warning("写入失败记录失败 [%s]: %s", tid, e)
+
+    async def _aclear_failure_record(self, tid: str) -> None:
+        """清除失败记录（Store 不可达或删失败时静默跳过）。"""
+        store = getattr(self._registry, "_store", None)
+        if store is None:
+            return
+        try:
+            await store.aclear_failure(tid)
+        except Exception as e:
+            logger.warning("清除失败记录失败 [%s]: %s", tid, e)
 
     async def _build_raw_context(self, tid: str) -> str:
         """构建执行前注入的 raw_context：checkpoint 历史消息 + 长期记忆。
@@ -582,4 +923,4 @@ class WorkflowAdapter:
         return "\n\n".join(parts)
 
 
-__all__ = ["WorkflowAdapter"]
+__all__ = ["ResumeState", "WorkflowAdapter"]

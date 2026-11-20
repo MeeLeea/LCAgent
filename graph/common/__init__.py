@@ -5,23 +5,19 @@
 
 子模块:
     node_tracking      — NodeTrackingHandler 回调处理器
-    interrupt_forward   — run_team_turn_with_interrupt 中断转发
-    node_factory        — create_llm_node 节点工厂
     workflow_runner     — arun_compiled_workflow 通用运行器
     compaction_utils    — _build_compaction_middleware 压缩中间件构造
     node_spec           — NodeSpec / register_nodes 声明式注册
     registry            — WORKFLOWS / AGENT_REGISTRY / build_workflow 注册表
+
+注: create_llm_node(节点工厂) 与 run_team_turn_with_interrupt(中断转发)
+已随节点实现下沉迁至 team/ 包(team.node_factory / team.interrupt),
+其 runtime 依赖本来就是 team.base,不再属 graph 编排基建。
 """
 from __future__ import annotations
 
 # 压缩中间件构造工具
 from graph.common.compaction_utils import _build_compaction_middleware
-
-# 中断转发
-from graph.common.interrupt_forward import run_team_turn_with_interrupt
-
-# 节点工厂
-from graph.common.node_factory import create_llm_node
 
 # 声明式节点规格与注册
 from graph.common.node_spec import NodeSpec, register_nodes
@@ -30,27 +26,28 @@ from graph.common.node_spec import NodeSpec, register_nodes
 from graph.common.node_tracking import (
     NodeCallback,
     NodeTrackingHandler,
-    _extract_node_output,
+    build_tracking_callbacks,
 )
 
 # 注册表
 from graph.common.registry import (
     AGENT_REGISTRY,
-    BASE_DIR,
     WORKFLOWS,
     _load_builtin_workflows,
     arun_workflow_by_name,
     build_workflow,
-    get_workflow_runner,
     list_workflows,
     register_agent,
     register_workflow,
 )
 
+# 动态 State schema 组合器
+from graph.common.schema import compose_state_schema
+
 # 通用运行器
 from graph.common.workflow_runner import (
-    _aget_previous_workflow_summary,
     arun_compiled_workflow,
+    reset_round_counters,
 )
 
 # 加载内置工作流模块（触发自注册）— 放在所有子模块导入完成后调用，
@@ -59,22 +56,19 @@ _load_builtin_workflows()
 
 __all__ = [
     "AGENT_REGISTRY",
-    "BASE_DIR",
     "WORKFLOWS",
     "NodeCallback",
     "NodeSpec",
     "NodeTrackingHandler",
-    "_aget_previous_workflow_summary",
     "_build_compaction_middleware",
-    "_extract_node_output",
     "arun_compiled_workflow",
     "arun_workflow_by_name",
+    "build_tracking_callbacks",
     "build_workflow",
-    "create_llm_node",
-    "get_workflow_runner",
+    "compose_state_schema",
     "list_workflows",
     "register_agent",
     "register_nodes",
     "register_workflow",
-    "run_team_turn_with_interrupt",
+    "reset_round_counters",
 ]

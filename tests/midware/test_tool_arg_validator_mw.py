@@ -23,7 +23,7 @@ if ROOT not in sys.path:
 
 from langchain.messages import ToolMessage
 
-from agent.tool_arg_validator_mw import MutexRule, ToolArgValidatorMW
+from midware.tool_arg_validator_mw import MutexRule, ToolArgValidatorMW
 
 
 def _make_request(tool_name: str, args: dict) -> SimpleNamespace:

@@ -4,22 +4,33 @@
 from __future__ import annotations
 
 import asyncio
+import types
 from dataclasses import dataclass, field
+from typing import ClassVar
 from unittest.mock import patch
 
 import pytest
 
 from agent.turn_types import AgentTurnResult
 from cli.commands.workflow import workflow_command
+from graph.common.workflow_runner import arun_compiled_workflow
 from graph.simple import (
-    arun_simple_workflow,
     build_simple_workflow,
-    manager_plan_node,
-    summarize_context,
-    terminator_final_node,
-    worker_exec_node,
 )
 from team.base import TeamAgent
+from team.manager.manager import ManagerAgent
+from team.terminator.terminator import TerminatorAgent
+from team.worker.worker import WorkerAgent
+
+# simple 工作流特有的初始状态字段(原本在已删除的 arun_simple_workflow 内部,
+# 现已上移进 WORKFLOWS["simple"] 注册条目;测试持图对象故直接内联传给
+# arun_compiled_workflow,以保留图对象复用语义)
+SIMPLE_INITIAL_FIELDS: dict[str, str] = {
+    "context_summary": "",
+    "plan": "",
+    "worker_result": "",
+    "final_answer": "",
+}
 
 # 默认模板(与各角色 AGENT.md 的 ## workflow:* 小节一致,供 FakeAgent 兜底)
 DEFAULT_TEMPLATES: dict[str, str] = {
@@ -95,14 +106,49 @@ class FakeAgent:
         return AgentTurnResult.completed(self._next(prompt))
 
 
+@dataclass
+class FakeManagerAgent(FakeAgent):
+    """模拟 Manager 角色:声明 context_summary/plan 通道(与 ManagerAgent.state_fields 一致)。
+
+    __post_init__ 把 ManagerAgent 的真实节点方法 summarize_context_node 绑到
+    本实例上(types.MethodType):build_simple_workflow 的 NodeSpec 经
+    ``agents["manager"].summarize_context_node`` 取引用(register_nodes 的
+    bound-method 分支只补绑 injector),运行期执行的是真实节点逻辑,
+    执行后端由本 Fake 的 arun_structured 提供(不联网)。
+
+    注:必须重新加 @dataclass 装饰器——装饰器只在处理类体时检查
+    __post_init__ 是否存在并生成调用;父类 FakeAgent 类体无 __post_init__,
+    其 __init__ 不含调用,子类后补定义不会生效。
+    """
+
+    state_fields: ClassVar[dict[str, type]] = {"context_summary": str, "plan": str}
+
+    def __post_init__(self) -> None:
+        self.summarize_context_node = types.MethodType(
+            ManagerAgent.summarize_context_node, self
+        )
+
+
+class FakeWorkerAgent(FakeAgent):
+    """模拟 Worker 角色:声明 worker_result 通道(与 WorkerAgent.state_fields 一致)。"""
+
+    state_fields: ClassVar[dict[str, type]] = {"worker_result": str}
+
+
+class FakeTerminatorAgent(FakeAgent):
+    """模拟 Terminator 角色:声明 final_answer 通道(与 TerminatorAgent.state_fields 一致)。"""
+
+    state_fields: ClassVar[dict[str, type]] = {"final_answer": str}
+
+
 # ==================== 测试工作流节点 ====================
 
 def test_summarize_context_node():
-    """测试 summarize 节点:Manager 提炼记忆上下文摘要"""
-    manager = FakeAgent(name="manager", summary_response="记忆摘要: 项目背景A")
+    """测试 summarize 节点:Manager 提炼记忆上下文摘要(经 ManagerAgent 真实节点方法)"""
+    manager = FakeManagerAgent(name="manager", summary_response="记忆摘要: 项目背景A")
     state = {"raw_context": "用户: 之前聊过项目A"}
 
-    result = asyncio.run(summarize_context(state, manager))
+    result = asyncio.run(manager.summarize_context_node(state))
 
     assert result["context_summary"] == "记忆摘要: 项目背景A"
     assert len(manager.calls) == 1
@@ -114,10 +160,10 @@ def test_summarize_context_node():
 
 def test_manager_plan_node():
     """测试 Manager 节点:拆解任务"""
-    manager = FakeAgent(name="manager", response="计划: 步骤1、步骤2")
+    manager = FakeManagerAgent(name="manager", response="计划: 步骤1、步骤2")
     state = {"task": "帮我分析项目结构"}
     
-    result = asyncio.run(manager_plan_node(state, manager))
+    result = asyncio.run(ManagerAgent.plan_node(state, manager))
     
     assert result["plan"] == "计划: 步骤1、步骤2"
     assert len(manager.calls) == 1
@@ -127,10 +173,10 @@ def test_manager_plan_node():
 
 def test_worker_exec_node():
     """测试 Worker 节点:执行计划"""
-    worker = FakeAgent(name="worker", response="已完成步骤1和步骤2")
+    worker = FakeWorkerAgent(name="worker", response="已完成步骤1和步骤2")
     state = {"plan": "计划: 步骤1、步骤2"}
     
-    result = asyncio.run(worker_exec_node(state, worker))
+    result = asyncio.run(WorkerAgent.exec_node(state, worker))
     
     assert result["worker_result"] == "已完成步骤1和步骤2"
     assert len(worker.calls) == 1
@@ -140,14 +186,14 @@ def test_worker_exec_node():
 
 def test_terminator_final_node():
     """测试 Terminator 节点:汇总结果"""
-    terminator = FakeAgent(name="terminator", response="最终答案: 项目包含3个模块")
+    terminator = FakeTerminatorAgent(name="terminator", response="最终答案: 项目包含3个模块")
     state = {
         "task": "帮我分析项目结构",
         "plan": "计划: 步骤1、步骤2",
         "worker_result": "已完成步骤1和步骤2"
     }
     
-    result = asyncio.run(terminator_final_node(state, terminator))
+    result = asyncio.run(TerminatorAgent.final_node(state, terminator))
     
     assert result["final_answer"] == "最终答案: 项目包含3个模块"
     assert len(terminator.calls) == 1
@@ -160,10 +206,10 @@ def test_terminator_final_node():
 
 def test_manager_plan_node_with_summary():
     """测试 Manager 节点:有记忆摘要时注入摘要块"""
-    manager = FakeAgent(name="manager", response="计划")
+    manager = FakeManagerAgent(name="manager", response="计划")
     state = {"task": "任务", "context_summary": "用户偏好中文"}
 
-    result = asyncio.run(manager_plan_node(state, manager))
+    result = asyncio.run(ManagerAgent.plan_node(state, manager))
 
     assert result["plan"] == "计划"
     prompt = manager.calls[0][1]
@@ -173,7 +219,7 @@ def test_manager_plan_node_with_summary():
 
 def test_terminator_final_node_with_summary():
     """测试 Terminator 节点:有记忆摘要时注入摘要块"""
-    terminator = FakeAgent(name="terminator", response="最终答案")
+    terminator = FakeTerminatorAgent(name="terminator", response="最终答案")
     state = {
         "task": "任务",
         "plan": "计划",
@@ -181,7 +227,7 @@ def test_terminator_final_node_with_summary():
         "context_summary": "用户偏好中文",
     }
 
-    result = asyncio.run(terminator_final_node(state, terminator))
+    result = asyncio.run(TerminatorAgent.final_node(state, terminator))
 
     assert result["final_answer"] == "最终答案"
     prompt = terminator.calls[0][1]
@@ -191,14 +237,14 @@ def test_terminator_final_node_with_summary():
 
 def test_terminator_final_node_no_summary():
     """测试 Terminator 节点:无记忆摘要时摘要段头仍在但内容为空"""
-    terminator = FakeAgent(name="terminator", response="最终答案")
+    terminator = FakeTerminatorAgent(name="terminator", response="最终答案")
     state = {
         "task": "任务",
         "plan": "计划",
         "worker_result": "结果",
     }
 
-    asyncio.run(terminator_final_node(state, terminator))
+    asyncio.run(TerminatorAgent.final_node(state, terminator))
 
     prompt = terminator.calls[0][1]
     assert "记忆上下文摘要:" in prompt
@@ -211,14 +257,14 @@ def test_factory_nodes_do_not_inject_agent_rules():
     证明 create_llm_node 的 base_prompts="" 生效：三个标准节点的 prompt 与恢复文件的
     手写节点逐字一致，不注入 agent/AGENT.md 的「重要规则」/「工具规则」前缀。
     """
-    manager = FakeAgent(name="manager", response="计划")
-    worker = FakeAgent(name="worker", response="结果")
-    terminator = FakeAgent(name="terminator", response="答案")
+    manager = FakeManagerAgent(name="manager", response="计划")
+    worker = FakeWorkerAgent(name="worker", response="结果")
+    terminator = FakeTerminatorAgent(name="terminator", response="答案")
 
-    asyncio.run(manager_plan_node({"task": "任务", "context_summary": ""}, manager))
-    asyncio.run(worker_exec_node({"plan": "计划"}, worker))
+    asyncio.run(ManagerAgent.plan_node({"task": "任务", "context_summary": ""}, manager))
+    asyncio.run(WorkerAgent.exec_node({"plan": "计划"}, worker))
     asyncio.run(
-        terminator_final_node(
+        TerminatorAgent.final_node(
             {"task": "任务", "plan": "计划", "worker_result": "结果"}, terminator
         )
     )
@@ -281,9 +327,9 @@ def test_role_agent_md_strips_workflow_sections():
 
 def test_build_simple_workflow():
     """测试构建监督者工作流图"""
-    manager = FakeAgent(name="manager")
-    worker = FakeAgent(name="worker")
-    terminator = FakeAgent(name="terminator")
+    manager = FakeManagerAgent(name="manager")
+    worker = FakeWorkerAgent(name="worker")
+    terminator = FakeTerminatorAgent(name="terminator")
     
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
     
@@ -301,9 +347,9 @@ def test_build_simple_workflow():
 
 def test_workflow_edges():
     """测试工作流边的正确连接"""
-    manager = FakeAgent(name="manager")
-    worker = FakeAgent(name="worker")
-    terminator = FakeAgent(name="terminator")
+    manager = FakeManagerAgent(name="manager")
+    worker = FakeWorkerAgent(name="worker")
+    terminator = FakeTerminatorAgent(name="terminator")
     
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
     graph_obj = graph.get_graph()
@@ -333,9 +379,9 @@ def test_build_simple_workflow_with_prompt_file(tmp_path):
         encoding="utf-8",
     )
 
-    manager = FakeAgent(name="manager", response="计划X", summary_response="摘要S", prompt_file=str(manager_md))
-    worker = FakeAgent(name="worker", response="结果X", prompt_file=str(worker_md))
-    terminator = FakeAgent(name="terminator", response="答案X", prompt_file=str(terminator_md))
+    manager = FakeManagerAgent(name="manager", response="计划X", summary_response="摘要S", prompt_file=str(manager_md))
+    worker = FakeWorkerAgent(name="worker", response="结果X", prompt_file=str(worker_md))
+    terminator = FakeTerminatorAgent(name="terminator", response="答案X", prompt_file=str(terminator_md))
 
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
     asyncio.run(graph.ainvoke({
@@ -358,12 +404,12 @@ def test_build_simple_workflow_with_prompt_file(tmp_path):
 
 def test_run_simple_workflow():
     """测试运行工作流并验证状态流转"""
-    manager = FakeAgent(name="manager", response="计划: A、B、C")
-    worker = FakeAgent(name="worker", response="执行结果: 完成A、B、C")
-    terminator = FakeAgent(name="terminator", response="最终答案: 全部完成")
+    manager = FakeManagerAgent(name="manager", response="计划: A、B、C")
+    worker = FakeWorkerAgent(name="worker", response="执行结果: 完成A、B、C")
+    terminator = FakeTerminatorAgent(name="terminator", response="最终答案: 全部完成")
     
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
-    result = asyncio.run(arun_simple_workflow(graph, "测试任务"))
+    result = asyncio.run(arun_compiled_workflow(graph, "测试任务", initial_fields=SIMPLE_INITIAL_FIELDS))
     
     # 验证最终状态
     assert result["task"] == "测试任务"
@@ -389,7 +435,7 @@ def test_workflow_registry():
     # register_workflow 注册的是规格字典,不是裸函数
     assert isinstance(spec, dict)
     assert callable(spec["builder"])
-    assert spec["runner"] is not None
+    assert isinstance(spec["initial_fields"], dict)
 
 
 def test_build_workflow_unknown_name():
@@ -712,14 +758,14 @@ def test_workflow_command_parse():
 
 def test_workflow_thread_isolation():
     """测试多次运行使用独立 thread_id"""
-    manager = FakeAgent(name="manager", response="计划1")
-    worker = FakeAgent(name="worker", response="结果1")
-    terminator = FakeAgent(name="terminator", response="答案1")
+    manager = FakeManagerAgent(name="manager", response="计划1")
+    worker = FakeWorkerAgent(name="worker", response="结果1")
+    terminator = FakeTerminatorAgent(name="terminator", response="答案1")
     
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
     
     # 第一次运行
-    result1 = asyncio.run(arun_simple_workflow(graph, "任务1"))
+    result1 = asyncio.run(arun_compiled_workflow(graph, "任务1", initial_fields=SIMPLE_INITIAL_FIELDS))
     
     # 第二次运行(重置 agent 调用记录)
     manager.calls.clear()
@@ -729,7 +775,7 @@ def test_workflow_thread_isolation():
     worker.response = "结果2"
     terminator.response = "答案2"
     
-    result2 = asyncio.run(arun_simple_workflow(graph, "任务2"))
+    result2 = asyncio.run(arun_compiled_workflow(graph, "任务2", initial_fields=SIMPLE_INITIAL_FIELDS))
     
     # 验证两次运行结果独立
     assert result1["task"] == "任务1"
@@ -749,12 +795,12 @@ def test_workflow_thread_isolation():
 
 def test_run_simple_workflow_with_memory():
     """测试带记忆运行时:摘要注入 plan/final 节点,worker 不注入"""
-    manager = FakeAgent(name="manager", response="计划: A、B、C", summary_response="记忆摘要: 用户偏好中文")
-    worker = FakeAgent(name="worker", response="执行结果: 完成")
-    terminator = FakeAgent(name="terminator", response="最终答案: 完成")
+    manager = FakeManagerAgent(name="manager", response="计划: A、B、C", summary_response="记忆摘要: 用户偏好中文")
+    worker = FakeWorkerAgent(name="worker", response="执行结果: 完成")
+    terminator = FakeTerminatorAgent(name="terminator", response="最终答案: 完成")
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
 
-    result = asyncio.run(arun_simple_workflow(graph, "测试任务", raw_context="用户: 之前聊过偏好中文"))
+    result = asyncio.run(arun_compiled_workflow(graph, "测试任务", initial_fields=SIMPLE_INITIAL_FIELDS, raw_context="用户: 之前聊过偏好中文"))
 
     # manager 两次调用:summarize + plan(均经 arun_structured)
     assert manager.calls[0][0] == "arun_structured"
@@ -812,6 +858,14 @@ class FakeSession:
 
     async def aget_short_term(self, session_id=None):
         return []
+
+    async def aget_workspace(self, session_id=None):
+        """run_workflow 会读取当前会话 workspace 以继承到新工作流会话（本 fake 未绑定）。"""
+        return
+
+    async def aset_workspace(self, workspace_path, session_id=None):
+        """继承 workspace 的写入端（本 fake 未绑定 workspace，正常不会被调用）。"""
+        return workspace_path
 
 
 class FakeAgentCore:
@@ -926,15 +980,16 @@ def test_run_workflow_error_event():
 
 def test_run_simple_workflow_node_callbacks():
     """测试节点进度回调:4 个业务节点按链路顺序各触发 start/end 且 start 先于 end"""
-    manager = FakeAgent(name="manager", response="计划: A")
-    worker = FakeAgent(name="worker", response="结果: 完成")
-    terminator = FakeAgent(name="terminator", response="答案: 完成")
+    manager = FakeManagerAgent(name="manager", response="计划: A")
+    worker = FakeWorkerAgent(name="worker", response="结果: 完成")
+    terminator = FakeTerminatorAgent(name="terminator", response="答案: 完成")
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
 
     events: list[tuple[str, str]] = []
-    asyncio.run(arun_simple_workflow(
+    asyncio.run(arun_compiled_workflow(
         graph,
         "测试任务",
+        initial_fields=SIMPLE_INITIAL_FIELDS,
         on_node_start=lambda e: events.append(("start", e.node)),
         on_node_end=lambda e: events.append(("end", e.node)),
     ))
@@ -950,12 +1005,12 @@ def test_run_simple_workflow_node_callbacks():
 
 def test_run_simple_workflow_no_callbacks_still_works():
     """测试不传回调时工作流正常运行(向后兼容)"""
-    manager = FakeAgent(name="manager", response="计划")
-    worker = FakeAgent(name="worker", response="结果")
-    terminator = FakeAgent(name="terminator", response="答案")
+    manager = FakeManagerAgent(name="manager", response="计划")
+    worker = FakeWorkerAgent(name="worker", response="结果")
+    terminator = FakeTerminatorAgent(name="terminator", response="答案")
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
 
-    result = asyncio.run(arun_simple_workflow(graph, "测试任务"))
+    result = asyncio.run(arun_compiled_workflow(graph, "测试任务", initial_fields=SIMPLE_INITIAL_FIELDS))
     assert result["final_answer"] == "答案"
 
 
@@ -1230,9 +1285,9 @@ def test_workflow_cross_round_compression():
     """同一 thread_id + checkpointer 多轮运行时,第二轮注入上一轮工作流记录"""
     from langgraph.checkpoint.memory import MemorySaver
 
-    manager = FakeAgent(name="manager", response="计划: A、B、C", summary_response="摘要")
-    worker = FakeAgent(name="worker", response="执行结果: 完成")
-    terminator = FakeAgent(name="terminator", response="最终答案: 全部完成")
+    manager = FakeManagerAgent(name="manager", response="计划: A、B、C", summary_response="摘要")
+    worker = FakeWorkerAgent(name="worker", response="执行结果: 完成")
+    terminator = FakeTerminatorAgent(name="terminator", response="最终答案: 全部完成")
 
     checkpointer = MemorySaver()
     graph = build_simple_workflow(
@@ -1241,7 +1296,7 @@ def test_workflow_cross_round_compression():
     )
 
     # 第一轮:无历史,不注入
-    result1 = asyncio.run(arun_simple_workflow(graph, "第一轮任务", thread_id="wf-t1"))
+    result1 = asyncio.run(arun_compiled_workflow(graph, "第一轮任务", initial_fields=SIMPLE_INITIAL_FIELDS, thread_id="wf-t1"))
     assert result1["final_answer"] == "最终答案: 全部完成"
     # summarize 节点第一轮 raw_context 为空 → 短路不调 helper;
     # manager 只剩 manager_plan 一次调用(经 arun_structured)
@@ -1256,7 +1311,7 @@ def test_workflow_cross_round_compression():
     worker.response = "结果2"
     terminator.response = "答案2"
 
-    result2 = asyncio.run(arun_simple_workflow(graph, "第二轮任务", thread_id="wf-t1"))
+    result2 = asyncio.run(arun_compiled_workflow(graph, "第二轮任务", initial_fields=SIMPLE_INITIAL_FIELDS, thread_id="wf-t1"))
     assert result2["final_answer"] == "答案2"
 
     # summarize 节点收到上一轮工作流记录(经 arun_structured)
@@ -1270,9 +1325,9 @@ def test_workflow_cross_round_compression_truncation():
     """跨轮次记录超长时截断,不撑爆上下文"""
     from langgraph.checkpoint.memory import MemorySaver
 
-    manager = FakeAgent(name="manager", response="计划", summary_response="摘要")
-    worker = FakeAgent(name="worker", response="结果")
-    terminator = FakeAgent(name="terminator", response="答案")
+    manager = FakeManagerAgent(name="manager", response="计划", summary_response="摘要")
+    worker = FakeWorkerAgent(name="worker", response="结果")
+    terminator = FakeTerminatorAgent(name="terminator", response="答案")
 
     checkpointer = MemorySaver()
     graph = build_simple_workflow(
@@ -1280,11 +1335,11 @@ def test_workflow_cross_round_compression_truncation():
         checkpointer=checkpointer,
     )
 
-    asyncio.run(arun_simple_workflow(graph, "长内容任务 " + "X" * 500, thread_id="wf-t2"))
+    asyncio.run(arun_compiled_workflow(graph, "长内容任务 " + "X" * 500, initial_fields=SIMPLE_INITIAL_FIELDS, thread_id="wf-t2"))
 
     manager.calls.clear()
     result2 = asyncio.run(
-        arun_simple_workflow(graph, "第二轮", thread_id="wf-t2", max_history_chars=100)
+        arun_compiled_workflow(graph, "第二轮", initial_fields=SIMPLE_INITIAL_FIELDS, thread_id="wf-t2", max_history_chars=100)
     )
     assert result2["final_answer"] == "答案"
     summary_text = manager.calls[0][1]
@@ -1294,13 +1349,13 @@ def test_workflow_cross_round_compression_truncation():
 
 def test_workflow_cross_round_no_checkpointer():
     """无 checkpointer 时跨轮次压缩静默降级,不影响运行"""
-    manager = FakeAgent(name="manager", response="计划", summary_response="摘要")
-    worker = FakeAgent(name="worker", response="结果")
-    terminator = FakeAgent(name="terminator", response="答案")
+    manager = FakeManagerAgent(name="manager", response="计划", summary_response="摘要")
+    worker = FakeWorkerAgent(name="worker", response="结果")
+    terminator = FakeTerminatorAgent(name="terminator", response="答案")
 
     graph = build_simple_workflow({"manager": manager, "worker": worker, "terminator": terminator})
 
-    result = asyncio.run(arun_simple_workflow(graph, "任务", thread_id="wf-t3"))
+    result = asyncio.run(arun_compiled_workflow(graph, "任务", initial_fields=SIMPLE_INITIAL_FIELDS, thread_id="wf-t3"))
     assert result["final_answer"] == "答案"
     # 无 checkpointer → 无历史,summarize 节点 raw 为空 → 短路不调 helper;
     # manager.calls[0] 是 manager_plan 节点调用,prompt 含 manager_plan 模板内容

@@ -1,6 +1,6 @@
-"""llm.message_utils.extract_llm_error 的单元测试。"""
+"""llm.message_utils 的单元测试（extract_llm_error / final_answer_is_empty）。"""
 
-from llm.message_utils import extract_llm_error
+from llm.message_utils import extract_llm_error, final_answer_is_empty
 
 
 def test_extract_429_json_message():
@@ -50,3 +50,57 @@ def test_extract_empty_exception_fallback():
     """空错误信息：使用异常类型名兜底。"""
     result = extract_llm_error(RuntimeError())
     assert result == "执行出错: RuntimeError"
+
+
+# ============ final_answer_is_empty ============
+
+
+def _ai(content: str = "", *, finish_reason: str | None = None, tool_calls: list | None = None):
+    """构造测试用 AIMessage。"""
+    from langchain_core.messages import AIMessage
+
+    kwargs: dict = {}
+    if finish_reason is not None:
+        kwargs["response_metadata"] = {"finish_reason": finish_reason}
+    return AIMessage(content=content, tool_calls=tool_calls or [], **kwargs)
+
+
+def test_final_answer_none_message():
+    """无消息：非终态，返回 None。"""
+    assert final_answer_is_empty(None) is None
+
+
+def test_final_answer_with_tool_calls():
+    """带 tool_calls：仍在工具循环中，返回 None。"""
+    msg = _ai("", tool_calls=[{"name": "t", "args": {}, "id": "c1", "type": "tool_call"}])
+    assert final_answer_is_empty(msg) is None
+
+
+def test_final_answer_with_content():
+    """有内容：正常回答，返回 None。"""
+    assert final_answer_is_empty(_ai("正常回答", finish_reason="stop")) is None
+
+
+def test_final_answer_empty_length_mentions_max_tokens():
+    """空内容 + finish_reason=length：提示提高 max_tokens（推理 token 耗尽预算）。"""
+    reason = final_answer_is_empty(_ai("", finish_reason="length"))
+    assert reason is not None
+    assert "finish_reason=length" in reason
+    assert "max_tokens" in reason
+
+
+def test_final_answer_empty_network_error_mentions_retry_not_max_tokens():
+    """空内容 + finish_reason=network_error：提示网络重试，不误导提 max_tokens。"""
+    reason = final_answer_is_empty(_ai("", finish_reason="network_error"))
+    assert reason is not None
+    assert "finish_reason=network_error" in reason
+    assert "max_tokens" not in reason
+    assert "重试" in reason
+
+
+def test_final_answer_empty_unknown_finish_reason():
+    """空内容 + 无 response_metadata：通用兜底文案，不提 max_tokens。"""
+    reason = final_answer_is_empty(_ai(""))
+    assert reason is not None
+    assert "finish_reason=unknown" in reason
+    assert "max_tokens" not in reason

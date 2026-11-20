@@ -2,7 +2,7 @@
 
 arun_compiled_workflow 封装了跨轮次记忆压缩、长期记忆召回注入、
 节点进度回调、workspace 隔离等通用逻辑，各工作流只需提供
-自己特有的初始状态字段（state_fields）。
+自己特有的初始状态字段（initial_fields）。
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from typing import Any
 
 from langgraph.graph import StateGraph
 
-from graph.common.node_tracking import NodeCallback, NodeTrackingHandler
+from graph.common.node_tracking import NodeCallback, build_tracking_callbacks
 from utils.events import AgentEvent
 from utils.logging_config import TraceContext
 
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 async def arun_compiled_workflow(
     graph: StateGraph,
     task: str,
-    state_fields: dict[str, Any] | None = None,
+    initial_fields: dict[str, Any] | None = None,
     raw_context: str = "",
     thread_id: str | None = None,
     workspace_path: str | None = None,
@@ -38,13 +38,15 @@ async def arun_compiled_workflow(
 ) -> dict:
     """通用异步工作流运行器 - 所有工作流共享的 ainvoke 逻辑
 
-    各工作流只需提供自己特有的初始状态字段（state_fields），通用字段
-    （task / raw_context / context_summary）由本函数自动填充。
+    各工作流只需提供自己特有的初始状态字段（initial_fields），通用底座字段
+    （task / raw_context）由本函数自动填充；context_summary 等角色声明通道
+    由调用方经 initial_fields 显式传入（见 D2）。
 
     Args:
         graph: 编译好的 LangGraph StateGraph
         task: 用户任务
-        state_fields: 工作流特有的初始状态字段（值为空串的占位）
+        initial_fields: 工作流特有的初始状态字段（键须为图的已声明 state 通道，
+            否则在可自省 schema 时抛 ValueError；值为空串的占位）
         raw_context: 原始记忆文本，为空则不注入记忆
         thread_id: 会话线程 ID。为 None 时自动生成（无持久化绑定）
         workspace_path: 会话绑定的工作空间绝对路径
@@ -66,7 +68,7 @@ async def arun_compiled_workflow(
 
     with TraceContext(trace_id=tid, thread_id=tid):
         return await _arun_with_trace(
-            graph, task, state_fields, raw_context, tid,
+            graph, task, initial_fields, raw_context, tid,
             workspace_path, on_node_start, on_node_end, on_node_error,
             max_history_chars, memory, memory_thread_id, is_run_mode,
             active_skills,
@@ -76,7 +78,7 @@ async def arun_compiled_workflow(
 async def _arun_with_trace(
     graph: StateGraph,
     task: str,
-    state_fields: dict[str, Any] | None,
+    initial_fields: dict[str, Any] | None,
     raw_context: str,
     tid: str,
     workspace_path: str | None,
@@ -115,27 +117,25 @@ async def _arun_with_trace(
     initial_state: dict[str, Any] = {
         "task": task,
         "raw_context": raw_context,
-        "context_summary": "",
     }
     # 仅当显式传入非空技能时才写入 initial_state：正常重跑时该字段由
     # checkpoint 恢复（per-thread 持久化的手动加载技能），若无条件覆盖会清空它
     if active_skills:
         initial_state["active_skills"] = list(active_skills)
-    if state_fields:
-        initial_state.update(state_fields)
+    if initial_fields:
+        _guard_initial_fields_subset(graph, initial_fields)
+        initial_state.update(initial_fields)
+    # 新一轮任务开始：轮次计数器归零，避免跨任务累计（HITL 恢复 / 断点重试
+    # 不经过本函数，因此不会被清零）
+    reset_round_counters(graph, initial_state)
 
     if on_node_start or on_node_end or on_node_error:
-        known_nodes = {
-            n.id for n in graph.get_graph().nodes.values() if not n.id.startswith("__")
-        }
-        config["callbacks"] = [
-            NodeTrackingHandler(
-                known_nodes,
-                on_node_start=on_node_start,
-                on_node_end=on_node_end,
-                on_node_error=on_node_error,
-            )
-        ]
+        config["callbacks"] = build_tracking_callbacks(
+            graph,
+            on_node_start=on_node_start,
+            on_node_end=on_node_end,
+            on_node_error=on_node_error,
+        )
 
     result = await graph.ainvoke(initial_state, config=config)
 
@@ -153,6 +153,76 @@ async def _arun_with_trace(
 
     logger.info("工作流执行完成 [thread=%s]", tid)
     return result
+
+
+def _guard_initial_fields_subset(
+    graph: StateGraph, initial_fields: dict[str, Any]
+) -> None:
+    """轻量守卫：initial_fields 的键必须是图的已声明 state 通道。
+
+    LangGraph 对未知输入键静默丢弃，initial_fields 拼错字段名不会报错、只会
+    静默丢字段（见计划 §4.7 Oracle 守护）。这里自省图的 schema 通道集合，
+    存在未声明键时抛 ``ValueError``（中文提示，列出全部违规键）。
+
+    schema 自省放在 try/except 中（fail-open）：若当前 LangGraph 版本取不到
+    通道集合，则跳过守卫，不阻断既有调用方。
+    """
+    try:
+        declared = _schema_channel_names(graph)
+    except Exception as error:  # 自省不可用时跳过守卫（fail-open）
+        logger.debug("自省 workflow 图 schema 失败,跳过 initial_fields 子集守卫: %s", error)
+        return
+    unexpected = sorted(set(initial_fields) - declared)
+    if unexpected:
+        raise ValueError(
+            f"initial_fields 含未在 workflow State schema 中声明的通道: {unexpected};"
+            f" 请核对键名（可用通道: {sorted(declared)}）"
+        )
+
+
+_ROUND_COUNTER_SUFFIX = "round"
+_ROUND_LIMIT_FIELDS = frozenset({"max_rounds"})
+
+
+def reset_round_counters(graph: StateGraph, state: dict[str, Any]) -> None:
+    """把"新任务开跑时应归零"的轮次计数器写入 ``state``（原地修改）。
+
+    workflow 的 checkpoint 按 thread 持久化，``round`` 等计数器会随会话
+    跨任务累积——若不重置，同一会话的第二条任务一开局就已接近
+    ``max_rounds`` 上限，表现为"迭代环只走一次"/"仿真失败一次即交付"。
+
+    识别规则：State 通道名以 ``round`` 结尾即视为计数器（如 ``round`` /
+    ``retry_round``）；上限字段 ``max_rounds`` 除外。schema 自省不可用时
+    退化为当前 state 的键（fail-open，不清零也不阻断执行）。
+
+    调用点仅限"新任务注入"入口（``arun_compiled_workflow`` 与
+    ``WorkflowAdapter.arun_events``）：``Command(resume=...)`` 恢复与
+    ``ainvoke(None)`` 断点重试不走这两个入口，故轮次语义保持不变。
+    """
+    try:
+        channels = _schema_channel_names(graph)
+    except Exception as error:  # 自省不可用时跳过（fail-open）
+        logger.debug("自省 workflow 图 schema 失败,跳过轮次计数器清零: %s", error)
+        channels = set(state)
+    for key in channels:
+        if key.endswith(_ROUND_COUNTER_SUFFIX) and key not in _ROUND_LIMIT_FIELDS:
+            state[key] = 0
+
+
+def _schema_channel_names(graph: StateGraph) -> set[str]:
+    """从编译图提取已声明的 state 通道名集合。
+
+    优先用 ``get_input_jsonschema()``（只含真实 state 通道，无内部哨兵/分支
+    节点名）；回退到 ``graph.channels``（含 __start__ / __pregel_tasks /
+    branch:* 等内部键，仅放大允许集合，不影响子集守卫正确性）。
+    """
+    schema = graph.get_input_jsonschema()
+    if isinstance(schema, dict):
+        properties = schema.get("properties") or {}
+        if properties:
+            return set(properties)
+    channels = getattr(graph, "channels", None)
+    return set(channels) if channels else set()
 
 
 async def _aget_previous_workflow_summary(

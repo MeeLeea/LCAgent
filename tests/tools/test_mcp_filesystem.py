@@ -140,7 +140,7 @@ class TestMCPFilesystemWorkspaceIsolation:
         self, mcp_pool, workspace_a
     ):
         """中间件把相对路径解析为 workspace 内绝对路径后传给 MCP 工具。"""
-        from agent.workspace_mw import WorkspaceSecurityMW
+        from midware.workspace_mw import WorkspaceSecurityMW
 
         mw = WorkspaceSecurityMW()
         read_file_tool = next(
@@ -172,7 +172,7 @@ class TestMCPFilesystemWorkspaceIsolation:
         self, mcp_pool, workspace_a, workspace_b
     ):
         """两会话绑定不同 workspace，A 无法读 B 的文件。"""
-        from agent.workspace_mw import WorkspaceSecurityMW
+        from midware.workspace_mw import WorkspaceSecurityMW
 
         mw = WorkspaceSecurityMW()
         read_file_tool = next(

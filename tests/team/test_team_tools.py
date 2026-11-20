@@ -69,8 +69,8 @@ def test_tool_agent_middleware_chain(monkeypatch):
 
     TeamAgent(name="test", tools=[_echo], system_prompt="sys")
 
-    from agent.tool_error_mw import ToolExecutionErrorMW
-    from agent.workspace_mw import WorkspaceSecurityMW
+    from midware.tool_error_mw import ToolExecutionErrorMW
+    from midware.workspace_mw import WorkspaceSecurityMW
 
     mw_types = [type(m) for m in captured["middleware"]]
     assert ToolExecutionErrorMW in mw_types
