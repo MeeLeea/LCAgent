@@ -125,6 +125,9 @@ async def _arun_with_trace(
     if initial_fields:
         _guard_initial_fields_subset(graph, initial_fields)
         initial_state.update(initial_fields)
+    # 新一轮任务开始：轮次计数器归零，避免跨任务累计（HITL 恢复 / 断点重试
+    # 不经过本函数，因此不会被清零）
+    reset_round_counters(graph, initial_state)
 
     if on_node_start or on_node_end or on_node_error:
         config["callbacks"] = build_tracking_callbacks(
@@ -175,6 +178,35 @@ def _guard_initial_fields_subset(
             f"initial_fields 含未在 workflow State schema 中声明的通道: {unexpected};"
             f" 请核对键名（可用通道: {sorted(declared)}）"
         )
+
+
+_ROUND_COUNTER_SUFFIX = "round"
+_ROUND_LIMIT_FIELDS = frozenset({"max_rounds"})
+
+
+def reset_round_counters(graph: StateGraph, state: dict[str, Any]) -> None:
+    """把"新任务开跑时应归零"的轮次计数器写入 ``state``（原地修改）。
+
+    workflow 的 checkpoint 按 thread 持久化，``round`` 等计数器会随会话
+    跨任务累积——若不重置，同一会话的第二条任务一开局就已接近
+    ``max_rounds`` 上限，表现为"迭代环只走一次"/"仿真失败一次即交付"。
+
+    识别规则：State 通道名以 ``round`` 结尾即视为计数器（如 ``round`` /
+    ``retry_round``）；上限字段 ``max_rounds`` 除外。schema 自省不可用时
+    退化为当前 state 的键（fail-open，不清零也不阻断执行）。
+
+    调用点仅限"新任务注入"入口（``arun_compiled_workflow`` 与
+    ``WorkflowAdapter.arun_events``）：``Command(resume=...)`` 恢复与
+    ``ainvoke(None)`` 断点重试不走这两个入口，故轮次语义保持不变。
+    """
+    try:
+        channels = _schema_channel_names(graph)
+    except Exception as error:  # 自省不可用时跳过（fail-open）
+        logger.debug("自省 workflow 图 schema 失败,跳过轮次计数器清零: %s", error)
+        channels = set(state)
+    for key in channels:
+        if key.endswith(_ROUND_COUNTER_SUFFIX) and key not in _ROUND_LIMIT_FIELDS:
+            state[key] = 0
 
 
 def _schema_channel_names(graph: StateGraph) -> set[str]:

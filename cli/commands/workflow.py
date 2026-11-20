@@ -15,18 +15,42 @@ from .types import HANDLED, CommandContext, CommandOutcome
 logger = logging.getLogger(__name__)
 
 
+def _choice_options(choices: Any) -> list[tuple[str, str]]:
+    """把 interrupt 的 choices 列表归一化为 select_menu 的 (label, id) 选项"""
+    options: list[tuple[str, str]] = []
+    for choice in choices or []:
+        if isinstance(choice, dict):
+            label = str(choice.get("label") or choice.get("id", ""))
+            options.append((label, str(choice.get("id", ""))))
+        else:
+            options.append((str(choice), str(choice)))
+    return options
+
+
 def _render_interrupt_choices(ev: dict[str, Any], context: CommandContext) -> None:
-    """渲染 interrupt 事件的 prompt + choices（参考 human_input.render_human_interrupt）。"""
+    """渲染 interrupt 事件的 prompt + 选项（参考 human_input.render_human_interrupt）
+
+    两种形态：
+    - ``user_confirmation``（分组）：``items`` 内每个问题有独立选项，逐问题列出；
+    - ``human_choice`` / ``dangerous_command``（单选）：顶层 ``choices`` 平铺。
+    """
     prompt = str(ev.get("prompt") or "需要人工输入")
     context.print()
     for line in prompt.split("\n"):
         context.print(line.strip())
-    choices = ev.get("choices") or []
-    for choice in choices:
-        if isinstance(choice, dict):
-            cid = str(choice.get("id", ""))
-            label = str(choice.get("label", cid))
-            context.print(f"  [{cid}] {label}")
+    items = ev.get("items") or []
+    if items:
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id", ""))
+            question = str(item.get("question") or item_id)
+            context.print(f"  [{item_id}] {question}")
+            for cid, label in _choice_options(item.get("choices")):
+                context.print(f"    - [{cid}] {label}")
+        return
+    for cid, label in _choice_options(ev.get("choices")):
+        context.print(f"  [{cid}] {label}")
 
 
 def _collect_interrupt_choice(
@@ -35,31 +59,45 @@ def _collect_interrupt_choice(
 ) -> dict[str, Any]:
     """收集用户对 interrupt 的选择，返回 resume payload。
 
-    约定（对照 tools/safety.py:606-609 与 cli/human_input.py:82-98）：
-      {"choice_id": "<id>"}  -> 选择某个 choice
-      {"cancelled": True}    -> 用户取消（Esc/空输入）
+    约定：
+    - ``user_confirmation``（``items`` 分组）：
+      ``{"answers": {item_id: {"choice_id": selected_id}}}``
+      （对照 tools/human_confirmation.py 的 resume 契约）
+    - ``human_choice`` / ``dangerous_command``（顶层 choices 单选）：
+      ``{"choice_id": "<id>"}``（对照 tools/safety.py 与 cli/human_input.py）
+    - ``{"cancelled": True}`` -> 用户取消（Esc/空输入）
     """
     _render_interrupt_choices(ev, context)
+    items = ev.get("items") or []
+    if items:
+        # 分组模式：每个问题独立选择，全部回答后一次性提交
+        answers: dict[str, dict[str, str]] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id", ""))
+            options = _choice_options(item.get("choices"))
+            if not options:
+                continue
+            selected = context.select_menu(
+                str(item.get("question") or item_id), options
+            )
+            if selected is None:
+                return {"cancelled": True}
+            answers[item_id] = {"choice_id": selected}
+        return {"answers": answers} if answers else {"cancelled": True}
+
     choices = ev.get("choices") or []
     if not choices:
         # 非结构化中断回退到自由文本
         text = context.input("请输入: ").strip()
         return {"text": text} if text else {"cancelled": True}
 
-    options = []
-    for choice in choices:
-        if isinstance(choice, dict):
-            label = str(choice.get("label") or choice.get("id", ""))
-            options.append((label, str(choice.get("id", ""))))
-        else:
-            options.append((str(choice), str(choice)))
-
-    selected = context.select_menu(
-        str(ev.get("prompt") or "请选择"), options
-    )
+    selected = context.select_menu(str(ev.get("prompt") or "请选择"), _choice_options(choices))
     if selected is None:
         return {"cancelled": True}
     return {"choice_id": selected}
+
 
 
 async def run_workflow(context: CommandContext, name: str, task: str) -> dict:
@@ -138,6 +176,7 @@ async def run_workflow(context: CommandContext, name: str, task: str) -> dict:
                 resume_payload = None
 
             got_done = False
+            paused = False
             async for ev_dict in stream:
                 ev_type = ev_dict.get("type")
                 if ev_type == "workflow_node":
@@ -159,18 +198,31 @@ async def run_workflow(context: CommandContext, name: str, task: str) -> dict:
                     )
                     _emit(ev_dict)
                     got_done = True
-                elif ev_type == "interrupt":
-                    # 展示 prompt + choices 并收集用户答案（参考
-                    # cli/human_input.py 的 render_human_interrupt +
-                    # read_human_resume 模式；resume 负载约定
-                    # {"choice_id": "<id>"} / {"cancelled": True}，
-                    # 对照 tools/safety.py:606-609）
-                    resume_payload = _collect_interrupt_choice(ev_dict, context)
+                elif ev_type == "heartbeat":
+                    # 静默期心跳：节点内 LLM 长流式 / 工具长执行期间事件泵补发，
+                    # 必须转发给 SSE 客户端（前端仅重置看门狗、不渲染 UI），
+                    # 否则工作流长节点会被前端 90s 看门狗误判"响应超时"拉黑线程。
                     _emit(ev_dict)
+                elif ev_type == "interrupt":
+                    # 先转发事件：SSE 需要立即把中断卡片推给前端
+                    _emit(ev_dict)
+                    if not context.interactive:
+                        # 非交互入口（HTTP API）：不在后端替用户作答。直接退出，
+                        # 把 pending interrupt 留在外层图里，等前端调用
+                        # /api/chat/resume 携带答案恢复（否则会用 choices[0]
+                        # 秒答，用户根本没机会选择）。
+                        logger.info(
+                            "[workflow] 非交互入口遇到中断，保留 pending interrupt 等待 resume"
+                        )
+                        paused = True
+                        break
+                    # 交互入口（CLI）：渲染选项并收集答案（resume 负载约定见
+                    # _collect_interrupt_choice），由外层 while 续跑
+                    resume_payload = _collect_interrupt_choice(ev_dict, context)
                     # 跳出内层 for，由外层 while 调 aresume_stream 续跑
                     break
 
-            if resume_payload is None or got_done:
+            if paused or resume_payload is None or got_done:
                 break
     finally:
         # 无论成功失败都复位整体状态,避免前端 UI 停留在"运行中"

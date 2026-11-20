@@ -185,3 +185,71 @@ class TestLoadMcpToolsByNameSync:
 
             result = load_mcp_tools_by_name_sync(["not_exist"])
             assert result == []
+
+
+class TestLoadMcpToolsLogLevel:
+    """load_mcp_tools 成功加载日志的级别契约。
+
+    背景：工作流每次构建/恢复都会逐角色重新加载 MCP 工具（按名加载路径
+    aload_mcp_tools_by_name 内部委托 load_mcp_tools），同一启动周期内
+    "MCP x: 加载了 N 个工具" 日志会重复十余次刷屏，已降为 DEBUG。
+    本测试守护该级别不被回退到 INFO。
+    """
+
+    def _write_config(self, tmp_path):
+        """写一个仅含单个启用 stdio server 的临时 MCP 配置文件。"""
+        import json
+
+        config_file = tmp_path / "mcp_servers.json"
+        config_file.write_text(
+            json.dumps({
+                "servers": {
+                    "fake": {
+                        "transport": "stdio",
+                        "command": "python",
+                        "args": ["-c", "pass"],
+                        "enabled": True,
+                    }
+                }
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return str(config_file)
+
+    def test_success_load_logs_at_debug_level(self, tmp_path, caplog):
+        """成功加载工具时记录 DEBUG 级日志，不产生 INFO 级刷屏。"""
+        import logging
+
+        class FakeClient:
+            """MultiServerMCPClient 桩：get_tools 返回两个伪造工具。"""
+
+            def __init__(self, servers):
+                self.servers = servers
+
+            async def get_tools(self):
+                return [
+                    _make_fake_tool("fake_tool_a"),
+                    _make_fake_tool("fake_tool_b"),
+                ]
+
+        config_file = self._write_config(tmp_path)
+
+        async def _run():
+            with patch(
+                "langchain_mcp_adapters.client.MultiServerMCPClient",
+                new=FakeClient,
+            ):
+                from tools.mcp_loader import load_mcp_tools
+
+                return await load_mcp_tools(config_file)
+
+        with caplog.at_level(logging.DEBUG, logger="tools.mcp_loader"):
+            tools = asyncio.run(_run())
+
+        assert len(tools) == 2
+        loaded_records = [
+            r for r in caplog.records
+            if r.name == "tools.mcp_loader" and "加载了" in r.getMessage()
+        ]
+        assert len(loaded_records) == 1
+        assert loaded_records[0].levelno == logging.DEBUG

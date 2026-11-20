@@ -1282,6 +1282,9 @@ async def chat(req: ChatRequest, request: Request):
                             mcp_config_file=MCP_CONFIG_FILE,
                             workflow_event_cb=emit_workflow_event,
                             workflow_sm=workflow_sm,
+                            # 非交互入口：遇到 interrupt 不在后端替用户作答，
+                            # 保留 pending interrupt 交由 /api/chat/resume 恢复
+                            interactive=False,
                         )
                         
                         # 执行型命令（json:/react:/cot:/skill:<task>）走流式通道
@@ -1454,7 +1457,16 @@ async def chat_resume(req: ResumeRequest, request: Request):
             _active_streams[tid] = stream
 
             async def source() -> AsyncIterator[dict[str, Any]]:
-                async for ev_dict in agent.session_manager.aresume_stream(req.payload, thread_id=tid):
+                # 工作流会话的中断挂在外层 workflow 图上，必须经 workflow_sm
+                # （绑定 WorkflowAdapter）恢复；若走 agent 的会话管理器只会恢复
+                # chat 图，工作流会原地不动并秒回「完成」。
+                if workflow_sm is not None and agent.session.is_workflow_session(tid):
+                    resume_stream = workflow_sm.aresume_stream(req.payload, thread_id=tid)
+                else:
+                    resume_stream = agent.session_manager.aresume_stream(
+                        req.payload, thread_id=tid
+                    )
+                async for ev_dict in resume_stream:
                     await stream.publish(ev_dict)
                     yield ev_dict
 
@@ -1556,19 +1568,56 @@ async def chat_retry(req: RetryRequest, request: Request):
 
 @app.get("/api/threads/{thread_id}/stream-status")
 async def thread_stream_status(thread_id: str):
-    """查询线程流式状态 + 最近一次工作流失败记录。
+    """查询线程流式状态 + 断点/挂起语义 + 最近一次工作流失败记录。
 
     - streaming: 是否有正在进行的流（前端刷新后据此决定是否 attach）
     - failure: workflow 会话的最近失败记录 {"node", "error", "ts"}（无则 None），
       前端据此还原失败节点红态与重试入口
+    - pending_interrupt: 挂起的人工确认 {"kind", "payload"}（无则 None），
+      来源为 ``graph.aget_state`` 的挂起中断；无图/无状态/异常时恒为 None
+    - resumable: 是否还有待执行任务（``StateSnapshot.next`` 非空即可从断点续跑）
+    - resume_kind: 恢复入口类型，判定优先级见下
+
+    ``resume_kind`` 优先级（前端据此选择恢复入口）：
+
+    1. 有 ``pending_interrupt`` → ``"interrupt"``（人工确认卡片，POST /api/chat/resume）
+    2. 有 ``failure`` 记录 → ``"retry"``（从失败节点重试，POST /api/chat/retry；
+       不可续跑时前端自行提示"无可恢复断点"）
+    3. 无挂起、无 failure、``resumable`` → ``"resume"``（从断点继续，
+       POST /api/chat/resume）
+    4. 其余 → ``None``
+
+    ``streaming`` 为真时仍返回真实的 ``resumable`` / ``pending_interrupt``
+    （前端以 ``streaming`` 优先判断"后台仍在跑"，不短路为默认值）。
     """
     failure = None
+    resume_state = None
     if workflow_sm is not None and agent and agent.session.is_workflow_session(thread_id):
         failure = await workflow_sm.aget_failure(thread_id)
+        resume_state = await workflow_sm.aget_resume_state(thread_id)
+
+    # 非 workflow 会话 / 图不可用时 resume_state 为 None，防御式取默认值
+    pending_interrupt = getattr(resume_state, "pending_interrupt", None)
+    resumable = bool(getattr(resume_state, "resumable", False))
+
+    if pending_interrupt is not None:
+        resume_kind: str | None = "interrupt"
+    elif failure is not None:
+        # 无挂起但有失败记录：无论能否续跑都返回 retry（保持旧行为，
+        # 不可续跑时前端自行报"无可恢复断点"）
+        resume_kind = "retry"
+    elif resumable:
+        resume_kind = "resume"
+    else:
+        resume_kind = None
+
     return {
         "thread_id": thread_id,
         "streaming": thread_id in _active_streams,
         "failure": failure,
+        "pending_interrupt": pending_interrupt,
+        "resumable": resumable,
+        "resume_kind": resume_kind,
     }
 
 
@@ -1680,6 +1729,8 @@ async def execute_command(req: CommandRequest):
                 base_dir=BASE_DIR,
                 config_file=AGENT_CONFIG_FILE,
                 mcp_config_file=MCP_CONFIG_FILE,
+                # 命令执行入口同样是非交互的（中断交由 /api/chat/resume 恢复）
+                interactive=False,
             )
             
             outcome = await dispatch_command(context, command)

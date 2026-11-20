@@ -92,7 +92,9 @@
     - [工具超时保护（Tool Timeout）](#工具超时保护tool-timeout)
     - [统一异常层次](#统一异常层次)
   - [异步 Public API](#异步-public-api)
-  - [定时任务调度（Scheduler）](#定时任务调度scheduler)
+- [后台方案设计子程序（Planner）](#后台方案设计子程序planner)
+- [后台任务执行子程序（Executor）](#后台任务执行子程序executor)
+- [定时任务调度（Scheduler）](#定时任务调度scheduler)
     - [工具接口](#工具接口)
     - [快速开始](#快速开始-1)
     - [模块结构](#模块结构)
@@ -129,6 +131,7 @@
     - [4. `safety.json` — 安全护栏](#4-safetyjson--安全护栏)
     - [5. `remote_control.json` — 远程控制（飞书）](#5-remote_controljson--远程控制飞书)
     - [6. `scheduler_config.json` — 定时任务调度](#6-scheduler_configjson--定时任务调度)
+  - [subagent 统一配置文件（`subagent/config.json`）](#subagent-统一配置文件subagentconfigjson)
   - [测试](#测试)
     - [运行测试](#运行测试)
   - [技术栈](#技术栈)
@@ -230,6 +233,30 @@ LangChainAgent/
 │   ├── executor.py          # AgentCore 异步执行桥接(acreate/arun/aclose 单 loop)
 │   ├── engine.py            # APScheduler 引擎
 │   └── run.py               # 独立进程入口
+├── subagent/                # 后台子程序（独立进程，经 @tool 调用）
+│   ├── common/               # 子程序共享件（仅标准库，禁止反向 import planner/executor）
+│   │   ├── fsx.py            # 原子写/任务 ID/裸名校验/时间戳/文本截断(TRUNCATION_SUFFIX)
+│   │   ├── proc.py           # 分离进程启动 + Windows PID 存活探测
+│   │   ├── paths.py          # 路径归一化/包含校验/workspace 拒绝清单
+│   │   ├── task_state.py     # 任务状态常量(STATUS_*/ping/cancel.flag/终态判定，planner/executor 共用唯一事实源)
+│   │   ├── task_store.py     # TaskStoreBase 基类(原子写/独占认领/PID 回收/取消请求/文本读写复用流程)
+│   │   ├── prompt.py         # AGENT.md 解析(parse_workflow_section)+占位符渲染(render_placeholders)
+│   │   ├── awaitx.py         # await_with_cancel:超时+取消轮询包装(LLM 调用的超时/用户取消统一语义)
+│   │   └── config.py         # 子程序配置模块(通用机制 build_config/resolve_llm_settings + PlannerConfig/ExecutorConfig 默认值总表 + load_planner_config/load_executor_config)
+│   ├── config.json           # 统一子程序配置文件(planner/executor 两节小节，已入库)
+│   ├── planner/              # 复杂需求的后台方案设计子程序（一次性，无记忆）
+│   │   ├── AGENT.md          # 系统提示词 + 单个 ## workflow:design 模板
+│   │   ├── store.py          # 继承 common.task_store.TaskStoreBase（plan.md 产物 + 取消文案）
+│   │   ├── launcher.py       # detached 进程启动 + PID 存活检测 + preflight
+│   │   └── worker.py         # 子进程入口:一次 LLM 调用 → plan.md（薄包装 common.prompt/awaitx）
+│   └── executor/             # 后台多步任务执行子程序（受限工具集 ReAct 循环）
+│       ├── AGENT.md          # 系统提示词 + ## workflow:execute 模板
+│       ├── store.py          # 继承 common.task_store.TaskStoreBase（result.md 产物 + 取消文案）
+│       ├── workspace.py      # 显式 workspace 校验（拒绝清单/系统目录）
+│       ├── tools.py          # 受限工具集工厂（read_file/write_file/list_dir）
+│       ├── launcher.py       # detached 进程启动 + preflight（复用 common.proc）
+│       ├── worker.py         # 子进程入口：ReAct 工具循环 → result.md（薄包装 common.prompt/awaitx）
+│       └── tool.py           # 3 个 @tool：start/query/cancel
 ├── data/                  # 运行时数据库目录（自动生成）
 │   ├── checkpoints_async.sqlite # Checkpoint 持久化数据库 + 长期记忆 Store（同一文件）
 │   └── scheduled_tasks.sqlite# 定时任务数据库
@@ -374,6 +401,7 @@ LangChainAgent/
 │   ├── memory/              # 记忆：AgentMemory、MemoryManager、ThreadMemoryStore、读写中间件
 │   ├── scheduler/           # 定时任务：TaskStore CRUD、原子抢占、执行器与调度引擎
 │   ├── session/             # 会话存储、WorkspaceStore 映射、WorkflowAdapter
+│   ├── subagent/             # 后台子程序：planner/executor 的 store/launcher/worker/tool 测试 + common 共享件测试 + _fakes 共享夹具
 │   ├── team/                # 团队：TeamAgent 基类、角色切换与 LLM 重建
 │   ├── tools/               # 工具：calculator/create_tool/terminal/safety/search/MCP/包装器
 │   └── utils/               # 公共组件：events/metrics/logging/exceptions
@@ -412,6 +440,9 @@ LangChainAgent/
 | [cli/commands/types.py](cli/commands/types.py)                           | 命令依赖上下文、活动 LLM 状态和分发结果类型                                                                                                                                                                                                                                                                                                                                                        |
 | [cli/commands/](cli/commands/)                                           | 会话、记忆、模型、MCP、技能、安全及 Agent 执行命令                                                                                                                                                                                                                                                                                                                                                 |
 | [scheduler/](scheduler/)                                                 | 定时任务调度：TaskStore（SQLite CRUD）、SchedulerEngine（APScheduler 轮询）、独立进程入口                                                                                                                                                                                                                                                                                                          |
+| [subagent/planner/](subagent/planner/)                                     | 后台方案设计子程序（一次性、无记忆）：`subagent/planner/tool.py` 的 3 个 async 工具派活 → detached 子进程用 `LLMClient` **一次调用**产出 `plan.md` → 文件系统任务存储（原子写 + 独占 `worker.lock` + PID 回收 + `cancel.flag`）。产物落 `data/subagent/planner/<task_id>/`，仅 `status=done` 可读 `plan.md` |
+| [subagent/executor/](subagent/executor/)                                   | 后台任务执行子程序（多步 ReAct 工具循环，会真实写盘）：`subagent/executor/tool.py` 的 3 个 async 工具派活 → detached 子进程在工作区内用受限工具集（`read_file`/`write_file`/`list_dir`，全部绑定工作区并经路径包含校验）多步执行 → 落盘自包含 `result.md`；工作区互斥锁 + 显式 workspace 拒绝清单（见 [subagent/common/](subagent/common/)）。产物落 `data/subagent/executor/<task_id>/`，仅 `status=done` 可读 `result.md` |
+| [subagent/common/](subagent/common/)                                       | 子程序共享件包（仅标准库，禁止反向 import planner/executor）：`fsx.py`（原子写/任务 ID/裸名校验/`TRUNCATION_SUFFIX` 文本截断）+ `proc.py`（分离进程启动/PID 存活探测）+ `paths.py`（路径包含校验/workspace 拒绝清单）+ `task_state.py`（状态常量唯一事实源：`STATUS_*` / ping / `cancel.flag` / 终态判定）+ `task_store.py`（`TaskStoreBase` 基类：独占 `worker.lock` 认领 / PID 回收 reap / `request_cancel` 三分支 / 文本读写复用流程，planner/executor 的 Store 继承后仅声明 `result_filename` 与运行中取消文案）+ `prompt.py`（`parse_workflow_section` 切分 AGENT.md 系统提示词与 workflow 模板 + `render_placeholders` 按插入序渲染占位符）+ `awaitx.py`（`await_with_cancel`：LLM 调用的超时 + 用户取消轮询统一语义，`{timeout}` 占位注入）+ `config.py`（配置模块唯一入口，机制+要素同处一模块：通用机制 `build_config` 按「字段声明表」把统一配置文件 `subagent/config.json` 对应小节的覆盖值合并到 dataclass 默认值（支持 `section` 小节读取 + `output_root` 环境变量优先覆盖 + 防字段漂移校验）、`resolve_llm_settings` 解析并校验 LLM 提供商/模型（缺省 label 从 `config.name` 推导）；子程序配置要素（`PlannerConfig`/`ExecutorConfig` 数据类、默认值总表、`load_planner_config()`/`load_executor_config()`）亦在本模块，不再有单独的 `subagent/config.py`） |
 
 ### llm/llm_client.py 主要 API
 
@@ -1323,9 +1354,47 @@ workflow 链路（`session/workflow_adapter.py`）对节点异常（LLM 调用�
 
 **状态迁移**：图级失败 → 写记录；重试成功 / 转 INTERRUPT / 新任务开跑（`arun_events`）→ 清记录；再次失败 → 覆盖更新。
 
-**前端刷新还原**：`GET /api/threads/{thread_id}/stream-status` 响应体新增 `failure` 字段（workflow 会话返回上述记录或 `null`），前端据此还原失败节点红态与"从失败节点重试"入口。
+**前端刷新还原与断点/挂起判定**：`GET /api/threads/{thread_id}/stream-status` 在原有 `streaming` / `failure` 之外新增三个字段，让前端能区分三种"看起来可恢复"的现场（真实节点失败 vs HITL 挂起等人工确认 vs 普通断点续跑）：
 
-回归守护：`tests/session/test_workflow_adapter.py`（FakeGraph 重试/落库/断点校验）、`tests/session/test_session_store.py`（failures 存取）、`tests/graph/test_workflow_failure_recovery_integration.py`（真实 StateGraph + MemorySaver 验证 ainvoke(None) 仅重跑失败节点、已完结图不空转）。
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `pending_interrupt` | `{"kind": str, "payload": Any} \| null` | 图的挂起人工确认，来源 `graph.aget_state(config).interrupts` 的首个中断；`kind` 取中断 value 的 `kind`/`type`（缺失回落 `"interrupt"`），`payload` 为该 value。无图/无状态/读取异常时恒为 `null`（不抛错） |
+| `resumable` | `bool` | = `bool(StateSnapshot.next)`（非空表示还有待执行任务，可从断点续跑） |
+| `resume_kind` | `"interrupt" \| "retry" \| "resume" \| null` | 恢复入口类型，判定优先级见下表 |
+
+`resume_kind` 判定优先级（自上而下命中即止）：
+
+| 优先级 | 条件 | 取值 | 前端入口 |
+| --- | --- | --- | --- |
+| 1 | 有 `pending_interrupt` | `"interrupt"` | 人工确认卡片（`POST /api/chat/resume`） |
+| 2 | 无挂起、有 `failure` 记录 | `"retry"` | 从失败节点重试（`POST /api/chat/retry`；不可续跑时前端提示"无可恢复断点"） |
+| 3 | 无挂起、无 failure、`resumable` 为真 | `"resume"` | 从断点继续（复用 `POST /api/chat/resume`） |
+| 4 | 其余 | `null` | 无恢复入口 |
+
+> `streaming` 为真（后台仍在跑）时**不短路** `pending_interrupt` / `resumable`，仍返回真实值——前端以 `streaming` 优先判断"后台仍在执行"，其余字段供刷新后还原。
+
+实现要点：`WorkflowAdapter.aget_resume_state(thread_id)`（只读，不修改图状态）在 `try/except` 内构建图并读取 `graph.aget_state`，任何异常（图不支持 / 读取失败 / 非 workflow 会话）都返回空 `ResumeState`（`pending_interrupt=None`、`resumable=False`），保证查询路径永不失败；`SessionManager.aget_resume_state` 做透传，chat 链路无此接口时返回 `None` 回落到仅凭 `failure` 判定。`_extract_pending_interrupt` 优先读 `StateSnapshot.interrupts`，缺失时回退遍历 `tasks[*].interrupts`（兼容旧结构）。
+
+回归守护：`tests/session/test_workflow_adapter.py`（FakeGraph 重试/落库/断点校验/心跳/恢复前置校验）、`tests/session/test_session_store.py`（failures 存取）、`tests/graph/test_workflow_failure_recovery_integration.py`（真实 StateGraph + MemorySaver 验证 ainvoke(None) 仅重跑失败节点、已完结图不空转）。
+
+### Workflow 静默期心跳与恢复前置校验
+
+workflow 链路在两类"看起来像节点失败"的场景做了专门防护（`session/workflow_adapter.py`）：
+
+**1. 事件泵静默期心跳（HEARTBEAT）**：`_arun_input_events` 的事件泵队列（`node_queue`）在节点内 LLM 长流式、巨型工具调用参数生成（`tool_call_chunks` 期间 `content` 为空、无 TOKEN 事件）、工具长执行（如 Vivado 仿真）期间可能持续无任何事件产出。前端看门狗（`web/src/store.ts` 的 `WATCHDOG_MS = 90_000`）在此期间会误判"响应超时"并 `finish()` 拉黑线程——拉黑期间到达的 `interrupt` 事件被终止去重守卫丢弃，HITL 确认卡片永不渲染。事件泵因此在距上次产出事件超过 `_WORKFLOW_HEARTBEAT_INTERVAL`（15 秒，看门狗的 1/6）时补发 `AgentEvent.heartbeat`（纯保活：不渲染 UI、不沉淀记忆、不是终止事件），前端收到后仅重置看门狗。
+
+> ⚠️ **转发链路必须放行 heartbeat**：事件泵产出的 `heartbeat` 要真正到达客户端，中间每一跳都不得按事件类型白名单丢弃。工作流经 `/api/chat`（命令模式 `/workflow:<name> <任务>`）执行时，`cli/commands/workflow.py::run_workflow` 逐条消费 `workflow_sm.arun_stream` / `aresume_stream` 的事件并转发——它**必须显式转发 `heartbeat`**（否则长节点静默期前端仍会 90s 看门狗误判"响应超时"）。历史上该循环只处理 `workflow_node` / `done` / `error` / `interrupt` 四类、静默丢弃 `heartbeat`，是"事件泵已产心跳但实测 0 心跳"的根因。回归守护见 `tests/cli/test_workflow_hitl.py`。
+
+**2. aresume 前置校验（fail-open）**：无挂起中断时 `Command(resume=...)` 不会报错、图原地不动，现象是前端静默等到看门狗超时（用户理解为"节点失败"）；并行重跑产生的旧确认卡片重复提交时，载荷与当前挂起项错配。`aresume_events` 在 `_awarm_and_build_workflow` 后读取 `graph.aget_state` 的挂起中断列表：
+
+| 状态 | 行为 |
+| --- | --- |
+| 无法判定（图不支持 `aget_state` / 读取异常） | 放行，照常 `Command(resume)`（fail-open，不拦正常恢复） |
+| 无挂起中断 | yield `DONE`（"当前没有挂起的人工确认，本次恢复已忽略。"），不调 `ainvoke` |
+| 载荷为 `{"answers": {item_id: ...}}` 且 key 与全部挂起项 id 无交集（陈旧卡片重复提交） | 重放当前 `INTERRUPT` 事件（合并 prompt/choices/items），不调 `ainvoke`，让用户对当前问题重新作答 |
+| 其余（human_choice 的 `{"choice_id": ...}` / 部分命中 / 正常载荷） | 照常 `Command(resume=payload)` |
+
+回归守护：`tests/session/test_workflow_adapter.py`（心跳保活、无挂起优雅收尾、陈旧载荷重放、正常载荷放行、human_choice 不误拦）。
 
 ### 与 CLI 的关系
 
@@ -1379,6 +1448,12 @@ Agent 的工具分为两类：
 | `create_tool`    | [tools/create_tools.py](tools/create_tools.py)     | 动态生成工具代码并保存为 .py 文件（默认保存到 tools/ 目录、自动注册到 tools/__init__.py，并顺带生成单元测试到 tests/tools/test_<tool>.py；tool_logic 支持含 f-string/多行字符串的代码，内容行不会被误缩进）。安全边界：工具名须为合法 Python 标识符、工具路径限制在 tools/ 内且测试路径限制在 tests/tools/ 内禁止逃逸、默认禁止覆盖已有文件（`force=True` 可覆盖）、生成源码经 AST 校验禁止导入 os/subprocess/socket 等高风险模块 | `tool_name`, `tool_description`, `args_spec`, `tool_logic`, `tool_path`, `force`, `with_test` |
 | `ask_human`      | [cli/human_input.py](cli/human_input.py)           | 暂停 LangGraph 图并请求人工结构化选择                                                                                                                                                                                                                                                                                                                    | `prompt`, `choices`                                                                      |
 | `request_user_confirmation` | [tools/human_confirmation.py](tools/human_confirmation.py) | 多问题批量人工确认（LangGraph interrupt，`kind="user_confirmation"`），与单选语义的 `ask_human` 区分 | `items`（问题+选项清单） |
+| `start_planner_task` | [subagent/planner/tool.py](subagent/planner/tool.py) | 在后台启动方案设计子程序（非阻塞，毫秒级返回 task_id；启动前校验 provider/API Key） | `requirement`, `context` |
+| `query_planner_task` | [subagent/planner/tool.py](subagent/planner/tool.py) | 查询进度 / 读取结果（有界等待 ≤30 秒；`done` 时直接返回 `plan`；对 running 任务顺带回收死进程） | `task_id`, `wait_seconds`, `max_chars` |
+| `cancel_planner_task` | [subagent/planner/tool.py](subagent/planner/tool.py) | 请求取消（queued 立即取消；running 在当前 LLM 调用结束后生效，不写 `plan.md`） | `task_id` |
+| `start_executor_task` | [subagent/executor/tool.py](subagent/executor/tool.py) | 在后台启动任务执行子程序（非阻塞，毫秒级返回 task_id；preflight + workspace 校验；**会真实写盘**，工作区默认为任务目录内的隔离目录） | `task`, `plan`, `context`, `workspace` |
+| `query_executor_task` | [subagent/executor/tool.py](subagent/executor/tool.py) | 查询进度 / 读取结果（有界等待 ≤30 秒；`done` 时直接返回 `result` 正文与产出清单；对 running 任务顺带回收死进程） | `task_id`, `wait_seconds`, `max_chars` |
+| `cancel_executor_task` | [subagent/executor/tool.py](subagent/executor/tool.py) | 请求取消（阶段边界生效，不写 `result.md`；已写入工作区的文件不会回滚） | `task_id` |
 
 > `open_sqlite` 会自动查找 DB Browser for SQLite 路径（环境变量 `SQLITE_BROWSER_PATH` → 常见安装位置 → `shutil.which`），找不到则返回下载链接。Linux 下安装 `sqlitebrowser` 包即可使用。
 
@@ -2044,6 +2119,8 @@ with TraceContext(trace_id="req-123", thread_id="thread-abc"):
 
 与 `StreamStallRetryMixin` 的分工：流中途零字节超时（`StreamChunkTimeoutError`）且尚未交付任何 chunk → 流层透明重启；上游**正常结束流但 content 为空**（`length` / `network_error`）不经超时路径，由本检测兜底。
 
+**团队角色（TeamAgent）同源守卫**：工作流工具模式的角色（如 `rtl_designer`）内部是 TeamAgent 自己的内层图，其 thread_id 为 `team:{name}:{tid}`，**同角色的多个节点共用同一内层 checkpoint**（如 `designer_spec` 与 `designer_verilog`）。若某节点的思考型模型返回空最终 `AIMessage`，该空消息会残留在内层 checkpoint 中；同角色下一个节点复用该线程重放历史时会携带一条空 assistant 消息，被严格的 OpenAI 兼容网关（如 `bingxing`）以 400 拒绝（`the message at position 2 with role 'assistant' must not be empty`）。[`team/base.py`](team/base.py) 的 `arun_structured` 因此移植了同一守卫：`_astream_with_tools` 记录最后一次 `on_chat_model_end` 的 `AIMessage`，流结束且无挂起中断时，若**本轮无任何可见输出**且终态 `AIMessage` 为空 → 先经 `aupdate_state` + `RemoveMessage` 从内层 checkpoint 移除该空消息（`_aremove_empty_final_ai`），再返回 `AgentTurnResult.cancelled("任务执行失败: …")`（对齐主 Agent 的 ERROR 语义；工作流节点据此把错误文本写入产物字段并走重做/交付路由）。已流式产出文本时不判定为空（维持既有 completed 语义，不丢弃用户已见内容）；消息无 `id` 或删除失败仅记 warning，不阻塞 cancelled 返回。与孤儿 tool_call 修复互补：后者补配对 `ToolMessage`，本守卫清理空 assistant。
+
 ### 终端命令超时重试与分类（Terminal Timeout Retry）
 
 [`tools/terminal_tools.py`](tools/terminal_tools.py) 对 `run_shell` / `run_python` / `run_cmd` 三个终端工具叠加 ctrl+c 软中断 + 超时分类 + 重试上限机制，防止命令卡死导致 Agent 无限等待或无限重试：
@@ -2107,6 +2184,167 @@ LCAgentError                    ← 所有 LCAgent 异常的基类（含 detail 
 - **跨会话并发**：不同 `thread_id` 各自持有独立锁，可同时流式对话，互不阻塞。
 - **配置隔离**：两个会话可同时使用不同 provider/model/角色，互不污染——模型对象、系统提示词、`recursion_limit` 均不经过任何共享属性传递。
 - **轮内快照**：一轮开始处捕获不可变的 `SessionConfig` 快照，轮中修改会话配置只对下一轮生效。
+
+---
+
+## 后台方案设计子程序（Planner）
+
+当用户提出**复杂需求**、需要一份包含架构取舍、候选方案对比与落地计划的完整方案时，主 Agent
+调用 `start_planner_task` 把活派给独立后台子程序。子程序是**一次性任务**：在分离进程中用
+`LLMClient` 做**一次 LLM 调用**，产出 `plan.md` 后退出——不维护会话记忆、不写 checkpoint。
+
+```
+主 Agent 进程（subagent/planner/tool.py）              后台子进程（subagent.planner.worker）
+──────────────────────────────────               ──────────────────────────────────
+start_planner_task(requirement, context)
+  │  preflight 校验 provider/model/API Key
+  │  写 task.json（status=queued）
+  ▼
+spawn_worker → detached Popen ──────────────────►  claim（独占 worker.lock）
+  │  毫秒级返回 task_id                              │
+  ▼                                                  ▼
+query_planner_task(task_id, wait_seconds≤30)     system(AGENT.md) + user(需求/上下文/结构)
+  │  读 task.json + reap 死进程                     │
+  │                                                  ▼
+  │                                              LLMClient.ainvoke()
+  │                                                  │
+  │                                                  ▼
+  │                                              plan.md（仅 status=done 可读）
+  ▼                                                  │
+query_planner_task 返回 plan ◄────────────────────────┘
+```
+
+**单次调用的输入**：系统提示词来自 `subagent/planner/AGENT.md` 的 `## workflow:design` 之前部分，
+用户模板来自该小节之后部分，只支持 `{requirement}` 与 `{context}` 两个占位符。输出固定为一份
+自包含方案文档（背景/范围/假设/总览/候选方案对比/模块接口/关键流程/实施计划/验收标准/风险缓解），
+末行 `<!-- END OF PLAN -->`。
+
+**可靠性与安全边界**：
+
+| 机制 | 行为 |
+| --- | --- |
+| 非阻塞 | `start_planner_task` 只做 preflight + 写 task.json + `Popen`，毫秒级返回；`wait_seconds` 用 `asyncio.sleep`，不阻塞主进程事件循环 |
+| 独占认领 | `worker.lock` 以 `O_CREAT|O_EXCL` 原子创建，并发/重复启动只有一个 worker 继续 |
+| 僵尸回收 | `task.json` 记录 `pid`；查询工具对 `running` 任务 `reap()`：PID 已死 → `failed` |
+| 取消语义 | `queued` 立即取消；`running` 在当前 LLM 调用结束后停止，**不写 `plan.md`**，不会把半成品当结果 |
+| 终态保证 | worker 整段 `try/except BaseException/finally`，异常必写 `failed` + `error`；空输出经 `final_answer_is_empty` 判定为失败 |
+| 防编造 | 3 个工具的 docstring 均明确：`done != true` 前不得编造/推测方案内容 |
+| 失败前置 | `preflight` 在派活阶段同步校验 provider/model/API Key，缺 Key 直接返回 `success:false`，不产生僵尸任务 |
+
+**典型调用序列**：
+
+```
+1. start_planner_task(requirement="为现有 CLI 增加插件机制并给出落地方案", context="...")
+   → {"success": true, "task_id": "pl-20261102-143012-ab12cd34", "status": "queued", ...}
+
+2. query_planner_task(task_id, wait_seconds=30)
+   → {"success": true, "done": false, "status": "running", ...}   # 未完成，继续轮询
+
+3. query_planner_task(task_id, wait_seconds=30)
+   → {"success": true, "done": true, "status": "done", "plan": "# ...", "chars": 8231}
+```
+
+**配置与产物**：
+
+- 配置：`subagent/config.json`（**统一配置文件，已入库**）中 `planner` 小节的
+  `provider`/`model`/`temperature`/`max_tokens`/`timeout_seconds` 在子程序初始化时生效：
+  `load_planner_config()`（[subagent/common/config.py](subagent/common/config.py)）读取该小节合并到 dataclass 默认值，
+  小节缺失/损坏时回退总表默认值。`provider=null` 时自动选择第一个已配置 API Key 的提供商。
+- 产物：`data/subagent/planner/<task_id>/`（`task.json`、`worker.log`、`prompt.md`、`plan.md`）。
+  可用环境变量 `LCAGENT_PLANNER_ROOT` 覆盖根目录。
+- 手动调试：`uv run python -m subagent.planner.worker --task-id <id>`。
+- 已知限制：任务目录不会自动清理；取消不是立即 kill；文件系统 + PID 检测假设单机部署；
+  方案深度受单次输出预算限制。详见 [subagent/planner/README.md](subagent/planner/README.md)。
+
+---
+
+## 后台任务执行子程序（Executor）
+
+executor 是 planner 的姊妹子程序：planner 产出**方案文档**（一次 LLM 调用，零写盘副作用），
+executor 负责**真实实现**——主 Agent 通过 `start_executor_task` 派活，分离子进程
+`subagent.executor.worker` 持一个受限工具集（`read_file` / `write_file` / `list_dir`，
+全部绑定到工作区），按 ReAct 循环多步执行，最终在任务目录落一份自包含的 `result.md` 结果文档。
+
+**与 planner 的分工**：纯方案讨论用 `start_planner_task`（零副作用）；只有已有明确的
+「任务 + 可执行计划」（例如 planner 产出的方案要点）才派 executor，两者不要串联混用于同一目标。
+
+| 维度 | planner（方案设计） | executor（任务执行） |
+| --- | --- | --- |
+| LLM 调用 | 一次 one-shot | 多步 ReAct 循环（每步 = 一次模型调用 + 本轮全部 tool_calls 执行） |
+| 可用工具 | 无（纯文本） | `read_file` / `write_file` / `list_dir`（v1 不提供 `run_shell`） |
+| 副作用 | 无 | 工作区内真实创建/修改文件（取消/失败**不回滚**） |
+| 终态产物 | `plan.md` | `result.md` |
+| 适用前提 | 纯方案讨论 | 已有明确的任务与可执行计划 |
+
+### 执行流程
+
+```
+主 Agent（subagent/executor/tool.py）            后台子进程（subagent.executor.worker）
+──────────────────────────────────               ──────────────────────────────────
+start_executor_task(task, plan, context, ws)
+  │  preflight（提示词/API Key）+ workspace 校验
+  │  写 task.json（status=queued，workspace 已固化）
+  ▼
+spawn_worker → detached Popen ─────────────────►  claim（独占 worker.lock）
+  │  毫秒级返回 task_id                            │  获取工作区互斥锁
+  ▼                                               ▼
+query_executor_task(task_id, wait_seconds≤30)   prompt.md 落盘（审计产物）
+  │  读 task.json + reap 死进程                    │
+  │                                               ▼
+  │                                       model.bind_tools([工具集])
+  │                                               │
+  │                                       ReAct 循环（≤ max_steps 步）
+  │                                       每步：LLM 调用 → 本轮 tool_calls
+  │                                       全部执行 → 同 id ToolMessage 配对
+  │                                               │
+  │                                       无 tool_calls 且内容非空 → 最终答复
+  │                                               ▼
+  │                                       result.md（含 <!-- END OF RESULT -->）
+  ▼                                               │
+query_executor_task 返回 result ◄─────────────────┘
+```
+
+### ReAct 循环契约
+
+| 机制 | 行为 |
+| --- | --- |
+| 工具绑定 | 统一 `model.bind_tools(tools)`（`bind(tools=...)` 不会序列化 schema） |
+| ToolMessage 配对 | 每个工具调用（含失败与未知工具名）恰好得到一条同 `tool_call_id` 的 `ToolMessage`（异常包装为 `status="error"`），杜绝孤儿 tool_call 触发网关 400 |
+| 观测截断 | 单条工具输出截断到 `max_observation_chars`（默认 6000） |
+| 终结判定 | 无 tool_calls 且内容非空 → 最终答复；空 `AIMessage` 一律判 `failed`，不做同预算重试 |
+| 步数上限 | 超过 `max_steps`（默认 24）仍未收敛 → `failed`（`steps_used` 保留进度） |
+| 时间预算 | 总预算 `timeout_seconds`（默认 1800s）；剩余 < 30s 不发起新一步 |
+| 取消检查点 | 每步开始 / 每次模型调用中（轮询）/ 写 `result.md` 前；取消**不写** `result.md` |
+
+### 可靠性与安全边界
+
+| 机制 | 行为 |
+| --- | --- |
+| 非阻塞 | `start` 只做 preflight + 校验 + `Popen`，毫秒级返回；`query` 有界等待 ≤30 秒 |
+| 独占认领 | `worker.lock`（`O_CREAT\|O_EXCL`）：同一任务并发启动只有一个 worker 继续 |
+| 工作区互斥 | `.lcagent-executor.lock`：同一 workspace 同时只允许一个 executor 任务运行 |
+| 僵尸回收 | `query` 对 `running` 任务 `reap`：PID 已死 → `failed`（`steps_used` 保留诊断进度） |
+| 工作区边界 | 未指定 → 任务目录内隔离 `workspace/`（推荐）；指定 → 必须是已存在的目录绝对路径，拒绝清单覆盖卷根 / 系统目录 / ProgramFiles / 用户主目录 / 项目根及其关键子目录（`agent`/`config`/`.git`/`.venv`/`data`/`subagent`） |
+| 工具路径校验 | 每次工具调用前 `realpath`+`normcase` 归一化 + `commonpath` 包含判定；`write_file` 对父目录二次校验后原子写入 |
+| 终态保证 | 整段 `try/except BaseException/finally`：异常必写 `failed` + `error`，绝不留 `running` 僵尸 |
+| 防编造 | `done != true` 前不得编造任何执行结果（3 个工具的 docstring 反复提示） |
+| 副作用提示 | 取消/失败**不回滚**工作区已写入文件——工具 docstring 与消息均已声明该语义 |
+
+### 配置与产物
+
+- 配置：`subagent/config.json`（**统一配置文件，已入库**，planner/executor 共用一文件分小节）中
+  `executor` 小节的默认值：`temperature=0.2`、`max_tokens=8192`、
+  `timeout_seconds=1800`、`max_steps=24`、`max_observation_chars=6000`、`max_read_bytes=262144`、
+  `max_list_entries=500`；`load_executor_config()`（[subagent/common/config.py](subagent/common/config.py)）在初始化时
+  读取该小节，小节缺失/损坏时回退总表默认值；`provider=null` 时自动选择第一个已配置 API Key 的提供商。
+- 产物：`data/subagent/executor/<task_id>/`（`task.json`、`worker.log`、`prompt.md`、
+  `workspace/`、终态时 `result.md`）。可用环境变量 `LCAGENT_EXECUTOR_ROOT` 覆盖根目录。
+- 提示词：`subagent/executor/AGENT.md`（系统提示词 + `## workflow:execute` 模板，占位符
+  `{task}`/`{plan}`/`{context}`/`{workspace}`）；结果文档固定结构为「任务与目标 / 执行过程 /
+  产出清单 / 假设与遗留问题」，末尾 `<!-- END OF RESULT -->`（缺失只记录 `marker_present`，不判失败）。
+- 手动调试：`uv run python -m subagent.executor.worker --task-id <id>`。
+- 已知限制：任务目录不会自动清理；取消不是立即 kill；文件系统 + PID 检测假设单机部署；
+  v1 不提供 `run_shell`/delete/rename（detached 进程无人机确认兜底，默认禁用）。
 
 ---
 
@@ -2330,6 +2568,19 @@ resume = {
 
 **多轮暂停**也支持：恢复后若又遇到新的 `ask_human`，`complete_human_input_turn` 会继续循环处理，直到 `status == "completed"`。例如一个图节点里连续两次 `ask_human`，需要两次 resume 才能完成。
 
+### 工作流节点的中断转发（team/interrupt.py）
+
+工作流节点内部是 **TeamAgent 自己的内层 agent 图**，其 `ask_human` / `request_user_confirmation` 中断需要经 `run_team_turn_with_interrupt` 转发到**外层工作流图**（两层图、两次 interrupt）。关键约束：LangGraph 在 resume 时会**从节点函数首行重新执行**整个节点，因此转发逻辑必须做到幂等重入：
+
+| 语义 | 行为 |
+| --- | --- |
+| **不重放内层 turn** | 恢复轮先判定 scratchpad 是否携带 resume（`get_null_resume(False)` 窥视不消费），是则跳过 `arun_structured`，改用 `TeamAgent.aget_pending_interrupts()` 读取内层挂起中断。若重放 `arun_structured`，会向内层注入重复 `HumanMessage`，导致 `AIMessage.tool_calls` 无对应 `ToolMessage`，OpenAI 直接返回 400（`tool_call_ids did not have response messages`） |
+| **位置重放** | `interrupt()` 按「本 task 已消费答案数」索引恢复值，重入时必须先用等量 `interrupt(None)` 消费旧答案、把位置计数器推进到新中断处；否则多轮中断会读到**上一轮**答案 |
+| **陈旧中断清场** | 内层图残留与当前问题无关的 pending interrupt（上次中断后未恢复）时，进入新轮次前用 `{"cancelled": True, "answers": {}}` 清场（最多 2 次），仍有残留只记 warning，不阻塞新任务 |
+| **返回契约** | 内层 `completed` → 返回输出；`cancelled` → 返回取消文案（`TASK_ERROR_PREFIX: 任务被取消`）；未知状态抛 `RuntimeError` |
+
+回归守护：[tests/team/test_interrupt_forward.py](tests/team/test_interrupt_forward.py)（真实 `StateGraph` + `MemorySaver` 验证 resume 不重放内层 turn、第二轮拿到新答案）。
+
 ### 线程隔离
 
 `resume_structured` 会校验当前 `thread_id` 与产生 interrupt 的线程一致，跨线程恢复会抛 `ValueError`：
@@ -2398,6 +2649,9 @@ output = chat_until_completion(agent, "需要人工选择时请先问我")
 | **同一 AgentCore 实例** | `resume_structured` 要求在同一个 `AgentCore` 实例中调用，跨实例恢复不支持                                        |
 | **跨线程拒绝**          | `resume_structured` 校验 `thread_id`，跨线程恢复会抛 `ValueError`                                              |
 | **与 cot 无关**         | `cot()` 模式不走 LangGraph，不会触发 interrupt；HITL 仅对 `run_structured`/`chat_structured` 生效              |
+| **工作流中断须经 workflow 门面恢复** | 工作流会话的 interrupt 挂在外层 workflow 图上，`POST /api/chat/resume` 对 `workflow-*` 会话走 `workflow_sm.aresume_stream`；若误用 chat 会话管理器恢复，工作流会原地不动 |
+| **HTTP 入口不替用户作答** | `CommandContext.interactive=False`（API 命令入口）：遇到 interrupt 只把事件转发给前端后退出本轮，答案由前端 `POST /api/chat/resume` 提交；CLI 入口仍用方向键结构化收集。user_confirmation 的 resume 负载为 `{"answers": {item_id: {"choice_id": ...}}}`，human_choice 为 `{"choice_id": ...}` |
+| **存量中毒会话需新建**   | 修复前留下 pending interrupt 的工作流会话（内层 `team:*` thread 已污染）没有公开 API 清理，建议新建工作流会话重跑；已完成的会话不受影响 |
 | **测试覆盖**            | [tests/agent/test_human_input.py](tests/agent/test_human_input.py) 覆盖了 interrupt、resume、并行选择、线程隔离等场景 |
 
 ---
@@ -2416,8 +2670,8 @@ output = chat_until_completion(agent, "需要人工选择时请先问我")
 | `tools`                                       | 查看可用工具列表（含 MCP 工具）                                              |
 | `clear [long\|short\|agent\|all]`                | 清理记忆（默认 long；agent 清 agent 级跨会话记忆）                           |
 | `forget <关键词>` / `forget agent <关键词>`    | 记忆遗忘（软删除，按内容关键词/主题匹配；scope 同 clear：long 默认/agent）    |
-| `session memory`                             | 召回并展示当前会话(thread 级)长期记忆                                       |
-| `agent memory`                                | 召回并展示 agent 级（跨会话共享）长期记忆                                    |
+| `session memory` 或 `session:memory` 或 `sessionmem` | 召回并展示当前会话(thread 级)长期记忆（三种写法等价）                       |
+| `agent memory` 或 `agent:memory` 或 `agentmem` | 召回并展示 agent 级（跨会话共享）长期记忆（三种写法等价）                    |
 | `compress` 或 `压缩`                        | 压缩当前会话(thread 级)长期记忆（LLM 摘要后替换原内容；默认作用域为 thread） |
 | `compress agent` 或 `压缩 agent`             | 压缩 agent 级（跨会话共享）长期记忆（LLM 摘要后替换原内容；别名 `compress:agent`） |
 | `compact`                                     | 手动压缩当前会话上下文（增量摘要 + 工具输出 Prune，`force=True` 跳过阈值） |
@@ -2496,9 +2750,9 @@ Verification (spec_design_task:验证计划)
 Designer (designer_output:整理最终交付物) → END（终止）
 ```
 
-- **多轮交互**：`designer_verilog` → `designer_file_check` → `verification_check` → `sim_exec_check` 构成迭代环，由 `route_after_file_check` / `route_after_sim_check` 条件路由判定。`designer_file_check` 校验本轮产出 RTL 文件存在且非空；`sim_exec_check` 实际执行 Vivado 仿真并检查覆盖率（全部 src 被 filelist 包含且报告已生成），仿真+覆盖率通过即经 `designer_output` 交付后终止（END）；失败且轮次未达 `max_rounds`（默认 3）时携带验证反馈回到 Designer 重新编码；达上限强制经 `designer_output` 交付后终止（END），防止死循环。
+- **多轮交互**：`designer_verilog` → `designer_file_check` → `verification_check` → `sim_exec_check` 构成迭代环，由 `route_after_file_check` / `route_after_sim_check` 条件路由判定。`designer_file_check` 校验本轮产出 RTL 文件存在且非空；`sim_exec_check` 实际执行 Vivado 仿真并检查覆盖率（全部 src 被 filelist 包含且报告已生成），仿真+覆盖率通过即经 `designer_output` 交付后终止（END）；失败且轮次未达 `max_rounds`（默认 3）时携带验证反馈回到 Designer 重新编码（进入 `designer_verilog` 的 prompt 含上一轮验证报告、上一轮 `sim_log_path` 与 `read_file` 读取指引，日志正文不内嵌 state）；达上限强制经 `designer_output` 交付后终止（END），防止死循环。**轮次按任务重置**：`round` 等计数器与 `rtl_code` / `verification_report` / `output_files` 等产物字段随 checkpoint 按 thread 持久化，故 `WorkflowAdapter.arun_events` 每次新任务都按注册表的 `initial_fields` 播种回空（`reset_round_counters` 兜底），避免同一 workflow 会话的第二条任务开局就接近 `max_rounds` 或把上一轮产物拼进交付物。
 - **交付节点（零 LLM）**：`designer_output` 是**确定性机械拼装**节点，**不调用任何 LLM、不渲染模板、不做网络/磁盘 IO**——仅把 `task` / `design_spec` / `rtl_code` / `verification_report` / `output_files` 等 state 字段按固定小节拼装成 `final_answer`（空字段整段省略，全空时至少回退 `state["task"]`）。两条终态路径（`sim_exec_check` 通过、达 `max_rounds` 上限）以及 `designer_file_check` 达上限，均先经 `designer_output` 交付再 `→ END`，保证 `final_answer` 非空、跨轮次记忆沉淀与 DONE 事件内容可用。
-- **上下文衔接**：Architect 各阶段任务文本逐级拼接上游产物（计划→设计→分析→评审→规格），Designer/Verification 基于架构规格分工，多轮迭代时第二轮起注入上一轮验证报告反馈。
+- **上下文衔接**：Architect 各阶段任务文本逐级拼接上游产物（计划→设计→分析→评审→规格），Designer/Verification 基于架构规格分工，多轮迭代时第二轮起注入上一轮验证报告反馈；仿真失败回退时额外注入上一轮 Vivado 仿真失败日志的**路径**（`sim_status == "FAIL"` 时），由 designer 经 `read_file` 自行读取定位报错，消费后该字段随之清空，避免 `designer_file_check` 回退时携带更早轮次的陈旧日志。
 - **角色注册**：`team/__init__.py` 未导入 `rtl_designer`/`rtl_verification`，由 `rtl_graph.py` 顶部 from-import 三个角色类（`ArchiAgent`/`DesignerAgent`/`VerificationAgent`，NodeSpec 需引用其类属性节点）触发 `@register_agent` 注册，与 `graph.common` 无循环导入。**节点实现全部归属角色类**：LLM 节点为类属性（`create_llm_node` 闭包，经 `ArchiAgent.plan_node` 等类属性引用注册），代码型节点为实例方法（经 `agents[role].xxx_node` bound-method 引用注册，`register_nodes` 自动识别两种形态）。
 
 ### 团队角色
@@ -2523,6 +2777,7 @@ Designer (designer_output:整理最终交付物) → END（终止）
 - **按需工具注入**:Manager/Terminator 纯 LLM 推理,Worker 注入工具列表后用 `create_agent` 构建轻量 ReAct 循环
 - **工具超时 + 错误纠错**:工具经 `tools.tool_wrapper.wrap_tools_with_timeout` 包裹超时保护(防卡死,默认 60 秒+工具级覆盖如 `ask_human` 600 秒);executor 挂载 `ToolExecutionErrorMW`(工具异常转 `ToolMessage(status="error")` + 反思指令,LLM 可读到报错修正重试)与 `WorkspaceSecurityMW`(workspace 路径解析 + 逃逸校验),与主 Agent 的工具执行质量对齐
 - **孤儿 tool_call 修复**(`_arepair_orphan_tool_calls`,对照 `AgentCore` 的 `_arepair_rejected_tool_calls` 同构移植):启用 checkpointer 时内层 thread_id(`team:{name}:{tid}`)跨 turn 复用,上次 turn 因用户拒绝危险命令/执行异常/中途取消结束时,checkpoint 残留 `AIMessage(tool_calls)` 而无对应 `ToolMessage`,下次开跑直接把非法消息序列发给 LLM 会触发 OpenAI 400(`tool_call_ids did not have response messages`)。修复时机:`_astream_with_tools` 开跑前防御性修复(覆盖历史残留)+ `UserRejectedCommandError` re-raise 前当次修复;有 pending interrupts 时跳过(属工具内 confirm 的合法暂停,等 resume 由工具正常写入结果,抢先补写会产生重复 `ToolMessage` 干扰恢复语义)。修复动作:补写 `ToolMessage(status="error", content="工具调用未完成(用户拒绝或上次执行中断),已跳过。")` 并 `aupdate_state` 持久化。
+- **空最终回答清理**(`_aremove_empty_final_ai`,对照 `agent/streaming.py` 同源守卫移植):思考型模型(reasoning token 计入 `max_tokens`)预算耗尽返回空 `AIMessage`(`finish_reason=length`),空消息随图落入内层 checkpoint;内层 thread(`team:{name}:{tid}`)被同角色后续节点复用时会携带空 assistant 消息,触发严格网关 400(`message ... role 'assistant' must not be empty`)。`arun_structured` 在流结束且无挂起中断时,若本轮**无任何可见输出**且终态 `AIMessage` 为空 → 先 `aupdate_state` + `RemoveMessage` 移除该空消息,再返回 `cancelled("任务执行失败: …")`;已流式产出文本时不判空(维持 completed 语义)。无 `id`/删除失败仅记 warning。与孤儿 tool_call 修复互补:后者补配对 `ToolMessage`,本守卫清空 assistant。
 - **快速构建**:不加载 MCP Server、不创建 SQLite checkpointer
 - **内建技能注入**:持有 `SkillManager`(`skills_dir` 参数指定目录,默认 `.agents/skills`),`build_skill_block`/`inject_into_prompt` 转发 `skmng.core`(满足 `PromptInjector` 协议),三来源合并(角色级 `fixed_skills` 类属性 + 运行时 `active_names` + 自动匹配);`VerificationAgent` 声明 `fixed_skills = ["vivado-2025.2"]`,由 `create_llm_node` 读取并传参给注入器,实现角色级固定技能无条件注入;单节点可通过 `exclude_skills` opt-out(如 `VerificationAgent.check_node` 排除 `"vivado-2025.2"` 因与 Xsim 流程冲突)。工作流节点可直接以角色实例为注入器,无需外部构造
 - **类型化执行结果**:`arun_structured` 返回 `AgentTurnResult`(completed / cancelled,复用 `agent/turn_types.py`),调用方可区分"正常完成"与"LLM 失败",工作流节点可据此重试/降级;`ainvoke`/`astream` 保持返回字符串契约不变
@@ -2535,10 +2790,10 @@ Designer (designer_output:整理最终交付物) → END（终止）
 
 工作流节点全面异步化,`TeamAgent` 提供 `arun_structured`/`aresume_structured`/`ainvoke`/`astream` 异步能力,节点经通用工厂统一调用 `TeamAgent` 方法并透传 LangGraph `config`(callbacks 通道)实现 TOKEN 级流式;同时具备技能注入与跨轮次记忆压缩能力:
 
-- **异步节点执行 + TOKEN 流式**:`simple.py` / `rtl_graph.py` 的业务节点(`manager_plan`/`worker_exec`/`terminator_final` 及 RTL 各节点)全部由 `team/node_factory.py::create_llm_node` 工厂构建(手写节点如 `ManagerAgent.summarize_context_node` 复用同一链路),执行路径统一为:`agent.get_template(template_name)` 取模板 → `agent.render_template(...)` 渲染 → 基础提示词前置(`llm.config.load_agent_rules` 按 `agent.tools` 判定) → `injector.inject_into_prompt(...)` 注入技能 → `run_team_turn_with_interrupt(agent, prompt, config)` 执行,并透传 LangGraph 注入的 `config: Optional[RunnableConfig]`。`run_team_turn_with_interrupt`(`team/interrupt.py`)内部调通用 `TeamAgent.arun_structured`;内层被 interrupt 时调外层 `langgraph.types.interrupt()` 暂停外层图,resume 后经 `TeamAgent.aresume_structured` 注入内层恢复,循环处理多次 interrupt。**节点实现归属各角色类**:两个内置工作流的业务节点全部以类属性(LLM 节点,`create_llm_node` 闭包)或实例方法(代码型节点)形式定义在 team/ 角色类中,graph 文件只保留编排(NodeSpec 表 + 边 + 条件路由)。`TeamAgent`(`team/base.py`)提供 `arun_structured`/`aresume_structured`/`ainvoke`/`astream` 异步能力:`_astream_with_tools` 经 `agent_executor.astream_events(version="v2")` 过滤 `on_chat_model_stream`;`_astream_pure_text` 经 chat model `astream`。因同事件循环执行,callbacks 自然透传——`NodeTrackingHandler.on_chat_model_stream` 捕获 LLM token 增量转发为 `AgentEvent.token`,`WorkflowAdapter._on_token` 闭包补 `thread_id`/`role="assistant"`/`trace_id` 后注入事件流,实现节点执行期间的 TOKEN 级流式(空块自动过滤)。
+- **异步节点执行 + TOKEN 流式**:`simple.py` / `rtl_graph.py` 的业务节点(`manager_plan`/`worker_exec`/`terminator_final` 及 RTL 各节点)全部由 `team/node_factory.py::create_llm_node` 工厂构建(手写节点如 `ManagerAgent.summarize_context_node` 复用同一链路),执行路径统一为:`agent.get_template(template_name)` 取模板 → `agent.render_template(...)` 渲染 → 基础提示词前置(`llm.config.load_agent_rules` 按 `agent.tools` 判定) → `injector.inject_into_prompt(...)` 注入技能 → `run_team_turn_with_interrupt(agent, prompt, config)` 执行,并透传 LangGraph 注入的 `config: Optional[RunnableConfig]`。`run_team_turn_with_interrupt`(`team/interrupt.py`)内部调通用 `TeamAgent.arun_structured`;内层被 interrupt 时调外层 `langgraph.types.interrupt()` 暂停外层图,resume 后经 `TeamAgent.aresume_structured` 注入内层恢复,循环处理多次 interrupt。**节点实现归属各角色类**:两个内置工作流的业务节点全部以类属性(LLM 节点,`create_llm_node` 闭包)或实例方法(代码型节点)形式定义在 team/ 角色类中,graph 文件只保留编排(NodeSpec 表 + 边 + 条件路由)。`TeamAgent`(`team/base.py`)提供 `arun_structured`/`aresume_structured`/`ainvoke`/`astream` 异步能力:`_astream_with_tools` 经 `agent_executor.astream_events(version="v2")` 过滤 `on_chat_model_stream`;`_astream_pure_text` 经 chat model `astream`。因同事件循环执行,callbacks 自然透传——`NodeTrackingHandler.on_llm_new_token`(LangChain 回调系统派发的标准流式 token 钩子;注意 `on_chat_model_stream` 是 `astream_events` 的事件名而非回调钩子,历史上误用作 handler 方法名导致 TOKEN 事件从不触发) 捕获 LLM token 增量转发为 `AgentEvent.token`,`WorkflowAdapter._on_token` 闭包补 `thread_id`/`role="assistant"`/`trace_id` 后注入事件流,实现节点执行期间的 TOKEN 级流式(空块自动过滤)。前端配套:`web/src/store.ts` 的 `interrupt` 事件豁免 `terminatedThreads` 终止去重守卫——HITL 中断是需要用户响应的状态机事件,不得被当作迟到重复包静默丢弃(否则看门狗误判超时拉黑线程后,确认卡片永不渲染);工作流会话前端**不渲染 TOKEN**(节点产出以 `workflow_node` 结果块为唯一呈现,避免"流式原文 + 节点块"重复),TOKEN 事件仍照常消费并重置看门狗。
 - **技能注入(SkillInjector)**:两个 `build_*_workflow` 的 `SkillInjector` 创建与 State schema 组合(`compose_state_schema`)统一由 `graph/common/builder_utils.py::build_graph_scaffold(agents, *, skills_dir, auto_match_skills, extra_channels=None) -> (builder, injector)` 在构建期一步完成(接受 `skills_dir` / `auto_match_skills` 参数,经 `skmng.injector.SkillInjector` 构造注入器并包出 `StateGraph`)。节点渲染 prompt 后调用 `inject_into_prompt()` 把命中技能(`match_skills(task)`)的指引块追加到 prompt 末尾,已含技能块时跳过(防重复)。`skmng.core.build_skill_block` 的三来源合并(角色级 `fixed_skills` + 运行时 `active_names` + 自动匹配)完整生效:`SkillInjector.inject_into_prompt` 接受 `fixed_skills` 参数,节点经 `create_llm_node` 读取 `agent.fixed_skills` 传入(如 `VerificationAgent.fixed_skills = ["vivado-2025.2"]`,验证环境始终注入 Vivado Xsim 指引,与任务关键词无关);需要排除某技能时经 `exclude_skills` 传入(如 `VerificationAgent.check_node` 排除 `"vivado-2025.2"`,因该技能的 add_files 目录通配与 Xsim `sim_filelist.f` 流程冲突,作为节点级 opt-out)。`TeamAgent` 亦内建同等能力(`build_skill_block` / `inject_into_prompt` 转发 `skmng.core`,满足 `PromptInjector` 协议)——节点可直接以角色实例为注入器,无需外部构造;`team/factory.py` 会把角色 `team/team_agents.json` 的 `skills_dir` / `auto_match_skills` / `tool_timeout` 透传给 TeamAgent。节点在 `create_llm_node` 内从 `state["active_skills"]` 读取手动加载技能并作为 `active_names` 传入(与 `fixed_skills` / `exclude_skills` 并列),使 `skill:<name>` 加载的技能经 workflow checkpoint per-thread 持久化后真正到达节点 prompt;`arun_compiled_workflow` / `arun_workflow_by_name` 均接受 `active_skills` 参数(仅非空时写入初始状态,不覆盖 checkpoint 已持久化的值)。`WorkflowAdapter`(`session/workflow_adapter.py`)提供 `list_skills` / `auto_match_skills` / `aload_skill` / `aclear_skills`,经 `graph.aget_state` / `graph.aupdate_state` 读写 workflow 会话 state,使 workflow 会话具备与主 Agent(`SkillOps`)同级的技能读写能力。
 - **消息通道压缩(compaction)**:工作流 State schema 已不再手写固定的 `WorkflowState` / `RTLGraphState` TypedDict,改由 `graph/common/schema.py::compose_state_schema(agents, extra_channels)` 在构建期动态组合(底座 `messages`/`task`/`raw_context`/`active_skills` + 各角色 `state_fields` 声明 + 工作流级 `extra_channels`)。`messages`(LangGraph `add_messages` 通道)仍为底座通道,每个业务节点产出追加一条 `AIMessage`;工作流级 `summary` 通道已移除。**消息压缩统一由 `LCAgentCompactionMiddleware.before_model` 中间件在模型调用前自动触发**(见 `midware/compaction.py`),节点级压缩(`register_nodes` 的 `compaction_mw`、`build_*_workflow` 的 `compaction_config` 参数)已移除——`register_nodes` 不再接受 `compaction_mw`,`build_*_workflow` 也不再接受 `compaction_config`,`graph/common/compaction_utils.py::_build_compaction_middleware` 保留,供 `session/workflow_adapter.py` 手动压缩路径使用。
-- **跨轮次上下文延续**:统一入口(CLI/API)经 `WorkflowAdapter`(`session/workflow_adapter.py`)执行——运行前从 workflow 专属会话的 checkpoint `messages` 通道读取历史节点产出(预览最多 5 条、每条截断 200 字符,拼为 `【历史执行记录】` 块),叠加 `MemoryManager.recall_text` 的长期记忆,合并注入 `raw_context`,实现多轮运行间的上下文延续。
+- **跨轮次上下文延续**:统一入口(CLI/API)经 `WorkflowAdapter`(`session/workflow_adapter.py`)执行——运行前从 workflow 专属会话的 checkpoint `messages` 通道读取历史节点产出(预览最多 5 条、每条截断 200 字符,拼为 `【历史执行记录】` 块),叠加 `MemoryManager.recall_text` 的长期记忆,合并注入 `raw_context`,实现多轮运行间的上下文延续。**用户输入作为 `HumanMessage` 写入 `messages` 通道**:`arun_events` 的 `initial_state` 除 `task` 外同时注入 `"messages": [HumanMessage(content=message)]`(`add_messages` reducer 追加),使工作流会话的 checkpoint 历史与普通对话一致——否则会话内只有节点产出的 `AIMessage`、无任何 `HumanMessage`,`serialize_messages` / `aget_messages` 拿不到用户输入,前端重载历史(切会话 / 刷新 / 断流重连)后用户消息会从会话窗口中消失(侧栏预览也会回落到节点产出)。仅 `arun_events`(新一轮用户输入)注入;`aresume_events` / `aretry_events` 沿用 checkpoint 不重复注入。
 
 ### 状态隔离机制
 
@@ -3340,6 +3595,11 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 | `provider`      | string\|null | null                            | 调度器使用的 LLM 服务商标识（null = 默认）         |
 | `blocking`      | bool         | true                            | 是否阻塞主进程（`false` 时调度器在后台运行）     |
 
+> **subagent 统一配置文件**：后台子程序（planner/executor）的参数（provider/model/采样/预算等）
+> 统一在 [subagent/config.json](subagent/config.json)（已入库，`planner` / `executor` 各占一节小节），
+> 初始化时由 [subagent/common/config.py](subagent/common/config.py) 的 `load_planner_config()` /
+> `load_executor_config()` 读取合并，小节缺失/损坏时回退该模块内的默认值。
+
 ---
 
 ## 测试
@@ -3369,6 +3629,7 @@ Agent 执行本地命令时的安全检查策略，由 [tools/safety.py](tools/s
 | `tests/memory/test_memory.py`                   | memory/ 包`AgentMemory`：checkpointer + Store 基础设施的初始化、SQLite/acreate/aclose                                                                                                     |
 | `tests/agent/test_agent_core_regressions.py`    | Agent 核心回归：HITL 恢复、会话隔离、技能匹配、长上下文裁剪等                                                                                                                               |
 | `tests/scheduler/test_scheduler.py`             | 定时任务调度：TaskStore CRUD、原子抢占、重试逻辑                                                                                                                                            |
+| `tests/subagent/`                               | 后台子程序（planner + executor + common）：公共侧 `_fakes.py`（两 worker 测试共享的模型/工具调用夹具）、`test_common_task_state.py`（状态常量/claim 互斥/reap/request_cancel 三分支/read_result 截断）、`test_common_prompt.py`（workflow 小节切分/精确文案/占位符渲染）、`test_common_awaitx.py`（超时+取消轮询/`{timeout}` 注入/超时优先于取消）、`test_common_config.py`（字段声明表分派/非法值回退/env 覆盖/损坏 json 警告/防御分支/resolve_llm_settings 提供商校验与 label 报错文案）；planner 侧 `test_store`（原子写/独占认领/PID 回收/取消）、`test_launcher`（PID 存活检测/preflight）、`test_worker`（单次调用成功/失败/空输出/取消/超时/提示词解析）、`test_tools`（3 工具注册/非阻塞/等待上限/防编造门禁）；executor 侧 `test_executor_store`（原子写/独占认领/PID 回收/取消）、`test_executor_tools_confinement`（受限工具集路径包含校验/拒绝清单/写入原子性）、`test_executor_worker`（ReAct 循环/ToolMessage 配对/步数与时间预算/取消检查点/空输出判失败）、`test_executor_tool`（3 工具注册/非阻塞/防编造门禁)` |
 | `tests/api/test_api.py`                         | API Server：端点路由、流式聊天、命令执行（FastAPI TestClient）                                                                                                                              |
 | `tests/llm/test_message_utils.py`               | LLM 异常信息提取：429/5xx/鉴权/未知错误的中文提示                                                                                                                                           |
 | `tests/llm/test_llm_client.py`                  | 瞬时错误自动重试：should_retry 判定与重试行为                                                                                                                                               |

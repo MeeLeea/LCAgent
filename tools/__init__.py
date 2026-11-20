@@ -4,6 +4,16 @@ LangChainAgent Tools Package
 
 from cli.human_input import ask_human
 from skmng.tool import read_skill
+from subagent.executor.tool import (
+    cancel_executor_task,
+    query_executor_task,
+    start_executor_task,
+)
+from subagent.planner.tool import (
+    cancel_planner_task,
+    query_planner_task,
+    start_planner_task,
+)
 
 from .calculator import calculate
 from .create_tools import create_tool
@@ -43,12 +53,20 @@ all_tools = [
     request_user_confirmation,
     search_file_content,
     forget_memory,
+    start_planner_task,
+    query_planner_task,
+    cancel_planner_task,
+    start_executor_task,
+    query_executor_task,
+    cancel_executor_task,
 ]
 
 __all__ = [
     'all_tools',
     'ask_human',
     'calculate',
+    'cancel_executor_task',
+    'cancel_planner_task',
     'cancel_scheduled_task',
     'cleanup_finished_tasks',
     'create_tool',
@@ -58,6 +76,8 @@ __all__ = [
     'list_scheduled_tasks',
     'open_file',
     'open_sqlite',
+    'query_executor_task',
+    'query_planner_task',
     'read_skill',
     'request_user_confirmation',
     'run_cmd',
@@ -66,4 +86,6 @@ __all__ = [
     'schedule_task',
     'search',
     'search_file_content',
+    'start_executor_task',
+    'start_planner_task',
 ]

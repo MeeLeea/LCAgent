@@ -4,6 +4,9 @@ import { api } from './api'
 import type {
   ChatMessage,
   InterruptInfo,
+  InterruptItem,
+  InterruptItemChoice,
+  PendingInterrupt,
   Provider,
   SessionConfig,
   RawMessage,
@@ -118,6 +121,10 @@ interface AppState {
   failedNodes: Record<string, StreamFailure>
   /** 当前线程的失败节点（展示用，随 selectThread 同步；供失败横幅与断点重试） */
   failedNode: StreamFailure | null
+  /** 各线程是否可从断点继续（看门狗求证到后端 resume_kind=resume 时置位） */
+  resumableThreads: Record<string, boolean>
+  /** 设置/清除某线程的「可从断点继续」标记 */
+  setResumableThread: (threadId: string, resumable: boolean) => void
 
   // 连接状态
   connectionStatus: 'connected' | 'disconnected' | 'checking'
@@ -138,7 +145,7 @@ interface AppState {
   /** 分叉会话：完整复制当前会话生成新会话并切换过去 */
   forkThread: (id: string) => Promise<void>
   /** 页面刷新后重连进行中的流式执行：重放错过的事件并继续实时接收 */
-  reattachStream: (threadId: string) => Promise<void>
+  reattachStream: (threadId: string, initialContent?: string) => Promise<void>
 
   // 聊天
   sendMessage: (text: string) => void
@@ -196,9 +203,13 @@ let terminatedThreads: Set<string> = new Set()
 let msgSeq = 0
 const nextId = () => `m${++msgSeq}`
 
-/** 看门狗：N 秒内无任何事件则强制复位该线程的 streaming，防止流卡死 */
+/** 看门狗：N 秒内无任何事件则向后端求证真实状态，再决定复位/重挂，防止流卡死 */
 let watchdogTimers: Record<string, ReturnType<typeof setTimeout> | null> = {}
 const WATCHDOG_MS = 90_000
+/** 求证失败 / 后端无续跑信息时的降级文案（与历史行为一致） */
+const WATCHDOG_TIMEOUT_TEXT = '> ⏱️ 响应超时，请重试。'
+/** 后端仍在执行时的提示文案（同时作为重连后新建流式气泡的初始内容） */
+const WATCHDOG_STILL_RUNNING_TEXT = '⏱️ 前端等待超时，但后端仍在执行，正在重新连接…'
 
 function armWatchdog(threadId: string, onTimeout: () => void) {
   clearWatchdog(threadId)
@@ -212,9 +223,168 @@ function clearWatchdog(threadId: string) {
 }
 
 /**
- * 构造看门狗超时处理器：把指定线程最后一条仍在流式中的 assistant 消息标记为
- * 超时错误，并强制复位该线程 streaming。所有事件循环中重挂看门狗时都必须复用
- * 同一个处理器，否则一旦换成空函数，流卡死时线程将永久处于 streaming 状态。
+ * 非流式分支的统一收尾：拆卸本地流（含可能已静默的旧连接）并复位 streaming，
+ * 但不写入终止黑名单——保留线程可恢复性（确认卡片/断点重试/断点继续仍需可用）。
+ */
+function teardownStream(get: StoreGet, set: StoreSet, threadId: string) {
+  abortFns[threadId]?.()
+  delete abortFns[threadId]
+  clearWatchdog(threadId)
+  markStreaming(get, set, threadId, false)
+}
+
+/**
+ * 给该线程最后一条仍在流式中的 assistant 消息追加一段提示并落终态。
+ * streaming 统一置 false（求证已结束，不再显示生成中）；error / interrupted 按需置位。
+ */
+function appendWatchdogNotice(
+  get: StoreGet,
+  set: StoreSet,
+  threadId: string,
+  text: string,
+  flags: { error?: boolean; interrupted?: boolean } = {},
+): void {
+  const msgs = [...(get().messagesByThread[threadId] ?? [])]
+  const lastIndex = msgs.length - 1
+  const last = msgs[lastIndex]
+  if (!last || last.role !== 'assistant' || !last.streaming) return
+  msgs[lastIndex] = {
+    ...last,
+    streaming: false,
+    error: flags.error ?? false,
+    interrupted: flags.interrupted ?? false,
+    content: last.content + (last.content ? '\n\n' : '') + text,
+  }
+  commitThreadMessages(get, set, threadId, msgs)
+}
+
+/**
+ * 把后端 stream-status 的 pending_interrupt 安全转换为 InterruptInfo。
+ * payload 结构未知，逐字段容错解析：缺失/类型不符时退化为「无选项提示」，
+ * 由 InterruptCard 渲染出可点击的「继续」按钮，保证确认卡片总能出现。
+ */
+function toInterruptInfo(pending: PendingInterrupt | null): InterruptInfo | null {
+  if (!pending) return null
+  const payload = pending.payload
+  const rec = payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : null
+  const prompt = rec && typeof rec.prompt === 'string' ? rec.prompt : '需要你的确认后继续。'
+  const choices: { id: string; label: string }[] = []
+  const rawChoices: unknown[] = rec && Array.isArray(rec.choices) ? (rec.choices as unknown[]) : []
+  for (const c of rawChoices) {
+    if (!c || typeof c !== 'object') continue
+    const item = c as Record<string, unknown>
+    if (typeof item.id === 'string' && typeof item.label === 'string') {
+      choices.push({ id: item.id, label: item.label })
+    }
+  }
+  const items: InterruptItem[] = []
+  const rawItems: unknown[] = rec && Array.isArray(rec.items) ? (rec.items as unknown[]) : []
+  for (const it of rawItems) {
+    if (!it || typeof it !== 'object') continue
+    const item = it as Record<string, unknown>
+    if (typeof item.id !== 'string' || typeof item.question !== 'string' || !Array.isArray(item.choices)) {
+      continue
+    }
+    const itemChoices: InterruptItemChoice[] = []
+    for (const c of item.choices as unknown[]) {
+      if (!c || typeof c !== 'object') continue
+      const cc = c as Record<string, unknown>
+      if (typeof cc.id === 'string' && typeof cc.label === 'string') {
+        itemChoices.push({ id: cc.id, label: cc.label })
+      }
+    }
+    items.push({ id: item.id, question: item.question, choices: itemChoices })
+  }
+  return items.length > 0 ? { prompt, choices, items } : { prompt, choices }
+}
+
+/**
+ * 看门狗超时的异步求证处理器：
+ * 超时不再无条件写死「请重试」并永久拉黑线程，而是先向后端求证真实状态，再分支处理：
+ *   streaming=true        → 后端仍在执行：不写超时、不拉黑；挂「仍在执行」提示并复用既有
+ *                           重连逻辑重新挂流（内部会重新 arm 看门狗，避免无限快速轮询）。
+ *   resume_kind=interrupt → 等待人工确认：还原 pendingInterrupts 让确认卡片渲染，不拉黑。
+ *   resume_kind=retry     → 从失败节点重试：沿用失败路径（同步失败记录 + 失败文案 + finish）。
+ *   resume_kind=resume    → 从断点继续：写提示 + 置 resumableThreads，供 UI 渲染续跑按钮。
+ *   resume_kind=null      → 保留旧的超时文案 + finish 行为。
+ * 求证失败（网络错误/超时）一律降级为旧行为，且绝不把异常抛回事件循环打断 store。
+ */
+async function resolveWatchdogTimeout(
+  get: StoreGet,
+  set: StoreSet,
+  threadId: string,
+  finish: () => void,
+): Promise<void> {
+  // 求证前该线程已被终止（新一轮执行 / 已删除），放弃处理，避免污染新流状态
+  if (terminatedThreads.has(threadId)) return
+  let status: StreamStatus
+  try {
+    status = await api.fetchStreamStatus(threadId)
+  } catch {
+    appendWatchdogNotice(get, set, threadId, WATCHDOG_TIMEOUT_TEXT, { error: true })
+    finish()
+    return
+  }
+  // 求证期间线程可能已结束（done/error 事件已处理并 finish）：二次确认，避免覆盖新状态
+  if (terminatedThreads.has(threadId)) return
+
+  if (status.streaming) {
+    // 后端仍在执行：挂提示（兼作重连后新气泡初始内容）+ 拆卸可能已静默的旧连接 + 重挂流
+    appendWatchdogNotice(get, set, threadId, `> ${WATCHDOG_STILL_RUNNING_TEXT}`)
+    teardownStream(get, set, threadId)
+    // reattachStream 内部会重新 arm 看门狗（间隔不小于 WATCHDOG_MS），不会无限快速轮询
+    void get().reattachStream(threadId, WATCHDOG_STILL_RUNNING_TEXT)
+    return
+  }
+
+  // 后端未在流式：直接按后端已算好的 resume_kind 分支，前端不自行推导
+  switch (status.resume_kind) {
+    case 'interrupt': {
+      // 等待人工确认：还原中断卡片（不拉黑，否则确认卡片点不了）
+      const info = toInterruptInfo(status.pending_interrupt)
+      if (info) {
+        set((s) => {
+          const pendingInterrupts = { ...s.pendingInterrupts, [threadId]: info }
+          const patch: Partial<AppState> = { pendingInterrupts }
+          if (normKey(s.currentThreadId) === threadId) patch.pendingInterrupt = info
+          return patch
+        })
+      }
+      appendWatchdogNotice(get, set, threadId, '> ⏸️ 已中断，等待你确认后继续。', { interrupted: true })
+      get().setResumableThread(threadId, false)
+      teardownStream(get, set, threadId)
+      return
+    }
+    case 'retry': {
+      // 从失败节点重试：沿用失败路径，驱动 WorkflowView 的失败横幅
+      syncFailureRecord(get, set, threadId, status.failure ?? null)
+      appendWatchdogNotice(get, set, threadId, '> ❌ 执行失败，可从失败节点重试。', { error: true })
+      get().setResumableThread(threadId, false)
+      teardownStream(get, set, threadId)
+      finish()
+      return
+    }
+    case 'resume': {
+      // 可从断点继续：写提示 + 置 resumableThreads，供 UI 渲染「从断点继续」按钮
+      appendWatchdogNotice(get, set, threadId, '> ⏸️ 已中断，可从断点继续。', { interrupted: true })
+      get().setResumableThread(threadId, true)
+      teardownStream(get, set, threadId)
+      finish()
+      return
+    }
+    default: {
+      // resume_kind === null：保留旧的「响应超时，请重试。」行为
+      get().setResumableThread(threadId, false)
+      appendWatchdogNotice(get, set, threadId, WATCHDOG_TIMEOUT_TEXT, { error: true })
+      finish()
+      return
+    }
+  }
+}
+
+/**
+ * 构造看门狗超时处理器（固定线程 ID 版本，供 resume / retry / reattach 复用）。
+ * 所有事件循环中重挂看门狗时都必须复用同一个处理器，否则流卡死时线程会永久 streaming。
  */
 function makeWatchdogHandler(
   get: StoreGet,
@@ -223,19 +393,7 @@ function makeWatchdogHandler(
   finish: () => void,
 ) {
   return () => {
-    const msgs = [...(get().messagesByThread[threadId] ?? [])]
-    const lastIndex = msgs.length - 1
-    const last = msgs[lastIndex]
-    if (last && last.role === 'assistant' && last.streaming) {
-      msgs[lastIndex] = {
-        ...last,
-        streaming: false,
-        error: true,
-        content: last.content + (last.content ? '\n\n' : '') + '> ⏱️ 响应超时，请重试。',
-      }
-      commitThreadMessages(get, set, threadId, msgs)
-    }
-    finish()
+    void resolveWatchdogTimeout(get, set, threadId, finish)
   }
 }
 
@@ -287,7 +445,7 @@ function syncFailureRecord(
  * （重试/发消息），放弃过期结果，避免横幅在重试过程中闪烁复活。
  */
 function refreshFailureRecord(get: StoreGet, set: StoreSet, threadId: string) {
-  api.getStreamStatus(threadId)
+  api.fetchStreamStatus(threadId)
     .then((st) => {
       if (get().streamingThreads[threadId]) return
       syncFailureRecord(get, set, threadId, st.failure ?? null)
@@ -360,10 +518,16 @@ function rebindThread(get: StoreGet, set: StoreSet, oldKey: string, newKey: stri
     terminatedThreads.delete(oldKey)
     terminatedThreads.add(newKey)
   }
+  const resumableThreads = { ...s.resumableThreads }
+  if (resumableThreads[oldKey] !== undefined) {
+    resumableThreads[newKey] = resumableThreads[oldKey]
+    delete resumableThreads[oldKey]
+  }
   set({
     messagesByThread,
     streamingThreads,
     pendingInterrupts,
+    resumableThreads,
     currentThreadId: newKey,
     messages: messagesByThread[newKey] ?? [],
     pendingInterrupt: pendingInterrupts[newKey] ?? null,
@@ -382,9 +546,13 @@ function handleStreamEvent(
   ev: StreamEvent,
   ctx: { finish: () => void },
 ): string {
-  // terminatedThreads 仅阻止终止事件重复处理（done/error/cancelled/interrupt），
+  // terminatedThreads 仅阻止终止事件重复处理（done/error/cancelled），
   // 不阻止 tool_result 等迟到事件——代理缓冲可能导致 done 先于 tool_result 到达。
-  const isTerminalEv = ev.type === 'done' || ev.type === 'error' || ev.type === 'cancelled' || ev.type === 'interrupt'
+  // interrupt 必须豁免：HITL 中断是需要用户响应的状态机事件而非迟到重复包。
+  // 若被本守卫吞掉（典型场景：节点 LLM 流式期间 SSE 静默触发看门狗误判超时、
+  // 线程被拉黑后真实中断到达），确认卡片将不再渲染，用户无法恢复工作流。
+  // 重复 interrupt 幂等：pendingInterrupt 被同值覆盖、消息重复标记 interrupted 无副作用。
+  const isTerminalEv = ev.type === 'done' || ev.type === 'error' || ev.type === 'cancelled'
   if (isTerminalEv && terminatedThreads.has(threadId)) return threadId
   const arr = [...(get().messagesByThread[threadId] ?? [])]
   const lastIndex = arr.length - 1
@@ -414,11 +582,21 @@ function handleStreamEvent(
       rebindThread(get, set, threadId, ev.thread_id)
       get().fetchThreads()
       return ev.thread_id
-    case 'token':
+    case 'token': {
+      // 工作流会话不做 token 级渲染：节点产出一律以 workflow_node(done) 结果块
+      // 呈现（见下方 case），若再把同一文本实时灌入通用气泡，消息区会出现
+      // "流式原文 + 节点块"两份重复内容（resume 后尤为明显：中断节点恢复时
+      // 满屏刷流式文本）。token 事件仍会被消费——调用方在事件回调里重置看门狗。
+      const tokenThread = get().threads.find((t) => t.thread_id === threadId)
+      const isWfThread = tokenThread
+        ? isWorkflowThread(tokenThread)
+        : threadId.includes('workflow')
+      if (isWfThread) return threadId
       if (!streamLast || streamLast.role !== 'assistant') return threadId
       arr[streamIdx] = { ...streamLast, content: streamLast.content + ev.content }
       commitThreadMessages(get, set, threadId, arr)
       break
+    }
     case 'tool_call':
       if (!streamLast || streamLast.role !== 'assistant') return threadId
       // ask_human 的 UI 由 INTERRUPT 事件渲染，不添加到 toolCalls 避免重复显示
@@ -470,6 +648,8 @@ function handleStreamEvent(
     case 'interrupt': {
       // 后端发出 INTERRUPT 前已清失败记录（失败场景被中断场景取代），前端同步清横幅
       syncFailureRecord(get, set, threadId, null)
+      // 进入中断等待：清除「可从断点继续」标记（已由 pendingInterrupt 卡片接管）
+      get().setResumableThread(threadId, false)
       if (!streamLast || streamLast.role !== 'assistant') return threadId
       arr[streamIdx] = { ...streamLast, streaming: false, interrupted: true }
       const info: InterruptInfo = { prompt: ev.prompt, choices: ev.choices, items: ev.items }
@@ -486,6 +666,7 @@ function handleStreamEvent(
     case 'cancelled':
       // 取消不等于失败：从后端同步权威状态（如重试中途取消，旧失败断点仍在，横幅应复原）
       refreshFailureRecord(get, set, threadId)
+      get().setResumableThread(threadId, false)
       if (!streamLast || streamLast.role !== 'assistant') return threadId
       arr[streamIdx] = {
         ...fillMissingToolResults(streamLast),
@@ -507,6 +688,7 @@ function handleStreamEvent(
     case 'error':
       // 流以错误结束：从后端拉取最新失败记录（节点名+异常详情），驱动失败横幅展示
       refreshFailureRecord(get, set, threadId)
+      get().setResumableThread(threadId, false)
       if (!streamLast || streamLast.role !== 'assistant') return threadId
       // 避免重复追加多条错误
       if (!streamLast.error) {
@@ -561,6 +743,7 @@ function handleStreamEvent(
     case 'done': {
       // 运行成功：清除失败横幅（后端 DONE 前已清 Store 记录，含重试成功场景）
       syncFailureRecord(get, set, threadId, null)
+      get().setResumableThread(threadId, false)
       if (!streamLast || streamLast.role !== 'assistant') return threadId
       arr[streamIdx] = { ...fillMissingToolResults(streamLast), streaming: false }
       commitThreadMessages(get, set, threadId, arr)
@@ -659,6 +842,7 @@ export const useStore = create<AppState>((set, get) => ({
   pendingInterrupt: null,
   failedNodes: {},
   failedNode: null,
+  resumableThreads: {},
   connectionStatus: 'checking',
 
   checkConnection: async () => {
@@ -672,6 +856,14 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   setViewMode: (mode) => set({ viewMode: mode }),
+
+  setResumableThread: (threadId, resumable) =>
+    set((s) => {
+      const resumableThreads = { ...s.resumableThreads }
+      if (resumable) resumableThreads[threadId] = true
+      else delete resumableThreads[threadId]
+      return { resumableThreads }
+    }),
 
   switchViewMode: async (mode) => {
     set({ viewMode: mode })
@@ -834,20 +1026,24 @@ export const useStore = create<AppState>((set, get) => ({
     void get().reattachStream(id)
   },
 
-  reattachStream: async (threadId) => {
+  reattachStream: async (threadId, initialContent = '') => {
     // 本页面已有该线程的活跃流（sendMessage/resume 发起），无需重连
     if (get().streamingThreads[threadId]) return
     if (abortFns[threadId]) return
 
     let status: StreamStatus
     try {
-      status = await api.getStreamStatus(threadId)
+      status = await api.fetchStreamStatus(threadId)
     } catch {
       return
     }
     // 同步失败记录：页面刷新后据此还原失败横幅（含非流式中的失败断点）
     syncFailureRecord(get, set, threadId, status.failure ?? null)
-    if (!status.streaming) return
+    if (!status.streaming) {
+      // 刷新后还原「可从断点继续」标记，供工作流视图渲染续跑按钮
+      if (status.resume_kind === 'resume') get().setResumableThread(threadId, true)
+      return
+    }
     // 查询期间用户可能已切换线程或发起新消息，二次确认
     if (get().streamingThreads[threadId] || abortFns[threadId]) return
 
@@ -866,7 +1062,7 @@ export const useStore = create<AppState>((set, get) => ({
     const streamMsg: ChatMessage = {
       id: nextId(),
       role: 'assistant',
-      content: '',
+      content: initialContent,
       toolCalls: [],
       toolResults: [],
       streaming: true,
@@ -982,6 +1178,8 @@ export const useStore = create<AppState>((set, get) => ({
         delete pendingInterrupts[id]
         const failedNodes = { ...s.failedNodes }
         delete failedNodes[id]
+        const resumableThreads = { ...s.resumableThreads }
+        delete resumableThreads[id]
         const sessionConfigs = { ...s.sessionConfigs }
         delete sessionConfigs[id]
         const patch: Partial<AppState> = {
@@ -989,6 +1187,7 @@ export const useStore = create<AppState>((set, get) => ({
           streamingThreads,
           pendingInterrupts,
           failedNodes,
+          resumableThreads,
           sessionConfigs,
         }
         if (s.currentThreadId === id) {
@@ -1054,6 +1253,8 @@ export const useStore = create<AppState>((set, get) => ({
 
     // 新一轮执行开跑：清除上一轮失败横幅（后端同样在新任务开跑前清失败记录）
     syncFailureRecord(get, set, key, null)
+    // 新一轮执行开跑：清除「可从断点继续」标记（旧断点已被新执行取代）
+    get().setResumableThread(key, false)
 
     // 清除上一轮的终止标记：finish() 会将 key 加入 terminatedThreads 且永不删除，
     // 若不清理，后续 handleStreamEvent 的 early return 会丢弃所有事件（需刷新才恢复）
@@ -1074,19 +1275,9 @@ export const useStore = create<AppState>((set, get) => ({
     }
 
     const watchdogHandler = () => {
-      const msgs = [...(get().messagesByThread[activeKey] ?? [])]
-      const lastIndex = msgs.length - 1
-      const last = msgs[lastIndex]
-      if (last && last.role === 'assistant' && last.streaming) {
-        msgs[lastIndex] = {
-          ...last,
-          streaming: false,
-          error: true,
-          content: last.content + (last.content ? '\n\n' : '') + '> ⏱️ 响应超时，请重试。',
-        }
-        commitThreadMessages(get, set, activeKey, msgs)
-      }
-      finish()
+      // 超时不再同步写死「请重试」：先向后端求证真实状态，再按 streaming/resume_kind 分支处理。
+      // 引用可变的 activeKey，确保 thread_created 重绑定后用真实线程 ID 求证。
+      void resolveWatchdogTimeout(get, set, activeKey, finish)
     }
 
     armWatchdog(key, watchdogHandler)
@@ -1211,6 +1402,8 @@ export const useStore = create<AppState>((set, get) => ({
 
     // 清除上一轮的终止标记，确保恢复流的事件不被阻塞
     terminatedThreads.delete(threadId)
+    // 恢复执行即消费旧断点：清除「可从断点继续」标记
+    get().setResumableThread(threadId, false)
 
     const finish = makeFinish(get, set, threadId)
     const watchdogHandler = makeWatchdogHandler(get, set, threadId, finish)
@@ -1245,6 +1438,8 @@ export const useStore = create<AppState>((set, get) => ({
 
     // 清除上一轮的终止标记，确保重试流的事件不被阻塞
     terminatedThreads.delete(threadId)
+    // 重试即消费旧断点：清除「可从断点继续」标记
+    get().setResumableThread(threadId, false)
 
     const finish = makeFinish(get, set, threadId)
     const watchdogHandler = makeWatchdogHandler(get, set, threadId, finish)
