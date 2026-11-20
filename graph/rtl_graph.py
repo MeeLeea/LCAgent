@@ -234,5 +234,7 @@ register_workflow(
         "output_files": [],
         "file_check_passed": False,
         "sim_check_passed": False,
+        "sim_status": "",
+        "sim_log_path": "",
     },
 )

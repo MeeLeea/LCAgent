@@ -35,6 +35,12 @@ TOOL_TIMEOUTS: dict[str, float] = {
     "schedule_task": 120.0,   # 调度器可能需要更长
     "search": 90.0,           # 搜索可能需要多次请求
     "run_shell": 600.0,       # shell 命令
+    # planner 方案设计子程序工具：均为非阻塞派活/查询，硬超时须覆盖单次调用开销。
+    # query_planner_task 硬超时 45s 必须大于其 30s 的 wait_seconds 等待上限，
+    # 否则外层 wait_for 会先于工具内部有界等待触发，丢失状态信息。
+    "start_planner_task": 30.0,
+    "query_planner_task": 45.0,
+    "cancel_planner_task": 30.0,
 }
 
 # 完全排除超时的工具（无限等待）

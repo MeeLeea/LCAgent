@@ -672,6 +672,117 @@ def test_create_workflow_thread_default_name(client, mock_agent):
     )
 
 
+def _fake_new_session_rejecting_missing(thread_id: str) -> Any:
+    """构造模拟 SessionRegistry 校验行为的 new_session：路径不存在则抛 ValueError。"""
+
+    def _new_session(workspace_path: str | None = None) -> str:
+        if workspace_path is not None and not os.path.isdir(workspace_path):
+            raise ValueError(f"工作空间路径不存在或不是目录: {workspace_path}")
+        return thread_id
+
+    return _new_session
+
+
+def _fake_new_workflow_session_rejecting_missing(thread_id: str) -> Any:
+    """构造模拟 SessionRegistry 校验行为的 new_workflow_session（同上）。"""
+
+    def _new_workflow_session(
+        workflow_name: str, workspace_path: str | None = None
+    ) -> str:
+        if workspace_path is not None and not os.path.isdir(workspace_path):
+            raise ValueError(f"工作空间路径不存在或不是目录: {workspace_path}")
+        return thread_id
+
+    return _new_workflow_session
+
+
+def test_create_thread_invalid_workspace_falls_back(client, mock_agent, tmp_path):
+    """chat 会话传入不存在的 workspace_path：降级为不绑定，返回 200 + workspace_error"""
+    missing = str(tmp_path / "deleted-workspace")
+    mock_agent.session.new_session.side_effect = _fake_new_session_rejecting_missing(
+        "new-thread-456"
+    )
+
+    response = client.post(
+        "/api/threads",
+        json={"type": "chat", "workspace_path": missing},
+    )
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["thread_id"] == "new-thread-456"
+    assert data["workspace_error"]
+    assert missing in data["workspace_error"]
+
+    # 首次带 workspace 创建被拒绝，降级后不带 workspace_path 重新创建
+    assert mock_agent.session.new_session.call_count == 2
+    mock_agent.session.new_session.assert_called_with()
+    mock_agent.set_current_session.assert_called_once_with("new-thread-456")
+
+    # 该会话未绑定 workspace
+    workspace_response = client.get("/api/threads/new-thread-456/workspace")
+    assert workspace_response.status_code == 200
+    assert workspace_response.json()["workspace"] is None
+
+
+def test_create_workflow_thread_invalid_workspace_falls_back(
+    client, mock_agent, tmp_path
+):
+    """workflow 会话传入不存在的 workspace_path：同样降级，不返回 500"""
+    missing = str(tmp_path / "deleted-workspace")
+    mock_agent.session.new_workflow_session.side_effect = (
+        _fake_new_workflow_session_rejecting_missing("server-workflow-simple-abc12345")
+    )
+
+    response = client.post(
+        "/api/threads",
+        json={"type": "workflow", "workflow_name": "simple", "workspace_path": missing},
+    )
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["thread_id"] == "server-workflow-simple-abc12345"
+    assert data["workspace_error"]
+    assert missing in data["workspace_error"]
+
+    # 首次带 workspace 创建被拒绝，降级后仅以 workflow_name 重新创建
+    assert mock_agent.session.new_workflow_session.call_count == 2
+    mock_agent.session.new_workflow_session.assert_called_with("simple")
+    mock_agent.set_current_session.assert_called_once_with(
+        "server-workflow-simple-abc12345"
+    )
+
+    workspace_response = client.get(
+        "/api/threads/server-workflow-simple-abc12345/workspace"
+    )
+    assert workspace_response.status_code == 200
+    assert workspace_response.json()["workspace"] is None
+
+
+def test_create_thread_valid_workspace_binds(client, mock_agent, tmp_path):
+    """合法已存在目录：正常绑定，workspace_error 为 None，GET workspace 返回该路径"""
+    workspace = str(tmp_path)
+    mock_agent.session.new_session.side_effect = _fake_new_session_rejecting_missing(
+        "new-thread-456"
+    )
+    mock_agent.session.aget_workspace.return_value = workspace
+
+    response = client.post(
+        "/api/threads",
+        json={"type": "chat", "workspace_path": workspace},
+    )
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["thread_id"] == "new-thread-456"
+    assert data["workspace_error"] is None
+    mock_agent.session.new_session.assert_called_once_with(workspace_path=workspace)
+
+    workspace_response = client.get("/api/threads/new-thread-456/workspace")
+    assert workspace_response.status_code == 200
+    assert workspace_response.json()["workspace"] == workspace
+
+
 def test_list_workflows(client):
     """测试列出可用工作流名称"""
     with patch("graph.common.WORKFLOWS", {"simple": None, "pipline": None}):
@@ -1604,6 +1715,115 @@ def test_clear_memory_default_scope(client, mock_agent):
     response = client.delete("/api/memory")
     assert response.status_code == 200
     assert response.json()["scope"] == "long"
+
+
+# --------------------------------------------------------------------------- #
+# 显式遗忘（forgotten 软删除）— DELETE /api/memory/facts
+# --------------------------------------------------------------------------- #
+def _forget_facts_response(scope: str = "long", keyword: str | None = "深色", **params: Any):
+    """构造被遗忘前后的 facts 快照（同一 fact_id，仅 status 变化），供 preview 断言使用。"""
+    from memory.models import (
+        FACT_STATUS_ACTIVE,
+        FACT_STATUS_FORGOTTEN,
+        ThreadFactItem,
+    )
+
+    target = ThreadFactItem(content="用户偏好深色主题", status=FACT_STATUS_ACTIVE)
+    other = ThreadFactItem(content="无关条目", status=FACT_STATUS_ACTIVE)
+    before = [target, other]
+
+    # 遗忘后：同一 fact_id，仅 status/forgotten_at 变化（模拟 Store 落库回读）
+    target_after = ThreadFactItem.from_dict(target.to_dict())
+    target_after.status = FACT_STATUS_FORGOTTEN
+    target_after.forgotten_at = "2026-01-01T00:00:00"
+    other_after = ThreadFactItem.from_dict(other.to_dict())
+    after = [target_after, other_after]
+    return before, after
+
+
+def test_forget_memory_facts_long(client, mock_agent):
+    """DELETE /api/memory/facts?scope=long&keyword=... → 200 + forgotten_count + preview"""
+    from memory.models import ThreadFactItem
+
+    before, after = _forget_facts_response()
+    mock_agent.session_manager.memory = MagicMock()
+    mock_agent.session_manager.memory.forget = AsyncMock(return_value=1)
+    mock_agent.session_manager.memory.store = MagicMock()
+    mock_agent.session_manager.memory.store.query_facts = AsyncMock(
+        side_effect=[before, after]
+    )
+    assert isinstance(before[0], ThreadFactItem)
+
+    response = client.delete("/api/memory/facts?scope=long&keyword=深色主题")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["scope"] == "long"
+    assert data["forgotten_count"] == 1
+    # 断言"哪条内容被遗忘"，不只断言计数
+    assert data["preview"] == ["用户偏好深色主题"]
+    mock_agent.session_manager.memory.forget.assert_awaited_once()
+    mock_agent.session_manager.memory.forget_agent.assert_not_called()
+
+
+def test_forget_memory_facts_agent_scope(client, mock_agent):
+    """scope=agent → 调用 forget_agent，且路由到 agent 级查询"""
+    from memory.models import FACT_STATUS_ACTIVE, FACT_STATUS_FORGOTTEN, ThreadFactItem
+
+    before = [ThreadFactItem(content="用户偏好中文", category="user_fact", scope="agent")]
+    after_item = ThreadFactItem.from_dict(before[0].to_dict())
+    after_item.status = FACT_STATUS_FORGOTTEN
+    after_item.forgotten_at = "2026-01-01T00:00:00"
+    after = [after_item]
+    mock_agent.session_manager.memory = MagicMock()
+    mock_agent.session_manager.memory.forget_agent = AsyncMock(return_value=1)
+    mock_agent.session_manager.memory.forget = AsyncMock(return_value=0)
+    mock_agent.session_manager.memory.store = MagicMock()
+    mock_agent.session_manager.memory.store.query_agent_facts = AsyncMock(
+        side_effect=[before, after]
+    )
+    assert before[0].status == FACT_STATUS_ACTIVE
+
+    response = client.delete("/api/memory/facts?scope=agent&keyword=中文")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["scope"] == "agent"
+    assert data["forgotten_count"] == 1
+    assert data["preview"] == ["用户偏好中文"]
+    mock_agent.session_manager.memory.forget_agent.assert_awaited_once()
+    mock_agent.session_manager.memory.forget.assert_not_called()
+
+
+def test_forget_memory_facts_topic_param(client, mock_agent):
+    """topic 查询参数透传为 topic_key"""
+    before, after = _forget_facts_response()
+    mock_agent.session_manager.memory = MagicMock()
+    mock_agent.session_manager.memory.forget = AsyncMock(return_value=0)
+    mock_agent.session_manager.memory.store = MagicMock()
+    mock_agent.session_manager.memory.store.query_facts = AsyncMock(
+        side_effect=[before, after]
+    )
+
+    response = client.delete("/api/memory/facts?scope=long&topic=Dim-Y%20Formula")
+
+    assert response.status_code == 200
+    kwargs = mock_agent.session_manager.memory.forget.await_args.kwargs
+    assert kwargs["topic_key"] == "Dim-Y Formula"
+
+
+def test_forget_memory_facts_invalid_scope(client, mock_agent):
+    """非法 scope → 400（JSON error body），不抛 500"""
+    response = client.delete("/api/memory/facts?scope=short&keyword=x")
+    assert response.status_code == 400
+    assert "detail" in response.json()
+
+
+def test_forget_memory_facts_missing_keyword(client, mock_agent):
+    """缺少 keyword 且无 topic → 400"""
+    response = client.delete("/api/memory/facts?scope=long")
+    assert response.status_code == 400
+    assert "detail" in response.json()
 
 
 # --------------------------------------------------------------------------- #

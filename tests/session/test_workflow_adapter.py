@@ -24,8 +24,9 @@ from unittest.mock import AsyncMock, MagicMock
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
 
+from graph.common import WORKFLOWS
 from session.context import SessionContext
-from session.workflow_adapter import WorkflowAdapter
+from session.workflow_adapter import ResumeState, WorkflowAdapter
 from utils.events import EventType
 
 
@@ -68,10 +69,10 @@ class FakeGraph:
 
 
 class FakeGraphToken(FakeGraph):
-    """在节点执行期间额外触发 on_chat_model_stream 的图(TOKEN 事件)。
+    """在节点执行期间额外触发 on_llm_new_token 的图(TOKEN 事件)。
 
     模拟 TeamAgent.astream 透传 callbacks 后,LLM token 增量到达
-    NodeTrackingHandler.on_chat_model_stream 的场景;含一个空 content 块,
+    NodeTrackingHandler.on_llm_new_token 的场景;含一个空 token,
     验证空块被过滤不产生事件。
     """
 
@@ -82,8 +83,8 @@ class FakeGraphToken(FakeGraph):
         handler.on_chain_start(
             {}, {}, run_id="r1", metadata={"langgraph_node": "node_a"}
         )
-        handler.on_chat_model_stream(types.SimpleNamespace(content="增量文本"))
-        handler.on_chat_model_stream(types.SimpleNamespace(content=""))
+        handler.on_llm_new_token("增量文本")
+        handler.on_llm_new_token("")
         handler.on_chain_end(
             {"messages": [AIMessage(content="节点产出文本")]}, run_id="r1"
         )
@@ -140,6 +141,33 @@ class FakeGraphResume(FakeGraph):
     async def ainvoke(self, state, config):
         self.received_input = state  # 应为 Command(resume=...)
         return await super().ainvoke(state, config)
+
+
+class FakeGraphResumeWithState(FakeGraphResume):
+    """带 aget_state 的 resume 图：返回指定挂起中断 value 列表。
+
+    供 aresume_events 前置校验测试（无挂起中断 / 陈旧载荷 / 正常载荷）。
+    `pending_values` 为空时模拟图无挂起中断（tasks 不含 interrupts）。
+    """
+
+    def __init__(
+        self, pending_values: list | None = None, result: dict | None = None
+    ) -> None:
+        super().__init__(result=result)
+        self._pending_values = list(pending_values or [])
+        self.state_reads: list = []
+
+    async def aget_state(self, config):
+        self.state_reads.append(config)
+        tasks = [
+            types.SimpleNamespace(interrupts=[types.SimpleNamespace(value=value)])
+            for value in self._pending_values
+        ]
+        return types.SimpleNamespace(
+            values={},
+            next=("node_a",) if tasks else (),
+            tasks=tasks,
+        )
 
 
 class FakeGraphFailOnce(FakeGraph):
@@ -202,6 +230,34 @@ class FakeGraphRetryable(FakeGraph):
     async def ainvoke(self, state, config):
         self.received_input = state
         return await super().ainvoke(state, config)
+
+
+class FakeGraphResumeState(FakeGraph):
+    """带 ``aget_state`` 且可注入挂起中断的图（供 ``aget_resume_state`` 测试）。
+
+    - ``interrupts``: 顶层 ``state.interrupts`` 列表（元素为含 ``value`` 的对象），
+      为空时模拟无挂起中断；
+    - ``next_nodes``: 待执行节点元组（决定 ``resumable``）；
+    - ``state_error``: 非 None 时 ``aget_state`` 抛出该异常（验证防御式兜底）。
+    """
+
+    def __init__(
+        self,
+        next_nodes: tuple[str, ...] = (),
+        interrupts: list | None = None,
+        state_error: BaseException | None = None,
+    ) -> None:
+        super().__init__(result={"final_answer": ""})
+        self.next_nodes = next_nodes
+        self.interrupts = list(interrupts or [])
+        self.state_error = state_error
+
+    async def aget_state(self, config):
+        if self.state_error is not None:
+            raise self.state_error
+        return types.SimpleNamespace(
+            values={}, next=self.next_nodes, interrupts=self.interrupts
+        )
 
 
 class FakeStore:
@@ -381,8 +437,8 @@ def test_arun_events_node_flow(monkeypatch):
 def test_arun_events_emits_token_stream(monkeypatch):
     """节点执行期间 LLM token 增量 → TOKEN 事件;空块被过滤。
 
-    模拟 TeamAgent.astream 透传 callbacks 后,LLM 的 on_chat_model_stream
-    事件被 NodeTrackingHandler 捕获转发为 TOKEN 事件。
+    模拟 TeamAgent.astream 透传 callbacks 后,LLM 的 on_llm_new_token
+    回调被 NodeTrackingHandler 捕获转发为 TOKEN 事件。
     """
     fake_graph = FakeGraphToken()
     monkeypatch.setattr(
@@ -457,6 +513,44 @@ def test_arun_events_history_injected(monkeypatch):
     assert "上一轮的设计方案 A" in raw_context
     # HumanMessage 不进入历史预览
     assert "用户新任务" not in raw_context
+
+
+def test_arun_events_injects_user_message(monkeypatch):
+    """用户任务作为 HumanMessage 写入 messages 通道（前端历史可见用户输入）。
+
+    回归守护：此前 initial_state 只放 task，工作流会话 checkpoint 无任何
+    HumanMessage，前端重载历史（selectThread / reattach）后用户消息消失。
+    """
+    fake_graph = FakeGraph()
+    monkeypatch.setattr(
+        "graph.common.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
+    adapter = _make_adapter()
+
+    _collect(adapter, task="帮我设计一个加法器", thread_id="workflow-simple-thread-1")
+
+    messages = fake_graph.last_state["messages"]
+    assert len(messages) == 1
+    assert isinstance(messages[0], HumanMessage)
+    assert messages[0].content == "帮我设计一个加法器"
+    # task 通道仍然保留（节点 prompt 从 task 取值，不受影响）
+    assert fake_graph.last_state["task"] == "帮我设计一个加法器"
+
+
+def test_aresume_events_does_not_reinject_user_message(monkeypatch):
+    """aresume_events 用 Command(resume=...) 恢复，不重复注入 HumanMessage。"""
+    fake_graph = FakeGraphResume(result={"final_answer": "恢复后完成"})
+    monkeypatch.setattr(
+        "graph.common.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
+    adapter = _make_adapter()
+
+    _collect_resume(adapter, {"answer": "yes"}, thread_id="workflow-simple-thread-1")
+
+    # resume 传的是 Command，而非含 messages 的 initial_state
+    assert isinstance(fake_graph.received_input, Command)
 
 
 def test_arun_events_done_is_important_false_by_default(monkeypatch):
@@ -687,6 +781,156 @@ def test_aresume_events_non_workflow_session_raises(monkeypatch):
         raise AssertionError("应抛出 ValueError")
 
 
+# ────────────── 静默期心跳（喂前端看门狗） ──────────────
+
+
+def test_arun_events_emits_heartbeat_during_silence(monkeypatch):
+    """节点执行静默期（队列无事件）周期性发 HEARTBEAT 保活。
+
+    回归守护：巨型工具调用参数生成 / LLM 长流式 / 工具长执行期间 node_queue
+    无事件，前端 90s 看门狗曾误判"响应超时"并拉黑线程，导致后续 HITL 中断
+    整批丢失、确认卡片永不渲染。
+    """
+    monkeypatch.setattr(
+        "session.workflow_adapter._WORKFLOW_HEARTBEAT_INTERVAL", 0.01
+    )
+
+    class _SlowGraph(FakeGraph):
+        async def ainvoke(self, state, config):
+            self.last_state = state
+            self.last_config = config
+            # 静默 0.05s：足够触发多次心跳（间隔 0.01s）
+            await asyncio.sleep(0.05)
+            handler = config["callbacks"][0]
+            handler.on_chain_start(
+                {}, {}, run_id="r1", metadata={"langgraph_node": "node_a"}
+            )
+            handler.on_chain_end(
+                {"messages": [AIMessage(content="节点产出文本")]}, run_id="r1"
+            )
+            return dict(self.result)
+
+    monkeypatch.setattr(
+        "graph.common.build_workflow",
+        lambda name, checkpointer=None: (_SlowGraph(), {"manager": object()}),
+    )
+    adapter = _make_adapter()
+
+    events = _collect(adapter, thread_id="workflow-simple-thread-1")
+
+    heartbeats = [ev for ev in events if ev.event_type == EventType.HEARTBEAT]
+    assert heartbeats, "静默期应产出 HEARTBEAT 事件"
+    assert all(hb.thread_id == "workflow-simple-thread-1" for hb in heartbeats)
+    assert all(hb.content == "" for hb in heartbeats)
+    # 心跳纯保活，不干扰终止事件
+    assert events[-1].event_type == EventType.DONE
+
+
+# ────────────── aresume 前置校验（无挂起 / 陈旧载荷） ──────────────
+
+
+_PENDING_CONFIRMATION = {
+    "kind": "user_confirmation",
+    "items": [
+        {
+            "id": "clk_strategy",
+            "question": "时钟策略?",
+            "choices": [{"id": "single", "label": "单时钟"}],
+        }
+    ],
+}
+
+
+def test_aresume_events_no_pending_interrupt_done(monkeypatch):
+    """无挂起中断时优雅 DONE（不调 ainvoke），避免前端白等到超时。
+
+    回归守护：无挂起中断时 Command(resume) 不报错、图原地不动，现象是
+    前端 90s 后看门狗误报"响应超时"（用户理解为节点失败）。
+    """
+    fake_graph = FakeGraphResumeWithState(pending_values=[])
+    monkeypatch.setattr(
+        "graph.common.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
+    adapter = _make_adapter()
+
+    events = _collect_resume(
+        adapter, {"answers": {"q1": {"choice_id": "a"}}},
+        thread_id="workflow-simple-thread-1",
+    )
+
+    assert fake_graph.received_input is None  # 未调用 ainvoke
+    assert [ev.event_type for ev in events] == [EventType.DONE]
+    assert "没有挂起的人工确认" in events[0].content
+    assert fake_graph.state_reads  # 前置校验读取了 checkpoint 状态
+
+
+def test_aresume_events_stale_answers_replays_interrupt(monkeypatch):
+    """陈旧 answers（与挂起项 id 无交集）→ 重放当前 INTERRUPT，不调 ainvoke。
+
+    并行重跑产生新中断后，用户对旧卡片重复提交会排队；后端若不拦，
+    resume 要么错配答案要么空等。重放卡片让用户对当前问题正确作答。
+    """
+    fake_graph = FakeGraphResumeWithState(pending_values=[_PENDING_CONFIRMATION])
+    monkeypatch.setattr(
+        "graph.common.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
+    adapter = _make_adapter()
+
+    events = _collect_resume(
+        adapter,
+        {"answers": {"old_item_1": {"choice_id": "x"}}},
+        thread_id="workflow-simple-thread-1",
+    )
+
+    assert fake_graph.received_input is None
+    assert [ev.event_type for ev in events] == [EventType.INTERRUPT]
+    assert events[0].interrupt_items[0]["id"] == "clk_strategy"
+
+
+def test_aresume_events_matching_answers_proceeds(monkeypatch):
+    """answers key 与挂起项 id 有交集 → 正常 Command(resume) 恢复。"""
+    fake_graph = FakeGraphResumeWithState(
+        pending_values=[_PENDING_CONFIRMATION],
+        result={"final_answer": "恢复后完成"},
+    )
+    monkeypatch.setattr(
+        "graph.common.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
+    adapter = _make_adapter()
+
+    payload = {"answers": {"clk_strategy": {"choice_id": "single"}}}
+    events = _collect_resume(adapter, payload, thread_id="workflow-simple-thread-1")
+
+    assert isinstance(fake_graph.received_input, Command)
+    assert fake_graph.received_input.resume == payload
+    assert events[-1].event_type == EventType.DONE
+
+
+def test_aresume_events_human_choice_payload_not_stale(monkeypatch):
+    """human_choice 的 {"choice_id": ...} 载荷不触发陈旧判定（fail-open）。"""
+    pending = {
+        "kind": "human_choice",
+        "prompt": "确认执行?",
+        "choices": [{"id": "approve", "label": "确认"}],
+    }
+    fake_graph = FakeGraphResumeWithState(pending_values=[pending])
+    monkeypatch.setattr(
+        "graph.common.build_workflow",
+        lambda name, checkpointer=None: (fake_graph, {"manager": object()}),
+    )
+    adapter = _make_adapter()
+
+    events = _collect_resume(
+        adapter, {"choice_id": "approve"}, thread_id="workflow-simple-thread-1"
+    )
+
+    assert isinstance(fake_graph.received_input, Command)
+    assert events[-1].event_type == EventType.DONE
+
+
 # ────────────── 图级自动重试（瞬时异常）+ 失败记录落库 ──────────────
 
 
@@ -866,6 +1110,142 @@ def test_aget_failure_record_without_store_returns_none():
     adapter = _make_adapter(reg)
 
     assert asyncio.run(adapter.aget_failure_record()) is None
+
+
+# ────────────── aget_resume_state：可恢复状态（断点/挂起） ──────────────
+
+
+def _patch_graph(monkeypatch, graph) -> None:
+    """把 build_workflow 替换为返回指定 FakeGraph 的桩。"""
+    monkeypatch.setattr(
+        "graph.common.build_workflow",
+        lambda name, checkpointer=None: (graph, {"manager": object()}),
+    )
+
+
+def test_aget_resume_state_with_interrupt(monkeypatch):
+    """有挂起中断 → pending_interrupt 非空（kind 取自 value.kind）+ resumable 真。"""
+    interrupt_value = {"kind": "user_confirmation", "items": [{"id": "clk"}]}
+    fake_graph = FakeGraphResumeState(
+        next_nodes=("node_a",),
+        interrupts=[types.SimpleNamespace(value=interrupt_value)],
+    )
+    _patch_graph(monkeypatch, fake_graph)
+    adapter = _make_adapter()
+
+    state = asyncio.run(adapter.aget_resume_state("workflow-simple-thread-1"))
+
+    assert isinstance(state, ResumeState)
+    assert state.pending_interrupt == {
+        "kind": "user_confirmation",
+        "payload": interrupt_value,
+    }
+    assert state.resumable is True
+
+
+def test_aget_resume_state_resumable_without_interrupt(monkeypatch):
+    """无挂起中断但 next 非空 → resumable 真、pending_interrupt None。"""
+    _patch_graph(monkeypatch, FakeGraphResumeState(next_nodes=("node_a",)))
+    adapter = _make_adapter()
+
+    state = asyncio.run(adapter.aget_resume_state("workflow-simple-thread-1"))
+
+    assert state.pending_interrupt is None
+    assert state.resumable is True
+
+
+def test_aget_resume_state_finished_graph_not_resumable(monkeypatch):
+    """next 为空（图已跑完/从未执行）→ 空状态（不可续跑、无挂起）。"""
+    _patch_graph(monkeypatch, FakeGraphResumeState(next_nodes=()))
+    adapter = _make_adapter()
+
+    state = asyncio.run(adapter.aget_resume_state("workflow-simple-thread-1"))
+
+    assert state == ResumeState()
+
+
+def test_aget_resume_state_interrupt_kind_fallbacks(monkeypatch):
+    """kind 取值优先级：value.kind > value.type > 默认 "interrupt"。"""
+    cases = [
+        ({"kind": "k1"}, "k1"),
+        ({"type": "k2"}, "k2"),
+        ({"prompt": "无 kind/type"}, "interrupt"),
+    ]
+    for value, expected_kind in cases:
+        fake_graph = FakeGraphResumeState(
+            interrupts=[types.SimpleNamespace(value=value)]
+        )
+        _patch_graph(monkeypatch, fake_graph)
+        adapter = _make_adapter()
+
+        state = asyncio.run(adapter.aget_resume_state("workflow-simple-thread-1"))
+
+        assert state.pending_interrupt == {"kind": expected_kind, "payload": value}
+
+
+def test_aget_resume_state_non_dict_value(monkeypatch):
+    """value 非 dict → kind="interrupt"、payload=value。"""
+    _patch_graph(
+        monkeypatch,
+        FakeGraphResumeState(interrupts=[types.SimpleNamespace(value="raw_payload")]),
+    )
+    adapter = _make_adapter()
+
+    state = asyncio.run(adapter.aget_resume_state("workflow-simple-thread-1"))
+
+    assert state.pending_interrupt == {"kind": "interrupt", "payload": "raw_payload"}
+
+
+def test_aget_resume_state_tasks_fallback(monkeypatch):
+    """顶层无 interrupts 时回退遍历 tasks[*].interrupts。"""
+
+    class _TasksOnlyState(FakeGraphResumeState):
+        async def aget_state(self, config):
+            task = types.SimpleNamespace(
+                interrupts=[types.SimpleNamespace(value={"kind": "human_choice"})]
+            )
+            return types.SimpleNamespace(values={}, next=("node_a",), tasks=[task])
+
+    _patch_graph(monkeypatch, _TasksOnlyState())
+    adapter = _make_adapter()
+
+    state = asyncio.run(adapter.aget_resume_state("workflow-simple-thread-1"))
+
+    assert state.pending_interrupt == {"kind": "human_choice", "payload": {"kind": "human_choice"}}
+    assert state.resumable is True
+
+
+def test_aget_resume_state_state_error_returns_empty(monkeypatch):
+    """aget_state 抛异常 → 返回空 ResumeState（不抛出）。"""
+    _patch_graph(monkeypatch, FakeGraphResumeState(state_error=RuntimeError("boom")))
+    adapter = _make_adapter()
+
+    state = asyncio.run(adapter.aget_resume_state("workflow-simple-thread-1"))
+
+    assert state == ResumeState()
+
+
+def test_aget_resume_state_build_error_returns_empty(monkeypatch):
+    """build_workflow 抛异常 → 返回空 ResumeState（不抛出）。"""
+
+    def _boom(name, checkpointer=None):
+        raise RuntimeError("构建图失败")
+
+    monkeypatch.setattr("graph.common.build_workflow", _boom)
+    adapter = _make_adapter()
+
+    state = asyncio.run(adapter.aget_resume_state("workflow-simple-thread-1"))
+
+    assert state == ResumeState()
+
+
+def test_aget_resume_state_non_workflow_session(monkeypatch):
+    """非 workflow 会话 → 空 ResumeState（不构建图）。"""
+    adapter = _make_adapter(_make_registry(workflow_name=None))
+
+    state = asyncio.run(adapter.aget_resume_state("thread-abc"))
+
+    assert state == ResumeState()
 
 
 def test_aget_execution_history_reuses_store():
@@ -1110,3 +1490,64 @@ def test_aclear_skills_non_workflow_session_noop(monkeypatch):
     asyncio.run(adapter.aclear_skills())
 
     assert built == []
+
+# ────────────── 新任务初始 state：按 registry initial_fields 播种 ──────────────
+
+
+def _patch_seed_graph(monkeypatch, graph) -> None:
+    """把 build_workflow 替换为返回指定 FakeGraph 的桩（本区块自包含）。"""
+    monkeypatch.setattr(
+        "graph.common.build_workflow",
+        lambda name, checkpointer=None: (graph, {"manager": object()}),
+    )
+
+
+def test_arun_events_seeds_initial_fields(monkeypatch):
+    """新任务按 registry 的 initial_fields 播种：上一轮产物/计数器回空。
+
+    回归场景：checkpoint 按 thread 持久化，若不播种，第二条任务会继承
+    上一轮的 rtl_code / verification_report / output_files（designer_output
+    把旧产物拼进交付物），且 round 已接近 max_rounds。
+    """
+    fake_graph = FakeGraph()
+    _patch_seed_graph(monkeypatch, fake_graph)
+    adapter = _make_adapter(_make_registry(workflow_name="rtl_graph"))
+
+    _collect(adapter, task="第二条任务")
+
+    state = fake_graph.last_state
+    assert state is not None
+    assert state["task"] == "第二条任务"
+    assert state["rtl_code"] == ""
+    assert state["verification_report"] == ""
+    assert state["output_files"] == []
+    assert state["sim_status"] == ""
+    assert state["sim_log_path"] == ""
+    assert state["round"] == 0
+    assert state["max_rounds"] == 3
+    assert [m.content for m in state["messages"]] == ["第二条任务"]
+
+
+def test_arun_events_seed_excludes_active_skills(monkeypatch):
+    """initial_fields 若声明 active_skills，播种时必须剔除（per-thread 持久化技能）。"""
+    fake_graph = FakeGraph()
+    _patch_seed_graph(monkeypatch, fake_graph)
+    monkeypatch.setitem(
+        WORKFLOWS,
+        "_test_seed_flow",
+        {
+            "builder": lambda *args, **kwargs: None,
+            "initial_fields": {"active_skills": ["git-helper"], "draft": ""},
+            "roles": [],
+            "description": "",
+        },
+    )
+    adapter = _make_adapter(_make_registry(workflow_name="_test_seed_flow"))
+
+    _collect(adapter, task="任务")
+
+    state = fake_graph.last_state
+    assert state is not None
+    assert "active_skills" not in state
+    assert state["draft"] == ""
+    assert state["task"] == "任务"

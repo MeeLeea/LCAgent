@@ -804,10 +804,14 @@ class TestDeterministicJudgment:
         asyncio.run(run())
 
     def test_two_failed_tool_results_become_lesson(self):
-        """同类失败 ≥2 次记为 lesson（agent 级）：分类确定性锁定，内容经 LLM 蒸馏。
+        """同类失败 ≥2 次记为 lesson：分类确定性锁定，内容经 LLM 蒸馏。
+
+        蒸馏返回裸文本（非 JSON）时容错为教训文本 + persistence 保守取
+        session（会话隔离，thread 级）——防止会话局部环境状态被误升为
+        跨会话共享的普适教训。
 
         历史 bug 回归：确定性 lesson 曾把错误原文逐字入库（含巨型命令与
-        反思指令后缀），污染跨会话共享 namespace。现在必须存蒸馏文本。
+        反思指令后缀），污染共享 namespace。现在必须存蒸馏文本。
         """
         async def run():
             distilled_text = "run_shell 反复超时：命令含交互式等待，应改为非交互参数后执行"
@@ -825,12 +829,40 @@ class TestDeterministicJudgment:
 
             # 失败 ≥2 → 分类不再交 LLM 判定，但内容走蒸馏通道（调用一次 chat）
             assert len(llm.calls) == 1
+            # 裸文本蒸馏回退 persistence=session → thread 级（会话隔离）
+            thread_facts = await store.query_facts("t1")
+            assert len(thread_facts) == 1
+            assert thread_facts[0].category == "lesson"
+            assert thread_facts[0].scope == "thread"
+            # 存的是蒸馏文本，不是错误原文
+            assert thread_facts[0].content == distilled_text
+
+        asyncio.run(run())
+
+    def test_two_failed_tool_results_global_lesson_json(self):
+        """蒸馏返回 JSON 且 persistence=global 时 → agent 级（跨会话共享）。"""
+        async def run():
+            llm = _RecordingLLM(response=json.dumps({
+                "lesson": "run_shell 命令含交互式等待会反复超时，应改为非交互参数",
+                "persistence": "global",
+                "topic_key": "run_shell_timeout",
+            }))
+            mw, store = _make_write_middleware(llm_getter=lambda: llm)
+            for _ in range(2):
+                await mw.submit_event(
+                    "t1",
+                    "assistant",
+                    "命令超时 run_shell",
+                    event_type="tool_result",
+                    tool_name="run_shell",
+                )
+            await mw._aflush_thread("t1")
+
             agent_facts = await store.query_agent_facts()
             assert len(agent_facts) == 1
             assert agent_facts[0].category == "lesson"
             assert agent_facts[0].scope == "agent"
-            # 存的是蒸馏文本，不是错误原文
-            assert agent_facts[0].content == distilled_text
+            assert agent_facts[0].topic_key == "run_shell_timeout"
 
         asyncio.run(run())
 
@@ -1142,7 +1174,7 @@ class TestPerThreadLLMResolution:
         asyncio.run(run())
 
     def test_distill_lesson_uses_per_thread_llm(self):
-        """lesson 蒸馏同样按 thread_id 解析 LLM。"""
+        """lesson 蒸馏同样按 thread_id 解析 LLM（返回三元组）。"""
 
         async def run():
             llms = {
@@ -1151,11 +1183,11 @@ class TestPerThreadLLMResolution:
             }
             mw = self._make_per_thread_middleware(llms)
 
-            distilled_t1 = await mw._a_distill_lesson("t1", "命令超时 run_shell")
-            distilled_t2 = await mw._a_distill_lesson("t2", "命令超时 run_shell")
+            lesson_t1, _, _ = await mw._a_distill_lesson("t1", "命令超时 run_shell")
+            lesson_t2, _, _ = await mw._a_distill_lesson("t2", "命令超时 run_shell")
 
-            assert distilled_t1 == "t1 的蒸馏教训"
-            assert distilled_t2 == "t2 的蒸馏教训"
+            assert lesson_t1 == "t1 的蒸馏教训"
+            assert lesson_t2 == "t2 的蒸馏教训"
             assert llms["t1"].calls and llms["t2"].calls
 
         asyncio.run(run())

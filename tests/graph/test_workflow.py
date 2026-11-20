@@ -859,6 +859,14 @@ class FakeSession:
     async def aget_short_term(self, session_id=None):
         return []
 
+    async def aget_workspace(self, session_id=None):
+        """run_workflow 会读取当前会话 workspace 以继承到新工作流会话（本 fake 未绑定）。"""
+        return
+
+    async def aset_workspace(self, workspace_path, session_id=None):
+        """继承 workspace 的写入端（本 fake 未绑定 workspace，正常不会被调用）。"""
+        return workspace_path
+
 
 class FakeAgentCore:
     """模拟 AgentCore 的 executor + memory"""

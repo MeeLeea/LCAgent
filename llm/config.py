@@ -22,13 +22,6 @@
                                       temperature。云雾网关思考型模型可能长时间零字节，
                                       默认 300.0 以免 langchain-openai 默认 120s 误触发)
 
-Memory 层配置（由 memory/config.py 统一管理，不写入 agent_config.json）:
-    memory_buffer_delay_seconds   int  记忆写入防抖延迟(秒)
-    memory_max_buffer_messages    int  防抖 buffer 最大消息数(超出强制刷新)
-    memory_max_facts_per_thread   int  单线程最大 fact 条数(超出 LRU 淘汰)
-    memory_recall_limit           int  召回长期记忆时的默认条数上限
-    session_enable_memory         bool SessionManager 是否启用长期记忆处理
-
 Agent 核心提示词加载顺序：
     1. agent/AGENT.md（优先）
     2. 内置默认提示词（fallback）

@@ -14,26 +14,26 @@
   "architect": {
     "name": "architect",
     "agent_prompt_file": "team/architect/AGENT.md",
-    "provider": "yunlan",
-    "model": "deepseek-v4.1-flash"
+    "provider": "bingxing",
+    "model": "Kimi-K3"
   },
   "rtl_designer": {
     "name": "rtl_designer",
     "agent_prompt_file": "team/rtl_designer/AGENT.md",
-    "provider": "yunlan",
-    "model": "deepseek-v4.1-flash"
+    "provider": "bingxing",
+    "model": "Kimi-K3"
   },
   "rtl_verification": {
     "name": "rtl_verification",
     "agent_prompt_file": "team/rtl_verification/AGENT.md",
-    "provider": "yunlan",
-    "model": "deepseek-v4.1-flash"
+    "provider": "bingxing",
+    "model": "Kimi-K3"
   },
   "manager": {
     "name": "manager",
     "agent_prompt_file": "team/manager/AGENT.md",
-    "provider": "yunlan",
-    "model": "deepseek-v4.1-flash"
+    "provider": "bingxing",
+    "model": "Kimi-K3"
   },
   "worker": {
     "name": "worker",

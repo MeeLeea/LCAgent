@@ -52,6 +52,8 @@ async def dispatch_command(context: CommandContext, user_input: str) -> CommandO
         return await _invoke(core.show_tools, context)
     if low.startswith("clear"):
         return await _invoke(memory.clear_memory, context, user_input)
+    if low.startswith("forget"):
+        return await _invoke(memory.forget_memory, context, user_input)
     if low in ("session memory", "session:memory", "sessionmem"):
         return await _invoke(memory.show_thread_memory, context)
     if low in ("agent memory", "agent:memory", "agentmem"):

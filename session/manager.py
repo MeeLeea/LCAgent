@@ -207,6 +207,24 @@ class SessionManager:
         tid = self._resolve_thread_id(thread_id)
         return await aget(tid)
 
+    async def aget_resume_state(
+        self, thread_id: str | None = None
+    ) -> Any:
+        """读取会话可恢复状态（挂起中断 + 是否可续跑）。
+
+        委托 workflow 执行体的 ``aget_resume_state``（workflow 会话返回
+        ``ResumeState``）；chat 链路（AgentCore）无此接口时返回 None，
+        由调用方回落到仅凭 failure 判定。
+
+        Args:
+            thread_id: 目标会话线程 ID（为 None 时使用当前会话）
+        """
+        aget = getattr(self._agent, "aget_resume_state", None)
+        if aget is None:
+            return None
+        tid = self._resolve_thread_id(thread_id)
+        return await aget(tid)
+
     async def arun_stream(
         self,
         task: str,
