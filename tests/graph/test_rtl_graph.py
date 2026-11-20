@@ -45,6 +45,7 @@ RTL_INITIAL_FIELDS: dict[str, Any] = {
     "verification_report": "",
     "round": 0,
     "max_rounds": 3,
+    "sim_rounds": 5,
     "final_answer": "",
     "output_files": [],
     "file_check_passed": False,
@@ -553,8 +554,8 @@ def test_run_rtl_graph_multi_round_iteration(tmp_path, monkeypatch):
     assert result["sim_check_passed"] is True
 
 
-def test_run_rtl_graph_forced_output_at_max_rounds(tmp_path, monkeypatch):
-    """验证仿真一直失败达 max_rounds 上限强制交付(不无限循环)。"""
+def test_run_rtl_graph_forced_output_at_sim_rounds(tmp_path, monkeypatch):
+    """验证仿真一直失败达 sim_rounds 上限强制交付(不无限循环)。"""
     manager = FakeRTLManagerAgent(name="manager", response="摘要")
     architect = FakeRTLArchitectAgent(name="architect", response="架构方案")
     designer = FakeRTLDesignerAgent(name="rtl_designer", response="module uart;")
@@ -569,12 +570,17 @@ def test_run_rtl_graph_forced_output_at_max_rounds(tmp_path, monkeypatch):
     }
     graph = build_rtl_graph_workflow(agents, max_rounds=3)
     ws = _make_workspace(tmp_path)
-    # 仿真三次均失败(退出码 1)→ 达 max_rounds 后强制交付
+    # 仿真三次均失败(退出码 1)→ 达 sim_rounds=3 后强制交付
     _patch_vivado(monkeypatch, [1, 1, 1])
 
-    result = asyncio.run(arun_compiled_workflow(graph, "设计 UART", initial_fields=RTL_INITIAL_FIELDS, workspace_path=ws))
+    result = asyncio.run(arun_compiled_workflow(
+        graph,
+        "设计 UART",
+        initial_fields={**RTL_INITIAL_FIELDS, "sim_rounds": 3},
+        workspace_path=ws,
+    ))
 
-    # 3 次迭代后强制交付,round 达上限
+    # 3 次迭代后强制交付,round 达 sim_rounds 上限
     assert result["round"] == 3
     assert result["sim_check_passed"] is False
     # verifier 的 verification_check 被调 3 次(prompt 含"待验证 RTL 源码")
@@ -583,6 +589,36 @@ def test_run_rtl_graph_forced_output_at_max_rounds(tmp_path, monkeypatch):
         if c[0] == "arun_structured" and "待验证 RTL 源码" in c[1]
     ]
     assert len(verifier_check_calls) == 3
+
+
+def test_run_rtl_graph_sim_rounds_independent_of_max_rounds(tmp_path, monkeypatch):
+    """sim_rounds 独立控制仿真迭代上限:sim_rounds=2 时两轮即强制交付(不受 max_rounds=3 影响)。"""
+    manager = FakeRTLManagerAgent(name="manager", response="摘要")
+    architect = FakeRTLArchitectAgent(name="architect", response="架构方案")
+    designer = FakeRTLDesignerAgent(name="rtl_designer", response="module uart;")
+    verifier = FakeRTLVerificationAgent(name="rtl_verification",
+        response="验证结论: FAIL\n始终有问题",
+    )
+    agents = {
+        "manager": manager,
+        "architect": architect,
+        "rtl_designer": designer,
+        "rtl_verification": verifier,
+    }
+    graph = build_rtl_graph_workflow(agents, max_rounds=3)
+    ws = _make_workspace(tmp_path)
+    _patch_vivado(monkeypatch, [1, 1])
+
+    result = asyncio.run(arun_compiled_workflow(
+        graph,
+        "设计 UART",
+        initial_fields={**RTL_INITIAL_FIELDS, "sim_rounds": 2},
+        workspace_path=ws,
+    ))
+
+    assert result["round"] == 2
+    assert result["sim_check_passed"] is False
+    assert result["final_answer"] != ""
 
 
 def test_run_rtl_graph_with_context_memory(tmp_path, monkeypatch):
@@ -632,6 +668,8 @@ def test_rtl_graph_registered():
     assert callable(spec["builder"])
     assert isinstance(spec["initial_fields"], dict)
     assert spec["roles"] == ["manager", "architect", "rtl_designer", "rtl_verification"]
+    # sim_rounds 是仿真迭代上限(独立于 max_rounds),默认 5
+    assert spec["initial_fields"]["sim_rounds"] == 5
 
 
 def test_rtl_agents_registered():
@@ -664,10 +702,10 @@ def test_route_after_file_check():
 
 
 def test_route_after_sim_check():
-    """sim_exec_check 路由:通过→designer_output;失败未达上限→回环;达上限→designer_output。"""
-    assert route_after_sim_check({"sim_check_passed": True, "round": 1, "max_rounds": 3}) == "designer_output"
-    assert route_after_sim_check({"sim_check_passed": False, "round": 1, "max_rounds": 3}) == "designer_verilog"
-    assert route_after_sim_check({"sim_check_passed": False, "round": 3, "max_rounds": 3}) == "designer_output"
+    """sim_exec_check 路由:通过→designer_output;失败未达 sim_rounds→回环;达 sim_rounds→designer_output。"""
+    assert route_after_sim_check({"sim_check_passed": True, "round": 1, "sim_rounds": 5}) == "designer_output"
+    assert route_after_sim_check({"sim_check_passed": False, "round": 1, "sim_rounds": 5}) == "designer_verilog"
+    assert route_after_sim_check({"sim_check_passed": False, "round": 5, "sim_rounds": 5}) == "designer_output"
 
 
 async def _run_file_check(state, workspace):

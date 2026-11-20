@@ -25,8 +25,8 @@ RTL 芯片设计流水线工作流 - Manager 提炼 → Architect 架构 → Des
     由条件路由 route_after_file_check / route_after_sim_check 判定:
       designer_file_check 校验本轮产出 RTL 文件存在且非空,缺失则回 designer_verilog 重做;
       sim_exec_check 实际执行 Vivado 仿真并检查覆盖率(syn_filelist ⊆ sim_filelist 且报告已生成),
-      仿真+覆盖率通过 → 经 designer_output 交付后终止(END);失败且轮次未达 max_rounds → 携带上轮验证报告反馈回到
-      designer_verilog 重新设计;轮次达 max_rounds 上限 → 强制经 designer_output 交付后终止(END,防止死循环)。
+      仿真+覆盖率通过 → 经 designer_output 交付后终止(END);失败且轮次未达 sim_rounds(默认 5)→ 携带上轮验证报告反馈回到
+      designer_verilog 重新设计;轮次达 sim_rounds 上限 → 强制经 designer_output 交付后终止(END,防止死循环)。
 
 节点执行链路说明：
     节点函数在自身渲染 prompt(get_template + render_template + 技能注入)后,
@@ -93,10 +93,11 @@ def route_after_file_check(state: dict[str, Any]) -> str:
 
 def route_after_sim_check(state: dict[str, Any]) -> str:
     """sim_exec_check 后的条件路由:仿真+覆盖率通过 → designer_output 交付;
-    失败且未达轮次上限 → 回 designer_verilog 重做;达上限 → designer_output 交付。"""
+    失败且未达仿真轮次上限(sim_rounds,默认 5) → 回 designer_verilog 重做;
+    达上限 → designer_output 交付。"""
     if state.get("sim_check_passed"):
         return "designer_output"
-    if state.get("round", 0) >= state.get("max_rounds", 3):
+    if state.get("round", 0) >= state.get("sim_rounds", 5):
         return "designer_output"
     return "designer_verilog"
 
@@ -129,7 +130,7 @@ def build_rtl_graph_workflow(
     rtl_verification = agents["rtl_verification"]
 
     # 基础 setup(技能注入器 + State schema 组合)收敛为公共构图辅助;
-    # RTL 额外声明编排通道(round/max_rounds 等),经 extra_channels 透传 compose_state_schema
+    # RTL 额外声明编排通道(round/max_rounds/sim_rounds 等),经 extra_channels 透传 compose_state_schema
     builder, injector = build_graph_scaffold(
         agents,
         skills_dir=skills_dir,
@@ -137,6 +138,7 @@ def build_rtl_graph_workflow(
         extra_channels={
             "round": int,
             "max_rounds": int,
+            "sim_rounds": int,
             "final_answer": str,
             "file_check_passed": bool,
             "sim_check_passed": bool,
@@ -230,6 +232,7 @@ register_workflow(
         "verification_report": "",
         "round": 0,
         "max_rounds": 3,
+        "sim_rounds": 5,
         "final_answer": "",
         "output_files": [],
         "file_check_passed": False,

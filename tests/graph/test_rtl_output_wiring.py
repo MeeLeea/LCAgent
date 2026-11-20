@@ -106,11 +106,11 @@ def test_designer_output_node_and_end_edge_present():
 # ==================== 用例 (b)(c):条件路由终态 ====================
 
 def test_route_after_sim_check_terminal_paths_deliver():
-    """sim_exec_check 两条终态(通过 / 达上限)均路由到 designer_output 交付。"""
-    assert route_after_sim_check({"sim_check_passed": True, "round": 1, "max_rounds": 3}) == "designer_output"
-    assert route_after_sim_check({"sim_check_passed": False, "round": 3, "max_rounds": 3}) == "designer_output"
-    # 未达上限仍回环重做
-    assert route_after_sim_check({"sim_check_passed": False, "round": 1, "max_rounds": 3}) == "designer_verilog"
+    """sim_exec_check 两条终态(通过 / 达 sim_rounds 上限)均路由到 designer_output 交付。"""
+    assert route_after_sim_check({"sim_check_passed": True, "round": 1, "sim_rounds": 5}) == "designer_output"
+    assert route_after_sim_check({"sim_check_passed": False, "round": 5, "sim_rounds": 5}) == "designer_output"
+    # 未达 sim_rounds 上限仍回环重做
+    assert route_after_sim_check({"sim_check_passed": False, "round": 1, "sim_rounds": 5}) == "designer_verilog"
 
 
 def test_route_after_file_check_max_rounds_delivers():

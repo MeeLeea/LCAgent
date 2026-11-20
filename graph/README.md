@@ -107,7 +107,7 @@ graph/                        # 命名空间包（无 __init__.py，PEP 420 隐�
 | --- | --- |
 | 底座（`_BASE_CHANNELS`，所有图共有） | `task: str` / `raw_context: str` / `messages: Annotated[list[AnyMessage], add_messages]` / `active_skills: list[str]` |
 | 各角色 `state_fields` ClassVar | manager→`context_summary`/`plan`；worker→`worker_result`；terminator→`final_answer`；architect→5 个 `arch_*`；rtl_designer→`design_spec`/`rtl_code`/`output_files`；rtl_verification→`verification_plan`/`verification_report` |
-| `extra_channels`（工作流级编排字段） | rtl 的 `round`/`max_rounds`/`final_answer`/`file_check_passed`/`sim_check_passed`/`sim_status`/`sim_log_path` |
+| `extra_channels`（工作流级编排字段） | rtl 的 `round`/`max_rounds`/`sim_rounds`/`final_answer`/`file_check_passed`/`sim_check_passed`/`sim_status`/`sim_log_path` |
 
 规则：
 
@@ -392,8 +392,8 @@ START
   → verification_check                   # Testbench / 验证报告
   → sim_exec_check                       # Vivado 仿真 + 覆盖率
       ├─ 通过 ─────────────→ designer_output
-      ├─ 未达 max_rounds ──→ designer_verilog（带验证报告 + sim_log_path 反馈重新设计）
-      └─ 达 max_rounds ────→ designer_output
+      ├─ 未达 sim_rounds ──→ designer_verilog（带验证报告 + sim_log_path 反馈重新设计）
+      └─ 达 sim_rounds ────→ designer_output
   → designer_output（零 LLM 机械拼装）
   → END
 ```
@@ -430,6 +430,7 @@ builder, injector = build_graph_scaffold(
     extra_channels={
         "round": int,
         "max_rounds": int,
+        "sim_rounds": int,
         "final_answer": str,
         "file_check_passed": bool,
         "sim_check_passed": bool,
@@ -452,10 +453,12 @@ def route_after_file_check(state) -> str:
 def route_after_sim_check(state) -> str:
     if state.get("sim_check_passed"):
         return "designer_output"
-    if state.get("round", 0) >= state.get("max_rounds", 3):
+    if state.get("round", 0) >= state.get("sim_rounds", 5):
         return "designer_output"
     return "designer_verilog"
 ```
+
+**两条回环上限相互独立**：`designer_file_check` 用 `max_rounds`（默认 3），`sim_exec_check` 用 `sim_rounds`（默认 5），二者都以共享的 `round` 计数（由 `designer_verilog` 每轮 +1）作为判定依据。
 
 注册时必须以 `{返回值: 目标节点}` 映射表显式声明每条分支，否则 LangGraph 报未知目标：
 
@@ -468,14 +471,14 @@ builder.add_conditional_edges(
 )
 ```
 
-**双出口设计**：两条终态路径（仿真通过 / 达 `max_rounds` 上限）都先经 `designer_output` 再 `→ END`，保证 `final_answer` 非空——跨轮次记忆沉淀与 DONE 事件内容都依赖它。`designer_output` 不调 LLM、不渲染模板、不做 IO，只按固定小节机械拼装 state 字段（空字段整段省略，全空则回退 `task`）。
+**双出口设计**：两条终态路径（仿真通过 / 达 `sim_rounds` 上限）都先经 `designer_output` 再 `→ END`，保证 `final_answer` 非空——跨轮次记忆沉淀与 DONE 事件内容都依赖它。`designer_output` 不调 LLM、不渲染模板、不做 IO，只按固定小节机械拼装 state 字段（空字段整段省略，全空则回退 `task`）。
 
 ### 11.5 其他公开符号
 
 | 符号 | 说明 |
 | --- | --- |
 | `verification_passed(report: str) -> bool` | 从验证报告文本解析结论：优先匹配"验证结论: PASS/FAIL"标记行；无标记时回退全文扫描（含 PASS 且不含 FAIL 视为通过）。当前图的路由依据 `sim_check_passed` 通道，本函数保留供外部复用与测试（`tests/graph/test_rtl_graph.py`）。 |
-| `build_rtl_graph_workflow(agents, checkpointer=None, skills_dir=None, auto_match_skills=True, max_rounds=3)` | 构建函数。注意 `max_rounds` 在 `extra_channels` 里只是**通道类型声明**，实际初始值由 `register_workflow` 的 `initial_fields["max_rounds"] = 3` 提供——`build_workflow` 不传该参数，改上限须同步改这两处。 |
+| `build_rtl_graph_workflow(agents, checkpointer=None, skills_dir=None, auto_match_skills=True, max_rounds=3)` | 构建函数。注意 `max_rounds` / `sim_rounds` 在 `extra_channels` 里只是**通道类型声明**，实际初始值由 `register_workflow` 的 `initial_fields`（`max_rounds=3`、`sim_rounds=5`）提供——`build_workflow` 不传这些参数，改上限须同步改 `initial_fields`。 |
 
 ### 11.6 角色注册的隐藏依赖
 
