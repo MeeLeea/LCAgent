@@ -7,6 +7,9 @@
 1. prompt 内容:task + 【设计规格与Filelist】 + 【验证计划】;
    仅当 ``round > 0 and verification_report`` 时追加
    【第 N 轮验证报告反馈(请据此修正 RTL)】;且不得出现「重要规则」前缀。
+   仅当 ``round > 0 and sim_status == "FAIL" and sim_log_path`` 时追加
+   【上一轮 Vivado 仿真失败日志】(含日志路径 + read_file 指引,不内嵌日志正文);
+   ``sim_status == "ERROR"`` 时追加环境排查提示。
 2. ``round == state["round"] + 1``。
 3. ``output_files``:从 ``config.configurable.workspace_path`` 下
    ``scripts/syn_filelist.f`` 解析,仅保留 .v/.sv/.vhd/.vhdl token。
@@ -14,6 +17,7 @@
 5. ``rtl_code == result``。
 6. 技能注入:injector 以 ``(prompt, prompt_task)`` 被调用
    (prompt_task 为未套渲染模板外壳的拼装文本)。
+7. 消费后清空 ``sim_status`` / ``sim_log_path``,避免 file_check 回退携带陈旧仿真信息。
 
 另断言缺失 workspace 时优雅降级(``output_files == []``)。
 
@@ -89,6 +93,8 @@ def _initial_state(**overrides) -> dict[str, Any]:
         "round": 0,
         "max_rounds": 3,
         "final_answer": "",
+        "sim_status": "",
+        "sim_log_path": "",
     }
     state.update(overrides)
     return state
@@ -106,6 +112,20 @@ def _expected_prompt_task(state: dict[str, Any]) -> str:
         parts.append(
             f"【第 {state['round']} 轮验证报告反馈(请据此修正 RTL)】\n"
             f"{state['verification_report']}"
+        )
+    round_n = state.get("round", 0)
+    sim_status = state.get("sim_status", "")
+    sim_log_path = state.get("sim_log_path", "")
+    if round_n > 0 and sim_status == "FAIL" and sim_log_path:
+        parts.append(
+            f"【上一轮 Vivado 仿真失败日志】\n日志文件: {sim_log_path}\n"
+            "请先使用 read_file 工具读取该日志(重点看末尾的编译/仿真报错与 ERROR 行),"
+            "据此定位并修正 RTL 后再交付。"
+        )
+    elif round_n > 0 and sim_status == "ERROR":
+        parts.append(
+            "【上一轮仿真执行失败】仿真环境或脚本执行异常(未产生日志),"
+            "请检查 scripts/start.tcl 与仿真脚本配置是否正确后重试。"
         )
     return "\n\n".join(parts)
 
@@ -188,6 +208,80 @@ def test_prompt_omits_spec_and_plan_sections_when_empty():
     assert prompt == _expected_prompt(state)
     assert "【设计规格与Filelist】" not in prompt
     assert "【验证计划】" not in prompt
+
+
+# ==================== 1b. 仿真日志交割 ====================
+
+def test_prompt_appends_sim_log_hint_when_sim_failed():
+    """round>0 且 sim_status==FAIL 且日志路径非空:追加日志路径 + read_file 指引。"""
+    designer = FakeDesignerAgent()
+    state = _initial_state(
+        round=1,
+        verification_report="验证结论: FAIL",
+        sim_status="FAIL",
+        sim_log_path=r"D:\ws\logs\sim_exec.log",
+    )
+    asyncio.run(DesignerAgent.verilog_node(state, designer))
+    prompt = designer.calls[0][1]
+
+    assert prompt == _expected_prompt(state)
+    assert "【上一轮 Vivado 仿真失败日志】" in prompt
+    assert r"D:\ws\logs\sim_exec.log" in prompt
+    assert "read_file" in prompt
+    # 只传路径,不内嵌日志正文
+    assert "ERROR: [XSIM 43-3322]" not in prompt
+
+
+def test_prompt_omits_sim_hint_when_sim_not_failed():
+    """sim_status 为 PASS / 空:不追加仿真日志小节(即使路径存在)。"""
+    for status in ("", "PASS"):
+        designer = FakeDesignerAgent()
+        state = _initial_state(
+            round=1, sim_status=status, sim_log_path=r"D:\ws\logs\sim_exec.log"
+        )
+        asyncio.run(DesignerAgent.verilog_node(state, designer))
+        prompt = designer.calls[0][1]
+
+        assert prompt == _expected_prompt(state)
+        assert "Vivado 仿真失败日志" not in prompt
+
+
+def test_prompt_omits_sim_hint_at_round_zero_even_if_failed():
+    """round==0:即使 sim_status==FAIL 也不追加(尚无"上一轮")。"""
+    designer = FakeDesignerAgent()
+    state = _initial_state(
+        round=0, sim_status="FAIL", sim_log_path=r"D:\ws\logs\sim_exec.log"
+    )
+    asyncio.run(DesignerAgent.verilog_node(state, designer))
+    prompt = designer.calls[0][1]
+
+    assert prompt == _expected_prompt(state)
+    assert "Vivado 仿真失败日志" not in prompt
+
+
+def test_prompt_appends_env_hint_when_sim_status_error():
+    """sim_status==ERROR(无日志产出):追加环境/脚本排查提示。"""
+    designer = FakeDesignerAgent()
+    state = _initial_state(round=1, sim_status="ERROR", sim_log_path="")
+    asyncio.run(DesignerAgent.verilog_node(state, designer))
+    prompt = designer.calls[0][1]
+
+    assert prompt == _expected_prompt(state)
+    assert "【上一轮仿真执行失败】" in prompt
+    assert "scripts/start.tcl" in prompt
+
+
+def test_sim_fields_cleared_after_consumption():
+    """消费仿真反馈后必须清空 sim_status/sim_log_path,防 file_check 回退携带陈旧值。"""
+    designer = FakeDesignerAgent()
+    state = _initial_state(
+        round=1,
+        sim_status="FAIL",
+        sim_log_path=r"D:\ws\logs\sim_exec.log",
+    )
+    result = asyncio.run(DesignerAgent.verilog_node(state, designer))
+    assert result["sim_status"] == ""
+    assert result["sim_log_path"] == ""
 
 
 # ==================== 2. round 递增 ====================

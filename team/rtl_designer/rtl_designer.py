@@ -24,16 +24,26 @@ def _designer_spec_task(s: dict[str, Any]) -> str:
 
 
 def _designer_verilog_task(s: dict[str, Any]) -> str:
-    """Designer RTL 编码节点的任务文本:task + 设计规格 + 验证计划 + 上轮验证反馈。
+    """Designer RTL 编码节点的任务文本:task + 设计规格 + 验证计划 + 上轮验证反馈 + 仿真日志指引。
 
-    与手写节点逐字一致(拼装逻辑承载原 parts 逻辑,供模板变量与技能匹配文本复用):
-    仅当 ``round > 0`` 且存在 ``verification_report`` 时追加反馈小节。
+    拼装逻辑承载原 parts 逻辑,供模板变量与技能匹配文本复用:
+      - 仅当 ``round > 0`` 且存在 ``verification_report`` 时追加验证报告反馈小节;
+      - 仅当上一轮 ``sim_status == "FAIL"`` 且 ``sim_log_path`` 非空时,追加
+        Vivado 仿真失败日志的**路径**与 ``read_file`` 读取指引(不内嵌日志正文,
+        避免海量 stdout 撑大 checkpoint;见 sim_exec_check_node 的设计意图);
+      - 上一轮仿真为 ``ERROR``(环境/脚本异常,无日志产出)时追加环境排查提示。
+
+    注意:``sim_status`` / ``sim_log_path`` 由 designer_verilog 消费后清空
+    (见 ``_designer_verilog_extra``),因此 ``designer_file_check`` 失败回退走到
+    本节点时不会携带更早轮次的陈旧仿真信息。
     """
     task = s["task"]
     design_spec = s.get("design_spec", "")
     vplan = s.get("verification_plan", "")
     report = s.get("verification_report", "")
     round_n = s.get("round", 0)
+    sim_status = s.get("sim_status", "")
+    sim_log_path = s.get("sim_log_path", "")
     parts = [task]
     if design_spec:
         parts.append(f"【设计规格与Filelist】\n{design_spec}")
@@ -41,6 +51,17 @@ def _designer_verilog_task(s: dict[str, Any]) -> str:
         parts.append(f"【验证计划】\n{vplan}")
     if round_n > 0 and report:
         parts.append(f"【第 {round_n} 轮验证报告反馈(请据此修正 RTL)】\n{report}")
+    if round_n > 0 and sim_status == "FAIL" and sim_log_path:
+        parts.append(
+            f"【上一轮 Vivado 仿真失败日志】\n日志文件: {sim_log_path}\n"
+            "请先使用 read_file 工具读取该日志(重点看末尾的编译/仿真报错与 ERROR 行),"
+            "据此定位并修正 RTL 后再交付。"
+        )
+    elif round_n > 0 and sim_status == "ERROR":
+        parts.append(
+            "【上一轮仿真执行失败】仿真环境或脚本执行异常(未产生日志),"
+            "请检查 scripts/start.tcl 与仿真脚本配置是否正确后重试。"
+        )
     return "\n\n".join(parts)
 
 
@@ -49,17 +70,25 @@ def _designer_verilog_extra(
     result: str,
     config: Optional[RunnableConfig] = None,  # noqa: UP045 - 与 node_fn 注解形态一致
 ) -> dict[str, Any]:
-    """Designer RTL 编码节点的额外返回字段:round 递增 + output_files 解析。
+    """Designer RTL 编码节点的额外返回字段:round 递增 + output_files 解析 + 清空仿真反馈。
 
     解析 designer 产出的 ``scripts/syn_filelist.f``,得到本轮待交付 RTL 文件
     清单(相对路径),供下游 designer_file_check 校验存在/非空,以及
     sim_exec_check 做覆盖率包含检查。workspace 取自
     ``config.configurable.workspace_path``,缺失时优雅降级为空列表。
+
+    同时把上游 ``sim_status`` / ``sim_log_path`` 清空:这两个字段仅在
+    ``sim_exec_check`` 失败回退时作为"上一轮仿真反馈"被本节点消费,
+    消费后必须复位,否则 ``designer_file_check`` 失败再次回退时会把更早轮次
+    的陈旧日志当作上一轮反馈注入 prompt。路由(``route_after_sim_check``)
+    在本节点之前判定,故清空不影响任何条件边。
     """
     workspace = ((config or {}).get("configurable", {}) or {}).get("workspace_path")
     return {
         "round": state.get("round", 0) + 1,
         "output_files": parse_filelist(workspace, "scripts/syn_filelist.f"),
+        "sim_status": "",
+        "sim_log_path": "",
     }
 
 

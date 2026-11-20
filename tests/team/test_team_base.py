@@ -11,9 +11,15 @@ import asyncio
 from types import SimpleNamespace
 from typing import ClassVar
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    HumanMessage,
+    RemoveMessage,
+    ToolMessage,
+)
 
-from team.base import TeamAgent
+from team.base import TASK_ERROR_PREFIX, TeamAgent
 from tools.terminal_tools import UserRejectedCommandError
 
 
@@ -123,10 +129,11 @@ def test_template_cache_reuses_init_parse(tmp_path, monkeypatch):
 class _FakeExecutor:
     """模拟 agent_executor:记录方法调用顺序与 aupdate_state 参数"""
 
-    def __init__(self, state=None, events=None, error=None):
+    def __init__(self, state=None, events=None, error=None, update_error=None):
         self.state = state  # StateSnapshot 或 Exception(aget_state 时抛出)
         self.events = events or []
         self.error = error  # astream_events 时抛出的异常
+        self.update_error = update_error  # aupdate_state 时抛出的异常
         self.updates: list[dict] = []
         self.call_order: list[str] = []
         self.seen_configs: list[dict] = []
@@ -140,6 +147,8 @@ class _FakeExecutor:
 
     async def aupdate_state(self, config, values):
         self.call_order.append("aupdate_state")
+        if self.update_error is not None:
+            raise self.update_error
         self.updates.append(values)
         # 模拟 add_messages reducer:追加修复消息,使后续 aget_state 可见
         if self.state is not None and not isinstance(self.state, Exception):
@@ -304,3 +313,188 @@ def test_astream_with_tools_repairs_on_user_rejection():
         "aget_state",
     ]
     assert len(executor.updates) == 1
+
+
+# ==================== 空最终回答清理(_aremove_empty_final_ai / arun_structured) ====================
+
+
+def _ai_end_event(msg) -> dict:
+    """构造 on_chat_model_end 事件(携带最终 AIMessage)。"""
+    return {"event": "on_chat_model_end", "data": {"output": msg}, "name": "ChatOpenAI"}
+
+
+def _token_event(text: str) -> dict:
+    """构造 on_chat_model_stream 事件(携带 token 增量)。"""
+    return {"event": "on_chat_model_stream", "data": {"chunk": AIMessageChunk(content=text)}}
+
+
+def _remove_ids(executor: _FakeExecutor) -> list[str]:
+    """收集所有 aupdate_state 中的 RemoveMessage id。"""
+    return [
+        m.id
+        for upd in executor.updates
+        for m in upd.get("messages", [])
+        if isinstance(m, RemoveMessage)
+    ]
+
+
+def test_arun_structured_empty_final_ai_returns_cancelled_and_removes_message():
+    """空最终回答 → cancelled(TASK_ERROR_PREFIX + 原因),并从 checkpoint 移除空 assistant。"""
+    empty = AIMessage(content="", id="m1", response_metadata={"finish_reason": "length"})
+    executor = _FakeExecutor(
+        state=_state_with([HumanMessage("任务")]),
+        events=[_ai_end_event(empty)],
+    )
+    agent = _make_repair_agent(executor)
+
+    turn = asyncio.run(agent.arun_structured("任务", {"configurable": {"thread_id": "tid"}}))
+
+    assert turn.status == "cancelled"
+    assert turn.output is not None and turn.output.startswith(TASK_ERROR_PREFIX)
+    assert "模型未返回任何内容" in turn.output
+    assert _remove_ids(executor) == ["m1"]
+
+
+def test_arun_structured_content_final_ai_returns_completed_no_removal():
+    """有内容的最终回答 → completed,不做清理。"""
+    answer = "module top; endmodule"
+    executor = _FakeExecutor(
+        state=_state_with([HumanMessage("任务")]),
+        events=[_token_event(answer), _ai_end_event(AIMessage(content=answer, id="m1"))],
+    )
+    agent = _make_repair_agent(executor)
+
+    turn = asyncio.run(agent.arun_structured("任务", {}))
+
+    assert turn.status == "completed"
+    assert turn.output == answer
+    assert _remove_ids(executor) == []
+
+
+def test_arun_structured_streamed_content_with_empty_end_ai_returns_completed():
+    """已流式产出文本时,即使 on_chat_model_end 的 AIMessage 为空也维持 completed:
+    不丢弃用户已见内容,也不做空回答清理。"""
+    executor = _FakeExecutor(
+        state=_state_with([HumanMessage("任务")]),
+        events=[_token_event("hello "), _ai_end_event(AIMessage(content="", id="m1"))],
+    )
+    agent = _make_repair_agent(executor)
+
+    turn = asyncio.run(agent.arun_structured("任务", {}))
+
+    assert turn.status == "completed"
+    assert turn.output == "hello "
+    assert _remove_ids(executor) == []
+
+
+def test_arun_structured_empty_with_tool_calls_returns_completed():
+    """空 content 但带 tool_calls 属工具中间态,不判空、不清理。"""
+    tooling = AIMessage(
+        content="",
+        id="m1",
+        tool_calls=[{"name": "write_file", "args": {}, "id": "c1"}],
+    )
+    executor = _FakeExecutor(
+        state=_state_with([HumanMessage("任务")]),
+        events=[_ai_end_event(tooling)],
+    )
+    agent = _make_repair_agent(executor)
+
+    turn = asyncio.run(agent.arun_structured("任务", {}))
+
+    assert turn.status == "completed"
+    assert _remove_ids(executor) == []
+
+
+def test_arun_structured_pending_interrupt_wins_over_empty():
+    """有挂起中断时优先 interrupted,不做空回答清理。"""
+    empty = AIMessage(content="", id="m1")
+    executor = _FakeExecutor(
+        state=_state_with([HumanMessage("任务")], interrupts=[SimpleNamespace(id="i1")]),
+        events=[_ai_end_event(empty)],
+    )
+    agent = _make_repair_agent(executor)
+
+    turn = asyncio.run(agent.arun_structured("任务", {}))
+
+    assert turn.status == "interrupted"
+    assert _remove_ids(executor) == []
+
+
+def test_arun_structured_empty_final_ai_without_id_returns_cancelled_no_update():
+    """空回答无 id(部分网关不返回)时仍返回 cancelled,但不执行清理。"""
+    empty = AIMessage(content="")  # 无 id
+    executor = _FakeExecutor(
+        state=_state_with([HumanMessage("任务")]),
+        events=[_ai_end_event(empty)],
+    )
+    agent = _make_repair_agent(executor)
+
+    turn = asyncio.run(agent.arun_structured("任务", {}))
+
+    assert turn.status == "cancelled"
+    assert executor.updates == []
+
+
+def test_astream_with_tools_captures_last_final_ai():
+    """多个 on_chat_model_end 时 final_ai 取最后一次(最终回答)。"""
+    executor = _FakeExecutor(
+        state=_state_with([HumanMessage("任务")]),
+        events=[
+            _ai_end_event(AIMessage(content="中间", id="a")),
+            _ai_end_event(AIMessage(content="最终", id="b")),
+        ],
+    )
+    agent = _make_repair_agent(executor)
+    final_ai: list = []
+
+    async def run():
+        async for _ in agent._astream_with_tools("任务", {}, final_ai=final_ai):
+            pass
+
+    asyncio.run(run())
+    assert len(final_ai) == 1
+    assert final_ai[0].id == "b"
+
+
+def test_astream_with_tools_ignores_non_ai_message_output():
+    """on_chat_model_end 的 output 非 AIMessage 时不记入 final_ai。"""
+    executor = _FakeExecutor(
+        state=_state_with([HumanMessage("任务")]),
+        events=[
+            {"event": "on_chat_model_end", "data": {"output": {"weird": 1}}, "name": "x"}
+        ],
+    )
+    agent = _make_repair_agent(executor)
+    final_ai: list = []
+
+    async def run():
+        async for _ in agent._astream_with_tools("任务", {}, final_ai=final_ai):
+            pass
+
+    asyncio.run(run())
+    assert final_ai == []
+
+
+def test_aremove_empty_final_ai_noop_without_checkpointer():
+    """未启用 checkpointer 时直接返回,不触碰 aupdate_state。"""
+    executor = _FakeExecutor(state=_state_with([]))
+    agent = _make_repair_agent(executor)
+    agent._checkpointer = None
+
+    asyncio.run(agent._aremove_empty_final_ai({}, AIMessage(content="", id="m1")))
+
+    assert executor.call_order == []
+
+
+def test_aremove_empty_final_ai_swallows_update_error():
+    """aupdate_state 抛异常时仅告警不抛出(不阻塞 cancelled 返回)。"""
+    executor = _FakeExecutor(
+        state=_state_with([]),
+        update_error=RuntimeError("checkpoint 不可达"),
+    )
+    agent = _make_repair_agent(executor)
+
+    # 不抛异常即通过
+    asyncio.run(agent._aremove_empty_final_ai({}, AIMessage(content="", id="m1")))
+    assert executor.updates == []

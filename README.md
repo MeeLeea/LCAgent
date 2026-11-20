@@ -1354,9 +1354,47 @@ workflow 链路（`session/workflow_adapter.py`）对节点异常（LLM 调用�
 
 **状态迁移**：图级失败 → 写记录；重试成功 / 转 INTERRUPT / 新任务开跑（`arun_events`）→ 清记录；再次失败 → 覆盖更新。
 
-**前端刷新还原**：`GET /api/threads/{thread_id}/stream-status` 响应体新增 `failure` 字段（workflow 会话返回上述记录或 `null`），前端据此还原失败节点红态与"从失败节点重试"入口。
+**前端刷新还原与断点/挂起判定**：`GET /api/threads/{thread_id}/stream-status` 在原有 `streaming` / `failure` 之外新增三个字段，让前端能区分三种"看起来可恢复"的现场（真实节点失败 vs HITL 挂起等人工确认 vs 普通断点续跑）：
 
-回归守护：`tests/session/test_workflow_adapter.py`（FakeGraph 重试/落库/断点校验）、`tests/session/test_session_store.py`（failures 存取）、`tests/graph/test_workflow_failure_recovery_integration.py`（真实 StateGraph + MemorySaver 验证 ainvoke(None) 仅重跑失败节点、已完结图不空转）。
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `pending_interrupt` | `{"kind": str, "payload": Any} \| null` | 图的挂起人工确认，来源 `graph.aget_state(config).interrupts` 的首个中断；`kind` 取中断 value 的 `kind`/`type`（缺失回落 `"interrupt"`），`payload` 为该 value。无图/无状态/读取异常时恒为 `null`（不抛错） |
+| `resumable` | `bool` | = `bool(StateSnapshot.next)`（非空表示还有待执行任务，可从断点续跑） |
+| `resume_kind` | `"interrupt" \| "retry" \| "resume" \| null` | 恢复入口类型，判定优先级见下表 |
+
+`resume_kind` 判定优先级（自上而下命中即止）：
+
+| 优先级 | 条件 | 取值 | 前端入口 |
+| --- | --- | --- | --- |
+| 1 | 有 `pending_interrupt` | `"interrupt"` | 人工确认卡片（`POST /api/chat/resume`） |
+| 2 | 无挂起、有 `failure` 记录 | `"retry"` | 从失败节点重试（`POST /api/chat/retry`；不可续跑时前端提示"无可恢复断点"） |
+| 3 | 无挂起、无 failure、`resumable` 为真 | `"resume"` | 从断点继续（复用 `POST /api/chat/resume`） |
+| 4 | 其余 | `null` | 无恢复入口 |
+
+> `streaming` 为真（后台仍在跑）时**不短路** `pending_interrupt` / `resumable`，仍返回真实值——前端以 `streaming` 优先判断"后台仍在执行"，其余字段供刷新后还原。
+
+实现要点：`WorkflowAdapter.aget_resume_state(thread_id)`（只读，不修改图状态）在 `try/except` 内构建图并读取 `graph.aget_state`，任何异常（图不支持 / 读取失败 / 非 workflow 会话）都返回空 `ResumeState`（`pending_interrupt=None`、`resumable=False`），保证查询路径永不失败；`SessionManager.aget_resume_state` 做透传，chat 链路无此接口时返回 `None` 回落到仅凭 `failure` 判定。`_extract_pending_interrupt` 优先读 `StateSnapshot.interrupts`，缺失时回退遍历 `tasks[*].interrupts`（兼容旧结构）。
+
+回归守护：`tests/session/test_workflow_adapter.py`（FakeGraph 重试/落库/断点校验/心跳/恢复前置校验）、`tests/session/test_session_store.py`（failures 存取）、`tests/graph/test_workflow_failure_recovery_integration.py`（真实 StateGraph + MemorySaver 验证 ainvoke(None) 仅重跑失败节点、已完结图不空转）。
+
+### Workflow 静默期心跳与恢复前置校验
+
+workflow 链路在两类"看起来像节点失败"的场景做了专门防护（`session/workflow_adapter.py`）：
+
+**1. 事件泵静默期心跳（HEARTBEAT）**：`_arun_input_events` 的事件泵队列（`node_queue`）在节点内 LLM 长流式、巨型工具调用参数生成（`tool_call_chunks` 期间 `content` 为空、无 TOKEN 事件）、工具长执行（如 Vivado 仿真）期间可能持续无任何事件产出。前端看门狗（`web/src/store.ts` 的 `WATCHDOG_MS = 90_000`）在此期间会误判"响应超时"并 `finish()` 拉黑线程——拉黑期间到达的 `interrupt` 事件被终止去重守卫丢弃，HITL 确认卡片永不渲染。事件泵因此在距上次产出事件超过 `_WORKFLOW_HEARTBEAT_INTERVAL`（15 秒，看门狗的 1/6）时补发 `AgentEvent.heartbeat`（纯保活：不渲染 UI、不沉淀记忆、不是终止事件），前端收到后仅重置看门狗。
+
+> ⚠️ **转发链路必须放行 heartbeat**：事件泵产出的 `heartbeat` 要真正到达客户端，中间每一跳都不得按事件类型白名单丢弃。工作流经 `/api/chat`（命令模式 `/workflow:<name> <任务>`）执行时，`cli/commands/workflow.py::run_workflow` 逐条消费 `workflow_sm.arun_stream` / `aresume_stream` 的事件并转发——它**必须显式转发 `heartbeat`**（否则长节点静默期前端仍会 90s 看门狗误判"响应超时"）。历史上该循环只处理 `workflow_node` / `done` / `error` / `interrupt` 四类、静默丢弃 `heartbeat`，是"事件泵已产心跳但实测 0 心跳"的根因。回归守护见 `tests/cli/test_workflow_hitl.py`。
+
+**2. aresume 前置校验（fail-open）**：无挂起中断时 `Command(resume=...)` 不会报错、图原地不动，现象是前端静默等到看门狗超时（用户理解为"节点失败"）；并行重跑产生的旧确认卡片重复提交时，载荷与当前挂起项错配。`aresume_events` 在 `_awarm_and_build_workflow` 后读取 `graph.aget_state` 的挂起中断列表：
+
+| 状态 | 行为 |
+| --- | --- |
+| 无法判定（图不支持 `aget_state` / 读取异常） | 放行，照常 `Command(resume)`（fail-open，不拦正常恢复） |
+| 无挂起中断 | yield `DONE`（"当前没有挂起的人工确认，本次恢复已忽略。"），不调 `ainvoke` |
+| 载荷为 `{"answers": {item_id: ...}}` 且 key 与全部挂起项 id 无交集（陈旧卡片重复提交） | 重放当前 `INTERRUPT` 事件（合并 prompt/choices/items），不调 `ainvoke`，让用户对当前问题重新作答 |
+| 其余（human_choice 的 `{"choice_id": ...}` / 部分命中 / 正常载荷） | 照常 `Command(resume=payload)` |
+
+回归守护：`tests/session/test_workflow_adapter.py`（心跳保活、无挂起优雅收尾、陈旧载荷重放、正常载荷放行、human_choice 不误拦）。
 
 ### 与 CLI 的关系
 
@@ -2081,6 +2119,8 @@ with TraceContext(trace_id="req-123", thread_id="thread-abc"):
 
 与 `StreamStallRetryMixin` 的分工：流中途零字节超时（`StreamChunkTimeoutError`）且尚未交付任何 chunk → 流层透明重启；上游**正常结束流但 content 为空**（`length` / `network_error`）不经超时路径，由本检测兜底。
 
+**团队角色（TeamAgent）同源守卫**：工作流工具模式的角色（如 `rtl_designer`）内部是 TeamAgent 自己的内层图，其 thread_id 为 `team:{name}:{tid}`，**同角色的多个节点共用同一内层 checkpoint**（如 `designer_spec` 与 `designer_verilog`）。若某节点的思考型模型返回空最终 `AIMessage`，该空消息会残留在内层 checkpoint 中；同角色下一个节点复用该线程重放历史时会携带一条空 assistant 消息，被严格的 OpenAI 兼容网关（如 `bingxing`）以 400 拒绝（`the message at position 2 with role 'assistant' must not be empty`）。[`team/base.py`](team/base.py) 的 `arun_structured` 因此移植了同一守卫：`_astream_with_tools` 记录最后一次 `on_chat_model_end` 的 `AIMessage`，流结束且无挂起中断时，若**本轮无任何可见输出**且终态 `AIMessage` 为空 → 先经 `aupdate_state` + `RemoveMessage` 从内层 checkpoint 移除该空消息（`_aremove_empty_final_ai`），再返回 `AgentTurnResult.cancelled("任务执行失败: …")`（对齐主 Agent 的 ERROR 语义；工作流节点据此把错误文本写入产物字段并走重做/交付路由）。已流式产出文本时不判定为空（维持既有 completed 语义，不丢弃用户已见内容）；消息无 `id` 或删除失败仅记 warning，不阻塞 cancelled 返回。与孤儿 tool_call 修复互补：后者补配对 `ToolMessage`，本守卫清理空 assistant。
+
 ### 终端命令超时重试与分类（Terminal Timeout Retry）
 
 [`tools/terminal_tools.py`](tools/terminal_tools.py) 对 `run_shell` / `run_python` / `run_cmd` 三个终端工具叠加 ctrl+c 软中断 + 超时分类 + 重试上限机制，防止命令卡死导致 Agent 无限等待或无限重试：
@@ -2528,6 +2568,19 @@ resume = {
 
 **多轮暂停**也支持：恢复后若又遇到新的 `ask_human`，`complete_human_input_turn` 会继续循环处理，直到 `status == "completed"`。例如一个图节点里连续两次 `ask_human`，需要两次 resume 才能完成。
 
+### 工作流节点的中断转发（team/interrupt.py）
+
+工作流节点内部是 **TeamAgent 自己的内层 agent 图**，其 `ask_human` / `request_user_confirmation` 中断需要经 `run_team_turn_with_interrupt` 转发到**外层工作流图**（两层图、两次 interrupt）。关键约束：LangGraph 在 resume 时会**从节点函数首行重新执行**整个节点，因此转发逻辑必须做到幂等重入：
+
+| 语义 | 行为 |
+| --- | --- |
+| **不重放内层 turn** | 恢复轮先判定 scratchpad 是否携带 resume（`get_null_resume(False)` 窥视不消费），是则跳过 `arun_structured`，改用 `TeamAgent.aget_pending_interrupts()` 读取内层挂起中断。若重放 `arun_structured`，会向内层注入重复 `HumanMessage`，导致 `AIMessage.tool_calls` 无对应 `ToolMessage`，OpenAI 直接返回 400（`tool_call_ids did not have response messages`） |
+| **位置重放** | `interrupt()` 按「本 task 已消费答案数」索引恢复值，重入时必须先用等量 `interrupt(None)` 消费旧答案、把位置计数器推进到新中断处；否则多轮中断会读到**上一轮**答案 |
+| **陈旧中断清场** | 内层图残留与当前问题无关的 pending interrupt（上次中断后未恢复）时，进入新轮次前用 `{"cancelled": True, "answers": {}}` 清场（最多 2 次），仍有残留只记 warning，不阻塞新任务 |
+| **返回契约** | 内层 `completed` → 返回输出；`cancelled` → 返回取消文案（`TASK_ERROR_PREFIX: 任务被取消`）；未知状态抛 `RuntimeError` |
+
+回归守护：[tests/team/test_interrupt_forward.py](tests/team/test_interrupt_forward.py)（真实 `StateGraph` + `MemorySaver` 验证 resume 不重放内层 turn、第二轮拿到新答案）。
+
 ### 线程隔离
 
 `resume_structured` 会校验当前 `thread_id` 与产生 interrupt 的线程一致，跨线程恢复会抛 `ValueError`：
@@ -2596,6 +2649,9 @@ output = chat_until_completion(agent, "需要人工选择时请先问我")
 | **同一 AgentCore 实例** | `resume_structured` 要求在同一个 `AgentCore` 实例中调用，跨实例恢复不支持                                        |
 | **跨线程拒绝**          | `resume_structured` 校验 `thread_id`，跨线程恢复会抛 `ValueError`                                              |
 | **与 cot 无关**         | `cot()` 模式不走 LangGraph，不会触发 interrupt；HITL 仅对 `run_structured`/`chat_structured` 生效              |
+| **工作流中断须经 workflow 门面恢复** | 工作流会话的 interrupt 挂在外层 workflow 图上，`POST /api/chat/resume` 对 `workflow-*` 会话走 `workflow_sm.aresume_stream`；若误用 chat 会话管理器恢复，工作流会原地不动 |
+| **HTTP 入口不替用户作答** | `CommandContext.interactive=False`（API 命令入口）：遇到 interrupt 只把事件转发给前端后退出本轮，答案由前端 `POST /api/chat/resume` 提交；CLI 入口仍用方向键结构化收集。user_confirmation 的 resume 负载为 `{"answers": {item_id: {"choice_id": ...}}}`，human_choice 为 `{"choice_id": ...}` |
+| **存量中毒会话需新建**   | 修复前留下 pending interrupt 的工作流会话（内层 `team:*` thread 已污染）没有公开 API 清理，建议新建工作流会话重跑；已完成的会话不受影响 |
 | **测试覆盖**            | [tests/agent/test_human_input.py](tests/agent/test_human_input.py) 覆盖了 interrupt、resume、并行选择、线程隔离等场景 |
 
 ---
@@ -2614,8 +2670,8 @@ output = chat_until_completion(agent, "需要人工选择时请先问我")
 | `tools`                                       | 查看可用工具列表（含 MCP 工具）                                              |
 | `clear [long\|short\|agent\|all]`                | 清理记忆（默认 long；agent 清 agent 级跨会话记忆）                           |
 | `forget <关键词>` / `forget agent <关键词>`    | 记忆遗忘（软删除，按内容关键词/主题匹配；scope 同 clear：long 默认/agent）    |
-| `session memory`                             | 召回并展示当前会话(thread 级)长期记忆                                       |
-| `agent memory`                                | 召回并展示 agent 级（跨会话共享）长期记忆                                    |
+| `session memory` 或 `session:memory` 或 `sessionmem` | 召回并展示当前会话(thread 级)长期记忆（三种写法等价）                       |
+| `agent memory` 或 `agent:memory` 或 `agentmem` | 召回并展示 agent 级（跨会话共享）长期记忆（三种写法等价）                    |
 | `compress` 或 `压缩`                        | 压缩当前会话(thread 级)长期记忆（LLM 摘要后替换原内容；默认作用域为 thread） |
 | `compress agent` 或 `压缩 agent`             | 压缩 agent 级（跨会话共享）长期记忆（LLM 摘要后替换原内容；别名 `compress:agent`） |
 | `compact`                                     | 手动压缩当前会话上下文（增量摘要 + 工具输出 Prune，`force=True` 跳过阈值） |
@@ -2694,9 +2750,9 @@ Verification (spec_design_task:验证计划)
 Designer (designer_output:整理最终交付物) → END（终止）
 ```
 
-- **多轮交互**：`designer_verilog` → `designer_file_check` → `verification_check` → `sim_exec_check` 构成迭代环，由 `route_after_file_check` / `route_after_sim_check` 条件路由判定。`designer_file_check` 校验本轮产出 RTL 文件存在且非空；`sim_exec_check` 实际执行 Vivado 仿真并检查覆盖率（全部 src 被 filelist 包含且报告已生成），仿真+覆盖率通过即经 `designer_output` 交付后终止（END）；失败且轮次未达 `max_rounds`（默认 3）时携带验证反馈回到 Designer 重新编码；达上限强制经 `designer_output` 交付后终止（END），防止死循环。
+- **多轮交互**：`designer_verilog` → `designer_file_check` → `verification_check` → `sim_exec_check` 构成迭代环，由 `route_after_file_check` / `route_after_sim_check` 条件路由判定。`designer_file_check` 校验本轮产出 RTL 文件存在且非空；`sim_exec_check` 实际执行 Vivado 仿真并检查覆盖率（全部 src 被 filelist 包含且报告已生成），仿真+覆盖率通过即经 `designer_output` 交付后终止（END）；失败且轮次未达 `max_rounds`（默认 3）时携带验证反馈回到 Designer 重新编码（进入 `designer_verilog` 的 prompt 含上一轮验证报告、上一轮 `sim_log_path` 与 `read_file` 读取指引，日志正文不内嵌 state）；达上限强制经 `designer_output` 交付后终止（END），防止死循环。**轮次按任务重置**：`round` 等计数器与 `rtl_code` / `verification_report` / `output_files` 等产物字段随 checkpoint 按 thread 持久化，故 `WorkflowAdapter.arun_events` 每次新任务都按注册表的 `initial_fields` 播种回空（`reset_round_counters` 兜底），避免同一 workflow 会话的第二条任务开局就接近 `max_rounds` 或把上一轮产物拼进交付物。
 - **交付节点（零 LLM）**：`designer_output` 是**确定性机械拼装**节点，**不调用任何 LLM、不渲染模板、不做网络/磁盘 IO**——仅把 `task` / `design_spec` / `rtl_code` / `verification_report` / `output_files` 等 state 字段按固定小节拼装成 `final_answer`（空字段整段省略，全空时至少回退 `state["task"]`）。两条终态路径（`sim_exec_check` 通过、达 `max_rounds` 上限）以及 `designer_file_check` 达上限，均先经 `designer_output` 交付再 `→ END`，保证 `final_answer` 非空、跨轮次记忆沉淀与 DONE 事件内容可用。
-- **上下文衔接**：Architect 各阶段任务文本逐级拼接上游产物（计划→设计→分析→评审→规格），Designer/Verification 基于架构规格分工，多轮迭代时第二轮起注入上一轮验证报告反馈。
+- **上下文衔接**：Architect 各阶段任务文本逐级拼接上游产物（计划→设计→分析→评审→规格），Designer/Verification 基于架构规格分工，多轮迭代时第二轮起注入上一轮验证报告反馈；仿真失败回退时额外注入上一轮 Vivado 仿真失败日志的**路径**（`sim_status == "FAIL"` 时），由 designer 经 `read_file` 自行读取定位报错，消费后该字段随之清空，避免 `designer_file_check` 回退时携带更早轮次的陈旧日志。
 - **角色注册**：`team/__init__.py` 未导入 `rtl_designer`/`rtl_verification`，由 `rtl_graph.py` 顶部 from-import 三个角色类（`ArchiAgent`/`DesignerAgent`/`VerificationAgent`，NodeSpec 需引用其类属性节点）触发 `@register_agent` 注册，与 `graph.common` 无循环导入。**节点实现全部归属角色类**：LLM 节点为类属性（`create_llm_node` 闭包，经 `ArchiAgent.plan_node` 等类属性引用注册），代码型节点为实例方法（经 `agents[role].xxx_node` bound-method 引用注册，`register_nodes` 自动识别两种形态）。
 
 ### 团队角色
@@ -2721,6 +2777,7 @@ Designer (designer_output:整理最终交付物) → END（终止）
 - **按需工具注入**:Manager/Terminator 纯 LLM 推理,Worker 注入工具列表后用 `create_agent` 构建轻量 ReAct 循环
 - **工具超时 + 错误纠错**:工具经 `tools.tool_wrapper.wrap_tools_with_timeout` 包裹超时保护(防卡死,默认 60 秒+工具级覆盖如 `ask_human` 600 秒);executor 挂载 `ToolExecutionErrorMW`(工具异常转 `ToolMessage(status="error")` + 反思指令,LLM 可读到报错修正重试)与 `WorkspaceSecurityMW`(workspace 路径解析 + 逃逸校验),与主 Agent 的工具执行质量对齐
 - **孤儿 tool_call 修复**(`_arepair_orphan_tool_calls`,对照 `AgentCore` 的 `_arepair_rejected_tool_calls` 同构移植):启用 checkpointer 时内层 thread_id(`team:{name}:{tid}`)跨 turn 复用,上次 turn 因用户拒绝危险命令/执行异常/中途取消结束时,checkpoint 残留 `AIMessage(tool_calls)` 而无对应 `ToolMessage`,下次开跑直接把非法消息序列发给 LLM 会触发 OpenAI 400(`tool_call_ids did not have response messages`)。修复时机:`_astream_with_tools` 开跑前防御性修复(覆盖历史残留)+ `UserRejectedCommandError` re-raise 前当次修复;有 pending interrupts 时跳过(属工具内 confirm 的合法暂停,等 resume 由工具正常写入结果,抢先补写会产生重复 `ToolMessage` 干扰恢复语义)。修复动作:补写 `ToolMessage(status="error", content="工具调用未完成(用户拒绝或上次执行中断),已跳过。")` 并 `aupdate_state` 持久化。
+- **空最终回答清理**(`_aremove_empty_final_ai`,对照 `agent/streaming.py` 同源守卫移植):思考型模型(reasoning token 计入 `max_tokens`)预算耗尽返回空 `AIMessage`(`finish_reason=length`),空消息随图落入内层 checkpoint;内层 thread(`team:{name}:{tid}`)被同角色后续节点复用时会携带空 assistant 消息,触发严格网关 400(`message ... role 'assistant' must not be empty`)。`arun_structured` 在流结束且无挂起中断时,若本轮**无任何可见输出**且终态 `AIMessage` 为空 → 先 `aupdate_state` + `RemoveMessage` 移除该空消息,再返回 `cancelled("任务执行失败: …")`;已流式产出文本时不判空(维持 completed 语义)。无 `id`/删除失败仅记 warning。与孤儿 tool_call 修复互补:后者补配对 `ToolMessage`,本守卫清空 assistant。
 - **快速构建**:不加载 MCP Server、不创建 SQLite checkpointer
 - **内建技能注入**:持有 `SkillManager`(`skills_dir` 参数指定目录,默认 `.agents/skills`),`build_skill_block`/`inject_into_prompt` 转发 `skmng.core`(满足 `PromptInjector` 协议),三来源合并(角色级 `fixed_skills` 类属性 + 运行时 `active_names` + 自动匹配);`VerificationAgent` 声明 `fixed_skills = ["vivado-2025.2"]`,由 `create_llm_node` 读取并传参给注入器,实现角色级固定技能无条件注入;单节点可通过 `exclude_skills` opt-out(如 `VerificationAgent.check_node` 排除 `"vivado-2025.2"` 因与 Xsim 流程冲突)。工作流节点可直接以角色实例为注入器,无需外部构造
 - **类型化执行结果**:`arun_structured` 返回 `AgentTurnResult`(completed / cancelled,复用 `agent/turn_types.py`),调用方可区分"正常完成"与"LLM 失败",工作流节点可据此重试/降级;`ainvoke`/`astream` 保持返回字符串契约不变
@@ -2733,7 +2790,7 @@ Designer (designer_output:整理最终交付物) → END（终止）
 
 工作流节点全面异步化,`TeamAgent` 提供 `arun_structured`/`aresume_structured`/`ainvoke`/`astream` 异步能力,节点经通用工厂统一调用 `TeamAgent` 方法并透传 LangGraph `config`(callbacks 通道)实现 TOKEN 级流式;同时具备技能注入与跨轮次记忆压缩能力:
 
-- **异步节点执行 + TOKEN 流式**:`simple.py` / `rtl_graph.py` 的业务节点(`manager_plan`/`worker_exec`/`terminator_final` 及 RTL 各节点)全部由 `team/node_factory.py::create_llm_node` 工厂构建(手写节点如 `ManagerAgent.summarize_context_node` 复用同一链路),执行路径统一为:`agent.get_template(template_name)` 取模板 → `agent.render_template(...)` 渲染 → 基础提示词前置(`llm.config.load_agent_rules` 按 `agent.tools` 判定) → `injector.inject_into_prompt(...)` 注入技能 → `run_team_turn_with_interrupt(agent, prompt, config)` 执行,并透传 LangGraph 注入的 `config: Optional[RunnableConfig]`。`run_team_turn_with_interrupt`(`team/interrupt.py`)内部调通用 `TeamAgent.arun_structured`;内层被 interrupt 时调外层 `langgraph.types.interrupt()` 暂停外层图,resume 后经 `TeamAgent.aresume_structured` 注入内层恢复,循环处理多次 interrupt。**节点实现归属各角色类**:两个内置工作流的业务节点全部以类属性(LLM 节点,`create_llm_node` 闭包)或实例方法(代码型节点)形式定义在 team/ 角色类中,graph 文件只保留编排(NodeSpec 表 + 边 + 条件路由)。`TeamAgent`(`team/base.py`)提供 `arun_structured`/`aresume_structured`/`ainvoke`/`astream` 异步能力:`_astream_with_tools` 经 `agent_executor.astream_events(version="v2")` 过滤 `on_chat_model_stream`;`_astream_pure_text` 经 chat model `astream`。因同事件循环执行,callbacks 自然透传——`NodeTrackingHandler.on_chat_model_stream` 捕获 LLM token 增量转发为 `AgentEvent.token`,`WorkflowAdapter._on_token` 闭包补 `thread_id`/`role="assistant"`/`trace_id` 后注入事件流,实现节点执行期间的 TOKEN 级流式(空块自动过滤)。
+- **异步节点执行 + TOKEN 流式**:`simple.py` / `rtl_graph.py` 的业务节点(`manager_plan`/`worker_exec`/`terminator_final` 及 RTL 各节点)全部由 `team/node_factory.py::create_llm_node` 工厂构建(手写节点如 `ManagerAgent.summarize_context_node` 复用同一链路),执行路径统一为:`agent.get_template(template_name)` 取模板 → `agent.render_template(...)` 渲染 → 基础提示词前置(`llm.config.load_agent_rules` 按 `agent.tools` 判定) → `injector.inject_into_prompt(...)` 注入技能 → `run_team_turn_with_interrupt(agent, prompt, config)` 执行,并透传 LangGraph 注入的 `config: Optional[RunnableConfig]`。`run_team_turn_with_interrupt`(`team/interrupt.py`)内部调通用 `TeamAgent.arun_structured`;内层被 interrupt 时调外层 `langgraph.types.interrupt()` 暂停外层图,resume 后经 `TeamAgent.aresume_structured` 注入内层恢复,循环处理多次 interrupt。**节点实现归属各角色类**:两个内置工作流的业务节点全部以类属性(LLM 节点,`create_llm_node` 闭包)或实例方法(代码型节点)形式定义在 team/ 角色类中,graph 文件只保留编排(NodeSpec 表 + 边 + 条件路由)。`TeamAgent`(`team/base.py`)提供 `arun_structured`/`aresume_structured`/`ainvoke`/`astream` 异步能力:`_astream_with_tools` 经 `agent_executor.astream_events(version="v2")` 过滤 `on_chat_model_stream`;`_astream_pure_text` 经 chat model `astream`。因同事件循环执行,callbacks 自然透传——`NodeTrackingHandler.on_llm_new_token`(LangChain 回调系统派发的标准流式 token 钩子;注意 `on_chat_model_stream` 是 `astream_events` 的事件名而非回调钩子,历史上误用作 handler 方法名导致 TOKEN 事件从不触发) 捕获 LLM token 增量转发为 `AgentEvent.token`,`WorkflowAdapter._on_token` 闭包补 `thread_id`/`role="assistant"`/`trace_id` 后注入事件流,实现节点执行期间的 TOKEN 级流式(空块自动过滤)。前端配套:`web/src/store.ts` 的 `interrupt` 事件豁免 `terminatedThreads` 终止去重守卫——HITL 中断是需要用户响应的状态机事件,不得被当作迟到重复包静默丢弃(否则看门狗误判超时拉黑线程后,确认卡片永不渲染);工作流会话前端**不渲染 TOKEN**(节点产出以 `workflow_node` 结果块为唯一呈现,避免"流式原文 + 节点块"重复),TOKEN 事件仍照常消费并重置看门狗。
 - **技能注入(SkillInjector)**:两个 `build_*_workflow` 的 `SkillInjector` 创建与 State schema 组合(`compose_state_schema`)统一由 `graph/common/builder_utils.py::build_graph_scaffold(agents, *, skills_dir, auto_match_skills, extra_channels=None) -> (builder, injector)` 在构建期一步完成(接受 `skills_dir` / `auto_match_skills` 参数,经 `skmng.injector.SkillInjector` 构造注入器并包出 `StateGraph`)。节点渲染 prompt 后调用 `inject_into_prompt()` 把命中技能(`match_skills(task)`)的指引块追加到 prompt 末尾,已含技能块时跳过(防重复)。`skmng.core.build_skill_block` 的三来源合并(角色级 `fixed_skills` + 运行时 `active_names` + 自动匹配)完整生效:`SkillInjector.inject_into_prompt` 接受 `fixed_skills` 参数,节点经 `create_llm_node` 读取 `agent.fixed_skills` 传入(如 `VerificationAgent.fixed_skills = ["vivado-2025.2"]`,验证环境始终注入 Vivado Xsim 指引,与任务关键词无关);需要排除某技能时经 `exclude_skills` 传入(如 `VerificationAgent.check_node` 排除 `"vivado-2025.2"`,因该技能的 add_files 目录通配与 Xsim `sim_filelist.f` 流程冲突,作为节点级 opt-out)。`TeamAgent` 亦内建同等能力(`build_skill_block` / `inject_into_prompt` 转发 `skmng.core`,满足 `PromptInjector` 协议)——节点可直接以角色实例为注入器,无需外部构造;`team/factory.py` 会把角色 `team/team_agents.json` 的 `skills_dir` / `auto_match_skills` / `tool_timeout` 透传给 TeamAgent。节点在 `create_llm_node` 内从 `state["active_skills"]` 读取手动加载技能并作为 `active_names` 传入(与 `fixed_skills` / `exclude_skills` 并列),使 `skill:<name>` 加载的技能经 workflow checkpoint per-thread 持久化后真正到达节点 prompt;`arun_compiled_workflow` / `arun_workflow_by_name` 均接受 `active_skills` 参数(仅非空时写入初始状态,不覆盖 checkpoint 已持久化的值)。`WorkflowAdapter`(`session/workflow_adapter.py`)提供 `list_skills` / `auto_match_skills` / `aload_skill` / `aclear_skills`,经 `graph.aget_state` / `graph.aupdate_state` 读写 workflow 会话 state,使 workflow 会话具备与主 Agent(`SkillOps`)同级的技能读写能力。
 - **消息通道压缩(compaction)**:工作流 State schema 已不再手写固定的 `WorkflowState` / `RTLGraphState` TypedDict,改由 `graph/common/schema.py::compose_state_schema(agents, extra_channels)` 在构建期动态组合(底座 `messages`/`task`/`raw_context`/`active_skills` + 各角色 `state_fields` 声明 + 工作流级 `extra_channels`)。`messages`(LangGraph `add_messages` 通道)仍为底座通道,每个业务节点产出追加一条 `AIMessage`;工作流级 `summary` 通道已移除。**消息压缩统一由 `LCAgentCompactionMiddleware.before_model` 中间件在模型调用前自动触发**(见 `midware/compaction.py`),节点级压缩(`register_nodes` 的 `compaction_mw`、`build_*_workflow` 的 `compaction_config` 参数)已移除——`register_nodes` 不再接受 `compaction_mw`,`build_*_workflow` 也不再接受 `compaction_config`,`graph/common/compaction_utils.py::_build_compaction_middleware` 保留,供 `session/workflow_adapter.py` 手动压缩路径使用。
 - **跨轮次上下文延续**:统一入口(CLI/API)经 `WorkflowAdapter`(`session/workflow_adapter.py`)执行——运行前从 workflow 专属会话的 checkpoint `messages` 通道读取历史节点产出(预览最多 5 条、每条截断 200 字符,拼为 `【历史执行记录】` 块),叠加 `MemoryManager.recall_text` 的长期记忆,合并注入 `raw_context`,实现多轮运行间的上下文延续。**用户输入作为 `HumanMessage` 写入 `messages` 通道**:`arun_events` 的 `initial_state` 除 `task` 外同时注入 `"messages": [HumanMessage(content=message)]`(`add_messages` reducer 追加),使工作流会话的 checkpoint 历史与普通对话一致——否则会话内只有节点产出的 `AIMessage`、无任何 `HumanMessage`,`serialize_messages` / `aget_messages` 拿不到用户输入,前端重载历史(切会话 / 刷新 / 断流重连)后用户消息会从会话窗口中消失(侧栏预览也会回落到节点产出)。仅 `arun_events`(新一轮用户输入)注入;`aresume_events` / `aretry_events` 沿用 checkpoint 不重复注入。

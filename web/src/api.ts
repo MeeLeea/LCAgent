@@ -246,8 +246,13 @@ export const api = {
     onEvent: (ev: StreamEvent) => void,
   ): (() => void) => streamRequest(`${BASE}/chat/retry`, body, onEvent),
 
-  /** 查询线程流式状态与最近失败记录（页面刷新后据此还原失败横幅/重连） */
-  getStreamStatus: (thread_id: string) =>
+  /**
+   * 查询线程真实流式状态（GET /api/threads/{id}/stream-status）。
+   * 返回 streaming / failure / pending_interrupt / resumable / resume_kind，
+   * 供页面刷新还原失败横幅/重连，以及看门狗超时后向后端求证真实状态使用。
+   * 前端按后端已算好的 resume_kind 分支（interrupt > retry > resume > null），不自行推导。
+   */
+  fetchStreamStatus: (thread_id: string) =>
     jsonFetch<StreamStatus>(
       `${BASE}/threads/${encodeURIComponent(thread_id)}/stream-status`,
     ),

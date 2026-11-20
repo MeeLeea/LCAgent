@@ -10,6 +10,7 @@ import {
   ChevronUp,
   ChevronDown,
   RotateCcw,
+  Play,
 } from 'lucide-react'
 import { useStore, selectIsStreaming } from '../store'
 import { WorkflowGraph } from './WorkflowGraph'
@@ -69,6 +70,8 @@ export function WorkflowView() {
   const failedNode = useStore((s) => s.failedNode)
   const retryCurrentThread = useStore((s) => s.retryCurrentThread)
   const isStreaming = useStore(selectIsStreaming)
+  const currentThreadId = useStore((s) => s.currentThreadId)
+  const resumableThreads = useStore((s) => s.resumableThreads)
   const [collapsed, setCollapsed] = useState(false)
   const [panelHeight, setPanelHeight] = useState(loadPanelHeight)
   const [isResizing, setIsResizing] = useState(false)
@@ -129,6 +132,9 @@ export function WorkflowView() {
   const panelStyle = collapsed
     ? undefined
     : { height: panelHeight, transition: isResizing ? 'none' : undefined }
+
+  // 可从断点继续：失败横幅优先，其次才展示续跑入口
+  const canResume = !!currentThreadId && resumableThreads[currentThreadId] === true
 
   return (
     <div
@@ -212,6 +218,28 @@ export function WorkflowView() {
               >
                 <RotateCcw size={13} />
                 从失败节点重试
+              </button>
+            </div>
+          )}
+          {!failedNode && canResume && (
+            <div className="workflow-resume-banner">
+              <Play size={15} className="workflow-resume-icon" />
+              <div className="workflow-resume-info">
+                <span className="workflow-resume-title">工作流已暂停，可从断点继续</span>
+                <span className="workflow-failure-detail">
+                  后端保留了待执行任务，点击可继续执行
+                </span>
+              </div>
+              <button
+                className="choice-btn workflow-retry-btn"
+                onClick={retryCurrentThread}
+                disabled={isStreaming}
+                title={
+                  isStreaming ? '正在执行中，结束后可继续' : '从 checkpoint 断点继续执行待完成任务'
+                }
+              >
+                <Play size={13} />
+                从断点继续
               </button>
             </div>
           )}
